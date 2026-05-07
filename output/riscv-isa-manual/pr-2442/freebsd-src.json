@@ -1,0 +1,163 @@
+{
+  "pr_number": 2442,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2442,
+    "violation_condition": "FreeBSD kernel reads stval into frame->tf_stval (exception.S:110-111) without first ensuring senvcfg.PME=0 to disable pointer masking. If prior boot stages (M-mode firmware, UEFI, or previous kernel) left senvcfg.PME=1, the hardware applies pointer masking to the faulting address written to stval. In trap.c page_fault_handler, the masked stval is consumed raw: checked with VIRT_IS_VALID (which interprets sign-extended masked addresses as illegal), truncated to va=trunc_page(stval) for pmap lookups, and passed as si_addr to userspace signals. For kernel-mode faults at line 245, if PMM=0 zeroes upper bits of a kernel address, the masked stval falls below VM_MIN_KERNEL_ADDRESS, causing the fault to be routed to the user map instead of the kernel map.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "frame->tf_stval|csrr.*stval|CSR_STVAL|senvcfg|SENVCFG",
+    "affected_entities": [
+      "stval",
+      "senvcfg",
+      "menvcfg"
+    ],
+    "summary": "FreeBSD kernel never initializes senvcfg, so if firmware left pointer masking enabled, hardware-masked stval values break VIRT_IS_VALID address checks, causing spurious SIGSEGV for userspace or kernel panic for kernel-mode faults misrouted to user map"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers",
+        "line_start": 110,
+        "line_end": 111,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Hardware stval CSR is read directly via csrr and stored into tf_stval without consulting senvcfg.PME, but since the kernel never writes senvcfg (zero PMLEN on reset), pointer masking is never enabled for S-mode, so stval always holds the raw unmasked VA.",
+      "snippet": "csrr    t0, stval\nsd      t0, (TF_STVAL)(sp)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 228,
+        "line_end": 228,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "stval is consumed raw from the trapframe without PMLEN-aware unmasking. This is safe because the kernel never enables pointer masking (no senvcfg write anywhere in the codebase, PMLEN=0 after reset).",
+      "snippet": "stval = frame->tf_stval;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 231,
+        "line_end": 231,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VIRT_IS_VALID(stval) for usermode checks uses raw stval. If PMLEN were non-zero and PMM=0 (zeroing upper bits), a sign-extended masked address could be misclassified as invalid. But PMLEN=0 in practice.",
+      "snippet": "if (!VIRT_IS_VALID(stval)) {"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 245,
+        "line_end": 251,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Kernel-mode stval compared against VM_MIN_KERNEL_ADDRESS (0xffffffc000000000) to choose kernel_map vs user map. If PMLEN were non-zero and PMM=0 zeroed upper bits of a kernel VA, the masked stval would fall below VM_MIN_KERNEL_ADDRESS, routing the fault to the wrong map. But PMLEN=0 in practice.",
+      "snippet": "if (stval >= VM_MIN_KERNEL_ADDRESS) {\n    map = kernel_map;\n} else {\n    if (pcb->pcb_onfault == 0)\n        goto fatal;\n    map = &p->p_vmspace->vm_map;\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 254,
+        "line_end": 254,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "trunc_page(stval) truncates raw stval for pmap lookups. If PMLEN were non-zero and PMM=0, the truncated page address could misalign due to masked upper bits. But PMLEN=0 in practice.",
+      "snippet": "va = trunc_page(stval);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 275,
+        "line_end": 276,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Masked stval passed as si_addr to userspace via call_trapsignal. If PMLEN were non-zero, userspace would receive a corrupted fault address. But PMLEN=0 in practice.",
+      "snippet": "call_trapsignal(td, sig, ucode, (void *)stval,\n    frame->tf_scause & SCAUSE_CODE);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 303,
+        "line_end": 303,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Fatal kernel page fault panic prints masked stval. Minor forensic impact if PMLEN were non-zero. But PMLEN=0 in practice.",
+      "snippet": "panic(\"Fatal page fault at %#lx: %#lx\", frame->tf_sepc, stval);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "(boot assembly)",
+        "line_start": 1,
+        "line_end": 396,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Boot code sets up stvec, satp, sscratch, and page tables but never configures senvcfg. Pointer masking remains disabled (PMLEN=0) across the full boot-to-kernel transition. No violation.",
+      "snippet": "(no senvcfg write anywhere in locore.S)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_run",
+        "line_start": 630,
+        "line_end": 632,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Hypervisor writes only HENVCFG_STCE (timer delegation). No PMLEN or PMM bits are set in henvcfg. Guest senvcfg slot exists in struct hypcsr (riscv.h:67) but is never read/written — dead field.",
+      "snippet": "if (has_sstc)\n    csr_write(henvcfg, HENVCFG_STCE);\ncsr_write(hie, HIE_VSEIE | HIE_VSSIE | HIE_SGEIE);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "(header)",
+        "line_start": 176,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Only HENVCFG_* bitfields are defined (STCE, PBMTE, CBZE, CBCFE, CBIE, FIOM). No SENVCFG_PMM, SENVCFG_PMLEN, or any pointer-masking bit definitions exist — confirming zero PM support.",
+      "snippet": "#define HENVCFG_STCE  (1UL << 63)\n#define HENVCFG_PBMTE (1UL << 62)\n/* No SENVCFG_* or PM definitions */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/encoding.h",
+        "function_name": "(header)",
+        "line_start": 567,
+        "line_end": 576,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR definitions exist for sstatus/sie/stvec/sscratch/sepc/scause/stval/sip/satp only. No CSR_SENVCFG, CSR_MENVCFG, or CSR_HENVCFG register numbers — confirming no envcfg CSR access possible.",
+      "snippet": "#define CSR_SSTATUS 0x100\n/* No CSR_SENVCFG (0x10A), CSR_MENVCFG (0x30A), CSR_HENVCFG (0x60A) */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/identcpu.c",
+        "function_name": "parse_ext_s",
+        "line_start": 163,
+        "line_end": 193,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ISA extension parser recognizes sstc/svnapot/svpbmt/svinval/sscofpmf only. No Ss npm (pointer masking) extension check — PM is not advertised to the kernel, so no PM hardware path is activated.",
+      "snippet": "CHECK_S_EXT(\"sstc\",    SV_SSTC);\nCHECK_S_EXT(\"sscofpmf\",SV_SSCOFPMF);\n/* No CHECK_S_EXT(\"ssnpm\", ...) or PM flag */"
+    }
+  ],
+  "overall_severity": "compliant"
+}

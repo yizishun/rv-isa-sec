@@ -1,0 +1,347 @@
+[
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688207643",
+    "pull_request_review_id": 3658042636,
+    "id": 2688207643,
+    "node_id": "PRRC_kwDOBM85g86gOssb",
+    "diff_hunk": "@@ -0,0 +1,552 @@\n+[[S-level-physical-memory-protection]]\n+=== \"Sspmp\" Extension for S-level Physical Memory Protection (SPMP)\n+\n+The RISC-V S-level Physical Memory Protection (SPMP) mechanism provides per-hart control registers in supervisor mode.\n+These registers define physical memory access privileges—read, write, and execute—for discrete physical memory regions.\n+\n+A memory access is successful only when permission checks for both S-mode execution environment and SPMP pass.\n+SPMP checks can be performed by the hardware in parallel with PMA and PMP checks.\n+SPMP exceptions take priority over PMP or PMA exceptions.\n+Consequently, if a memory access violates both SPMP and PMP/PMA rules, only the SPMP exception is reported.\n+\n+SPMP checks are enforced on all memory accesses with effective privilege modes less privileged than M-mode.\n+SPMP can be configured to grant permissions to U-mode, which has none by default, and to revoke permissions from S-mode.\n+\n+If the Hypervisor Extension is implemented in conjunction with `Sspmp`, when V = 1 and hgatp.MODE = Bare, SPMP enforces access checks on all memory accesses from VS and VU-modes, effectively applying SPMP protections to guest execution contexts.\n+Additionally, the Hypervisor Virtual Machine Load and Store instructions (HLV, HLVX, HSV), when executed from the HS-mode, or U-mode (when hstatus.HU = 1), are also subject to SPMP checks under the V = 1 condition.\n+\n+\n+==== Extension Dependencies\n+\n+. The `Sscsrind` extension for indirect CSR access must be implemented.\n++\n+. The `sstatus.SUM` (permit Supervisor User Memory access) bit must be *writable*. In SPMP, this writability is essential because the bit alters how S-mode load and store operations access user memory.\n++\n+. The `sstatus.MXR` (Make eXecutable Readable) bit must be *writable*. This writability supports M-mode emulation handlers that require reading instructions with `MXR=1 and MPRV=1`.\n++\n+. If the Hypervisor Extension is implemented in conjunction with `Sspmp`, the only mandatory translation mode in both hgatp and satp is Bare.\n+\n+\n+[NOTE]\n+====\n+The `Sspmp` extension does not provide ISA support to accelerate virtualization of the SPMP functionality.\n+====\n+\n+\n+[[spmp-csrs]]\n+==== S-level Physical Memory Protection CSRs\n+\n+Each SPMP entry is composed of an SXLEN-bit configuration register and an associated SXLEN-bit address register.\n+The SPMP registers are accessible only via the indirect access mechanism.\n+For details on CSR numbers and how to access them, see <<access-method>>.\n+In TOR mode, an entry also uses the address register of the preceding entry to define its range (see <<address-matching>>).\n+Implementations support from 1 to 64 SPMP entries.\n+\n+\n+[NOTE]\n+====\n+An SPMP entry refers to the register pair `spmpcfg[i]` and `spmpaddr[i]`.\n+\n+An SPMP rule is defined by the contents of an `spmpcfg` register and its corresponding `spmpaddr` register(s).\n+These registers collectively define a protected physical memory region and its access constraints.\n+====\n+\n+The SPMP address registers, named `spmpaddr0` through `spmpaddr63`, share the same layout as the M-mode PMP architecture.\n+On RV32 systems, each `spmpaddr` register encodes a 34-bit physical address from bit 33 down to bit 2, as illustrated in <<spmpaddr-rv32>>.\n+On RV64 systems, each `spmpaddr` register encodes a 56-bit physical address from bit 55 down to bit 2, as shown in <<spmpaddr-rv64>>.\n+An implementation may support fewer address bits on systems with a smaller physical address space.\n+All writable SPMP entries should implement the same number of address bits.\n+Since not all physical address bits must be implemented, the SPMP address registers are considered WARL, with exceptions defined by granularity rules.\n+Refer to <<pmp-address-matching>>.\n+\n+[NOTE]\n+====\n+If `spmpaddr` is narrower than the number of supported physical address bits, some physical addresses may not be representable in an SPMP entry.\n+Since S-mode cannot access any memory unless an SPMP entry permits it, any memory region that cannot be addressed by an SPMP entry is inaccessible to S-mode.\n+====\n+\n+\n+\n+[[spmpaddr-rv32]]\n+.SPMP address register format, RV32.\n+include::images/bytefield/spmpaddr-rv32.edn[]\n+\n+[[spmpaddr-rv64]]\n+.SPMP address register format, RV64.\n+include::images/bytefield/spmpaddr-rv64.edn[]\n+\n+Every SPMP entry contains an SXLEN-bit configuration register, `spmpcfg[i]`.\n+<<spmpcfg>> illustrates the layout of `spmpcfg[i]`.\n+Permission rules and their encodings are detailed in <<encoding>>.\n+\n+. The R, W, and X bits govern permissions for read, write, and instruction execution, respectively.\n+. The A field, which defines the address-matching mode, is detailed in <<address-matching>>.\n+. Bits 5 and 6 are reserved for future standard use.\n+. The L (lock) bit designates an entry as locked.\n+Setting the L bit locks the SPMP entry, regardless of the A field's setting (even OFF).\n+Attempts to write to locked `spmpcfg[i]` and `spmpaddr[i]` registers using the `siselect` CSR are ignored.\n+If a locked entry has `spmpcfg[i].A` set to TOR, writes to the preceding `spmpaddr[i-1]` via `siselect` are also ignored.\n+. For any rule not designated as a `Shared-Region`, the U bit determines if it is `U-mode` (when set) or `S-mode-only` (when clear), as explained in <<encoding>>.\n+. The SHARED bit identifies a rule as a `Shared-Region` rule.\n+\n+\n+[[spmpcfg]]\n+.SPMP configuration register format.\n+include::images/bytefield/spmpcfg.edn[]\n+\n+\n+[NOTE]\n+====\n+M-mode can leverage the L bit to create a sandbox for S-mode software.\n+This is achieved by setting and locking high-priority SPMP entries where `spmpcfg[i].U` is 1.\n+This mechanism effectively thwarts privilege escalation attacks that might try to reconfigure SPMP entries to bypass S-mode restrictions.\n+While PMP/ePMP entries could offer a similar function, the resulting configuration is not identical because PMP does not distinguish between S-mode and U-mode.\n+Moreover, if resource sharing is statically defined (see <<pmp-entry-sharing>>), there might not be enough PMP/ePMP entries to enforce the intended isolation policy.\n+====\n+\n+\n+[[address-matching]]\n+==== Address Matching\n+\n+The A field within an SPMP entry's configuration register determines the address-matching mode for its associated spmpaddr register.\n+The following table details the A field's encoding.\n+\n+[cols=\"^1,^1,^3\", stripes=even, options=\"header\"]\n+|===\n+|spmpcfg[i].A|Name|Description\n+|0|OFF|Null region (disabled)\n+|1|TOR|Top of range\n+|2|NA4|Naturally aligned four-byte region\n+|3|NAPOT|Naturally aligned power-of-two region, ≥8 bytes\n+|===\n+\n+\n+[NOTE]\n+====\n+This encoding is consistent with the PMP/ePMP.\n+For comprehensive details, refer to <<pmp-address-matching>>.\n+\n+For a rule to be valid, its `spmpcfg[i].A` field must not be OFF.\n+Furthermore, if `spmpcfg[i].A` is set to TOR, the condition `spmpaddr[i-1] < spmpaddr[i]` must hold.\n+Particularly, if `spmpcfg[0].A` is set to TOR, zero is used for the lower bound.\n+\n+Software can probe the minimum SPMP granularity.\n+This is done by clearing `spmpcfg[i]`, writing all ones to `spmpaddr[i]`, and then reading back the resulting `spmpaddr[i]` value.\n+If asciimath:[G] is the index of the least-significant bit set in the result, the granularity is asciimath:[2^{G+2}] bytes.\n+\n+Software can also determine the implemented physical address bits in `spmpaddr`.\n+This involves setting `spmpcfg[i].A` to `0b11`, writing all ones to `spmpaddr[i]`, and reading back the result.\n+(Consult <<pmpcfg-napot>> for interpretation.)\n+\n+Because the `spmpcfg[i].A` field is WARL, an implementation is free to hardwire a specific address-matching mode.\n+====\n+\n+\n+[[encoding]]\n+==== Encoding of Permissions\n+\n+\n+SPMP supports three distinct rule types: *S-mode-only*, *U-mode* and *Shared-Region*.\n+\n+. An *S-mode-only* rule *enforces* accesses for Supervisor mode and *denies* accesses for User mode.\n++\n+. A *U-mode* rule is always enforced for User mode accesses. Its behavior for Supervisor mode accesses depends on the `sstatus.SUM` bit.\n++\n+* With `sstatus.SUM` set, the rule is enforced for Supervisor mode data accesses, but execution permission is denied (termed *EnforceNoX* in <<spmpencode>>). This prevents the OS from executing the memory of an unprivileged process at all times.\n++\n+* With `sstatus.SUM` clear, the rule is denied for any Supervisor mode access. This prevents the OS from accessing the memory of an unprivileged process unless a specific code path is followed.\n++\n+. The encoding `spmpcfg.SHARED == 1 and spmpcfg.U == 1` defines a *Shared-Region* rule. For shared regions, the state of the `sstatus.SUM` bit is irrelevant.\n++\n+. A *Shared-Region* rule is *enforced* for both Supervisor and User modes, but it imposes the constraint that read and write permissions for User mode are mutually exclusive.\n++\n+. The R, W, and X bits collectively form a WARL field.\n++\n+. The encoding `spmpcfg.RWX=010`, `spmpcfg.RWX=011`, and the combination `spmpcfg.SHARED == 1 and spmpcfg.U == 0` are all reserved for future standard use.\n+\n+If the Hypervisor Extension is implemented, when V = 1 and hgatp.MODE = Bare, the permission encodings remain consistent with those when spmpcfg.U = 1, but are applied to VS/VU rather than U-mode accesses.\n+\n+The complete table of encodings and their outcomes is presented in <<spmpencode>>:\n+\n+[[spmpencode]]\n+image::SPMP_Encoding_Table.svg[title=\"SPMP Encoding Table\"]\n+\n+*Deny*: The memory access is blocked and an exception is raised.\n+\n+*Enforce*: The R/W/X permissions defined in `spmpcfg` are applied to the access.\n+\n+*EnforceNoX*: The R/W permissions from `spmpcfg` are applied, but execute permission is denied.\n+\n+*Reserved*: This encoding is reserved for future standard use.\n+\n+*SUM bit*: The SPMP mechanism uses the `sstatus.SUM` (permit Supervisor User Memory access) bit to alter the privilege of S-mode load and store operations on physical memory.\n+\n+[NOTE]\n+====\n+The semantics of `sstatus.SUM` within SPMP are consistent with its definition in the Machine-Level ISA (for details, refer to <<mstatus-memory-privilege>>).\n+====\n+\n+\n+==== Matching Logic\n+. SPMP entries are statically prioritized.\n++\n+. The lowest-numbered SPMP entry that matches any byte of an access (indicated by an address and the accessed length) determines whether that access is allowed or denied.\n++\n+. This matching SPMP entry must match *all* bytes of the access, or the access fails and an instruction, load, or store page-fault exception is generated (see <<exceptions>>).\n++\n+. This matching is done irrespective of the SHARED, U, R, W, and X bits.\n++\n+. If the effective privilege mode of the access is S/U and no SPMP entry matches, but at least one SPMP entry is implemented, the access is `denied`.\n++\n+. Otherwise, each access is checked according to the permission bits in the matching SPMP entry. That access is allowed if it satisfies the permission checking with the encoding corresponding to the access type.\n+\n+\n+Certain implementations may decompose misaligned memory operations into multiple accesses.\n+In such cases, some of these sub-accesses might succeed before another triggers an exception.\n+Notably, a portion of a misaligned store that passes an SPMP check could become architecturally visible, even if another portion of the same store fails.\n+This behavior may also occur for stores wider than XLEN (e.g., FSD instruction in RV32D), even if the store address is naturally aligned.\n+\n+SPMP rules are checked for all memory accesses, both implicit and explicit, that originate from S-mode or any less-privileged mode.\n+\n+\n+[NOTE]\n+====\n+The execution environment is expected to configure one or more SPMP entries to grant S-mode its necessary baseline permissions.\n+S-mode software can subsequently constrain these permissions by refining the SPMP entries.\n+====\n+\n+\n+[[spmp-and-paging]]\n+==== SPMP and Paging\n+SPMP and paged virtual memory are mutually exclusive.\n+\n+The following table dictates which isolation mechanism is active based on the satp configuration.\n+\n+\n+[cols=\"^1,^1\", stripes=even, options=\"header\"]\n+|===\n+|satp|Isolation mechanism\n+|satp.mode == Bare with Sspmp |SPMP only\n+|satp.mode == Bare without Sspmp|no S-mode protection checks\n+|satp.mode != Bare |Paged Virtual Memory only\n+|===\n+\n+\n+\n+[[access-method]]\n+==== The Access Method for SPMP CSRs in S-mode\n+Each value of `siselect` maps to a corresponding set of SPMP CSRs.\n+`sireg` is used to access the `spmpaddr` register, while `sireg2` is used for the `spmpcfg` register.\n+The registers `sireg3` through `sireg6` are reserved as WPRI.",
+    "path": "src/sspmp.adoc",
+    "commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "original_commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "user": {
+      "login": "ved-rivos",
+      "id": 91900059,
+      "node_id": "U_kgDOBXpImw",
+      "avatar_url": "https://avatars.githubusercontent.com/u/91900059?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/ved-rivos",
+      "html_url": "https://github.com/ved-rivos",
+      "followers_url": "https://api.github.com/users/ved-rivos/followers",
+      "following_url": "https://api.github.com/users/ved-rivos/following{/other_user}",
+      "gists_url": "https://api.github.com/users/ved-rivos/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/ved-rivos/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/ved-rivos/subscriptions",
+      "organizations_url": "https://api.github.com/users/ved-rivos/orgs",
+      "repos_url": "https://api.github.com/users/ved-rivos/repos",
+      "events_url": "https://api.github.com/users/ved-rivos/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/ved-rivos/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "```suggestion\r\nThe registers `sireg3` through `sireg6` are reserved.\r\n```",
+    "created_at": "2026-01-13T21:38:57Z",
+    "updated_at": "2026-01-13T21:38:57Z",
+    "html_url": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688207643",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688207643"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688207643"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688207643/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 240,
+    "original_line": 240,
+    "side": "RIGHT",
+    "author_association": "COLLABORATOR",
+    "original_position": 240,
+    "position": 240,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688357293",
+    "pull_request_review_id": 3658212857,
+    "id": 2688357293,
+    "node_id": "PRRC_kwDOBM85g86gPROt",
+    "diff_hunk": "@@ -0,0 +1,552 @@\n+[[S-level-physical-memory-protection]]\n+=== \"Sspmp\" Extension for S-level Physical Memory Protection (SPMP)\n+\n+The RISC-V S-level Physical Memory Protection (SPMP) mechanism provides per-hart control registers in supervisor mode.\n+These registers define physical memory access privileges—read, write, and execute—for discrete physical memory regions.\n+\n+A memory access is successful only when permission checks for both S-mode execution environment and SPMP pass.\n+SPMP checks can be performed by the hardware in parallel with PMA and PMP checks.\n+SPMP exceptions take priority over PMP or PMA exceptions.\n+Consequently, if a memory access violates both SPMP and PMP/PMA rules, only the SPMP exception is reported.\n+\n+SPMP checks are enforced on all memory accesses with effective privilege modes less privileged than M-mode.\n+SPMP can be configured to grant permissions to U-mode, which has none by default, and to revoke permissions from S-mode.\n+\n+If the Hypervisor Extension is implemented in conjunction with `Sspmp`, when V = 1 and hgatp.MODE = Bare, SPMP enforces access checks on all memory accesses from VS and VU-modes, effectively applying SPMP protections to guest execution contexts.\n+Additionally, the Hypervisor Virtual Machine Load and Store instructions (HLV, HLVX, HSV), when executed from the HS-mode, or U-mode (when hstatus.HU = 1), are also subject to SPMP checks under the V = 1 condition.",
+    "path": "src/sspmp.adoc",
+    "commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "original_commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "user": {
+      "login": "aswaterman",
+      "id": 1031106,
+      "node_id": "MDQ6VXNlcjEwMzExMDY=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1031106?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/aswaterman",
+      "html_url": "https://github.com/aswaterman",
+      "followers_url": "https://api.github.com/users/aswaterman/followers",
+      "following_url": "https://api.github.com/users/aswaterman/following{/other_user}",
+      "gists_url": "https://api.github.com/users/aswaterman/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/aswaterman/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/aswaterman/subscriptions",
+      "organizations_url": "https://api.github.com/users/aswaterman/orgs",
+      "repos_url": "https://api.github.com/users/aswaterman/repos",
+      "events_url": "https://api.github.com/users/aswaterman/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/aswaterman/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "\"under the V = 1 condition\" => \"when V = 1 and hgatp.MODE = Bare\"",
+    "created_at": "2026-01-13T22:42:38Z",
+    "updated_at": "2026-01-13T22:43:24Z",
+    "html_url": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688357293",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688357293"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688357293"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688357293/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 16,
+    "original_line": 16,
+    "side": "RIGHT",
+    "author_association": "MEMBER",
+    "original_position": 16,
+    "position": 16,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688363403",
+    "pull_request_review_id": 3658219404,
+    "id": 2688363403,
+    "node_id": "PRRC_kwDOBM85g86gPSuL",
+    "diff_hunk": "@@ -0,0 +1,552 @@\n+[[S-level-physical-memory-protection]]\n+=== \"Sspmp\" Extension for S-level Physical Memory Protection (SPMP)\n+\n+The RISC-V S-level Physical Memory Protection (SPMP) mechanism provides per-hart control registers in supervisor mode.\n+These registers define physical memory access privileges—read, write, and execute—for discrete physical memory regions.\n+\n+A memory access is successful only when permission checks for both S-mode execution environment and SPMP pass.\n+SPMP checks can be performed by the hardware in parallel with PMA and PMP checks.\n+SPMP exceptions take priority over PMP or PMA exceptions.\n+Consequently, if a memory access violates both SPMP and PMP/PMA rules, only the SPMP exception is reported.\n+\n+SPMP checks are enforced on all memory accesses with effective privilege modes less privileged than M-mode.\n+SPMP can be configured to grant permissions to U-mode, which has none by default, and to revoke permissions from S-mode.\n+\n+If the Hypervisor Extension is implemented in conjunction with `Sspmp`, when V = 1 and hgatp.MODE = Bare, SPMP enforces access checks on all memory accesses from VS and VU-modes, effectively applying SPMP protections to guest execution contexts.\n+Additionally, the Hypervisor Virtual Machine Load and Store instructions (HLV, HLVX, HSV), when executed from the HS-mode, or U-mode (when hstatus.HU = 1), are also subject to SPMP checks under the V = 1 condition.\n+\n+\n+==== Extension Dependencies\n+\n+. The `Sscsrind` extension for indirect CSR access must be implemented.\n++\n+. The `sstatus.SUM` (permit Supervisor User Memory access) bit must be *writable*. In SPMP, this writability is essential because the bit alters how S-mode load and store operations access user memory.",
+    "path": "src/sspmp.adoc",
+    "commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "original_commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "user": {
+      "login": "aswaterman",
+      "id": 1031106,
+      "node_id": "MDQ6VXNlcjEwMzExMDY=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1031106?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/aswaterman",
+      "html_url": "https://github.com/aswaterman",
+      "followers_url": "https://api.github.com/users/aswaterman/followers",
+      "following_url": "https://api.github.com/users/aswaterman/following{/other_user}",
+      "gists_url": "https://api.github.com/users/aswaterman/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/aswaterman/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/aswaterman/subscriptions",
+      "organizations_url": "https://api.github.com/users/aswaterman/orgs",
+      "repos_url": "https://api.github.com/users/aswaterman/repos",
+      "events_url": "https://api.github.com/users/aswaterman/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/aswaterman/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "Delete the \"In SPMP [...]\" sentence.  It doesn't have any normative impact, and IMO it is pretty obvious why SUM is required.  (And if someone doesn't know, they'll easily figure it out by reading the section on SUM in the Supervisor chapter.)",
+    "created_at": "2026-01-13T22:45:49Z",
+    "updated_at": "2026-01-13T22:45:50Z",
+    "html_url": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688363403",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688363403"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688363403"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688363403/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 23,
+    "original_line": 23,
+    "side": "RIGHT",
+    "author_association": "MEMBER",
+    "original_position": 23,
+    "position": 23,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688363719",
+    "pull_request_review_id": 3658219743,
+    "id": 2688363719,
+    "node_id": "PRRC_kwDOBM85g86gPSzH",
+    "diff_hunk": "@@ -0,0 +1,552 @@\n+[[S-level-physical-memory-protection]]\n+=== \"Sspmp\" Extension for S-level Physical Memory Protection (SPMP)\n+\n+The RISC-V S-level Physical Memory Protection (SPMP) mechanism provides per-hart control registers in supervisor mode.\n+These registers define physical memory access privileges—read, write, and execute—for discrete physical memory regions.\n+\n+A memory access is successful only when permission checks for both S-mode execution environment and SPMP pass.\n+SPMP checks can be performed by the hardware in parallel with PMA and PMP checks.\n+SPMP exceptions take priority over PMP or PMA exceptions.\n+Consequently, if a memory access violates both SPMP and PMP/PMA rules, only the SPMP exception is reported.\n+\n+SPMP checks are enforced on all memory accesses with effective privilege modes less privileged than M-mode.\n+SPMP can be configured to grant permissions to U-mode, which has none by default, and to revoke permissions from S-mode.\n+\n+If the Hypervisor Extension is implemented in conjunction with `Sspmp`, when V = 1 and hgatp.MODE = Bare, SPMP enforces access checks on all memory accesses from VS and VU-modes, effectively applying SPMP protections to guest execution contexts.\n+Additionally, the Hypervisor Virtual Machine Load and Store instructions (HLV, HLVX, HSV), when executed from the HS-mode, or U-mode (when hstatus.HU = 1), are also subject to SPMP checks under the V = 1 condition.\n+\n+\n+==== Extension Dependencies\n+\n+. The `Sscsrind` extension for indirect CSR access must be implemented.\n++\n+. The `sstatus.SUM` (permit Supervisor User Memory access) bit must be *writable*. In SPMP, this writability is essential because the bit alters how S-mode load and store operations access user memory.\n++\n+. The `sstatus.MXR` (Make eXecutable Readable) bit must be *writable*. This writability supports M-mode emulation handlers that require reading instructions with `MXR=1 and MPRV=1`.",
+    "path": "src/sspmp.adoc",
+    "commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "original_commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "user": {
+      "login": "aswaterman",
+      "id": 1031106,
+      "node_id": "MDQ6VXNlcjEwMzExMDY=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1031106?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/aswaterman",
+      "html_url": "https://github.com/aswaterman",
+      "followers_url": "https://api.github.com/users/aswaterman/followers",
+      "following_url": "https://api.github.com/users/aswaterman/following{/other_user}",
+      "gists_url": "https://api.github.com/users/aswaterman/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/aswaterman/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/aswaterman/subscriptions",
+      "organizations_url": "https://api.github.com/users/aswaterman/orgs",
+      "repos_url": "https://api.github.com/users/aswaterman/repos",
+      "events_url": "https://api.github.com/users/aswaterman/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/aswaterman/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "Delete the \"This writablity [...]\" sentence.  Same reasoning as for my comment on SUM.",
+    "created_at": "2026-01-13T22:46:01Z",
+    "updated_at": "2026-01-13T22:46:01Z",
+    "html_url": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688363719",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688363719"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688363719"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688363719/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 25,
+    "original_line": 25,
+    "side": "RIGHT",
+    "author_association": "MEMBER",
+    "original_position": 25,
+    "position": 25,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688373888",
+    "pull_request_review_id": 3658230937,
+    "id": 2688373888,
+    "node_id": "PRRC_kwDOBM85g86gPVSA",
+    "diff_hunk": "@@ -0,0 +1,552 @@\n+[[S-level-physical-memory-protection]]\n+=== \"Sspmp\" Extension for S-level Physical Memory Protection (SPMP)\n+\n+The RISC-V S-level Physical Memory Protection (SPMP) mechanism provides per-hart control registers in supervisor mode.\n+These registers define physical memory access privileges—read, write, and execute—for discrete physical memory regions.\n+\n+A memory access is successful only when permission checks for both S-mode execution environment and SPMP pass.\n+SPMP checks can be performed by the hardware in parallel with PMA and PMP checks.\n+SPMP exceptions take priority over PMP or PMA exceptions.\n+Consequently, if a memory access violates both SPMP and PMP/PMA rules, only the SPMP exception is reported.\n+\n+SPMP checks are enforced on all memory accesses with effective privilege modes less privileged than M-mode.\n+SPMP can be configured to grant permissions to U-mode, which has none by default, and to revoke permissions from S-mode.\n+\n+If the Hypervisor Extension is implemented in conjunction with `Sspmp`, when V = 1 and hgatp.MODE = Bare, SPMP enforces access checks on all memory accesses from VS and VU-modes, effectively applying SPMP protections to guest execution contexts.\n+Additionally, the Hypervisor Virtual Machine Load and Store instructions (HLV, HLVX, HSV), when executed from the HS-mode, or U-mode (when hstatus.HU = 1), are also subject to SPMP checks under the V = 1 condition.\n+\n+\n+==== Extension Dependencies\n+\n+. The `Sscsrind` extension for indirect CSR access must be implemented.\n++\n+. The `sstatus.SUM` (permit Supervisor User Memory access) bit must be *writable*. In SPMP, this writability is essential because the bit alters how S-mode load and store operations access user memory.\n++\n+. The `sstatus.MXR` (Make eXecutable Readable) bit must be *writable*. This writability supports M-mode emulation handlers that require reading instructions with `MXR=1 and MPRV=1`.\n++\n+. If the Hypervisor Extension is implemented in conjunction with `Sspmp`, the only mandatory translation mode in both hgatp and satp is Bare.\n+\n+\n+[NOTE]\n+====\n+The `Sspmp` extension does not provide ISA support to accelerate virtualization of the SPMP functionality.\n+====\n+\n+\n+[[spmp-csrs]]\n+==== S-level Physical Memory Protection CSRs\n+\n+Each SPMP entry is composed of an SXLEN-bit configuration register and an associated SXLEN-bit address register.\n+The SPMP registers are accessible only via the indirect access mechanism.\n+For details on CSR numbers and how to access them, see <<access-method>>.\n+In TOR mode, an entry also uses the address register of the preceding entry to define its range (see <<address-matching>>).\n+Implementations support from 1 to 64 SPMP entries.\n+\n+\n+[NOTE]\n+====\n+An SPMP entry refers to the register pair `spmpcfg[i]` and `spmpaddr[i]`.\n+\n+An SPMP rule is defined by the contents of an `spmpcfg` register and its corresponding `spmpaddr` register(s).\n+These registers collectively define a protected physical memory region and its access constraints.\n+====\n+\n+The SPMP address registers, named `spmpaddr0` through `spmpaddr63`, share the same layout as the M-mode PMP architecture.\n+On RV32 systems, each `spmpaddr` register encodes a 34-bit physical address from bit 33 down to bit 2, as illustrated in <<spmpaddr-rv32>>.\n+On RV64 systems, each `spmpaddr` register encodes a 56-bit physical address from bit 55 down to bit 2, as shown in <<spmpaddr-rv64>>.\n+An implementation may support fewer address bits on systems with a smaller physical address space.\n+All writable SPMP entries should implement the same number of address bits.\n+Since not all physical address bits must be implemented, the SPMP address registers are considered WARL, with exceptions defined by granularity rules.\n+Refer to <<pmp-address-matching>>.\n+\n+[NOTE]\n+====\n+If `spmpaddr` is narrower than the number of supported physical address bits, some physical addresses may not be representable in an SPMP entry.\n+Since S-mode cannot access any memory unless an SPMP entry permits it, any memory region that cannot be addressed by an SPMP entry is inaccessible to S-mode.\n+====\n+\n+\n+\n+[[spmpaddr-rv32]]\n+.SPMP address register format, RV32.\n+include::images/bytefield/spmpaddr-rv32.edn[]\n+\n+[[spmpaddr-rv64]]\n+.SPMP address register format, RV64.\n+include::images/bytefield/spmpaddr-rv64.edn[]\n+\n+Every SPMP entry contains an SXLEN-bit configuration register, `spmpcfg[i]`.\n+<<spmpcfg>> illustrates the layout of `spmpcfg[i]`.\n+Permission rules and their encodings are detailed in <<encoding>>.\n+\n+. The R, W, and X bits govern permissions for read, write, and instruction execution, respectively.\n+. The A field, which defines the address-matching mode, is detailed in <<address-matching>>.\n+. Bits 5 and 6 are reserved for future standard use.\n+. The L (lock) bit designates an entry as locked.\n+Setting the L bit locks the SPMP entry, regardless of the A field's setting (even OFF).\n+Attempts to write to locked `spmpcfg[i]` and `spmpaddr[i]` registers using the `siselect` CSR are ignored.\n+If a locked entry has `spmpcfg[i].A` set to TOR, writes to the preceding `spmpaddr[i-1]` via `siselect` are also ignored.\n+. For any rule not designated as a `Shared-Region`, the U bit determines if it is `U-mode` (when set) or `S-mode-only` (when clear), as explained in <<encoding>>.\n+. The SHARED bit identifies a rule as a `Shared-Region` rule.\n+\n+\n+[[spmpcfg]]\n+.SPMP configuration register format.\n+include::images/bytefield/spmpcfg.edn[]\n+\n+\n+[NOTE]\n+====\n+M-mode can leverage the L bit to create a sandbox for S-mode software.\n+This is achieved by setting and locking high-priority SPMP entries where `spmpcfg[i].U` is 1.\n+This mechanism effectively thwarts privilege escalation attacks that might try to reconfigure SPMP entries to bypass S-mode restrictions.\n+While PMP/ePMP entries could offer a similar function, the resulting configuration is not identical because PMP does not distinguish between S-mode and U-mode.\n+Moreover, if resource sharing is statically defined (see <<pmp-entry-sharing>>), there might not be enough PMP/ePMP entries to enforce the intended isolation policy.\n+====\n+\n+\n+[[address-matching]]\n+==== Address Matching\n+\n+The A field within an SPMP entry's configuration register determines the address-matching mode for its associated spmpaddr register.\n+The following table details the A field's encoding.\n+\n+[cols=\"^1,^1,^3\", stripes=even, options=\"header\"]\n+|===\n+|spmpcfg[i].A|Name|Description\n+|0|OFF|Null region (disabled)\n+|1|TOR|Top of range\n+|2|NA4|Naturally aligned four-byte region\n+|3|NAPOT|Naturally aligned power-of-two region, ≥8 bytes\n+|===\n+\n+\n+[NOTE]\n+====\n+This encoding is consistent with the PMP/ePMP.\n+For comprehensive details, refer to <<pmp-address-matching>>.\n+\n+For a rule to be valid, its `spmpcfg[i].A` field must not be OFF.\n+Furthermore, if `spmpcfg[i].A` is set to TOR, the condition `spmpaddr[i-1] < spmpaddr[i]` must hold.\n+Particularly, if `spmpcfg[0].A` is set to TOR, zero is used for the lower bound.\n+\n+Software can probe the minimum SPMP granularity.\n+This is done by clearing `spmpcfg[i]`, writing all ones to `spmpaddr[i]`, and then reading back the resulting `spmpaddr[i]` value.\n+If asciimath:[G] is the index of the least-significant bit set in the result, the granularity is asciimath:[2^{G+2}] bytes.\n+\n+Software can also determine the implemented physical address bits in `spmpaddr`.\n+This involves setting `spmpcfg[i].A` to `0b11`, writing all ones to `spmpaddr[i]`, and reading back the result.\n+(Consult <<pmpcfg-napot>> for interpretation.)\n+\n+Because the `spmpcfg[i].A` field is WARL, an implementation is free to hardwire a specific address-matching mode.\n+====\n+\n+\n+[[encoding]]\n+==== Encoding of Permissions\n+\n+\n+SPMP supports three distinct rule types: *S-mode-only*, *U-mode* and *Shared-Region*.\n+\n+. An *S-mode-only* rule *enforces* accesses for Supervisor mode and *denies* accesses for User mode.\n++\n+. A *U-mode* rule is always enforced for User mode accesses. Its behavior for Supervisor mode accesses depends on the `sstatus.SUM` bit.\n++\n+* With `sstatus.SUM` set, the rule is enforced for Supervisor mode data accesses, but execution permission is denied (termed *EnforceNoX* in <<spmpencode>>). This prevents the OS from executing the memory of an unprivileged process at all times.\n++\n+* With `sstatus.SUM` clear, the rule is denied for any Supervisor mode access. This prevents the OS from accessing the memory of an unprivileged process unless a specific code path is followed.\n++\n+. The encoding `spmpcfg.SHARED == 1 and spmpcfg.U == 1` defines a *Shared-Region* rule. For shared regions, the state of the `sstatus.SUM` bit is irrelevant.\n++\n+. A *Shared-Region* rule is *enforced* for both Supervisor and User modes, but it imposes the constraint that read and write permissions for User mode are mutually exclusive.\n++\n+. The R, W, and X bits collectively form a WARL field.\n++\n+. The encoding `spmpcfg.RWX=010`, `spmpcfg.RWX=011`, and the combination `spmpcfg.SHARED == 1 and spmpcfg.U == 0` are all reserved for future standard use.\n+\n+If the Hypervisor Extension is implemented, when V = 1 and hgatp.MODE = Bare, the permission encodings remain consistent with those when spmpcfg.U = 1, but are applied to VS/VU rather than U-mode accesses.\n+\n+The complete table of encodings and their outcomes is presented in <<spmpencode>>:\n+\n+[[spmpencode]]\n+image::SPMP_Encoding_Table.svg[title=\"SPMP Encoding Table\"]\n+\n+*Deny*: The memory access is blocked and an exception is raised.\n+\n+*Enforce*: The R/W/X permissions defined in `spmpcfg` are applied to the access.\n+\n+*EnforceNoX*: The R/W permissions from `spmpcfg` are applied, but execute permission is denied.\n+\n+*Reserved*: This encoding is reserved for future standard use.\n+\n+*SUM bit*: The SPMP mechanism uses the `sstatus.SUM` (permit Supervisor User Memory access) bit to alter the privilege of S-mode load and store operations on physical memory.\n+\n+[NOTE]\n+====\n+The semantics of `sstatus.SUM` within SPMP are consistent with its definition in the Machine-Level ISA (for details, refer to <<mstatus-memory-privilege>>).\n+====\n+\n+\n+==== Matching Logic\n+. SPMP entries are statically prioritized.\n++\n+. The lowest-numbered SPMP entry that matches any byte of an access (indicated by an address and the accessed length) determines whether that access is allowed or denied.\n++\n+. This matching SPMP entry must match *all* bytes of the access, or the access fails and an instruction, load, or store page-fault exception is generated (see <<exceptions>>).\n++\n+. This matching is done irrespective of the SHARED, U, R, W, and X bits.\n++\n+. If the effective privilege mode of the access is S/U and no SPMP entry matches, but at least one SPMP entry is implemented, the access is `denied`.\n++\n+. Otherwise, each access is checked according to the permission bits in the matching SPMP entry. That access is allowed if it satisfies the permission checking with the encoding corresponding to the access type.\n+\n+\n+Certain implementations may decompose misaligned memory operations into multiple accesses.\n+In such cases, some of these sub-accesses might succeed before another triggers an exception.\n+Notably, a portion of a misaligned store that passes an SPMP check could become architecturally visible, even if another portion of the same store fails.\n+This behavior may also occur for stores wider than XLEN (e.g., FSD instruction in RV32D), even if the store address is naturally aligned.\n+\n+SPMP rules are checked for all memory accesses, both implicit and explicit, that originate from S-mode or any less-privileged mode.\n+\n+\n+[NOTE]\n+====\n+The execution environment is expected to configure one or more SPMP entries to grant S-mode its necessary baseline permissions.\n+S-mode software can subsequently constrain these permissions by refining the SPMP entries.\n+====\n+\n+\n+[[spmp-and-paging]]\n+==== SPMP and Paging\n+SPMP and paged virtual memory are mutually exclusive.\n+\n+The following table dictates which isolation mechanism is active based on the satp configuration.\n+\n+\n+[cols=\"^1,^1\", stripes=even, options=\"header\"]\n+|===\n+|satp|Isolation mechanism\n+|satp.mode == Bare with Sspmp |SPMP only\n+|satp.mode == Bare without Sspmp|no S-mode protection checks\n+|satp.mode != Bare |Paged Virtual Memory only\n+|===\n+\n+\n+\n+[[access-method]]\n+==== The Access Method for SPMP CSRs in S-mode\n+Each value of `siselect` maps to a corresponding set of SPMP CSRs.\n+`sireg` is used to access the `spmpaddr` register, while `sireg2` is used for the `spmpcfg` register.\n+The registers `sireg3` through `sireg6` are reserved as WPRI.\n+\n+SPMP entries are indexed starting from zero.\n+In a system with 48 SPMP entries, S-mode can address `SPMP[0..47]` using `siselect#0..47`.",
+    "path": "src/sspmp.adoc",
+    "commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "original_commit_id": "8877ec48ee697adbc36568c457bcb255e370c6eb",
+    "user": {
+      "login": "aswaterman",
+      "id": 1031106,
+      "node_id": "MDQ6VXNlcjEwMzExMDY=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1031106?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/aswaterman",
+      "html_url": "https://github.com/aswaterman",
+      "followers_url": "https://api.github.com/users/aswaterman/followers",
+      "following_url": "https://api.github.com/users/aswaterman/following{/other_user}",
+      "gists_url": "https://api.github.com/users/aswaterman/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/aswaterman/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/aswaterman/subscriptions",
+      "organizations_url": "https://api.github.com/users/aswaterman/orgs",
+      "repos_url": "https://api.github.com/users/aswaterman/repos",
+      "events_url": "https://api.github.com/users/aswaterman/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/aswaterman/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "This is giving an example, rather than declaring a special rule for systems with 48 entries.  I suggest one of the following; you choose:\r\n\r\n- In a system with 48 SPMP entries, for example, S-mode can address `SPMP[0..47]` using `siselect#0..47`.\r\n- In a system with _N_ SPMP entries, S-mode can address `SPMP[0..N-1]` using `siselect#0..N-1`.\r\n\r\n",
+    "created_at": "2026-01-13T22:50:53Z",
+    "updated_at": "2026-01-13T22:50:53Z",
+    "html_url": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688373888",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688373888"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-isa-manual/pull/2521#discussion_r2688373888"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/2521"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-isa-manual/pulls/comments/2688373888/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 243,
+    "original_line": 243,
+    "side": "RIGHT",
+    "author_association": "MEMBER",
+    "original_position": 243,
+    "position": 243,
+    "subject_type": "line"
+  }
+]

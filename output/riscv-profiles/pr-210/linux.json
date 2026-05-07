@@ -1,0 +1,107 @@
+{
+  "pr_number": 210,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 210,
+    "violation_condition": "Kernel does not save/restore all CHERI capability register state (capability data, bounds, permissions, tags, CIFC level metadata from uycfg) during context switch between userspace processes, or under Zyhybrid, fails to scrub capability registers when switching from a CHERI (RVY64I) process to a non-CHERI (RV64I) process, exposing capability state across the security boundary",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "__switch_to|switch_to|context_switch|switch_mm|capability.*save|capability.*restore|caphybrid|chybrid|SAVE_CAP|RESTORE_CAP|uycfg",
+    "affected_entities": [
+      "uycfg",
+      "Zyhybrid",
+      "Zydefaultcap",
+      "Zylevels1",
+      "Zys",
+      "Smyre",
+      "Svy"
+    ],
+    "summary": "Kernel must atomically save/restore all CHERI capability register file on context switch and scrub on Zyhybrid RVY-to-RV64I transitions, or capability metadata leaks between processes"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/processor.h",
+        "function_name": "thread_struct",
+        "line_start": 106,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "thread_struct has no CHERI capability register fields (no capdata, bounds, permissions, tags, or uycfg metadata). Any CHERI/RVY capability state in hardware registers has no kernel-side backing store to save/restore across context switches.",
+      "snippet": "struct thread_struct {\n\tunsigned long ra;\n\tunsigned long sp;\n\tunsigned long s[12];\n\tstruct __riscv_d_ext_state fstate;\n\tunsigned long envcfg;\n\t/* ... no CHERI/capability fields ... */\n};"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 421,
+        "line_end": 471,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "__switch_to saves/restores only callee-saved GPRs (ra, sp, s0-s11) and SUM status bit. No CHERI capability registers (CLEN-bit-wide cap regs, UYCFG, or any RVY-specific CSRs) are saved or restored. On CHERI hardware, capability tags/bounds/metadata would leak across process boundaries.",
+      "snippet": "SYM_FUNC_START(__switch_to)\n\tREG_S ra,  TASK_THREAD_RA_RA(a3)\n\tREG_S sp,  TASK_THREAD_SP_RA(a3)\n\tREG_S s0,  TASK_THREAD_S0_RA(a3)\n\t/* ... only callee-saved GPRs, no CHERI cap regs ... */\n\tREG_L s11, TASK_THREAD_S11_RA(a4)\n\tret\nSYM_FUNC_END(__switch_to)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/switch_to.h",
+        "function_name": "switch_to",
+        "line_start": 113,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "switch_to() macro calls __switch_to_fpu, __switch_to_vector, and __switch_to_envcfg, but has no capability-state save/restore callout. The Zyhybrid 'scrub on CHERI->non-CHERI transition' requirement has no corresponding implementation. If a CHERI (RVY64I) process context-switches to a non-CHERI (RV64I) process on Zyhybrid hardware, capability register state persists uncleaned.",
+      "snippet": "#define switch_to(prev, next, last) \\\n\t__switch_to_fpu(__prev, __next);   \\\n\t__switch_to_vector(__prev, __next); \\\n\t/* ... no CHERI/Zyhybrid scrubbing ... */ \\\n\t__switch_to_envcfg(__next);         \\\n\t((last) = __switch_to(__prev, __next));"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/hwcap.h",
+        "function_name": "",
+        "line_start": 13,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "hwcap.h defines 110+ ISA extensions (Z*, S*, X*), but no RVY* or CHERI capability-related ISA extension constants exist. No RVY64I, RVYA25 profile, Zyhybrid, or any CHERI encoding identifier is defined. Detection of CHERI-capable harts is impossible, so capability-aware save/restore paths cannot be gated.",
+      "snippet": "#define RISCV_ISA_EXT_ZICFISS 105\n/* no RVY*, CHERI, or Zyhybrid ISA extension defs */\n#define RISCV_ISA_EXT_MAX 128"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "SAVE_HOST_GPRS / RESTORE_GUEST_GPRS",
+        "line_start": 14,
+        "line_end": 100,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM VCPU context switch saves/restores standard GPRs and basic CSRs (sstatus, stvec, sscratch, sepc) but has no CHERI capability register save/restore. A VM using CHERI userspace would leak capability state across VM exits/resumes.",
+      "snippet": ".macro SAVE_HOST_GPRS\n\tREG_S ra, (KVM_ARCH_HOST_RA)(a0)\n\t/* ... only standard GPRs, no CHERI cap regs ... */\n.endm\n.macro RESTORE_GUEST_GPRS\n\tREG_L ra, (KVM_ARCH_GUEST_RA)(a0)\n\t/* ... only standard GPRs, no CHERI cap regs ... */\n.endm"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "start_thread",
+        "line_start": 144,
+        "line_end": 180,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "start_thread() initializes FPU and CFI state for new userspace processes but does not initialize or clear CHERI capability registers (PCC, capability GPR metadata/tags). A CHERI process exec'd into a non-CHERI process on Zyhybrid hardware would inherit stale capability state from the exec context.",
+      "snippet": "void start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp)\n{\n\tregs->status = SR_PIE;\n\t/* ... FPU init, CFI init, but no CHERI cap init ... */\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "save_fp_state / restore_fp_state",
+        "line_start": 44,
+        "line_end": 56,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Signal delivery saves/restores FPU and vector state to the signal frame, but has no CHERI capability register save/restore. A signal delivered to a CHERI process that runs a signal handler would see capability register corruption, and the sigreturn path would not restore capability metadata.",
+      "snippet": "static long restore_fp_state(struct pt_regs *regs,\n\t\t\t     union __riscv_fp_state __user *sc_fpregs)\n{\n\t__copy_from_user(&current->thread.fstate, state, sizeof(*state));\n\t/* ... no CHERI capability state in signal frame ... */\n}"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

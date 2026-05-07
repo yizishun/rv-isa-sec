@@ -1,0 +1,87 @@
+PR #609  target=linux  overall=bug_confirmed
+Spec: ACLIC drops its distinct eidelivery=0x20000000 delivery mode and presents as APLIC-direct-delivery subset with numbered (not bit-array) interrupt control registers and integrated IE/IP/IPRIO fields in sourcecfg; kernel driver code written for full APLIC register layout will silently fail interrupt management on ACLIC hardware
+Violation: The Linux kernel's AIA interrupt controller driver (running on hardware implementing Smaclic/Ssaclic) configures ACLIC using full APLIC register assumptions — writing to setip/clrip/setie/clrie bit-array registers that ACLIC does not implement, or interpreting sourcecfg without the new IE (bit 31), IP (bit 30), and IPRIO (bits 23:16) field layout — because ACLIC no longer advertises a distinct eidelivery delivery mode (0x20000000 was removed) and instead presents as a subset of APLIC in direct delivery mode
+Consequence: denial_of_service
+Pattern: riscv_aplic.*setip_le|riscv_aplic.*clrip_le|riscv_aplic.*setie_le|riscv_aplic.*clrie_le|writel_relaxed.*APLIC.*SETIP|writel_relaxed.*APLIC.*CLRIP|writel_relaxed.*APLIC.*SETIE|writel_relaxed.*APLIC.*CLRIE|aplic_direct.*setip|sourcecfg.*0x1FF|SM_SHIFT
+------------------------------------------------------------
+[bug_confirmed] drivers/irqchip/irq-riscv-aplic-main.c:292-293  aplic_init_hw_irqs
+  Writes -1U to APLIC_CLRIE_BASE bit-array region (0x1f00) to disable all interrupts. ACLIC does not implement the SETIE_BASE/CLRIE_BASE/SETIP_BASE/CLRIP_BASE bit-array regions — it only provides the single-register NUM variants (CLRIENUM at 0x1fdc). On ACLIC hardware this write targets non-existent address space, silently failing to disable interrupts.
+  | for (i = 0; i <= priv->nr_irqs; i += 32)
+  | 	writel(-1U, priv->regs + APLIC_CLRIE_BASE + (i / 32) * sizeof(u32));
+
+[bug_confirmed] drivers/irqchip/irq-riscv-aplic-main.c:296-297  aplic_init_hw_irqs
+  Writes 0 to every APLIC_SOURCECFG register during init. On ACLIC, sourcecfg includes IE (bit 31), IP (bit 30), and IPRIO (bits 23:16) fields in addition to the SM field (bits 2:0). Writing 0 clears all these ACLIC-specific fields, permanently disabling interrupt enable and clearing any configured priority for every source.
+  | for (i = 1; i <= priv->nr_irqs; i++) {
+  | 	writel(0, priv->regs + APLIC_SOURCECFG_BASE + (i - 1) * sizeof(u32));
+
+[bug_confirmed] drivers/irqchip/irq-riscv-aplic-main.c:202-234  aplic_irq_set_type
+  Every call to irq_set_type() initializes val=0 then sets only SM bits (bits 2:0) before writing to sourcecfg. On ACLIC, sourcecfg also holds IE (bit 31), IP (bit 30), and IPRIO (bits 23:16). Since val starts at 0, every set_type write silently clears these ACLIC fields — disabling the interrupt enable and zeroing priority. The cached value at line 232 also saves only the SM bits, so suspend/resume restore will further corrupt ACLIC state.
+  | u32 val = 0;
+  | switch (type) {
+  | case IRQ_TYPE_LEVEL_HIGH:
+  | 	val = APLIC_SOURCECFG_SM_LEVEL_HIGH;
+  | ...
+  | writel(val, sourcecfg);
+  | priv->saved_hw_regs.srcs[d->hwirq - 1].sourcecfg = val;
+
+[bug_confirmed] drivers/irqchip/irq-riscv-aplic-main.c:79-82  aplic_save_states
+  Reads from APLIC_SETIE_BASE bit-array region (0x1e00) to save IE state during suspend. ACLIC does not implement this register region. On ACLIC hardware this reads from non-existent MMIO, potentially returning garbage or causing a bus fault. The saved IE state will be incorrect, and any subsequent restore will write corrupted data.
+  | if (i % 32)
+  | 	continue;
+  | srcs->ie = readl(regs + APLIC_SETIE_BASE + (i / 32) * sizeof(u32));
+
+[bug_confirmed] drivers/irqchip/irq-riscv-aplic-main.c:51-59  aplic_restore_states
+  Suspend/resume restore path writes to four bit-array regions that ACLIC does not implement: (a) line 53 writes -1U to CLRIE_BASE (0x1f00), (b) line 54 writes saved IE to SETIE_BASE (0x1e00), (c) lines 58-59 read CLRIP_BASE (0x1d00) and write SETIP_BASE (0x1c00). All four accesses target non-existent address space on ACLIC hardware. Interrupt state silently fails to restore, leaving interrupts in undefined state after resume.
+  | writel(-1U, regs + APLIC_CLRIE_BASE + (i / 32) * sizeof(u32));
+  | writel(srcs->ie, regs + APLIC_SETIE_BASE + (i / 32) * sizeof(u32));
+  | writel(readl(regs + APLIC_CLRIP_BASE + (i / 32) * sizeof(u32)),
+  |        regs + APLIC_SETIP_BASE + (i / 32) * sizeof(u32));
+
+[potential_risk] drivers/irqchip/irq-riscv-aplic-main.c:195-200  aplic_irq_mask
+  Mask/unmask functions use the single-register variants (CLRIENUM/SETIENUM at 0x1fdc/0x1edc) which ACLIC does implement. However, on ACLIC, interrupt enable is also controlled by the IE bit (bit 31) in the sourcecfg register. Writing to CLRIENUM clears the separate enable bit-array flag, but the sourcecfg IE bit — which is the master enable on ACLIC — was already destroyed by set_type (writing val=0). This means unmask via SETIENUM is insufficient to re-enable an interrupt on ACLIC if sourcecfg.IE was previously cleared.
+  | void aplic_irq_unmask(struct irq_data *d)
+  | {
+  | 	writel(d->hwirq, priv->regs + APLIC_SETIENUM);
+  | }
+  | void aplic_irq_mask(struct irq_data *d)
+  | {
+  | 	writel(d->hwirq, priv->regs + APLIC_CLRIENUM);
+  | }
+
+[bug_confirmed] arch/riscv/kvm/aia_aplic.c:67-70  aplic_write_sourcecfg
+  KVM's APLIC emulation masks guest sourcecfg writes to APLIC_SOURCECFG_SM_MASK (0x7), destroying bits 31 down to 3. On an ACLIC-backed guest, the guest expects IE (bit 31), IP (bit 30), and IPRIO (bits 23:16) in sourcecfg. Every guest write to sourcecfg silently loses these fields. The guest kernel's interrupt enable/priority configuration is discarded by the hypervisor.
+  | if (val & APLIC_SOURCECFG_D)
+  | 	val = 0;
+  | else
+  | 	val &= APLIC_SOURCECFG_SM_MASK;
+
+[potential_risk] arch/riscv/kvm/aia_aplic.c:397-399  aplic_mmio_read_offset
+  KVM's DOMAINCFG read always ORs in APLIC_DOMAINCFG_DM (DM=1), advertising MSI delivery mode support. ACLIC only supports direct delivery mode. A guest seeing DM=1 may attempt to configure MSI delivery, which would fail on ACLIC hardware.
+  | if (off == APLIC_DOMAINCFG) {
+  | 	*val32 = APLIC_DOMAINCFG_RDONLY |
+  | 		 aplic->domaincfg | APLIC_DOMAINCFG_DM;
+
+[potential_risk] arch/riscv/kvm/aia_aplic.c:404-424  aplic_mmio_read_offset
+  KVM exposes SETIP_BASE (0x1c00)/CLRIP_BASE (0x1d00)/SETIE_BASE (0x1e00)/CLRIE_BASE (0x1f00) bit-array register ranges to guests via MMIO read. ACLIC hardware does not implement these regions. Guests accessing these ranges on an ACLIC-backed VM get the KVM software-emulated view, which diverges from what bare-metal access would produce.
+  | } else if ((off >= APLIC_SETIP_BASE) &&
+  | 	   (off < (APLIC_SETIP_BASE + aplic->nr_words * 4))) {
+  | ...
+  | } else if ((off >= APLIC_CLRIE_BASE) &&
+  | 	   (off < (APLIC_CLRIE_BASE + aplic->nr_words * 4))) {
+
+[potential_risk] include/linux/irqchip/riscv-aplic.h:20-29  (header definitions)
+  The header defines only the standard APLIC sourcecfg layout: SM bits 2:0, D bit 10, CHILDIDX bits 9:0. No definitions exist for ACLIC's additional sourcecfg fields: IE (bit 31), IP (bit 30), IPRIO (bits 23:16). All driver code operates within bit 0-10 only, making it structurally impossible to preserve ACLIC state.
+  | #define APLIC_SOURCECFG_D           BIT(10)
+  | #define APLIC_SOURCECFG_CHILDIDX_MASK   0x000003ff
+  | #define APLIC_SOURCECFG_SM_MASK     0x00000007
+  | #define APLIC_SOURCECFG_SM_INACTIVE  0x0
+  | ...
+  | #define APLIC_SOURCECFG_SM_LEVEL_LOW    0x7
+
+[potential_risk] drivers/irqchip/irq-riscv-aplic-main.c:402-405  (driver init)
+  The driver's OF match table only contains 'riscv,aplic'. ACLIC hardware presenting as 'riscv,aplic' compatible will be probed with the full APLIC driver, which applies all the non-ACLIC-safe register accesses analyzed above. There is no separate 'riscv,aclic' compatible, no Smaclic/Ssaclic ISA extension check, and no Kconfig option (RISCV_ACLIC) to enable ACLIC-aware code paths.
+  | static const struct of_device_id aplic_match[] = {
+  | 	{ .compatible = "riscv,aplic" },
+  | 	{}
+  | };
+

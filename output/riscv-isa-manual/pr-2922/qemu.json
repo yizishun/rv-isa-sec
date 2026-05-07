@@ -1,0 +1,111 @@
+{
+  "pr_number": 2922,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2922,
+    "violation_condition": "",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "",
+    "affected_entities": [],
+    "summary": "Agent error: exit code 1"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rva.c.inc",
+        "function_name": "trans_lr_w, trans_sc_w, trans_lr_d, trans_sc_d",
+        "line_start": 111,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Ziccrse is a cache/coherence PMA extension (RsrvEventual in cacheable+coherent memory), not a constrained LR/SC instruction-window extension. QEMU TCG does not model physical caches and treats this (like Za64rs, Zic64b, Ziccif, Ziccamoa, Zicclsm) as always-true. LR/SC translation gates on ext_zalrsc via REQUIRE_A_OR_ZALRSC, correctly distinct from Ziccrse. No constraint-tracking logic is needed because the spec does not mandate bounded LR→SC windows.",
+      "snippet": "REQUIRE_A_OR_ZALRSC(ctx);  // gates on Zalrsc, not Ziccrse — correct\nreturn gen_lr(ctx, a, MO_SL);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "CPURISCVState (struct)",
+        "line_start": 229,
+        "line_end": 230,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "load_res (reservation address) and load_val (LR data snapshot) are the only architecturally required LR/SC state for a simple address-match reservation model. Ziccrse requires no additional per-hart state in the architectural model — it is a PMA guarantee about cache-line coherence behavior, not a constraint tracker. Adding instruction counters or constraint flags would be speculative over-engineering.",
+      "snippet": "target_ulong load_res;\ntarget_ulong load_val;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "mseccfg_csr_write",
+        "line_start": 662,
+        "line_end": 703,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "write_mseccfg() applies WARL masking via a write-mask (mask variable) that only covers MMWP|MML plus conditional PMM and RLB. Bits outside the mask (e.g., USEED, SSEED, MLPE) are not explicitly masked-in or masked-out — they pass through from 'val' to env->mseccfg. While USEED/SSEED gating happens at the CSR access level (csr.c:834-842 checks env->mseccfg flags ad-hoc), the write path does not WARL-constrain them. If a new spec revision adds a security-critical mseccfg field (e.g., Ziccrse-enable), the current code would silently ignore it on write and return stale state on read — a functional gap. The read path (mseccfg_csr_read, pmp.c:708) performs no WARL read-as-zero filtering on reserved bits.",
+      "snippet": "void mseccfg_csr_write(CPURISCVState *env, target_ulong val)\n{\n    uint64_t mask = MSECCFG_MMWP | MSECCFG_MML;\n    ...\n    env->mseccfg = val;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.h",
+        "function_name": "mseccfg_field_t (enum)",
+        "line_start": 43,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MSECCFG bit definitions match current ratified spec: MML(0), MMWP(1), RLB(2), USEED(8), SSEED(9), MLPE(10), PMM(32:33). No Ziccrse-enable bit is defined in the spec, so none belongs here. The enum is complete for the current Smepmp/Smmpm/Zjpm/Zicfilp feature set.",
+      "snippet": "MSECCFG_MML   = 1 << 0,\nMSECCFG_MMWP  = 1 << 1,\nMSECCFG_RLB   = 1 << 2,\nMSECCFG_USEED = 1 << 8,\nMSECCFG_SSEED = 1 << 9,"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/tcg/tcg-cpu.c",
+        "function_name": "riscv_tcg_cpu_finalize_features",
+        "line_start": 532,
+        "line_end": 532,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ext_ziccrse is derived from has_priv_1_11 as part of the priv-1.11 baseline feature bundle (alongside Za64rs, Zic64b, Ziccif, Ziccamoa, Zicclsm per cpu.c:2087-2092). This is consistent: Ziccrse is a cache-behavior extension that TCG 'implements' by definition since it does not model cache PMAs. Disabling it would require emulating non-RsrvEventual behavior, which TCG cannot do.",
+      "snippet": "cpu->cfg.ext_ziccrse = cpu->cfg.has_priv_1_11;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/kvm/kvm-cpu.c",
+        "function_name": "kvm_riscv_isa_ext_cfgs[]",
+        "line_start": 297,
+        "line_end": 297,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM_EXT_CFG maps 'ziccrse' to KVM_RISCV_ISA_EXT_ZICCRSE for feature enumeration. KVM's VCPU reservation state (load_res/load_val) is handled by the host kernel's LR/SC emulation, not exposed via KVM_GET/SET_ONE_REG. This is correct — reservation state is transient (cleared on most events) and not architectural state to save/restore across migration. The kernel ensures RsrvEventual by managing cache coherence in hardware-backed VCPUs.",
+      "snippet": "KVM_EXT_CFG(\"ziccrse\", ext_ziccrse, KVM_RISCV_ISA_EXT_ZICCRSE),"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_riscv_cpu",
+        "line_start": 437,
+        "line_end": 438,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "load_res and load_val are serialized in the VMState for migration. This is sufficient — on the destination, if the reservation address does not match any memory (which it won't after migration to a different host), the subsequent SC will correctly fail. Ziccrse adds no persistent state beyond what Zalrsc already defines. Migrating constraint counters (as the prior analysis suggested) would be a spec violation since Ziccrse does not define instruction counters.",
+      "snippet": "VMSTATE_UINTTL(env.load_res, RISCVCPU),\nVMSTATE_UINTTL(env.load_val, RISCVCPU),"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/gdbstub.c",
+        "function_name": "(entire file)",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "gdbstub.c has zero references to load_res, load_val, or ZALRSC reservation state. While Ziccrse itself needs no debug visibility, the base LR/SC reservation (load_res/load_val) is invisible to GDB — a debugger cannot inspect whether a stopped hart holds an active LR reservation or what address is reserved. This is a pre-existing gap independent of Ziccrse, affecting debugging of any LR/SC-based synchronization primitive (spinlocks, CAS loops, lock-free data structures).",
+      "snippet": "(no load_res/load_val references found in gdbstub.c)"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

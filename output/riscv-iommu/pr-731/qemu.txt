@@ -1,0 +1,49 @@
+PR #731  target=qemu  overall=bug_confirmed
+Spec: QEMU uses PDTV configuration bit (or !!process_id integer coercion) instead of original request pid_valid for fault queue PV bit, causing incorrect process-ID attribution in IOMMU fault records when PDTV differs from the actual pid_valid state of the incoming translation request
+Violation: In riscv_iommu_translate(), when a translation fault occurs, the PV (Process Valid) bit in the fault queue record is derived from enable_pid = (ctx->tc & RISCV_IOMMU_DC_TC_PDTV) at line 1583, which is the device-context configuration bit for Process Directory Table Valid, not the original request's pid_valid. Similarly, riscv_iommu_ctx() at line 1337 uses !!process_id to infer PV, which cannot distinguish a request with no PID (NOPROCID=0) from a request that explicitly specified PID=0. The emulator never captures or preserves the original request's pid_valid state before the translation walk potentially modifies ctx->process_id.
+Consequence: function_loss
+Pattern: riscv_iommu_report_fault.*enable_pid|!!process_id.*report_fault|PDTV.*pv.*fault
+------------------------------------------------------------
+[bug_confirmed] hw/riscv/riscv-iommu.c:543-543  riscv_iommu_report_fault
+  FQ_HDR_PV is hardcoded to 'true' instead of using the 'pv' parameter. The function receives 'pv' as parameter (line 519) but only uses it to conditionally set FQ_HDR_PID (line 545). The PV bit in fault queue records is therefore always set regardless of whether the request actually had a valid process ID. This means PV=1 can be reported even for requests where pid_valid was false, violating the spec requirement that PV reflects the original request's pid_valid state.
+  | ev.hdr = set_field(ev.hdr, RISCV_IOMMU_FQ_HDR_PV, true);  // BUG: should be 'pv', not 'true'
+  | 
+  | if (pv) {
+  |     ev.hdr = set_field(ev.hdr, RISCV_IOMMU_FQ_HDR_PID, ctx->process_id);
+  | }
+
+[bug_confirmed] hw/riscv/riscv-iommu.c:1583-1659  riscv_iommu_translate
+  'enable_pid' is derived from the device-context configuration bit PDTV (ctx->tc & RISCV_IOMMU_DC_TC_PDTV) at line 1583, not from the original request's pid_valid. This value is then passed as the 'pv' argument to riscv_iommu_report_fault() at line 1658. The PDTV bit indicates whether the *device context* supports process directory tables, which is independent of whether the *incoming request* actually carried a valid PID. For example, a request with NOPROCID (no PID) arriving at a device with PDTV=1 would report PV=true, which is incorrect per spec.
+  | enable_pid = (ctx->tc & RISCV_IOMMU_DC_TC_PDTV);  // device config, NOT request pid_valid
+  | ...
+  | riscv_iommu_report_fault(s, ctx, ttype, fault, enable_pid,  // wrong: conflates config with request state
+  |                          iotlb->iova, iotlb->translated_addr);
+
+[bug_confirmed] hw/riscv/riscv-iommu.c:1337-1338  riscv_iommu_ctx
+  Uses '!!process_id' to infer pid_valid. Since RISCV_IOMMU_NOPROCID is defined as 0 (line 75), and process_id=0 is also a valid explicit PID (used as the default when DPE is set, line 1167), the expression '!!process_id' evaluates to false for both cases: (a) a request with no PID (NOPROCID=0) and (b) a request that explicitly specified PID=0. A request with explicit PID=0 would incorrectly get PV=0 in the fault record. Additionally, if the context is fetched from cache (line 1309), ctx->process_id retains the value from a prior lookup, potentially unrelated to the current request.
+  | riscv_iommu_report_fault(s, ctx, RISCV_IOMMU_FQ_TTYPE_UADDR_RD,
+  |                          fault, !!process_id, 0, 0);  // !!process_id can't distinguish PID=0 from no-PID
+
+[bug_confirmed] hw/riscv/riscv-iommu.c:699-700  riscv_iommu_msi_write (MRIF error path)
+  Uses '!!ctx->process_id' as PV for fault reporting. By the time MSI/MRIF processing happens inside riscv_iommu_spa_fetch, the ctx->process_id may have been mutated (e.g., set to 0 at line 1167 for NOPROCID+DPE path). The original request's pid_valid state is lost. This means MRIF-originated faults also report an incorrect PV bit.
+  | riscv_iommu_report_fault(s, ctx, fault_type, cause,
+  |                          !!ctx->process_id, 0, 0);  // ctx->process_id may have been mutated by spa_fetch
+
+[potential_risk] hw/riscv/riscv-iommu.c:1160-1167  riscv_iommu_ctx_fetch (process_id mutation)
+  ctx->process_id is mutated from NOPROCID (0) to 0 at line 1167 in the DPE default-process path. While this mutation is spec-correct for translation purposes (using the default process), it destroys the information about whether the original request had a PID. Any downstream fault reporting after this point can no longer determine the original request's pid_valid. The emulator should capture pid_valid before the walk begins.
+  | if (ctx->process_id == RISCV_IOMMU_NOPROCID) {
+  |     if (!(ctx->tc & RISCV_IOMMU_DC_TC_DPE)) {
+  |         ctx->satp = 0ULL;
+  |         return 0;
+  |     } else {
+  |         ctx->process_id = 0;  // original pid_valid state destroyed
+  |     }
+  | }
+
+[potential_risk] hw/riscv/riscv-iommu.c:2073-2085  riscv_iommu_process_dbg
+  The debug translation request path (TR_REQ) passes PID from the control register directly to riscv_iommu_ctx(). When translation fails (line 2085-2086), riscv_iommu_translate() reports the fault with enable_pid derived from PDTV, not from whether PID was valid in the TR_REQ control register. The TR_REQ_CTL register does not have an explicit pid_valid bit, so this is an inherent design limitation of the debug interface, but the PDTV-based derivation means the PV bit in the fault record is incorrect for this path as well.
+  | ctx = riscv_iommu_ctx(s, devid, pid, &ref);
+  | ...
+  | int fault = riscv_iommu_translate(s, ctx, &iotlb, false);
+  | // fault reported inside translate() with enable_pid=PDTV, not request pid_valid
+

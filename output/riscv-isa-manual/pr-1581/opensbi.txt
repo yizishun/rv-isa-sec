@@ -1,0 +1,43 @@
+PR #1581  target=opensbi  overall=compliant
+Spec: CSRRS/CSRRC on pmpaddr triggers unintended RMW of 'reads-as' shadow bits, corrupting PMP underlying state and weakening M-mode memory isolation enforced by OpenSBI
+Violation: OpenSBI M-mode code uses CSRRS or CSRRC (including pseudo-instructions) on pmpaddr CSRs to modify a subset of bits, causing bits that 'read as' a different value (e.g., unimplemented address bits [G-1] and above that read as 0) to be read-modify-written back with their apparent read value, silently corrupting the underlying hardware state of those bits
+Consequence: privilege_escape
+Pattern: csrr[sc][i]\s+\w+,\s*pmpaddr\d+|CSRRS|CSRRC|CSRRSI|CSRRCI.*pmpaddr|setbits|clrbits.*pmpaddr|__ASM_CSR.*pmpaddr|csr_set|csr_clear.*CSR_PMPADDR
+------------------------------------------------------------
+[compliant] lib/sbi/riscv_asm.c:333-381  pmp_set
+  PMP address value is computed entirely in local variables (CPU registers) then written via csr_write_num(pmpaddr_csr, pmpaddr) which expands to CSRW — a pure write instruction. No CSRRS/CSRRC touches pmpaddr CSRs, so unimplemented upper address bits that 'read as 0' are never read-modify-written back.
+  | pmpaddr_csr = CSR_PMPADDR0 + n;
+  | /* ... compute pmpaddr from addr/log2len in local var ... */
+  | csr_write_num(pmpaddr_csr, pmpaddr);
+
+[compliant] lib/sbi/riscv_asm.c:190-273  csr_write_num
+  All CSR_PMPADDR0 through CSR_PMPADDR63 writes are dispatched via csr_write() which emits the CSRW instruction. No CSRRS/CSRRC is used for any pmpaddr CSR.
+  | switchcase_csr_write_64(CSR_PMPADDR0, val)
+
+[compliant] lib/sbi/riscv_asm.c:290-315  pmp_disable
+  pmp_disable() only reads-modifies-writes pmpcfg CSRs (clearing the A field) and never touches pmpaddr CSRs at all. No risk of pmpaddr corruption.
+  | cfgmask = ~(0xffUL << pmpcfg_shift);
+  | pmpcfg = (csr_read_num(pmpcfg_csr) & cfgmask);
+  | csr_write_num(pmpcfg_csr, pmpcfg);
+
+[compliant] lib/sbi/riscv_asm.c:94-188  csr_read_num
+  All CSR_PMPADDR0 through CSR_PMPADDR63 reads use csr_read() which emits the CSRR instruction. Pure read, no writeback regardless of what 'reads as' bits return.
+  | switchcase_csr_read_64(CSR_PMPADDR0)
+
+[compliant] lib/sbi/sbi_hart_pmp.c:121-218  sbi_hart_smepmp_configure
+  SMEPMP configuration calls pmp_set() and pmp_disable() exclusively. The csr_set(CSR_MSECCFG, ...) touches MSECCFG (not pmpaddr) and is unrelated to this vulnerability pattern.
+  | csr_set(CSR_MSECCFG, MSECCFG_RLB);
+  | /* ... */
+  | sbi_hart_smepmp_set(scratch, dom, reg, pmp_idx++, pmp_flags, pmp_log2gran, pmp_addr_max);
+  | csr_set(CSR_MSECCFG, MSECCFG_MML);
+
+[compliant] include/sbi/riscv_asm.h:131-138  csr_set
+  csr_set() emits the CSRS instruction. Verified across the entire codebase: it is never called with a pmpaddr CSR number. All call sites use it on MSECCFG only.
+  | __asm__ __volatile__("csrs " __ASM_STR(csr) ", %0"
+
+[compliant] platform/generic/mips/p8700.c:82-100  mips_p8700_pmp_set
+  MIPS platform PMP override only touches MIPS-specific PMACFG CSRs (cacheability attributes), not standard pmpaddr CSRs. Uses safe read-modify-write pattern via local variable on pmacfg.
+  | pmacfg = (csr_read_num(pmacfg_csr) & cfgmask);
+  | /* ... modify pmacfg local var ... */
+  | csr_write_num(pmacfg_csr, pmacfg);
+

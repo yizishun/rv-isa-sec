@@ -1,0 +1,136 @@
+{
+  "pr_number": 653,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 653,
+    "violation_condition": "QEMU TCG implements implicit interrupt-entry context save (x10-x15 to stack) in riscv_cpu_do_interrupt() as a non-atomic sequence of guest memory stores, and a higher-priority interrupt arrives mid-save (late preemption), leaving partially-saved or clobbered x10-x15 values on stack that the preempting handler may overwrite before the original save completes. Additionally, if the TCG-generated ipopxret restore uses stack offsets or access sizes that differ from those used during the implicit trap-entry save (both 'implementation defined' per spec), restored x10-x15 values are corrupt.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "riscv_cpu_do_interrupt implicit stack write x10-x15 non-atomic + ipopxret stack offset mismatch + late preemption during trap-entry save",
+    "affected_entities": [
+      "ipopxret",
+      "x10",
+      "x11",
+      "x12",
+      "x13",
+      "x14",
+      "x15",
+      "sp",
+      "mepc",
+      "mstatus",
+      "sepc",
+      "sstatus"
+    ],
+    "summary": "Smip moves interrupt context save from explicit tpush instruction into implicit trap-entry behavior; QEMU must ensure the implicit stack writes (x10-x15) are consistent with ipopxret restore offsets, atomic with respect to late-preemption, and that removal of xepc/xpistatus from the save frame doesn't leak privileged CSR values through stale stack slots"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_do_nmi",
+        "line_start": 2183,
+        "line_end": 2198,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Smip (implicit x10-x15 save/restore to stack) is not implemented in this QEMU version. riscv_do_nmi() saves only CSR state (mnstatus, mncause, mnepc, MNPELP) and switches to M-mode. There is no implicit stack write of x10-x15 at all, so the 'non-atomic save + late preemption clobber' vulnerability from the security spec does not apply. No popxret/ipopxret instruction exists in the decode tables.",
+      "snippet": "env->mnstatus = set_field(env->mnstatus, MNSTATUS_NMIE, false);\nenv->mnstatus = set_field(env->mnstatus, MNSTATUS_MNPV, virt);\nenv->mnstatus = set_field(env->mnstatus, MNSTATUS_MNPP, env->priv);\nenv->mncause = cause;\nenv->mnepc = env->pc;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2242,
+        "line_end": 2246,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "NMI dispatch at interrupt entry correctly checks ext_smrnmi && rnmip before calling riscv_do_nmi(). No implicit GPR save to stack occurs here. The early return (line 2245) correctly short-circuits the normal trap path.",
+      "snippet": "if (cpu->cfg.ext_smrnmi && env->rnmip && async) {\n    riscv_do_nmi(env, cause | ((target_ulong)1U << (mxlen - 1)),\n                 env->virt_enabled);\n    return;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_local_irq_pending",
+        "line_start": 525,
+        "line_end": 535,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "RNMI priority and NMIE gating are correctly implemented. When MNSTATUS_NMIE=0, all interrupts return RISCV_EXCP_NONE, preventing interrupt delivery during NMI handler window. rnmip bits are scanned via ctz64 at top priority, correctly handling multi-source RNMI.",
+      "snippet": "if (riscv_cpu_cfg(env)->ext_smrnmi) {\n    if (!get_field(env->mnstatus, MNSTATUS_NMIE)) {\n        return RISCV_EXCP_NONE;\n    }\n    if (env->rnmip) {\n        return ctz64(env->rnmip);\n    }\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2431,
+        "line_end": 2508,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "NNMI (nested NMI / M-mode exception while NMIE=0) handling is correct. nnmi_excep is detected (lines 2431-2433, re-evaluated 2466-2468 after hypervisor swap), CFI ELP saved to mnstatus.MNPELP (line 2439), pc set to rnmi_excpvec (line 2504). Double-trap with MDT correctly aborts (line 2478) or routes to riscv_do_nmi (line 2480).",
+      "snippet": "nnmi_excep = cpu->cfg.ext_smrnmi &&\n             !get_field(env->mnstatus, MNSTATUS_NMIE) &&\n             !async;\n...\nif (nnmi_excep) {\n    env->pc = env->rnmi_excpvec;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "helper_mnret",
+        "line_start": 457,
+        "line_end": 503,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mnret correctly restores PC from mnepc and privilege from MNSTATUS_MNPP without any implicit stack-based GPR restore. Privilege checks via check_ret_from_m_mode (line 464) prevent invalid privilege escalation. NMIE is set to 1 by hardware only (line 468), matching spec. MPRV, DBLTRP, hypervisor swap, and CFI ELP restore are all handled.",
+      "snippet": "check_ret_from_m_mode(env, retpc, prev_priv, ra);\n...\nenv->mnstatus = set_field(env->mnstatus, MNSTATUS_NMIE, true);\n...\nriscv_cpu_set_mode(env, prev_priv, prev_virt);\nreturn retpc;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_mnstatus",
+        "line_start": 5495,
+        "line_end": 5512,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "NMIE bit is correctly write-protected: hardware-clear-only semantics enforced by line 5510 (env->mnstatus = (env->mnstatus & MNSTATUS_NMIE) | (val & mask)), so software cannot clear NMIE. TLB flush on MNPV change is correct. Mask covers only MNSTATUS_NMIE, MNSTATUS_MNPP, and conditionally MNSTATUS_MNPV.",
+      "snippet": "/* mnstatus.mnie can only be cleared by hardware. */\nenv->mnstatus = (env->mnstatus & MNSTATUS_NMIE) | (val & mask);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_riscv_cpu (implicit — no RNMI subsection)",
+        "line_start": 1,
+        "line_end": 0,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "RNMI state fields (mnscratch, mnepc, mncause, mnstatus, rnmip, rnmi_irqvec, rnmi_excpvec) are completely absent from VMState in machine.c. Live-migration of a guest with Smrnmi enabled would silently drop all NMI state. After migration, NMIE=1 (wrong), rnmip=0 (lost pending NMIs), mnepc/mncause=0 (lost NMI context). This is data corruption, though distinct from the Smip x10-x15 save/restore concern in the security spec.",
+      "snippet": "(No rnmip, mnscratch, mnepc, mncause, mnstatus, rnmi_irqvec, or rnmi_excpvec entries found in machine.c)"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_mnscratch",
+        "line_start": 5453,
+        "line_end": 5457,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mnscratch is a simple scratch register (WLRL read/write), so full-value read/write without masking is correct. No reserved bits to enforce.",
+      "snippet": "static RISCVException write_mnscratch(CPURISCVState *env, int csrno,\n                                      target_ulong val, uintptr_t ra)\n{\n    env->mnscratch = val;\n    return RISCV_EXCP_NONE;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_reset_hold",
+        "line_start": 791,
+        "line_end": 794,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Reset only clears rnmip and NMIE. Remaining RNMI CSRs (mnscratch, mnepc, mncause, mnstatus non-NMIE fields, rnmi_irqvec, rnmi_excpvec) are not explicitly reset. They rely on zero-initialization of the CPU struct. While practically correct due to g_new0, explicit reset of mnepc/mncause would be more robust against future changes.",
+      "snippet": "if (cpu->cfg.ext_smrnmi) {\n    env->rnmip = 0;\n    env->mnstatus = set_field(env->mnstatus, MNSTATUS_NMIE, false);\n}"
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,1 @@
+Zvvfmmofp8w was referenced in the FP encoding map (vfqwmmacc.vv, SEW=32, EEW=8) and as the implied base subextension of Zvvfmmmxfp8w, but was missing from the base FP subextension table.  Restore the entry between Zvvfmmofp8bf16 and Zvvfmmofp8d.

@@ -1,0 +1,155 @@
+PR #2504  target=linux  overall=potential_risk
+Spec: Sstc makes STIP/VSTIP read-only hardware-reflected bits; kernel code that writes STIP/VSTIP to manage timer state (context switch, KVM timer emulation, tick setup) silently fails, causing lost or stuck timer interrupts and potential CPU starvation or guest VM hangs.
+Violation: Linux kernel code in S-mode writes to mip.STIP or sip.STIP (or KVM in HS-mode writes to hip.VSTIP via hvip.VSTIP) to inject or clear timer interrupts while the Sstc extension is implemented and STCE is enabled in menvcfg/henvcfg, making these bits read-only and hardware-driven from stimecmp/vstimecmp comparisons. The write is silently ignored or causes an unexpected trap, breaking the kernel's assumption of software-controlled timer interrupt delivery.
+Consequence: denial_of_service
+Pattern: csr_write.*[Ss]TIP|csr_set.*[Ss]TIP|csr_clear.*[Ss]TIP|write.*mip.*STIP|write.*sip.*STIP|__kvm_riscv_vcpu_timer|kvm_riscv_vstimecmp
+------------------------------------------------------------
+[compliant] drivers/clocksource/timer-riscv.c:35-44  riscv_clock_event_stop
+  When Sstc is available, stops timer by writing ULONG_MAX to CSR_STIMECMP rather than clearing sip.STIP. Hardware comparator then deasserts STIP when time < stimecmp. No sip CSR write needed.
+  | if (static_branch_likely(&riscv_sstc_available)) {
+  | 	csr_write(CSR_STIMECMP, ULONG_MAX);
+  | 	if (IS_ENABLED(CONFIG_32BIT))
+  | 		csr_write(CSR_STIMECMPH, ULONG_MAX);
+  | } else {
+  | 	sbi_set_timer(U64_MAX);
+  | }
+
+[compliant] drivers/clocksource/timer-riscv.c:46-63  riscv_clock_next_event
+  When Sstc is available, directly programs CSR_STIMECMP with the next absolute cycle value. Hardware comparator will assert STIP when time >= stimecmp. No sip CSR manipulation. Correctly gates on riscv_sstc_available static branch.
+  | if (static_branch_likely(&riscv_sstc_available)) {
+  | 	csr_write(CSR_STIMECMP, next_tval);
+  | } else
+  | 	sbi_set_timer(next_tval);
+
+[compliant] drivers/clocksource/timer-riscv.c:108-126  riscv_timer_starting_cpu
+  CPU hotplug online path stops any stale timer via riscv_clock_event_stop() (Sstc-aware), then registers per-CPU clockevent with appropriate rating bump. No sip manipulation. SMP-safe: each CPU manages its own stimecmp via the per-CPU clockevent device.
+  | riscv_clock_event_stop();
+  | ce->cpumask = cpumask_of(cpu);
+  | ce->irq = riscv_clock_event_irq;
+  | if (static_branch_likely(&riscv_sstc_available))
+  | 	ce->rating = 450;
+
+[compliant] drivers/clocksource/timer-riscv.c:148-156  riscv_timer_interrupt
+  Timer IRQ handler first stops the timer via Sstc-aware riscv_clock_event_stop() (writes ULONG_MAX to stimecmp, causing hardware to clear STIP), then invokes the clockevent callback. No sip write for STIP acknowledgement — hardware deasserts STIP automatically because stimecmp is pushed far into the future.
+  | static irqreturn_t riscv_timer_interrupt(int irq, void *dev_id)
+  | {
+  | 	struct clock_event_device *evdev = this_cpu_ptr(&riscv_clock_event);
+  | 	riscv_clock_event_stop();
+  | 	evdev->event_handler(evdev);
+  | 	return IRQ_HANDLED;
+  | }
+
+[compliant] drivers/clocksource/timer-riscv.c:128-138  riscv_timer_dying_cpu
+  CPU hotplug offline path stops timer and disables percpu IRQ. No stale stimecmp left behind that could spuriously assert STIP on a hart about to power down.
+  | static int riscv_timer_dying_cpu(unsigned int cpu)
+  | {
+  | 	riscv_clock_event_stop();
+  | 	disable_percpu_irq(riscv_clock_event_irq);
+  | 	return 0;
+  | }
+
+[compliant] arch/riscv/kvm/vcpu_timer.c:72-82  kvm_riscv_vcpu_update_vstimecmp
+  Sstc-enabled KVM timer programming writes directly to CSR_VSTIMECMP (the VS-mode hardware comparator). When henvcfg.STCE=1, hardware drives VSTIP automatically from this comparator. KVM does NOT software-inject IRQ_VS_TIMER via hvip in this path — correct delegation to hardware.
+  | static int kvm_riscv_vcpu_update_vstimecmp(struct kvm_vcpu *vcpu, u64 ncycles)
+  | {
+  | 	ncsr_write(CSR_VSTIMECMP, ncycles);
+  | 	return 0;
+  | }
+
+[potential_risk] arch/riscv/kvm/vcpu_timer.c:245-269  kvm_riscv_vcpu_timer_init
+  The Sstc gate in timer_init uses host ISA (riscv_isa_extension_available(NULL, SSTC)) to decide whether to use the vstimecmp hardware path (t->sstc_enabled=true, timer_next_event→kvm_riscv_vcpu_update_vstimecmp, hrtimer callback→kvm_riscv_vcpu_vstimer_expired which only kicks VCPU without injecting IRQ_VS_TIMER). However, henvcfg.STCE is configured per-VCPU in kvm_riscv_vcpu_setup_config() based on guest ISA. If host has Sstc but guest ISA does not include Sstc (so henvcfg.STCE=0), the vstimecmp hardware comparator will NOT drive VSTIP, but KVM will never software-inject IRQ_VS_TIMER either. The guest would starve for timer interrupts while the hrtimer callback merely kicks the VCPU without setting any interrupt bit.
+  | if (riscv_isa_extension_available(NULL, SSTC)) {
+  | 	t->sstc_enabled = true;
+  | 	hrtimer_setup(&t->hrt, kvm_riscv_vcpu_vstimer_expired, ...);
+  | 	t->timer_next_event = kvm_riscv_vcpu_update_vstimecmp;
+  | } else {
+  | 	t->sstc_enabled = false;
+  | 	hrtimer_setup(&t->hrt, kvm_riscv_vcpu_hrtimer_expired, ...);
+  | 	t->timer_next_event = kvm_riscv_vcpu_update_hrtimer;
+  | }
+
+[compliant] arch/riscv/kvm/vcpu_timer.c:110-127  kvm_riscv_vcpu_vstimer_expired
+  The hrtimer callback for the Sstc-enabled path correctly only kicks the VCPU (kvm_vcpu_kick) without software-injecting IRQ_VS_TIMER. This relies on the hardware vstimecmp comparator to have already asserted VSTIP in hvip by the time the VCPU re-enters. Clean separation from the software-injection path (kvm_riscv_vcpu_hrtimer_expired which calls kvm_riscv_vcpu_set_interrupt).
+  | static enum hrtimer_restart kvm_riscv_vcpu_vstimer_expired(struct hrtimer *h)
+  | {
+  | 	...
+  | 	t->next_set = false;
+  | 	kvm_vcpu_kick(vcpu);
+  | 	return HRTIMER_NORESTART;
+  | }
+
+[compliant] arch/riscv/kvm/vcpu_timer.c:340-374  kvm_riscv_vcpu_timer_save
+  On VCPU put (schedule-out or userspace exit), sets vstimecmp to -1UL (maximum value) so that an expired hardware comparator does not keep VSTIP asserted while the VCPU is not running on this hart. This prevents spurious WFI wakeups on the host CPU per the RISC-V privileged spec WFI semantics. The actual next_cycles value was already preserved by kvm_riscv_vcpu_timer_sync() on prior VM exits, and will be restored in kvm_riscv_vcpu_timer_restore() on VCPU load. Correct save/restore discipline.
+  | csr_write(CSR_VSTIMECMP, -1UL);
+  | #if defined(CONFIG_32BIT)
+  | 	csr_write(CSR_VSTIMECMPH, -1UL);
+  | #endif
+
+[compliant] arch/riscv/kvm/vcpu_timer.c:325-338  kvm_riscv_vcpu_timer_sync
+  On every VM exit, reads back CSR_VSTIMECMP into t->next_cycles to capture the hardware comparator state (which the guest may have modified via SBI set_timer or direct CSR write if delegated). This keeps the software model in sync with hardware. Correct VM-exit synchronization.
+  | void kvm_riscv_vcpu_timer_sync(struct kvm_vcpu *vcpu)
+  | {
+  | 	if (!t->sstc_enabled)
+  | 		return;
+  | 	t->next_cycles = ncsr_read(CSR_VSTIMECMP);
+  | }
+
+[compliant] arch/riscv/kvm/vcpu.c:578-641  kvm_arch_vcpu_load
+  VCPU load correctly restores henvcfg (which includes STCE bit based on guest ISA) before calling kvm_riscv_vcpu_timer_restore() which writes vstimecmp. The ordering is: henvcfg.STCE is set first, then vstimecmp is written, so hardware correctly owns VSTIP from vstimecmp from that point onward. Also restores csr->hvip but the VSTIP bit in HVIP write is hardware-driven (read-only) when STCE=1 — the write is silently ignored by hardware, which is harmless since VSTIP state is governed by vstimecmp.
+  | csr_write(CSR_HVIP, csr->hvip);
+  | csr_write(CSR_HENVCFG, cfg->henvcfg);
+  | ...
+  | kvm_riscv_vcpu_timer_restore(vcpu);
+
+[compliant] arch/riscv/kvm/vcpu.c:347-362  kvm_riscv_vcpu_flush_interrupts
+  The irqs_pending→hvip flush path copies pending interrupt bits into csr->hvip, which is then written to hardware CSR_HVIP in kvm_riscv_update_hvip(). When Sstc is active for the guest (STCE=1), KVM never sets IRQ_VS_TIMER in irqs_pending (the hardware vstimecmp path uses kvm_vcpu_kick instead), so this flush path never attempts to write VSTIP via HVIP. Only VSSIP and VSEIP are software-managed. Correct separation of hardware-driven vs software-driven interrupt bits.
+  | if (READ_ONCE(vcpu->arch.irqs_pending_mask[0])) {
+  | 	mask = xchg_acquire(&vcpu->arch.irqs_pending_mask[0], 0);
+  | 	val = READ_ONCE(vcpu->arch.irqs_pending[0]) & mask;
+  | 	csr->hvip &= ~mask;
+  | 	csr->hvip |= val;
+  | }
+
+[compliant] arch/riscv/kvm/main.c:36-55  kvm_arch_enable_virtualization_cpu
+  KVM CPU enable initializes HVIP to 0 before any guest runs. The VSTIP bit in this write is silently ignored when host has Sstc (STCE in menvcfg set by firmware), but that's harmless — no guest VCPU context exists yet. hideleg delegates IRQ_VS_TIMER to VS-mode, which is correct for Sstc: the hardware vstimecmp comparator will assert VSTIP at VS privilege level directly without hypervisor intervention.
+  | csr_write(CSR_HIDELEG, KVM_HIDELEG_DEFAULT);
+  | csr_write(CSR_HVIP, 0);
+
+[compliant] arch/riscv/kvm/main.c:57-73  kvm_arch_disable_virtualization_cpu
+  KVM CPU disable correctly clears VSIE and HVIP before clearing hideleg, preventing spurious host interrupts from delegated bits (including IRQ_VS_TIMER). The comment explicitly documents this ordering requirement. HVIP.VSTIP write may be silently ignored with STCE=1, but clearing VSIE first ensures no spurious interrupt regardless.
+  | csr_write(CSR_VSIE, 0);
+  | csr_write(CSR_HVIP, 0);
+  | csr_write(CSR_HEDELEG, 0);
+  | csr_write(CSR_HIDELEG, 0);
+
+[compliant] arch/riscv/kernel/suspend.c:44-63  suspend_restore_csrs
+  Suspend restore correctly restores stimecmp with a safety-first write of ULONG_MAX to prevent spurious timer interrupts during the restore window. Only writes to CSR_STIMECMP (the comparator), never touches sip. The comment in suspend_save_csrs correctly notes that SIP/IP CSRs don't need save/restore across suspend because interrupt bits are set by external sources (hardware comparator, interrupt controller).
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SSTC)) {
+  | 	csr_write(CSR_STIMECMP, ULONG_MAX);
+  | 	csr_write(CSR_STIMECMPH, context->stimecmph);
+  | 	csr_write(CSR_STIMECMP, context->stimecmp);
+  | }
+
+[compliant] arch/riscv/kernel/head.S:133-133  early boot (head.S _start_kernel path)
+  csrw CSR_IP, zero at early boot (line 133 and 220) clears all pending interrupts including STIP. This occurs before Sstc timer driver initialization (which happens via TIMER_OF_DECLARE initcall). If firmware (OpenSBI) has set menvcfg.STCE=1 before Linux handoff, the STIP bit in this CSR write is silently ignored by hardware — but this is harmless because (a) sstatus.SIE is cleared so no interrupt fires, (b) the firmware should have initialized stimecmp to a safe value (e.g. ULONG_MAX or masked), and (c) the timer driver later calls riscv_clock_event_stop() which properly programs stimecmp to ULONG_MAX, causing hardware to deassert STIP. The kernel does not rely on this boot-time SIP write for timer correctness.
+  | csrw CSR_IP, zero
+
+[compliant] arch/riscv/kernel/sbi-ipi.c:24-30  __sbi_send_ipi (csr_clear path)
+  csr_clear(CSR_IP, IE_SIE) only clears bit 1 (SSIP/software interrupt), not bit 5 (STIP). Sstc does not affect SSIP — the Sstc extension only makes STIP read-only when STCE=1. This IPI clear is safe.
+  | static void __sbi_send_ipi(...) {
+  | 	csr_clear(CSR_IP, IE_SIE);
+  | }
+
+[compliant] arch/riscv/kvm/vcpu.c:543-576  kvm_riscv_vcpu_setup_config
+  henvcfg.STCE is correctly set based on guest ISA (vcpu->arch.isa), not host ISA. This is the correct architectural approach: each VCPU's henvcfg reflects that specific guest's feature set. The CSR write to henvcfg happens during kvm_arch_vcpu_load(). Combined with the finding in kvm_riscv_vcpu_timer_init(), the only risk is that timer_init uses host ISA for its Sstc gate while setup_config uses guest ISA — if they diverge, guest timer delivery breaks.
+  | if (riscv_isa_extension_available(isa, SSTC))
+  | 	cfg->henvcfg |= ENVCFG_STCE;
+
+[compliant] arch/riscv/kernel/entry.S:125-317  handle_exception / ret_from_exception
+  The generic exception/interrupt entry path saves/restores sstatus, sepc, scause, stval, and scratch but does NOT read or write sip (CSR_SIP). Timer interrupt delivery is entirely through the standard RISC-V interrupt architecture — sip bits are observed via the cause CSR (scause) during trap entry, not via explicit sip reads in the entry path. The kernel relies on the interrupt controller framework (handle_arch_irq → riscv_timer_interrupt) to handle timer interrupts, with the Sstc-aware stimecmp stop clearing STIP via hardware comparator. This is architecturally correct: with Sstc, STIP in sip is hardware-driven by the stimecmp comparator and does not need explicit clearing in the trap entry/exit path.
+  | /* Handle interrupts */
+  | 	call do_irq
+  | 	j ret_from_exception
+  | 1:
+  | 	/* Handle other exceptions */
+

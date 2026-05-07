@@ -1,0 +1,490 @@
+diff --git a/src/cheri/attributes.adoc b/src/cheri/attributes.adoc
+index 1b85b2624..0fe59c5d4 100644
+--- a/src/cheri/attributes.adoc
++++ b/src/cheri/attributes.adoc
+@@ -80,7 +80,6 @@ endif::support_varxlen[]
+ 
+ // Extension for CHERI CRG bits
+ :cheri_priv_crg_ext:          Svucrg
+-:cheri_priv_crg_load_tag_ext: Svucrglct
+ 
+ // Extension for capability levels (flow control)
+ :cheri_levels1_ext_name:             Zylevels1
+@@ -172,8 +171,7 @@ endif::support_varxlen[]
+ :cheri_excep_name_pc:        CHERI Instruction Access Fault
+ :cheri_excep_name_ld:        CHERI Load Access Fault
+ :cheri_excep_name_st:        CHERI Store/AMO Access Fault
+-:cheri_excep_name_pte:       CHERI Page Fault
+-:cheri_excep_name_pte_ld:    CHERI Load Page Fault
++:cheri_excep_name_pte_ld:    CHERI Load Capability Fault
+ :cheri_excep_name_pte_st:    CHERI Store/AMO Page Fault
+ 
+ :cheri_excep_desc_ytag:      Authorizing {ctag} is set to 0.
+diff --git a/src/cheri/cheri-pte-ext.adoc b/src/cheri/cheri-pte-ext.adoc
+index 4354a28f5..3a051a59f 100644
+--- a/src/cheri/cheri-pte-ext.adoc
++++ b/src/cheri/cheri-pte-ext.adoc
+@@ -5,7 +5,7 @@ NOTE: _Sv32_ (for RV32) does not have any spare PTE bits, and so no features fro
+ 
+ The {cheri_priv_crg_ext} extension is enabled when the `sstatus.CRGE` bit is set.
+ 
+-When enabled, the extension adds the ability for supervisor-mode software to quickly front-run loads of capabilities from userspace pages, and to track stores of capabilities to pages.
++The extension adds the ability for supervisor-mode software to quickly front-run loads of capabilities from userspace pages, and to track stores of capabilities to pages.
+ Such facilities have been shown to provide useful primitives for system-level implementation of certain forms of capability revocation which, in turn, allow userspace heap allocator software to deterministically guard against use-after-reallocation cite:[cornucopia-reloaded].
+ 
+ It achieves this by adding by adding the _pte.crg_, _pte.cd_ and `Xstatus.UCRG` bits as described below.
+@@ -62,53 +62,59 @@ When all of the following are true, {cheri_priv_crg_ext} adds two primitives for
+ 
+ ==== {cheri_excep_name_pte_ld}s
+ 
+-
+ When _pte.crw_ is set, _pte.crg_ can be used to trap on capability loads or AMOs when it does not match the value of `sstatus.UCRG`.
+ 
+ The implementation raises a {cheri_excep_name_pte_ld} when, in addition to the rules above, all of the following are true:
+ 
+ . A capability load or AMO is executed.
+-.. Where an AMO can raise both faults, {cheri_excep_name_pte_ld} is prioritized above {cheri_excep_name_pte_st}.
+ . _pte.crg_ does not equal `sstatus.UCRG`.
+ . _pte.u_ is set.
+ . Any other platform specific rules have not forced the loaded {ctag} to be clear.
++. The loaded {ctag} is set.
++
++{cheri_excep_name_pte_ld} is prioritized below {cheri_excep_name_pte_st} as shown in <<exception-priority-cheri>>, as AMOs can raise both.
+ 
+ NOTE: An example of a platform specific rule is a hardware engine clearing {ctag}s in memory after a call to free() to offload the CPU, which may have cleared a {ctag} before the CPU loads it.
+ 
+-There is an additional rule if _{cheri_priv_crg_load_tag_ext}_ is implemented:
++The {cheri_excep_name_pte_ld} _must_ be taken if the loaded {ctag} is set.
++The {cheri_excep_name_pte_ld} _may_ be taken if the loaded {ctag} is not set.
++This gives a range of valid implementations.
+ 
+-[start=5]
+-. The loaded {ctag} is set.
++[NOTE]
++====
++
++Checking the value of the {ctag} requires taking data dependent exceptions on loaded capabilities for loads or AMOs.
++Ideally all implementations would trap precisely (taking the {ctag} into account in all cases) rather than conservatively (trapping more often, potentially on every loaded capability).
++However, the loaded {ctag} may not be available in all implementations when determining whether to raise the exception, and therefore flexibility is permitted.
++As a result, the software is required to be tolerant of raising the trap when the {ctag} is not set, potentially resulting in spurious traps from pages which have _pte.crw=1_, and so are likely to store valid capabilities.
+ 
+-NOTE: Checking the value of the {ctag} requires taking data dependent exceptions on loaded data for loads or AMOs, and also affects the exception priority, see xref:exception-priority[xrefstyle=short].
+- Ideally all implementations would trap precisely (taking the {ctag} into account) rather than conservatively (on every capability access).
+- However, this information may not be available in all implementations, and therefore both choices are permitted.
+- This can be communicated to software by showing presence of the _{cheri_priv_crg_load_tag_ext}_ extension which implies {cheri_priv_crg_ext}.
+- Implementations which already take synchronous traps on loaded data, such as ECC faults, should implement _{cheri_priv_crg_load_tag_ext}_.
+- Both choices can be handled correctly by the same software, but {cheri_priv_crg_load_tag_ext} is expected to result in fewer spurious traps.
++Implementations which already take synchronous traps on loaded data, such as ECC faults, are recommended to check the loaded {ctag} when determining whether to raise the fault.
+ 
+-Even if the _{cheri_priv_crg_load_tag_ext}_ extension is implemented, implementations are still allowed to conservatively fault in some situations in which the {ctag} is not set.
++====
+ 
+ [[pte_crw_crg_load_summary]]
+ .Summary of capability load _pte.crw_ and _pte.crg_ behavior in the PTEs
+-[%autowidth,float="center",align="center",cols="<,<,<,<,<",options="header"]
++[%autowidth,float="center",align="center",cols="<,<,<,<,<,<",options="header"]
+ |===
+-|_pte.crw_| _pte.cd_| _pte.crg_              | _pte.u_| Load/AMO
+-| 0       | 0       | 0                      | X      | Clear loaded {ctag}
+-| 0       | 0       | 1                      | X      | Reserved
+-| 0       | 1       | X                      | X      | Reserved
+-| 1       | X       | {ne} `sstatus.` `UCRG` | 1      | {cheri_excep_name_pte_ld}, or {cheri_excep_name_pte_ld} if {ctag} is set for _{cheri_priv_crg_load_tag_ext}_
+-| 1       | X       | = `sstatus.` `UCRG`    | 1      | Normal operation
+-| 1       | X       | X                      | 0      | Normal operation^1^
++|_pte.crw_| _pte.cd_| _pte.crg_           | _pte.u_|tag^1^| Load Capability Behavior
++| 0       | 0       | 0                   | X      |  X   | Clear loaded {ctag}
++| 0       | 0       | 1                   | X      |  X   | Reserved
++| 0       | 1       | X                   | X      |  X   | Reserved
++| 1       | X       | X                   | 0      |  X   | Normal operation^2^
++| 1       | X       | {ne} `sstatus.UCRG` | 1      |  0   | Implementation defined choice of +
++{cheri_excep_name_pte_ld} or normal operation
++| 1       | X       | {ne} `sstatus.UCRG` | 1      |  1   | {cheri_excep_name_pte_ld}
++| 1       | X       | = `sstatus.UCRG`    | 1      |  X   | Normal operation
+ |===
+ 
+-^1^ A future version of this specification may check an SCRG bit in `sstatus` in this case for trapping on kernel pages.
++^1^ The loaded {ctag}.
++
++^2^ A future version of this specification may check an SCRG bit in `sstatus` in this case for trapping on kernel pages.
+ 
+ NOTE: {cheri_excep_name_pte_ld}s may be used to implement the load-barrier primitive from cite:[cornucopia-reloaded].
+ 
+ ==== Capability Dirty Tracking
+ 
+-
+ When _pte.crw_ is set, the _pte.cd_ bit indicates that a capability was stored to the
+ virtual page since the last time the _pte.cd_ bit was cleared.
+ 
+@@ -120,7 +126,7 @@ Capability dirty tracking behavior is enabled when, in addition to the rules abo
+ . The to-be-stored {ctag} is set.
+ . _pte.cd_ is clear.
+ 
+-Two schemes for this are permitted, and the scheme in use is determined by whether the _Svade_ or _Svadu_ extensions are enabled.
++Two schemes for capability dirty tracking are permitted, and the scheme in use is determined by whether the _Svade_ or _Svadu_ extensions are enabled.
+ 
+ * For _Svade_, take a {cheri_excep_name_pte_st}.
+ * For _Svadu_, do a hardware update which sets _pte.cd=1_, following the same rules as setting _pte.d_.
+@@ -128,28 +134,58 @@ Two schemes for this are permitted, and the scheme in use is determined by wheth
+ 
+ [[pte_crw_cd_store_summary]]
+ .Summary of capability store _pte.crw_ and _pte.cd_ behavior in the PTEs
+-[%autowidth,float="center",align="center",cols="<,<,<,<",options="header"]
++[%autowidth,float="center",align="center",cols="<,<,<,<,<",options="header"]
+ |===
+-|_pte.crw_|_pte.cd_|_pte.crg_| Store/AMO
+-| 0       | 0      | 0       | {cheri_excep_name_pte_st} if the to-be-stored {ctag} is set
+-| 0       | 0      | 1       | Reserved
+-| 0       | 1      | X       | Reserved
+-| 1       | 0      | X       | {cheri_excep_name_pte_st} if the to-be-stored {ctag} is set (_Svade_), or hardware _pte.cd_ update (_Svadu_)
+-| 1       | 1      | X       | Normal operation
++|_pte.crw_|_pte.cd_|_pte.crg_|tag^1^| Store Capability Behavior
++| 0       | 0      | 0       |  0   | Normal operation
++| 0       | 0      | 0       |  1   | {cheri_excep_name_pte_st}
++| 0       | 0      | 1       |  X   | Reserved
++| 0       | 1      | X       |  X   | Reserved
++| 1       | 0      | X       |  0   | Normal operation
++| 1       | 0      | X       |  1   | {cheri_excep_name_pte_st} (_Svade_) +
++or hardware _pte.cd_ update (_Svadu_)
++| 1       | 1      | X       |  X   | Normal operation
+ |===
+ 
+-NOTE: Because the state of _pte.cd=1_ and _pte.crw=0_ is illegal, it is possible for the update of _pte.cd_ to fail if another thread has cleared _pte.crw_.
++^1^ The to-be-stored {ctag}.
++
++[NOTE]
++====
++
++Because the state of _pte.cd=1_ and _pte.crw=0_ is _reserved_:
++
++*  It is possible for the update of _pte.cd_ to fail if another thread has cleared _pte.crw_.
+ ifndef::cheri_standalone_spec[]
+  This follows the standard rules in xref:sv32algorithm[xrefstyle=short].
+ endif::[]
++* For non-capability data, it is possible for a virtual page to be read-only but also dirty (_pte.w=0, pte.d=1_).
++ The analogous page state is not permitted for capability data.
+ 
+-NOTE: For non-capability data, it is possible for a virtual page to be read-only but also dirty (_pte.w=0, pte.d=1_).
+- The analogous page state is not permitted for capability data as _pte.crw=0, pte.cd=1_ is _reserved_.
++====
+ 
+-Capability dirty tracking _always_ checks the {ctag} on stored capabilities when determining whether to raise the {cheri_excep_name_pte_st}.
++The capability dirty tracking is resolved during memory translation, but there are cases it is not known if there will be a {ctag} stored to memory or not at this point.
++Capability dirty tracking _must_ be triggered when there is a stored {ctag}, and _may_ be triggered in the following case where it is not known if there will be a stored {ctag} during translation.
+ 
+-NOTE: Checking the stored {ctag} is less of a burden to the implementation than checking the loaded {ctag} for {cheri_priv_crg_load_tag_ext}, which is why checking the loaded {ctag} is optional behavior.
+- However, a future extension may reduce the burden further by removing the check on the stored {ctag}.
++* SC{LD_ST_DOT_CAP} triggers capability dirty tracking if the {ctag} is set in {cs2}, even if the store fails.
++
++[NOTE]
++====
++
++_pte.cd_ must always be set when there is a stored {ctag} to a virtual page so that software knows which pages have had capabilities stored to them.
++It may be set too often, which may cause software to examine the page to check for capabilities when none are present.
++This is a situation software is required to handle anyway, as it is always possible for all capabilities in a page to be overwritten by non-capability data.
++In this case the _pte.cd_ bit will still be set.
++
++Future AMOs fall into this category:
++
++* For future AMOCAS{LD_ST_DOT_CAP}, it is not known whether the store will happen until the load has executed and the compare has been done. Therefore, AMOCAS{LD_ST_DOT_CAP} is likely to trigger capability dirty tracking if the {ctag} is set in {cs2}.
++* For future AMOADD{LD_ST_DOT_CAP}, the stored {ctag} depends upon the loaded {ctag} which is not known during translation and also on the execution of the {CADD}.
++ Therefore, AMOADD{LD_ST_DOT_CAP}, is likely to always trigger capability dirty tracking.
++
++Checking the stored {ctag} is less of a burden to the implementation than checking the loaded {ctag} for {cheri_excep_name_pte_ld}, which is why checking the loaded {ctag} is optional behavior.
++ However, a future extension may reduce the burden further by removing the check on the to-be-stored {ctag}.
++
++====
+ 
+ NOTE: Capability dirty tracking may be used to implement the store-barrier primitive from cite:[cornucopia-reloaded].
+ 
+diff --git a/src/cheri/introduction.adoc b/src/cheri/introduction.adoc
+index b1a2fed7d..56a55d5fe 100644
+--- a/src/cheri/introduction.adoc
++++ b/src/cheri/introduction.adoc
+@@ -106,12 +106,10 @@ ifdef::support_varxlen[]
+ endif::support_varxlen[]
+ |<<section_priv_cheri_vmem,{cheri_priv_vmem_ext}>>          | Virtual Memory
+ |<<section_debug_integration_trig,{cheri_priv_debug_trig}>> | Debug triggers
+-|<<section_cheri_priv_crg_ext,    {cheri_priv_crg_ext}>>^1^ | MMU-based acceleration of capability revocation for heap temporal safety
++|<<section_cheri_priv_crg_ext,    {cheri_priv_crg_ext}>>    | MMU-based acceleration of capability revocation for heap temporal safety
+ |<<sec_zycheriot_priv>>                                     | CHERIoT privileged extension
+ |=============================================================================================================================================================
+ 
+-^1^ {cheri_priv_crg_load_tag_ext} is available for improved software revocation performance if {cheri_priv_crg_ext} is implemented.
+-
+ .Debug stable extensions and specifications
+ [#debug-extension-status,reftext="Extension Status and Summary"]
+ [options=header,align=center,width="90%"]
+diff --git a/src/cheri/riscv-priv-integration.adoc b/src/cheri/riscv-priv-integration.adoc
+index bfc5de847..d82e7cdbb 100644
+--- a/src/cheri/riscv-priv-integration.adoc
++++ b/src/cheri/riscv-priv-integration.adoc
+@@ -166,53 +166,51 @@ The new exception codes and priorities are listed in
+ xref:mcauses[xrefstyle=short] and xref:exception-priority-cheri[xrefstyle=short] respectively.
+ 
+ [[exception-priority-cheri]]
+-.Synchronous exception priority in decreasing priority order. Entries added in {cheri_base_ext_name} are in *bold*
+-[float="center",align="center",cols="<1,>1,<8",options="header"]
++.Synchronous exception priority in decreasing priority order for {cheri_base_ext_name}.
++[%autowidth,float="center",align="center",cols="<,>,<",options="header",]
+ |===
+ |Priority |Exc.Code |Description
+ |_Highest_ |3 |Instruction address breakpoint
+-| .>|*{cheri_excep_cause_pc}* .<|*Prior to instruction address translation:* +
+-*{cheri_excep_name_pc} due to {pcc} checks ({ctag}, execute permission, bounds^1^)*
++| .>|{cheri_excep_cause_pc} .<|Prior to instruction address translation: +
++{cheri_excep_name_pc} due to {pcc} checks ({ctag}, sealed, execute permission, bounds^1^)
+ | .>|12, 1 .<|During instruction address translation: +
+ First encountered page fault or access fault
+ | .>|1 .<|With physical address for instruction: +
+ Instruction access fault
+ 
+ | .>|2 +
+-*{cheri_excep_cause_pc}* +
++{cheri_excep_cause_pc} +
+ 0 +
+ 8,9,11 +
+ 3 +
+ 3 .<|Illegal instruction +
+-*{cheri_excep_name_pc} due to {pcc} <<asr_perm>> clear* +
++{cheri_excep_name_pc} due to {pcc} <<asr_perm>> clear +
+ Instruction address misaligned +
+ Environment call +
+ Environment break +
+ Load/store/AMO address breakpoint
+ 
+-| .>|*{cheri_excep_cause_ls_list}* .<|*Prior to address translation for an explicit memory access:* +
+-*{cheri_excep_name_ld}, {cheri_excep_name_st} due to capability checks ({ctag}, sealed, permissions, bounds)*
+-| .>|4,6 .<|*Load/store/AMO capability address misaligned* +
+-Optionally: +
++| .>|{cheri_excep_cause_ls_list} .<|Prior to address translation for an explicit memory access: +
++{cheri_excep_name_ld}, {cheri_excep_name_st} due to capability checks ({ctag}, sealed, permissions, bounds)
++| .>|4,6 .<|Load/store/AMO capability address misaligned +
++
++| .>|4,6 .<|Optionally: +
+ Load/store/AMO address misaligned
+-| .>|*{cheri_excep_cause_pte_ld}, {cheri_excep_cause_pte_st},* 13, 15, 5, 7 .<|During address translation for an explicit memory access: +
+-First encountered *{cheri_excep_name_pte_ld}^2^, {cheri_excep_name_pte_st}*, page fault or access fault
++| .>|{cheri_excep_cause_pte_st}, 13, 15, 5, 7 .<|During address translation for an explicit memory access: +
++First encountered {cheri_excep_name_pte_st}, page fault or access fault
+ | .>|5,7 .<|With physical address for an explicit memory access: +
+ Load/store/AMO access fault
+-| .>|4,6 .<|If not higher priority: +
++.>| .>|4,6 .<|If not higher priority: +
+ Load/store/AMO address misaligned
+-.>|_Lowest_ .>|*{cheri_excep_cause_pte_ld}* .<|*If not higher priority: +
+-{cheri_excep_name_pte_ld}^3^*
++.>|_Lowest_ .>|{cheri_excep_cause_pte_ld} .<|{cheri_excep_name_pte_ld}^2^
+ |===
+ 
+ ^1^ {pcc} bounds are checked against all bytes of fetched instructions.
+  If the instructions could not be decoded to determine the length, then the <<pcc>> bounds check is made against the minimum sized instruction supported by the implementation which can be executed, when prioritizing against Instruction Access Faults.
+ 
+-^2^ The higher priority {cheri_excep_name_pte_ld} covers capability loads or atomics where the loaded {ctag} _is not_ checked ({cheri_priv_crg_ext} is implemented) .
+-
+-^3^ The lower priority {cheri_excep_name_pte_ld} covers capability loads or atomics where the loaded {ctag} _is_ checked ({cheri_priv_crg_load_tag_ext} is implemented).
++^2^ {cheri_excep_name_pte_ld} is the lowest priority as determining whether to raise the exception may include checking the loaded {ctag}.
+ 
+-NOTE: The full details of the CHERI exceptions are in xref:cheri_exception_combs_descriptions[xrefstyle=short].
++NOTE: The full details of {cheri_excep_name_pc}, {cheri_excep_name_ld} and {cheri_excep_name_st} are in xref:cheri_exception_combs_descriptions[xrefstyle=short].
+ 
+ ifdef::cheri_standalone_spec[]
+ ==== Machine Trap Delegation Register (medeleg)
+@@ -586,9 +584,9 @@ Such sharing through virtual memory is on the page granularity, so preventing ca
+ ^*^ _allocated using mmap_
+ 
+ [#cheri_pte_fault]
+-=== CHERI page faults
++=== CHERI virtual memory related faults
+ 
+-CHERI adds the concept of _CHERI page faults_. They are split into:
++CHERI adds the concept of CHERI virtual memory related faults. They are split into:
+ 
+ * {cheri_excep_name_pte_ld} (cause value {cheri_excep_cause_pte_ld}), and
+ * {cheri_excep_name_pte_st} (cause value {cheri_excep_cause_pte_st})
+@@ -597,9 +595,9 @@ They are prioritized against other fault types as shown in <<exception-priority-
+ 
+ The _pte.crw_ bit allows {cheri_excep_name_pte_st}s to be raised.
+ 
+-NOTE: {cheri_excep_name_pte_ld} faults are at present raised only if <<section_cheri_priv_crg_ext,{cheri_priv_crg_ext}>> is enabled.
++NOTE: {cheri_excep_name_pte_ld} faults are at present raised only if  {cheri_priv_crg_ext} is enabled.
+ 
+-NOTE: {cheri_excep_name_pte_st} faults are raised under more circumstances if <<section_cheri_priv_crg_ext,{cheri_priv_crg_ext}>> and Svade are both enabled.
++NOTE: {cheri_excep_name_pte_st} faults are raised under more circumstances if  {cheri_priv_crg_ext} and Svade are both enabled.
+ 
+ ==== Extending the Page Table Entry Format
+ 
+@@ -625,8 +623,8 @@ When the CRW bit is set, capabilities are written as usual.
+ 
+ If the CRW bit is clear then, in priority order for AMOs:
+ 
+-* When a capability load or AMO instruction is executed, the {ctag} of the loaded capability is cleared before it is written to the destination register.
+ * When a capability store or AMO instruction is executed, and the to-be-stored {ctag} is set, a <<cheri_pte_fault,_{cheri_excep_name_pte_st}_>> exception is raised.
++* When a capability load or AMO instruction is executed, the {ctag} of the loaded capability is cleared before it is written to the destination register.
+ 
+ [[pte_crw_summary]]
+ .Summary of memory access behavior depending on _pte.crw_, in priority order for AMOs.
+diff --git a/src/cheri/trigger-integration.adoc b/src/cheri/trigger-integration.adoc
+index 67427d146..ee6ca8563 100644
+--- a/src/cheri/trigger-integration.adoc
++++ b/src/cheri/trigger-integration.adoc
+@@ -12,54 +12,53 @@ shown in xref:trigger-exception-priority[xrefstyle=short].
+ Debug triggers are higher priority than CHERI exceptions to allow debug.
+ 
+ [[trigger-exception-priority]]
+-.Synchronous exception priority (including triggers) in decreasing priority order. Entries added in {cheri_base_ext_name} are in *bold*
+-[float="center",align="center",cols="<1,>1,<4,<2",options="header"]
++.Synchronous exception priority in decreasing priority order.
++[align="center",float="center", cols="^1,<1,<2,<2", options="header"]
+ |===
+-|Priority |Exc. Code |Description |Trigger
+-|_Highest_ |3 +
++| Priority | Exception Code | Description | Trigger
++| _Highest_
++| 3 +
+ 3 +
+ 3 +
+-3 | | etrigger +
++3
++|
++| etrigger +
+ icount +
+ itrigger +
+-mcontrol/mcontrol6 after (on previous instruction)
+-
+-| .>|3 .<|Instruction address breakpoint |mcontrol/mcontrol6 execute address before
+-| .>|*{cheri_excep_cause_pc}* .<|*Prior to instruction address translation:* +
+-*{cheri_excep_name_pc} due to {pcc} checks (tag, execute permission, and bounds)* |
+-| .>|12, 1 .<|During instruction address translation: +
+-First encountered page fault or access fault |
+-| .>|1 .<|With physical address for instruction: +
+-Instruction access fault |
+-
+-| .>|3 .<| |mcontrol/mcontrol6 execute data before
+-
+-| .>|2 +
++mcontrol/mcontrol6 after (on previous instruction) +
++|| 3 | Instruction address breakpoint | mcontrol/mcontrol6 execute address before
++| .>|{cheri_excep_cause_pc} .<|Prior to instruction address translation: +
++{cheri_excep_name_pc} due to {pcc} checks ({ctag}, sealed, execute permission, bounds^1^)|
++|| 12, 20, 1 | During instruction address translation: First encountered page fault, guest-page fault, or access fault |
++|| 1 | With physical address for instruction: Instruction access fault |
++|| 3 || mcontrol/mcontrol6 execute data before
++|| 2 +
++{cheri_excep_cause_pc} +
++22 +
+ 0 +
+-8,9,11 +
+-3 .<|Illegal instruction +
++8, 9, 10, 11 +
++3 +
++3 +
++| Illegal instruction +
++{cheri_excep_name_pc} due to {pcc} <<asr_perm>> clear +
++Virtual instruction +
+ Instruction address misaligned +
+ Environment call +
+-Environment break |
++Environment break +
++Load/Store/AMO address breakpoint
++.>| mcontrol/mcontrol6 load/store address before, store data before
+ 
+-| .>|3 .<|Load/store/AMO address breakpoint |mcontrol/mcontrol6 load/store address before
+-| .>|3 .<| |mcontrol/mcontrol6 store data before
++| .>|{cheri_excep_cause_ls_list} .<|Prior to address translation for an explicit memory access: +
++{cheri_excep_name_ld}, {cheri_excep_name_st} due to capability checks ({ctag}, sealed, permissions, bounds) |
++| .>|4,6 .<|Load/store/AMO capability address misaligned |
+ 
+-| .>|*{cheri_excep_cause_ls_list}* .<|*Prior to address translation for an explicit memory access:* +
+-*Load/store/AMO capability address misaligned* +
+-*{cheri_excep_name_ld}, {cheri_excep_name_st} due to capability checks (tag, sealed, permissions and bounds)* |
++|| 4, 6 | Optionally: Load/Store/AMO address misaligned |
+ 
+-| .>|4,6 .<|Optionally: +
+-Load/store/AMO address misaligned |
+-| .>|*{cheri_excep_cause_pte_ld}*, *{cheri_excep_cause_pte_st}*, 5, 7 .<|During address translation for an explicit memory access: +
+-First encountered *{cheri_excep_name_pte_ld}, {cheri_excep_name_pte_st}*, page fault or access fault |
+-| .>|5,7 .<|With physical address for an explicit memory access: +
+-Load/store/AMO access fault |
+-|  .>|4,6 .<|If not higher priority: +
+-Load/store/AMO address misaligned |
+-| .>|*{cheri_excep_cause_pte_ld}* .<|If not higher priority: +
+-*{cheri_excep_name_pte_ld}* ^3^ |
+-|_Lowest_ .>|3 .<| |mcontrol/mcontrol6 load data before
++||{cheri_excep_cause_pte_st}, 13, 15, 21, 23, 5, 7 | During address translation for an explicit
++memory access: First encountered {cheri_excep_name_pte_st}, page fault, guest-page fault, or access
++fault |
++|| 5, 7 | With physical address for an explicit memory access: Load/store/AMO access fault |
++|| 4, 6 | If not higher priority: Load/store/AMO address misaligned |
++|| {cheri_excep_cause_pte_ld} |{cheri_excep_name_pte_ld} |
++| _Lowest_ | 3 || mcontrol/mcontrol6 load data before
+ |===
+-
+-NOTE: See the notes beneath <<exception-priority>> for details about <<section_priv_cheri_vmem,CHERI load page fault>> priority.
+diff --git a/src/hypervisor.adoc b/src/hypervisor.adoc
+index 91fc5c747..ea4855062 100644
+--- a/src/hypervisor.adoc
++++ b/src/hypervisor.adoc
+@@ -2204,6 +2204,9 @@ compatibility for software.
+ |Priority |Exc.Code |Description
+ |_Highest_ |3 |Instruction address breakpoint
+ 
++| .>|{cheri_excep_cause_pc} .<|Prior to instruction address translation: +
++{nbsp}{nbsp}{nbsp}{cheri_excep_name_pc} due to {pcc} checks ({ctag}, sealed, execute permission, bounds)
++
+ | .>|12, 20, 1 |During instruction address translation: +
+ {nbsp}{nbsp}{nbsp}First encountered page fault, guest-page fault, or access
+ fault
+@@ -2213,28 +2216,35 @@ fault
+ 
+ | |2 +
+ 22 +
++{cheri_excep_cause_pc} +
+ 0 +
+ 8, 9, 10, 11 +
+ 3 +
+ 3|Illegal instruction +
+ Virtual instruction +
++{cheri_excep_name_pc} due to {pcc} <<asr_perm>> clear +
+ Instruction address misaligned +
+ Environment call +
+ Environment break +
+ {nbsp}{nbsp}{nbsp}Load/store/AMO address breakpoint
+ 
++| |{cheri_excep_cause_ls_list} |Prior to address translation for an explicit memory access: +
++{nbsp}{nbsp}{nbsp}{cheri_excep_name_ld}, {cheri_excep_name_st} due to capability checks ({ctag}, sealed, permissions, bounds)
++| |4,6 |Load/store/AMO capability address misaligned +
++
+ | .>|4,6 |Optionally: +
+ {nbsp}{nbsp}{nbsp}Load/store/AMO address misaligned
+ 
+-| .>|13, 15, 21, 23, 5, 7 |During address translation for an explicit memory access: +
+-{nbsp}{nbsp}{nbsp}First encountered page fault, guest-page fault,
++| .>|{cheri_excep_cause_pte_st}, 13, 15, 21, 23, 5, 7 |During address translation for an explicit memory access: +
++{nbsp}{nbsp}{nbsp}First encountered {cheri_excep_name_pte_st}, page fault, guest-page fault,
+ or access fault
+ 
+ | .>|5, 7 |With physical address for an explicit memory access: +
+ {nbsp}{nbsp}{nbsp}Load/store/AMO access fault
+ 
+-.>|_Lowest_ .>|4, 6 |If not higher priority: +
++.>||4, 6 |If not higher priority: +
+ {nbsp}{nbsp}{nbsp}Load/store/AMO address misaligned
++|_Lowest_ |{cheri_excep_cause_pte_ld} |{cheri_excep_name_pte_ld}
+ |===
+ 
+ If an instruction may raise multiple synchronous exceptions, the
+diff --git a/src/supervisor.adoc b/src/supervisor.adoc
+index 966655694..c189744a8 100644
+--- a/src/supervisor.adoc
++++ b/src/supervisor.adoc
+@@ -1616,9 +1616,7 @@ __a__=__pte__.__ppn__×PAGESIZE and go to step 2.
+ 
+ . Determine if the requested memory access is allowed by the _pte_._u_ bit, given the current privilege mode and the value of the SUM and MXR fields of the *mstatus* register. If not, stop and raise a page-fault exception corresponding to the original access type.
+ 
+-. Determine if the requested memory access is allowed for {cheri_base64_ext_name} when {cheri_priv_crg_ext} is enabled, by the _pte_._crw_, _pte_._u_, _pte_._crg_ bits and the UCRG fields of the *status* register, given the rules in <<pte_crw_crg_load_summary>>. If not, stop and raise a {cheri_excep_name_pte_ld} exception.
+-
+-. Determine if the requested memory access is allowed for {cheri_base64_ext_name} by the _pte_._crw_ bit given the rules in <<pte_crw_summary>>. If not, stop and raise a {cheri_excep_name_pte_st} exception.
++. Determine if the requested capability store is allowed by the _pte_._crw_ bit for {cheri_base64_ext_name} given the {cheri_priv_crg_ext} rules. If not, stop and raise a {cheri_excep_name_pte_st} exception.
+ 
+ . Determine if the requested memory access is allowed by the _pte_._r_, _pte_._w_, and _pte_._x_ bits, given the Shadow Stack Memory Protection rules. If not, stop and raise an access-fault exception.
+ 

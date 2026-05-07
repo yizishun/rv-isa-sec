@@ -1,0 +1,26 @@
+PR #718  target=qemu  overall=compliant
+Spec: On interrupt delivery, xithreshold must be set to IPRIO (unmask all priorities), not to iprio[i] (the taken interrupt's priority); using iprio[i] would block higher-priority interrupts from preempting, breaking Smnip fast-preemption guarantees and causing guest interrupt starvation (DoS).
+Violation: In QEMU's Smnip interrupt delivery path (riscv_cpu_do_interrupt or a CLIC-specific handler), when the emulated xithreshold CSR is written with iprio[i] — the priority of the specific interrupt being taken — instead of the constant IPRIO (maximum/all-mask-off value), the interrupt threshold is set to mask out interrupts at or below the current interrupt's priority.
+Consequence: denial_of_service
+Pattern: xithreshold\s*=\s*(iprio|irq_priority|int_prio)\s*\[
+------------------------------------------------------------
+[compliant] target/riscv/cpu_helper.c:2206-2246  riscv_cpu_do_interrupt
+  Smnip extension (including xithreshold CSR) is not implemented in this QEMU codebase. No xithreshold variable, CSR definition, or threshold-setting code exists. The interrupt delivery path (riscv_cpu_do_interrupt) handles RNMI (via riscv_do_nmi at line 2242-2246) and standard AIA priority-based interrupts (via riscv_cpu_local_irq_pending), but has no Smnip-specific logic. Since the vulnerable code pattern (xithreshold set to iprio[i] instead of IPRIO constant) cannot exist without an xithreshold implementation, this codebase is not affected by the described vulnerability.
+  | if (cpu->cfg.ext_smrnmi && env->rnmip && async) {
+  |         riscv_do_nmi(env, cause | ((target_ulong)1U << (mxlen - 1)),
+  |                      env->virt_enabled);
+  |         return;
+  |     }
+
+[compliant] target/riscv/cpu_bits.h:1058-1084  
+  AIA IPRIO constants (IPRIO_MMAXIPRIO=255, IPRIO_IRQ_BITS=8, etc.) are properly defined for priority handling, but no Smnip-specific xithreshold constant or CSR bitmask exists. The IPRIO infrastructure is correctly used only in AIA context (TOP/I, IMSIC, hvictl), not in any Smnip threshold-setting path.
+  | #define IMSIC_TOPEI_IPRIO_MASK             0x7ff
+  | #define TOPI_IPRIO_MASK                    0xff
+  | #define IPRIO_IRQ_BITS                     8
+  | #define IPRIO_MMAXIPRIO                    255
+
+[compliant] target/riscv/csr.c:5446-5510  
+  Only RNMI CSRs (mnscratch, mnepc, mncause, mnstatus) are registered and implemented. No mnip, mnxti, or xithreshold CSRs exist. The write_mnstatus handler correctly enforces that MNSTATUS_NMIE can only be cleared by hardware (line 5510), follows proper TLB flush on MNPV change, and uses proper WARL masking. No Smnip CSR definitions are present to audit.
+  | /* mnstatus.mnie can only be cleared by hardware. */
+  |     env->mnstatus = (env->mnstatus & MNSTATUS_NMIE) | (val & mask);
+

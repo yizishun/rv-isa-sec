@@ -1,0 +1,153 @@
+{
+  "pr_number": 2569,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2569,
+    "violation_condition": "KVM (as the execution environment for a guest kernel) preempts a vCPU mid-constrained-LR/SC-loop and fails to guarantee eventual forward progress — e.g., by migrating the vCPU without preserving/invalidating the reservation, or by never scheduling another vCPU that could invalidate it",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "kvm_arch_vcpu_ioctl_run|kvm_riscv_vcpu_exit|kvm.*lr.*sc|guest.*reservation|kvm.*forward.progress",
+    "affected_entities": [
+      "LR.W",
+      "LR.D",
+      "SC.W",
+      "SC.D",
+      "constrained_lrsc_forward_progress"
+    ],
+    "summary": "KVM must guarantee constrained LR/SC forward progress for guest kernels; failure livelocks the guest inside spinlock/atomic paths, denying service to the entire VM"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "__kvm_riscv_switch_to",
+        "line_start": 198,
+        "line_end": 219,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Guest entry via 'sret' (line 206) implicitly clears any LR reservation per RISC-V privileged spec §3.3.2 (SRET clears reservation when returning to lower privilege mode). Guest exit via trap to HS-mode also clears the reservation. This is the primary mechanism ensuring in-flight guest LR reservations are invalidated on vCPU put/load cycles.",
+      "snippet": "/* Resume Guest using SRET */\nsret\n\n/* Back to Host */\n.align 2\n.Lkvm_switch_return:\n\tSAVE_GUEST_GPRS"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "__kvm_riscv_nacl_switch_to",
+        "line_start": 227,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "NACL guest entry via 'ecall' to M-mode firmware (line 235) also clears any pending LR reservation per RISC-V spec (§3.3.2: ECALL clears reservation), same as the sret path. The trap return from M-mode to VS-mode clears the reservation a second time.",
+      "snippet": "/* Resume Guest using SBI nested acceleration */\nadd\ta6, a2, zero\nadd\ta7, a1, zero\necall"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 578,
+        "line_end": 641,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vCPU load restores only architected CSR state (VSSTATUS, VSIE, VSTVEC, etc.) and FP/vector context. No reservation tracking is needed because: (a) LR reservations are per-hart microarchitectural state with no architectural CSR, (b) the subsequent sret in __kvm_riscv_switch_to clears any stale reservation before guest execution begins, and (c) the RISC-V spec explicitly permits reservations to be cleared at any time.",
+      "snippet": "kvm_riscv_mmu_update_hgatp(vcpu);\nkvm_riscv_vcpu_timer_restore(vcpu);\nkvm_riscv_vcpu_host_fp_save(&vcpu->arch.host_context);\nkvm_riscv_vcpu_guest_fp_restore(&vcpu->arch.guest_context, vcpu->arch.isa);\nvcpu->cpu = cpu;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_put",
+        "line_start": 643,
+        "line_end": 683,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vCPU put saves architected CSR state and sets vcpu->cpu = -1. No reservation clearing is needed here because the guest has already exited via trap (clearing the guest reservation) before kvm_arch_vcpu_put is called. The host-side reservation is cleared by entry.S:299 (REG_SC x0) during subsequent host context switches.",
+      "snippet": "vcpu->cpu = -1;\nkvm_riscv_vcpu_aia_put(vcpu);\nkvm_riscv_vcpu_guest_fp_save(&vcpu->arch.guest_context, vcpu->arch.isa);\nkvm_riscv_vcpu_host_fp_restore(&vcpu->arch.host_context);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_enter_exit",
+        "line_start": 784,
+        "line_end": 862,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The vCPU enter/exit path records last_exit_cpu (line 859) for TLB sanitization on migration. Reservation state is implicitly cleared by the sret/ecall on entry and trap on exit. The comment at lines 791-797 shows awareness that trap CSRs must be saved before re-enabling interrupts — the same reasoning applies to reservations being cleared by the privilege transitions.",
+      "snippet": "kvm_riscv_vcpu_swap_in_guest_state(vcpu);\nguest_state_enter_irqoff();\n/* ... sret/ecall to guest ... */\nvcpu->arch.last_exit_cpu = vcpu->cpu;\nguest_state_exit_irqoff();\nkvm_riscv_vcpu_swap_in_host_state(vcpu);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_ioctl_run",
+        "line_start": 864,
+        "line_end": 1018,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The vCPU run loop disables preemption before guest entry (line 924) and re-enables after exit (line 1004), preventing the vCPU from being migrated mid-guest-execution. Combined with sret clearing the reservation on guest entry, each guest execution slice starts with a clean reservation state. The loop handles re-entry correctly via kvm_xfer_to_guest_mode_handle_work at line 913.",
+      "snippet": "preempt_disable();\n/* ... AIA update, IRQ disable, IN_GUEST_MODE ... */\nkvm_riscv_vcpu_enter_exit(vcpu, &trap);\nvcpu->mode = OUTSIDE_GUEST_MODE;\n/* ... */\npreempt_enable();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_insn.c",
+        "function_name": "wrs_insn",
+        "line_start": 83,
+        "line_end": 88,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "WRS (Wait-on-Reservation-Set) handler calls kvm_vcpu_on_spin() which yields the CPU via kvm_vcpu_yield_to(), enabling another vCPU to be scheduled and potentially invalidate the reservation. This is the standard KVM pattern for ensuring forward progress on spin-type waits — the yielding vCPU is not starved because kvm_vcpu_on_spin() implements directed yield to the lock-holder vCPU when configured.",
+      "snippet": "static int wrs_insn(struct kvm_vcpu *vcpu, struct kvm_run *run, ulong insn)\n{\n\tvcpu->stat.wrs_exit_stat++;\n\tkvm_vcpu_on_spin(vcpu, vcpu->arch.guest_context.sstatus & SR_SPP);\n\treturn KVM_INSN_CONTINUE_NEXT_SEPC;\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_exit.c",
+        "function_name": "kvm_riscv_vcpu_exit",
+        "line_start": 187,
+        "line_end": 262,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Guest trap dispatch handles all standard exception causes (illegal inst, misaligned load/store, access faults, page faults, SBI ecalls, breakpoints) but has no special handling for LR/SC-related traps because LR/SC instructions execute natively in VS-mode and do not trap. Any SC failure (due to reservation loss from vCPU preemption) manifests as a zero write to rd, which the guest's LR/SC retry loop handles naturally.",
+      "snippet": "case EXC_VIRTUAL_INST_FAULT:\n\tif (vcpu->arch.guest_context.hstatus & HSTATUS_SPV)\n\t\tret = kvm_riscv_vcpu_virtual_insn(vcpu, run, trap);\n\tbreak;\n/* No LR/SC-specific trap handling needed */"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "ret_from_exception",
+        "line_start": 281,
+        "line_end": 299,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Host kernel return-to-userspace path explicitly clears LR reservations with a dummy SC to x0 (REG_SC x0, a2, PT_EPC(sp) at line 299). The comment at lines 282-296 explicitly acknowledges the forward-progress concern but notes 'we'll ignore that here.' This clears any residual host-side reservation from the IMSIC LR/SC atomic operations (aia_imsic.c:216-234) or any reservation picked up before the host context switch. This mechanism protects host-to-host context switches but is NOT the mechanism relied upon for guest reservation clearing — that is handled by sret/trap.",
+      "snippet": "REG_L  a2, PT_EPC(sp)\nREG_SC x0, a2, PT_EPC(sp)\ncsrw CSR_STATUS, a0\ncsrw CSR_EPC, a2"
+    },
+    {
+      "location": {
+        "file_path": "virt/kvm/kvm_main.c",
+        "function_name": "kvm_sched_out",
+        "line_start": 6395,
+        "line_end": 6408,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "When the host scheduler preempts a vCPU task, kvm_sched_out calls kvm_arch_vcpu_put which saves guest CSR state. The guest had already trapped to HS-mode (clearing its LR reservation) before any preemption could occur, because guest execution happens with preemption disabled (vcpu.c:924). If the vCPU was in WRS spin via kvm_vcpu_on_spin(), the preempt notifier correctly marks the vCPU as preempted (line 6403), and the directed yield mechanism in kvm_vcpu_on_spin() handles re-scheduling the lock holder.",
+      "snippet": "WRITE_ONCE(vcpu->scheduled_out, true);\nif (task_is_runnable(current) && vcpu->wants_to_run) {\n\tWRITE_ONCE(vcpu->preempted, true);\n\tWRITE_ONCE(vcpu->ready, true);\n}\nkvm_arch_vcpu_put(vcpu);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_onereg.c",
+        "function_name": "kvm_riscv_vcpu_isa_ext_allowed",
+        "line_start": 175,
+        "line_end": 230,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ZICCRSE extension (Constraint LR/SC) is exposed to guests via KVM_RISCV_ISA_EXT_ZICCRSE (line 215). The Ziccrse extension guarantees forward progress for constrained LR/SC sequences. When KVM preempts a vCPU mid-LR/SC, the SC fails, and Ziccrse guarantees the retry loop will eventually succeed provided the vCPU is scheduled again — which the CFS scheduler guarantees for runnable tasks. KVM does not need to explicitly paper over this because the architectural guarantee is at the hart level and the vCPU task is a runnable CFS task.",
+      "snippet": "case KVM_RISCV_ISA_EXT_ZICCRSE:\n\tif (!riscv_isa_extension_available(host_isa, ZICCRSE))\n\t\treturn -EINVAL;"
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,128 @@
+{
+  "pr_number": 668,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 668,
+    "violation_condition": "FreeBSD kernel code in the RISC-V CLIC/APLIC driver directly compares raw iprio[i] values against xithreshold without first converting to IPRIO per the spec mapping (saturate >255 to 255, handle priority-0 default based on relative ordering to machine external interrupt), causing the threshold mask to misclassify whether an interrupt should be disabled.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "iprio\\[|IPRIO|xithreshold|xtopei|CLIC.*priorit|APLIC.*priorit|threshold.*interrupt",
+    "affected_entities": [
+      "xithreshold",
+      "xtopei",
+      "CLIC",
+      "APLIC"
+    ],
+    "summary": "FreeBSD's CLIC driver may incorrectly gate interrupts via xithreshold by using raw iprio[i] instead of the spec-mapped IPRIO value, causing spurious interrupt suppression or unexpected delivery"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/aplic.c",
+        "function_name": "aplic_setup_direct_mode",
+        "line_start": 406,
+        "line_end": 411,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "APLIC ITHRESHOLD is set to APLIC_IDC_ITHRESHOLD_DISABLE (0) for all CPUs. This disables hardware priority threshold filtering, meaning all interrupts are delivered regardless of priority. No software-level iprio-to-threshold comparison is performed — thresholding is purely hardware-mediated via the MMIO register. The vulnerability pattern (comparing raw iprio[] against xithreshold without IPRIO conversion) does not apply because: (a) threshold comparison happens in silicon, not software; (b) threshold is disabled/zero; (c) no iprio[] arrays or xithreshold CSRs exist in this codebase.",
+      "snippet": "CPU_FOREACH(cpu) {\n\taplic_write(sc, APLIC_IDC_IDELIVERY(sc, cpu),\n\t    APLIC_IDC_IDELIVERY_DISABLE);\n\taplic_write(sc, APLIC_IDC_ITHRESHOLD(sc, cpu),\n\t    APLIC_IDC_ITHRESHOLD_DISABLE);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/aplic.c",
+        "function_name": "aplic_intr",
+        "line_start": 234,
+        "line_end": 243,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Interrupt claiming reads from APLIC_IDC_CLAIMI MMIO register. The hardware already applies the ITHRESHOLD filter before returning a claim value — only interrupts whose priority exceeds the threshold are presented via CLAIMI. The priority value extracted via APLIC_IDC_CLAIMI_PRIO() is for informational logging only and is not compared against any software-maintained threshold. No raw-priority-to-threshold miscomparison bug possible here.",
+      "snippet": "while ((claimi = aplic_read(sc, APLIC_IDC_CLAIMI(sc, cpu))) != 0) {\n\tprio = APLIC_IDC_CLAIMI_PRIO(claimi);\n\tirq = APLIC_IDC_CLAIMI_IRQ(claimi);\n\tKASSERT((irq != 0), (\"Invalid IRQ 0\"));\n\ttf = curthread->td_intr_frame;\n\taplic_irq_dispatch(sc, irq, prio, tf);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/aplic.c",
+        "function_name": "aplic_bind_intr",
+        "line_start": 530,
+        "line_end": 531,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Interrupt target/priority is set using APLIC_MK_IRQ_TARGET with hardcoded APLIC_INTR_DEF_PRIO=1. The priority value (1) is within the valid 8-bit range (0-255) and is written directly to the hardware TARGET register. No comparison against a threshold is performed here — the hardware will compare this priority against ITHRESHOLD at claim time.",
+      "snippet": "aplic_write(sc, APLIC_TARGET(src->irq),\n    APLIC_MK_IRQ_TARGET(sc, cpu, APLIC_INTR_DEF_PRIO));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/plic.c",
+        "function_name": "plic_attach",
+        "line_start": 434,
+        "line_end": 436,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PLIC threshold is set to 0 for every CPU, accepting all interrupt priorities. Like APLIC, PLIC threshold comparison is hardware-mediated — the PLIC silicon compares each pending interrupt's priority register value against the per-context threshold register. No software-level priority comparison code exists, so the iprio-vs-threshold miscomparison vulnerability cannot occur.",
+      "snippet": "/* Set the threshold for each CPU to accept all priorities. */\nCPU_FOREACH(cpu)\n\tWR4(sc, PLIC_THRESHOLD(sc, cpu), 0);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/plic.c",
+        "function_name": "plic_intr",
+        "line_start": 170,
+        "line_end": 188,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PLIC interrupt handler reads from PLIC_CLAIM MMIO register. The PLIC hardware internally filters pending interrupts by comparing each interrupt's priority against the context threshold. Only winning interrupts are presented via the claim register. FreeBSD software does no priority-threshold arithmetic — the raw claim value is an IRQ number, not a priority value.",
+      "snippet": "while ((pending = RD4(sc, PLIC_CLAIM(sc, cpu))) != 0) {\n\ttf = curthread->td_intr_frame;\n\tplic_irq_dispatch(sc, pending, tf);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_aplic.c",
+        "function_name": "aplic_handle_idc",
+        "line_start": 247,
+        "line_end": 253,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VMM APLIC emulation treats IDC_ITHRESHOLD as a no-op (falls through to error=0 without reading/writing any state). Guest writes to the threshold register are silently ignored. Guest reads return undefined/garbage. The CLAIMI emulation (aplic_handle_idc_claimi) hardcodes priority to 0 and performs no threshold comparison, always returning the first pending interrupt for the target hart regardless of priority. While this is an incomplete emulation (guests cannot use priority-based interrupt masking), it is not vulnerable to the iprio-vs-xithreshold miscomparison bug because no priority-to-threshold comparison logic exists at all.",
+      "snippet": "case IDC_IDELIVERY(0):\ncase IDC_IFORCE(0):\ncase IDC_ITHRESHOLD(0):\ncase IDC_TOPI(0):\n\terror = 0;\n\tbreak;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_aplic.c",
+        "function_name": "aplic_handle_idc_claimi",
+        "line_start": 222,
+        "line_end": 228,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VMM CLAIMI emulation hardcodes priority=0 (0 << CLAIMI_PRIO_S) and skips threshold comparison entirely. The first pending interrupt matching the target hart is returned regardless of its configured priority. While this is a functional limitation for guests, it does not match the vulnerability pattern (which requires an incorrect comparison, not the absence of comparison).",
+      "snippet": "if (irq->state & APLIC_IRQ_STATE_PENDING) {\n\t*val = (i << CLAIMI_IRQ_S) | (0 << CLAIMI_PRIO_S);\n\tirq->state &= ~APLIC_IRQ_STATE_PENDING;\n\tfound = true;\n\tbreak;\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_intr",
+        "line_start": 263,
+        "line_end": 289,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The CPU-local interrupt controller (intc) handles only the basic RISC-V interrupt types (software, timer, external) via scause dispatch. It does not deal with interrupt priorities or thresholds at all — those are the responsibility of the platform-level controllers (PLIC/APLIC). No iprio, threshold, or priority variables exist in this code.",
+      "snippet": "active_irq = frame->tf_scause & SCAUSE_CODE;\nif (active_irq >= INTC_NIRQS)\n\treturn (FILTER_HANDLED);\nsrc = &sc->isrcs[active_irq];\nif (intr_isrc_dispatch(&src->isrc, frame) != 0) {"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/aplic.c",
+        "function_name": "aplic_irq_dispatch",
+        "line_start": 209,
+        "line_end": 220,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The `prio` parameter is received but unused in dispatch — it is passed through from aplic_intr() but the dispatch function ignores it. This confirms that FreeBSD's APLIC driver performs no software-level priority-based decisions at all. Priority is purely a hardware concern.",
+      "snippet": "static inline void\naplic_irq_dispatch(struct aplic_softc *sc, u_int irq, u_int prio,\n    struct trapframe *tf)\n{\n\tstruct aplic_irqsrc *src;\n\tsrc = &sc->isrcs[irq];\n\tif (intr_isrc_dispatch(&src->isrc, tf) != 0)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

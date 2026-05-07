@@ -1,0 +1,1211 @@
+diff --git a/backends/cpp_hart_gen/lib/gen_cpp.rb b/backends/cpp_hart_gen/lib/gen_cpp.rb
+index f498928b3d..a9c503cd4f 100644
+--- a/backends/cpp_hart_gen/lib/gen_cpp.rb
++++ b/backends/cpp_hart_gen/lib/gen_cpp.rb
+@@ -177,6 +177,27 @@ def gen_cpp(symtab, indent = 0, indent_spaces: 2)
+   class AryRangeAssignmentAst < AstNode
+     sig { override.params(symtab: SymbolTable, indent: Integer, indent_spaces: Integer).returns(String) }
+     def gen_cpp(symtab, indent = 0, indent_spaces: 2)
++      base_name = Idl::AstNode.extract_base_var_name(variable)
++
++      # Special handling for X register range assignment: X[idx][msb:lsb] = val
++      if base_name == "X" && variable.is_a?(Idl::AryElementAccessAst) &&
++         variable.var.is_a?(Idl::IdAst) && variable.var.name == "X"
++        # X[idx][msb:lsb] = val
++        # Read X[idx], modify bits, write back
++        value_result = value_try do
++          msb_val = msb.value(symtab)
++          lsb_val = lsb.value(symtab)
++          # Use bit_insert to modify the value, then set_xreg
++          return "#{' ' * indent}__UDB_HART->_set_xreg( #{variable.index.gen_cpp(symtab, 0, indent_spaces:)}, bit_insert<#{msb_val}, #{lsb_val}, #{variable.type(symtab).width}>(#{variable.gen_cpp(symtab)}, #{write_value.gen_cpp(symtab)}))"
++        end
++
++        value_else(value_result) do
++          # Runtime msb/lsb
++          return "#{' ' * indent}__UDB_HART->_set_xreg( #{variable.index.gen_cpp(symtab, 0, indent_spaces:)}, bit_insert(#{variable.gen_cpp(symtab)}, #{msb.gen_cpp(symtab)}, #{lsb.gen_cpp(symtab)}, #{write_value.gen_cpp(symtab)}))"
++        end
++      end
++
++      # Standard range assignment (non-X register)
+       expression = nil
+       value_result = value_try do
+         # see if msb and lsb are compile-time-known
+@@ -186,7 +207,7 @@ def gen_cpp(symtab, indent = 0, indent_spaces: 2)
+       end
+ 
+       value_else(value_result) do
+-        expression = "bit_insert(#{variable.gen_cpp(symtab)}, #{msb.gen_cpp(symtab)}, #{lsb.gen_cpp(symtab)}, #{write_value.gen_cpp(symtab)})"
++        expression = "#{variable.gen_cpp(symtab, 0, indent_spaces:)} = bit_insert(#{variable.gen_cpp(symtab)}, #{msb.gen_cpp(symtab)}, #{lsb.gen_cpp(symtab)}, #{write_value.gen_cpp(symtab)})"
+       end
+ 
+       "#{' ' * indent}#{expression}"
+@@ -894,7 +915,8 @@ def gen_cpp(symtab, indent = 0, indent_spaces: 2)
+   class AryElementAssignmentAst < AstNode
+     sig { override.params(symtab: SymbolTable, indent: Integer, indent_spaces: Integer).returns(String) }
+     def gen_cpp(symtab, indent = 0, indent_spaces: 2)
+-      if lhs.text_value.start_with?("X")
++      base_name = Idl::AstNode.extract_base_var_name(lhs)
++      if base_name == "X"
+         #"#{' '*indent}  #{lhs.gen_cpp(symtab, 0, indent_spaces:)}[#{idx.gen_cpp(symtab, 0, indent_spaces:)}] = #{rhs.gen_cpp(symtab, 0, indent_spaces:)}"
+         "#{' ' * indent}__UDB_HART->_set_xreg( #{idx.gen_cpp(symtab, 0, indent_spaces:)}, #{rhs.gen_cpp(symtab, 0, indent_spaces:)})"
+       elsif lhs.type(symtab).kind == :bits
+diff --git a/spec/std/isa/inst/V/vmv.v.i.yaml b/spec/std/isa/inst/V/vmv.v.i.yaml
+index 6dcabe8abf..ac7458001b 100644
+--- a/spec/std/isa/inst/V/vmv.v.i.yaml
++++ b/spec/std/isa/inst/V/vmv.v.i.yaml
+@@ -54,19 +54,8 @@ operation(): |
+     U32 start_bit_pos = i * state.sew;
+     U32 end_bit_pos = start_bit_pos + state.sew - 1;
+ 
+-    # Write the sign-extended immediate (truncated to SEW bits) to the element,
+-    # guarding against invalid bit-slice ranges at vector register boundaries
+-    if (start_bit_pos == 0) {
+-      if (end_bit_pos == VLEN - 1) {
+-        v[vd] = sext_imm[state.sew-1:0];
+-      } else {
+-        v[vd] = {v[vd][VLEN-1:end_bit_pos + 1], sext_imm[state.sew-1:0]};
+-      }
+-    } else if (end_bit_pos == VLEN - 1) {
+-      v[vd] = {sext_imm[state.sew-1:0], v[vd][start_bit_pos-1:0]};
+-    } else {
+-      v[vd] = {v[vd][VLEN-1:end_bit_pos + 1], sext_imm[state.sew-1:0], v[vd][start_bit_pos-1:0]};
+-    }
++    # Write the sign-extended immediate (truncated to SEW bits) to the element
++    v[vd][end_bit_pos:start_bit_pos] = sext_imm[state.sew-1:0];
+   }
+ 
+   CSR[vstart].VALUE = 0;
+diff --git a/tests/data/golden/Xqci@0.13.0.adoc b/tests/data/golden/Xqci@0.13.0.adoc
+index c8108a3826..887239a25c 100644
+--- a/tests/data/golden/Xqci@0.13.0.adoc
++++ b/tests/data/golden/Xqci@0.13.0.adoc
+@@ -1,6 +1,6 @@
+ [[header]]
+ :description: Qualcomm uC extensions (Xqci)
+-:revdate: 2026-03-25
++:revdate: 2026-03-26
+ :revnumber: 0.13.0
+ :revmark: This document is in the http://riscv.org/spec-state[Frozen state]. + \
+ + \
+diff --git a/tools/ruby-gems/idlc/lib/idlc/ast.rb b/tools/ruby-gems/idlc/lib/idlc/ast.rb
+index 156d443a03..3506ed75b7 100644
+--- a/tools/ruby-gems/idlc/lib/idlc/ast.rb
++++ b/tools/ruby-gems/idlc/lib/idlc/ast.rb
+@@ -415,6 +415,49 @@ class << self
+       attr_accessor :value_error_reason, :value_error_ast
+     end
+ 
++    # Extract the base variable name from a potentially nested access chain
++    # @param node [RvalueAst] The node to extract from
++    # @return [String, nil] The base variable name, or nil if not extractable
++    sig { params(node: RvalueAst).returns(T.nilable(String)) }
++    def self.extract_base_var_name(node)
++      case node
++      when IdAst
++        node.name
++      when AryElementAccessAst, AryRangeAccessAst
++        extract_base_var_name(node.var)
++      else
++        nil
++      end
++    end
++
++    # Perform write-back for nested array access assignments
++    # Handles arbitrary nesting depth: v[a][b][c] = val recursively writes back through the chain
++    # @param target [RvalueAst] The target expression (possibly nested)
++    # @param new_value [Integer] The new value to write
++    # @param symtab [SymbolTable] The symbol table
++    # @return [void]
++    sig { params(target: RvalueAst, new_value: ValueRbType, symtab: SymbolTable).void }
++    def self.write_back_nested(target, new_value, symtab)
++      case target
++      when IdAst
++        # Base case: simple variable
++        symtab.add(target.name, Var.new(target.name, target.type(symtab), new_value))
++      when AryElementAccessAst
++        # Recursive case: v[idx] = val
++        # Read parent, modify element, write back parent
++        parent_value = target.var.value(symtab)
++        idx_val = target.index.value(symtab)
++        parent_value[idx_val] = new_value
++        # Recursively write back the parent (which may itself be nested)
++        write_back_nested(target.var, parent_value, symtab)
++      when AryRangeAccessAst
++        # Range access can't be on LHS of assignment
++        raise InternalError, "Cannot write back through range access"
++      else
++        raise InternalError, "Unknown target type for write-back: #{target.class.name}"
++      end
++    end
++
+     # raise a value error, indicating that the value is not known at compile time
+     #
+     # @param reason [String] Error message
+@@ -2855,12 +2898,6 @@ def self.from_h(yaml, source_mapper)
+     end
+   end
+ 
+-  class AryElementAssignmentSyntaxNode < SyntaxNode
+-    def to_ast
+-      AryElementAssignmentAst.new(input, interval, send(:var).to_ast, send(:idx).to_ast, send(:rval).to_ast)
+-    end
+-  end
+-
+   # represents an array element assignment
+   #
+   # for example:
+@@ -2875,8 +2912,10 @@ def const_eval?(symtab)
+       if idx.const_eval?(symtab) && rhs.const_eval?(symtab)
+         true
+       else
+-        lhs_var = symtab.get(lhs.name)
+-        type_error "array #{lhs.name} has not been declared" if lhs_var.nil?
++        base_name = AstNode.extract_base_var_name(lhs)
++        type_error "Cannot determine base variable for #{lhs.text_value}" if base_name.nil?
++        lhs_var = symtab.get(base_name)
++        type_error "array #{base_name} has not been declared" if lhs_var.nil?
+ 
+         lhs_var.const_incompatible!
+         false
+@@ -2942,7 +2981,8 @@ def execute(symtab)
+           value_error "right-hand side of array element assignment is unknown"
+         end
+       when :bits
+-        var = symtab.get(lhs.text_value)
++        base_name = T.must(AstNode.extract_base_var_name(lhs))
++        var = symtab.get(base_name)
+         value_result = value_try do
+           v = rhs.value(symtab)
+           var.value = (lhs.value(symtab) & ~0) | ((v & 1) << idx.value(symtab))
+@@ -2985,7 +3025,27 @@ def self.from_h(yaml, source_mapper)
+ 
+   class AryRangeAssignmentSyntaxNode < SyntaxNode
+     def to_ast
+-      AryRangeAssignmentAst.new(input, interval, send(:var).to_ast, send(:msb).to_ast, send(:lsb).to_ast, send(:rval).to_ast)
++      var = send(:var).to_ast
++      brackets = send(:brackets).elements
++
++      # Build access chain for all but the last bracket
++      brackets[0..-2].each do |bracket|
++        var =
++          if bracket.msb.empty?
++            AryElementAccessAst.new(input, interval, var, bracket.lsb.to_ast)
++          else
++            AryRangeAccessAst.new(input, interval, var,
++                                  bracket.msb.expression.to_ast, bracket.lsb.to_ast)
++          end
++      end
++
++      # Use accumulated `var` for the assignment target
++      last_bracket = brackets[-1]
++      if last_bracket.msb.empty?
++        AryElementAssignmentAst.new(input, interval, var, last_bracket.lsb.to_ast, send(:rval).to_ast)
++      else
++        AryRangeAssignmentAst.new(input, interval, var, last_bracket.msb.expression.to_ast, last_bracket.lsb.to_ast, send(:rval).to_ast)
++      end
+     end
+   end
+ 
+@@ -3003,8 +3063,10 @@ def const_eval?(symtab)
+       if lsb.const_eval?(symtab) && msb.const_eval?(symtab) && write_value.const_eval?(symtab)
+         true
+       else
+-        lhs_var = symtab.get(variable.name)
+-        type_error "array #{variable.name} has not be declared" if lhs_var.nil?
++        base_name = AstNode.extract_base_var_name(variable)
++        type_error "Cannot determine base variable for #{variable.text_value}" if base_name.nil?
++        lhs_var = symtab.get(base_name)
++        type_error "array #{base_name} has not be declared" if lhs_var.nil?
+ 
+         lhs_var.const_incompatible!
+         false
+@@ -3066,22 +3128,26 @@ def execute(symtab)
+       internal_error "Variable #{variable.name} not found" if var.nil?
+ 
+       value_result = value_try do
+-        var_val = variable.value(symtab)
+-
+         msb_val = msb.value(symtab)
+         lsb_val = lsb.value(symtab)
+ 
+         type_error "MSB (#{msb_val}) is <= LSB (#{lsb_val})" if msb_val <= lsb_val
+ 
+         rval_val = write_value.value(symtab)
+-
+         mask = ((1 << (msb_val - lsb_val + 1)) - 1) << lsb_val
+ 
+-        var.value = (var_val & ~mask) | ((rval_val << lsb_val) & mask)
++        # Read current value, modify bits
++        var_val = variable.value(symtab)
++        var_val &= ~mask
++        new_val = var_val | ((rval_val << lsb_val) & mask)
++
++        # Write back through the access chain
++        AstNode.write_back_nested(variable, new_val, symtab)
+         :ok
+       end
+       value_else(value_result) do
+-        var.value = nil
++        base_name = T.must(AstNode.extract_base_var_name(variable))
++        symtab.add(base_name, Var.new(base_name, variable.type(symtab)))
+         value_error "Either the range or right-hand side of an array range assignment is unknown"
+       end
+     end
+diff --git a/tools/ruby-gems/idlc/lib/idlc/idl.treetop b/tools/ruby-gems/idlc/lib/idlc/idl.treetop
+index 866ee8ad8c..62c553f660 100644
+--- a/tools/ruby-gems/idlc/lib/idlc/idl.treetop
++++ b/tools/ruby-gems/idlc/lib/idlc/idl.treetop
+@@ -516,8 +516,7 @@ grammar Idl
+     # note: there is no full CSR assignment (must assign fields)
+     csr_field_access_expression space* '=' space* rval:expression <Idl::CsrFieldAssignmentSyntaxNode> /
+     id space* '.' space* field_name space* '=' space* rval:expression <Idl::FieldAssignmentSyntaxNode> /
+-    var:ary_eligible_expression space* '[' space* msb:expression space* ':' space* lsb:expression space* ']' space* '=' space* rval:expression <Idl::AryRangeAssignmentSyntaxNode> /
+-    var:ary_eligible_expression space* '[' space* idx:expression space* ']' space* '=' space* rval:expression <Idl::AryElementAssignmentSyntaxNode>
++    var:ary_eligible_expression space* brackets:('[' space* msb:(expression space* ':' space*)? lsb:expression space* ']' space*)+ '=' space* rval:expression <Idl::AryRangeAssignmentSyntaxNode>
+   end
+ 
+   rule ary_size_decl
+diff --git a/tools/ruby-gems/idlc/lib/idlc/idl_parser.rb b/tools/ruby-gems/idlc/lib/idlc/idl_parser.rb
+index cffcdb88f1..37d2bde921 100644
+--- a/tools/ruby-gems/idlc/lib/idlc/idl_parser.rb
++++ b/tools/ruby-gems/idlc/lib/idlc/idl_parser.rb
+@@ -10726,34 +10726,34 @@ def rval
+   end
+ 
+   module Assignment6
+-    def var
++    def expression
+       elements[0]
+     end
+ 
++  end
++
++  module Assignment7
+     def msb
+-      elements[4]
++      elements[2]
+     end
+ 
+     def lsb
+-      elements[8]
++      elements[3]
+     end
+ 
+-    def rval
+-      elements[14]
+-    end
+   end
+ 
+-  module Assignment7
++  module Assignment8
+     def var
+       elements[0]
+     end
+ 
+-    def idx
+-      elements[4]
++    def brackets
++      elements[2]
+     end
+ 
+     def rval
+-      elements[10]
++      elements[5]
+     end
+   end
+ 
+@@ -11230,267 +11230,186 @@ def _nt_assignment
+                   r66 = instantiate_node(SyntaxNode,input, i66...index, s66)
+                   s64 << r66
+                   if r66
+-                    if (match_len = has_terminal?('[', false, index))
+-                      r68 = true
+-                      @index += match_len
+-                    else
+-                      terminal_parse_failure('\'[\'')
+-                      r68 = nil
+-                    end
+-                    s64 << r68
+-                    if r68
+-                      s69, i69 = [], index
+-                      loop do
+-                        r70 = _nt_space
+-                        if r70
+-                          s69 << r70
+-                        else
+-                          break
+-                        end
++                    s68, i68 = [], index
++                    loop do
++                      i69, s69 = index, []
++                      if (match_len = has_terminal?('[', false, index))
++                        r70 = true
++                        @index += match_len
++                      else
++                        terminal_parse_failure('\'[\'')
++                        r70 = nil
+                       end
+-                      r69 = instantiate_node(SyntaxNode,input, i69...index, s69)
+-                      s64 << r69
+-                      if r69
+-                        r71 = _nt_expression
+-                        s64 << r71
++                      s69 << r70
++                      if r70
++                        s71, i71 = [], index
++                        loop do
++                          r72 = _nt_space
++                          if r72
++                            s71 << r72
++                          else
++                            break
++                          end
++                        end
++                        r71 = instantiate_node(SyntaxNode,input, i71...index, s71)
++                        s69 << r71
+                         if r71
+-                          s72, i72 = [], index
+-                          loop do
+-                            r73 = _nt_space
+-                            if r73
+-                              s72 << r73
+-                            else
+-                              break
++                          i74, s74 = index, []
++                          r75 = _nt_expression
++                          s74 << r75
++                          if r75
++                            s76, i76 = [], index
++                            loop do
++                              r77 = _nt_space
++                              if r77
++                                s76 << r77
++                              else
++                                break
++                              end
+                             end
+-                          end
+-                          r72 = instantiate_node(SyntaxNode,input, i72...index, s72)
+-                          s64 << r72
+-                          if r72
+-                            if (match_len = has_terminal?(':', false, index))
+-                              r74 = true
+-                              @index += match_len
+-                            else
+-                              terminal_parse_failure('\':\'')
+-                              r74 = nil
++                            r76 = instantiate_node(SyntaxNode,input, i76...index, s76)
++                            s74 << r76
++                            if r76
++                              if (match_len = has_terminal?(':', false, index))
++                                r78 = true
++                                @index += match_len
++                              else
++                                terminal_parse_failure('\':\'')
++                                r78 = nil
++                              end
++                              s74 << r78
++                              if r78
++                                s79, i79 = [], index
++                                loop do
++                                  r80 = _nt_space
++                                  if r80
++                                    s79 << r80
++                                  else
++                                    break
++                                  end
++                                end
++                                r79 = instantiate_node(SyntaxNode,input, i79...index, s79)
++                                s74 << r79
++                              end
+                             end
+-                            s64 << r74
+-                            if r74
+-                              s75, i75 = [], index
++                          end
++                          if s74.last
++                            r74 = instantiate_node(SyntaxNode,input, i74...index, s74)
++                            r74.extend(Assignment6)
++                          else
++                            @index = i74
++                            r74 = nil
++                          end
++                          if r74
++                            r73 = r74
++                          else
++                            r73 = instantiate_node(SyntaxNode,input, index...index)
++                          end
++                          s69 << r73
++                          if r73
++                            r81 = _nt_expression
++                            s69 << r81
++                            if r81
++                              s82, i82 = [], index
+                               loop do
+-                                r76 = _nt_space
+-                                if r76
+-                                  s75 << r76
++                                r83 = _nt_space
++                                if r83
++                                  s82 << r83
+                                 else
+                                   break
+                                 end
+                               end
+-                              r75 = instantiate_node(SyntaxNode,input, i75...index, s75)
+-                              s64 << r75
+-                              if r75
+-                                r77 = _nt_expression
+-                                s64 << r77
+-                                if r77
+-                                  s78, i78 = [], index
++                              r82 = instantiate_node(SyntaxNode,input, i82...index, s82)
++                              s69 << r82
++                              if r82
++                                if (match_len = has_terminal?(']', false, index))
++                                  r84 = true
++                                  @index += match_len
++                                else
++                                  terminal_parse_failure('\']\'')
++                                  r84 = nil
++                                end
++                                s69 << r84
++                                if r84
++                                  s85, i85 = [], index
+                                   loop do
+-                                    r79 = _nt_space
+-                                    if r79
+-                                      s78 << r79
++                                    r86 = _nt_space
++                                    if r86
++                                      s85 << r86
+                                     else
+                                       break
+                                     end
+                                   end
+-                                  r78 = instantiate_node(SyntaxNode,input, i78...index, s78)
+-                                  s64 << r78
+-                                  if r78
+-                                    if (match_len = has_terminal?(']', false, index))
+-                                      r80 = true
+-                                      @index += match_len
+-                                    else
+-                                      terminal_parse_failure('\']\'')
+-                                      r80 = nil
+-                                    end
+-                                    s64 << r80
+-                                    if r80
+-                                      s81, i81 = [], index
+-                                      loop do
+-                                        r82 = _nt_space
+-                                        if r82
+-                                          s81 << r82
+-                                        else
+-                                          break
+-                                        end
+-                                      end
+-                                      r81 = instantiate_node(SyntaxNode,input, i81...index, s81)
+-                                      s64 << r81
+-                                      if r81
+-                                        if (match_len = has_terminal?('=', false, index))
+-                                          r83 = true
+-                                          @index += match_len
+-                                        else
+-                                          terminal_parse_failure('\'=\'')
+-                                          r83 = nil
+-                                        end
+-                                        s64 << r83
+-                                        if r83
+-                                          s84, i84 = [], index
+-                                          loop do
+-                                            r85 = _nt_space
+-                                            if r85
+-                                              s84 << r85
+-                                            else
+-                                              break
+-                                            end
+-                                          end
+-                                          r84 = instantiate_node(SyntaxNode,input, i84...index, s84)
+-                                          s64 << r84
+-                                          if r84
+-                                            r86 = _nt_expression
+-                                            s64 << r86
+-                                          end
+-                                        end
+-                                      end
+-                                    end
+-                                  end
++                                  r85 = instantiate_node(SyntaxNode,input, i85...index, s85)
++                                  s69 << r85
+                                 end
+                               end
+                             end
+                           end
+                         end
+                       end
+-                    end
+-                  end
+-                end
+-                if s64.last
+-                  r64 = instantiate_node(Idl::AryRangeAssignmentSyntaxNode,input, i64...index, s64)
+-                  r64.extend(Assignment6)
+-                else
+-                  @index = i64
+-                  r64 = nil
+-                end
+-                if r64
+-                  r64 = SyntaxNode.new(input, (index-1)...index) if r64 == true
+-                  r0 = r64
+-                else
+-                  i87, s87 = index, []
+-                  r88 = _nt_ary_eligible_expression
+-                  s87 << r88
+-                  if r88
+-                    s89, i89 = [], index
+-                    loop do
+-                      r90 = _nt_space
+-                      if r90
+-                        s89 << r90
++                      if s69.last
++                        r69 = instantiate_node(SyntaxNode,input, i69...index, s69)
++                        r69.extend(Assignment7)
++                      else
++                        @index = i69
++                        r69 = nil
++                      end
++                      if r69
++                        s68 << r69
+                       else
+                         break
+                       end
+                     end
+-                    r89 = instantiate_node(SyntaxNode,input, i89...index, s89)
+-                    s87 << r89
+-                    if r89
+-                      if (match_len = has_terminal?('[', false, index))
+-                        r91 = true
++                    if s68.empty?
++                      @index = i68
++                      r68 = nil
++                    else
++                      r68 = instantiate_node(SyntaxNode,input, i68...index, s68)
++                    end
++                    s64 << r68
++                    if r68
++                      if (match_len = has_terminal?('=', false, index))
++                        r87 = true
+                         @index += match_len
+                       else
+-                        terminal_parse_failure('\'[\'')
+-                        r91 = nil
++                        terminal_parse_failure('\'=\'')
++                        r87 = nil
+                       end
+-                      s87 << r91
+-                      if r91
+-                        s92, i92 = [], index
++                      s64 << r87
++                      if r87
++                        s88, i88 = [], index
+                         loop do
+-                          r93 = _nt_space
+-                          if r93
+-                            s92 << r93
++                          r89 = _nt_space
++                          if r89
++                            s88 << r89
+                           else
+                             break
+                           end
+                         end
+-                        r92 = instantiate_node(SyntaxNode,input, i92...index, s92)
+-                        s87 << r92
+-                        if r92
+-                          r94 = _nt_expression
+-                          s87 << r94
+-                          if r94
+-                            s95, i95 = [], index
+-                            loop do
+-                              r96 = _nt_space
+-                              if r96
+-                                s95 << r96
+-                              else
+-                                break
+-                              end
+-                            end
+-                            r95 = instantiate_node(SyntaxNode,input, i95...index, s95)
+-                            s87 << r95
+-                            if r95
+-                              if (match_len = has_terminal?(']', false, index))
+-                                r97 = true
+-                                @index += match_len
+-                              else
+-                                terminal_parse_failure('\']\'')
+-                                r97 = nil
+-                              end
+-                              s87 << r97
+-                              if r97
+-                                s98, i98 = [], index
+-                                loop do
+-                                  r99 = _nt_space
+-                                  if r99
+-                                    s98 << r99
+-                                  else
+-                                    break
+-                                  end
+-                                end
+-                                r98 = instantiate_node(SyntaxNode,input, i98...index, s98)
+-                                s87 << r98
+-                                if r98
+-                                  if (match_len = has_terminal?('=', false, index))
+-                                    r100 = true
+-                                    @index += match_len
+-                                  else
+-                                    terminal_parse_failure('\'=\'')
+-                                    r100 = nil
+-                                  end
+-                                  s87 << r100
+-                                  if r100
+-                                    s101, i101 = [], index
+-                                    loop do
+-                                      r102 = _nt_space
+-                                      if r102
+-                                        s101 << r102
+-                                      else
+-                                        break
+-                                      end
+-                                    end
+-                                    r101 = instantiate_node(SyntaxNode,input, i101...index, s101)
+-                                    s87 << r101
+-                                    if r101
+-                                      r103 = _nt_expression
+-                                      s87 << r103
+-                                    end
+-                                  end
+-                                end
+-                              end
+-                            end
+-                          end
++                        r88 = instantiate_node(SyntaxNode,input, i88...index, s88)
++                        s64 << r88
++                        if r88
++                          r90 = _nt_expression
++                          s64 << r90
+                         end
+                       end
+                     end
+                   end
+-                  if s87.last
+-                    r87 = instantiate_node(Idl::AryElementAssignmentSyntaxNode,input, i87...index, s87)
+-                    r87.extend(Assignment7)
+-                  else
+-                    @index = i87
+-                    r87 = nil
+-                  end
+-                  if r87
+-                    r87 = SyntaxNode.new(input, (index-1)...index) if r87 == true
+-                    r0 = r87
+-                  else
+-                    @index = i0
+-                    r0 = nil
+-                  end
++                end
++                if s64.last
++                  r64 = instantiate_node(Idl::AryRangeAssignmentSyntaxNode,input, i64...index, s64)
++                  r64.extend(Assignment8)
++                else
++                  @index = i64
++                  r64 = nil
++                end
++                if r64
++                  r64 = SyntaxNode.new(input, (index-1)...index) if r64 == true
++                  r0 = r64
++                else
++                  @index = i0
++                  r0 = nil
+                 end
+               end
+             end
+diff --git a/tools/ruby-gems/idlc/lib/idlc/passes/find_src_registers.rb b/tools/ruby-gems/idlc/lib/idlc/passes/find_src_registers.rb
+index 063ed50e5a..7b1afbaf62 100644
+--- a/tools/ruby-gems/idlc/lib/idlc/passes/find_src_registers.rb
++++ b/tools/ruby-gems/idlc/lib/idlc/passes/find_src_registers.rb
+@@ -103,14 +103,17 @@ def find_src_registers(symtab)
+   class AryElementAssignmentAst
+     def find_dst_registers(symtab)
+       value_result = value_try do
+-        if lhs.text_value == "X"
++        # Extract base variable name from potentially nested access
++        base_name = Idl::AstNode.extract_base_var_name(lhs)
++        if base_name == "X"
+           return [idx.value(symtab)]
+         else
+           return []
+         end
+       end
+       value_else(value_result) do
+-        if lhs.text_value == "X"
++        base_name = Idl::AstNode.extract_base_var_name(lhs)
++        if base_name == "X"
+           if idx.type(symtab).const?
+             return [idx.gen_cpp(symtab, 0)]
+           else
+@@ -122,4 +125,32 @@ def find_dst_registers(symtab)
+       end
+     end
+   end
++
++  class AryRangeAssignmentAst
++    def find_dst_registers(symtab)
++      # Check if this is an X register assignment
++      base_name = Idl::AstNode.extract_base_var_name(variable)
++      if base_name == "X"
++        # For X[idx][msb:lsb] = val, we need the idx
++        if variable.is_a?(Idl::AryElementAccessAst) && variable.var.is_a?(Idl::IdAst) && variable.var.name == "X"
++          # Direct X register access: X[idx][msb:lsb] = val
++          value_result = value_try do
++            return [variable.index.value(symtab)]
++          end
++          value_else(value_result) do
++            if variable.index.type(symtab).const?
++              return [variable.index.gen_cpp(symtab, 0)]
++            else
++              raise ComplexRegDetermination
++            end
++          end
++        else
++          # More complex X register nesting
++          raise ComplexRegDetermination
++        end
++      else
++        return []
++      end
++    end
++  end
+ end
+diff --git a/tools/ruby-gems/idlc/test/run.rb b/tools/ruby-gems/idlc/test/run.rb
+index a6d6bd4ad2..741c30c202 100644
+--- a/tools/ruby-gems/idlc/test/run.rb
++++ b/tools/ruby-gems/idlc/test/run.rb
+@@ -26,6 +26,7 @@
+ 
+ require "minitest/autorun"
+ 
++require_relative "test_arrays"
+ require_relative "test_ast_type"
+ require_relative "test_cli"
+ require_relative "test_const_function_arguments"
+diff --git a/tools/ruby-gems/idlc/test/test_arrays.rb b/tools/ruby-gems/idlc/test/test_arrays.rb
+new file mode 100644
+index 0000000000..bb949b77da
+--- /dev/null
++++ b/tools/ruby-gems/idlc/test/test_arrays.rb
+@@ -0,0 +1,254 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# typed: false
++# frozen_string_literal: true
++
++require "idlc"
++require "idlc/ast"
++require_relative "helpers"
++require "minitest/autorun"
++
++$root ||= (Pathname.new(__FILE__) / ".." / ".." / ".." / "..").realpath
++
++require_relative "helpers"
++
++# test IDL arrays
++class TestArrays < Minitest::Test
++  include TestMixin
++
++  def test_element_access
++    idl = "ary[0]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :ary_access)
++    refute_nil m
++  end
++
++  def test_element_access_var_index
++    idl = "ary[var]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :ary_access)
++    refute_nil m
++  end
++
++  def test_range_access
++    idl = "ary[0:1]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :ary_access)
++    refute_nil m
++  end
++
++  def test_range_access_var_range
++    idl = "ary[var1:var2]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :ary_access)
++    refute_nil m
++  end
++
++  def test_range_access_mixed_range
++    idl = "ary[0:var2]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :ary_access)
++    refute_nil m
++  end
++
++  def test_range_access_var_to_const
++    idl = "ary[var1:3]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :ary_access)
++    refute_nil m
++  end
++
++  def test_nested_element_access
++    idl = "ary[0][1]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :ary_access)
++    refute_nil m
++  end
++
++  def test_nested_element_access_var
++    idl = "ary[0][var]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :ary_access)
++    refute_nil m
++  end
++
++  def test_nested_element_range_access_var
++    idl = "ary[0][0:var]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :ary_access)
++    refute_nil m
++    assert_instance_of Idl::AryRangeAccessAst, m.to_ast
++  end
++
++  def test_element_assignment
++    idl = "ary[0] = 5"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    assert_instance_of Idl::AryElementAssignmentAst, m.to_ast
++  end
++
++  def test_range_assignment
++    idl = "ary[0:1] = 5"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    assert_instance_of Idl::AryRangeAssignmentAst, m.to_ast
++  end
++
++  def test_nested_element_assignment
++    idl = "ary[0][1] = 5"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    assert_instance_of Idl::AryElementAssignmentAst, m.to_ast
++  end
++
++  def test_nested_element_range_assignment
++    idl = "ary[0][0:1] = 5"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    assert_instance_of Idl::AryRangeAssignmentAst, m.to_ast
++  end
++
++  def test_nested_range_element_assignment
++    idl = "ary[0:1][0] = 5"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    assert_instance_of Idl::AryElementAssignmentAst, m.to_ast
++  end
++
++  def test_vmv
++    idl = "v[vd][end_bit_pos:start_bit_pos] = sext_imm[state.sew-1:0]"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    assert_instance_of Idl::AryRangeAssignmentAst, m.to_ast
++  end
++
++  def test_triple_nested_element_assignment
++    idl = "ary[0][1][2] = 5"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    assert_instance_of Idl::AryElementAssignmentAst, m.to_ast
++    # Verify the lhs is AryElementAccessAst(AryElementAccessAst(ary, 0), 1)
++    # The final [2] index is in the assignment itself
++    ast = m.to_ast
++    assert_instance_of Idl::AryElementAccessAst, ast.lhs
++    assert_instance_of Idl::AryElementAccessAst, ast.lhs.var
++    assert_instance_of Idl::IdAst, ast.lhs.var.var
++  end
++
++  def test_triple_nested_range_assignment
++    idl = "ary[0][1][7:0] = 5"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    assert_instance_of Idl::AryRangeAssignmentAst, m.to_ast
++    # Verify the variable is AryElementAccessAst(AryElementAccessAst(ary, 0), 1)
++    ast = m.to_ast
++    assert_instance_of Idl::AryElementAccessAst, ast.variable
++    assert_instance_of Idl::AryElementAccessAst, ast.variable.var
++  end
++
++  def test_deeply_nested_vmv_style
++    idl = "matrix[i][j][15:8] = value"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    assert_instance_of Idl::AryRangeAssignmentAst, m.to_ast
++  end
++
++  def test_x_register_range_assignment
++    idl = "X[rs1][7:0] = value"
++
++    symtab = Idl::SymbolTable.new(
++      possible_xlens_cb: proc { [32, 64] }
++    )
++    @compiler.parser.set_input_file(idl, 0)
++    m = @compiler.parser.parse(idl, root: :assignment)
++    refute_nil m
++    ast = m.to_ast
++    assert_instance_of Idl::AryRangeAssignmentAst, ast
++    # Verify the variable is AryElementAccessAst(X, rs1)
++    assert_instance_of Idl::AryElementAccessAst, ast.variable
++    assert_instance_of Idl::IdAst, ast.variable.var
++    assert_equal "X", ast.variable.var.name
++  end
++end
+diff --git a/tools/ruby-gems/idlc/test/test_functions.rb b/tools/ruby-gems/idlc/test/test_functions.rb
+index 3a11de7174..19f58fa1f9 100644
+--- a/tools/ruby-gems/idlc/test/test_functions.rb
++++ b/tools/ruby-gems/idlc/test/test_functions.rb
+@@ -15,8 +15,8 @@
+ 
+ require_relative "helpers"
+ 
+-# test IDL variables
+-class TestVariables < Minitest::Test
++# test IDL Functions
++class TestFunctions < Minitest::Test
+   include TestMixin
+ 
+   def test_that_reachable_raise_analysis_respects_transitive_known_values
+diff --git a/tools/ruby-gems/idlc/test/test_loops.rb b/tools/ruby-gems/idlc/test/test_loops.rb
+index be349afd1e..0b0a6c63f3 100644
+--- a/tools/ruby-gems/idlc/test/test_loops.rb
++++ b/tools/ruby-gems/idlc/test/test_loops.rb
+@@ -12,8 +12,8 @@
+ 
+ require_relative "helpers"
+ 
+-# test IDL variables
+-class TestVariables < Minitest::Test
++# test IDL loops
++class TestLoops < Minitest::Test
+   include TestMixin
+ 
+   def test_const_iter
+diff --git a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/idlc@0.1.1.rbi b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/idlc@0.1.1.rbi
+index 588762b7a0..965984453f 100644
+--- a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/idlc@0.1.1.rbi
++++ b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/idlc@0.1.1.rbi
+@@ -329,10 +329,6 @@ class Idl::AryElementAssignmentAst < ::Idl::AstNode
+   end
+ end
+ 
+-class Idl::AryElementAssignmentSyntaxNode < ::Idl::SyntaxNode
+-  def to_ast; end
+-end
+-
+ class Idl::AryRangeAccessAst < ::Idl::AstNode
+   include ::Idl::Rvalue
+ 
+@@ -446,14 +442,16 @@ module Idl::Assignment5
+ end
+ 
+ module Idl::Assignment6
++  def expression; end
++end
++
++module Idl::Assignment7
+   def lsb; end
+   def msb; end
+-  def rval; end
+-  def var; end
+ end
+ 
+-module Idl::Assignment7
+-  def idx; end
++module Idl::Assignment8
++  def brackets; end
+   def rval; end
+   def var; end
+ end
+@@ -595,6 +593,9 @@ class Idl::AstNode
+   def idl_pos_to_file_offset(pos, lfo); end
+ 
+   class << self
++    sig { params(node: T.all(::Idl::AstNode, ::Idl::Rvalue)).returns(T.nilable(::String)) }
++    def extract_base_var_name(node); end
++
+     sig do
+       params(
+         yaml: T::Hash[::String, T.untyped],
+@@ -627,6 +628,15 @@ class Idl::AstNode
+ 
+     sig { params(block: T.proc.params(arg0: ::Object).returns(T.untyped)).returns(T.untyped) }
+     def value_try(&block); end
++
++    sig do
++      params(
++        target: T.all(::Idl::AstNode, ::Idl::Rvalue),
++        new_value: T.any(::Integer, ::String, T::Array[::Integer], T::Array[::String], T::Array[T::Boolean], T::Boolean, T::Hash[::String, T.any(::Integer, ::String, T::Array[::Integer], T::Array[::String], T::Array[T::Boolean], T::Boolean)]),
++        symtab: ::Idl::SymbolTable
++      ).void
++    end
++    def write_back_nested(target, new_value, symtab); end
+   end
+ end
+ 
+diff --git a/tools/ruby-gems/udb/sorbet/rbi/gems/idlc@0.1.1.rbi b/tools/ruby-gems/udb/sorbet/rbi/gems/idlc@0.1.1.rbi
+index 588762b7a0..965984453f 100644
+--- a/tools/ruby-gems/udb/sorbet/rbi/gems/idlc@0.1.1.rbi
++++ b/tools/ruby-gems/udb/sorbet/rbi/gems/idlc@0.1.1.rbi
+@@ -329,10 +329,6 @@ class Idl::AryElementAssignmentAst < ::Idl::AstNode
+   end
+ end
+ 
+-class Idl::AryElementAssignmentSyntaxNode < ::Idl::SyntaxNode
+-  def to_ast; end
+-end
+-
+ class Idl::AryRangeAccessAst < ::Idl::AstNode
+   include ::Idl::Rvalue
+ 
+@@ -446,14 +442,16 @@ module Idl::Assignment5
+ end
+ 
+ module Idl::Assignment6
++  def expression; end
++end
++
++module Idl::Assignment7
+   def lsb; end
+   def msb; end
+-  def rval; end
+-  def var; end
+ end
+ 
+-module Idl::Assignment7
+-  def idx; end
++module Idl::Assignment8
++  def brackets; end
+   def rval; end
+   def var; end
+ end
+@@ -595,6 +593,9 @@ class Idl::AstNode
+   def idl_pos_to_file_offset(pos, lfo); end
+ 
+   class << self
++    sig { params(node: T.all(::Idl::AstNode, ::Idl::Rvalue)).returns(T.nilable(::String)) }
++    def extract_base_var_name(node); end
++
+     sig do
+       params(
+         yaml: T::Hash[::String, T.untyped],
+@@ -627,6 +628,15 @@ class Idl::AstNode
+ 
+     sig { params(block: T.proc.params(arg0: ::Object).returns(T.untyped)).returns(T.untyped) }
+     def value_try(&block); end
++
++    sig do
++      params(
++        target: T.all(::Idl::AstNode, ::Idl::Rvalue),
++        new_value: T.any(::Integer, ::String, T::Array[::Integer], T::Array[::String], T::Array[T::Boolean], T::Boolean, T::Hash[::String, T.any(::Integer, ::String, T::Array[::Integer], T::Array[::String], T::Array[T::Boolean], T::Boolean)]),
++        symtab: ::Idl::SymbolTable
++      ).void
++    end
++    def write_back_nested(target, new_value, symtab); end
+   end
+ end
+ 

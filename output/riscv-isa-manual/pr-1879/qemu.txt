@@ -1,0 +1,78 @@
+PR #1879  target=qemu  overall=bug_confirmed
+Spec: Smepmp field rename MMWP→MMAP at bit 1 — QEMU still uses the deprecated proposal-era name MSECCFG_MMWP; functionally benign today but risks missing future MMAP-specific spec tightening
+Violation: QEMU hardcodes the pre-ratification field name 'MMWP' (Machine-Mode Whitelist Policy) at pmp.h:45 (MSECCFG_MMWP = 1 << 1) while the integrated spec renames it to 'MMAP' (Machine-Mode Allowlist Policy). The bit position and sticky semantics are unchanged, so current enforcement is functionally correct. However, if the ratified spec later adds MMAP-specific WARL constraints, access-fault side-effects, or discovery requirements beyond what the MMWP name implied, QEMU's stale identifier and any MMWP-gated code paths would fail to enforce the new MMAP semantics.
+Consequence: privilege_escape
+Pattern: MSECCFG_MMWP|mseccfg\.MMWP|MMWP_ISSET|MSECCFG_MMWP_ISSET
+------------------------------------------------------------
+[potential_risk] target/riscv/pmp.h:44-45  mseccfg_field_t (typedef enum)
+  Field name MSECCFG_MMWP (bit 1) uses the pre-ratification identifier 'Machine-Mode Whitelist Policy'. The ratified Smepmp spec renames this bit to MMAP (Machine-Mode Allowlist Policy). Bit position and sticky-write-once semantics are unchanged, so current enforcement is functionally correct. However, if future spec versions add MMAP-specific WARL constraints, discovery mechanisms, or access-fault side-effects beyond what the MMWP name implied, code paths gated on MSECCFG_MMWP/MMWP_ISSET may silently fail to enforce the new MMAP semantics.
+  | typedef enum {
+  |     MSECCFG_MML   = 1 << 0,
+  |     MSECCFG_MMWP  = 1 << 1,
+  |     MSECCFG_RLB   = 1 << 2,
+
+[potential_risk] target/riscv/pmp.h:91-91  MSECCFG_MMWP_ISSET (macro)
+  MSECCFG_MMWP_ISSET macro perpetuates the stale pre-ratification field name. All call sites that check this macro would need to be audited and potentially updated if MMAP semantics diverge from MMWP in future spec revisions (e.g., different WARL constraints or side-effect requirements).
+  | #define MSECCFG_MMWP_ISSET(env) get_field(env->mseccfg, MSECCFG_MMWP)
+
+[compliant] target/riscv/pmp.c:317-323  pmp_hart_has_privs_default
+  When MMWP/MMAP is set, the default deny-all policy (even for M-mode) is correctly enforced via '*allowed_privs = 0' and 'return false'. This matches the ratified MMAP semantic: when mseccfg.MMAP=1, M-mode accesses without a matching PMP rule are denied. The enforcement logic is correct regardless of the stale field name.
+  | if (MSECCFG_MMWP_ISSET(env)) {
+  |     /*
+  |      * The Machine Mode Whitelist Policy (mseccfg.MMWP) is set
+  |      * so we default to deny all, even for M-mode.
+  |      */
+  |     *allowed_privs = 0;
+  |     return false;
+
+[compliant] target/riscv/pmp.c:662-703  mseccfg_csr_write
+  mseccfg_csr_write correctly enforces the sticky-write-once semantics for MMWP/MMAP (bit 1) under smepmp: 'val |= (env->mseccfg & mask)' where mask includes MSECCFG_MMWP, so bits can only transition 0→1, never 1→0. TLB flush is triggered on any sticky-bit change. The WARL constraint for RLB (cannot enable if PMP entries locked) is correctly enforced. PMM field handling is gated on valid Zjpm v1.0 values. The MMAP bit behavior is functionally correct even though the field is still named MMWP.
+  | uint64_t mask = MSECCFG_MMWP | MSECCFG_MML;
+  | ...
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |     /* Sticky bits */
+  |     val |= (env->mseccfg & mask);
+  |     if ((val ^ env->mseccfg) & mask) {
+  |         tlb_flush(env_cpu(env));
+  |     }
+
+[compliant] target/riscv/pmp.c:708-712  mseccfg_csr_read
+  mseccfg_csr_read returns the stored mseccfg value directly. No masking of reserved bits is performed on read, which means reserved bits could theoretically expose internal state. However, the write path's mask enforcement (MSECCFG_MMWP|MSECCFG_MML with conditional PMM/RLB) ensures only spec-defined writable bits can be set, so reserved bits read as zero in practice. Compliant with the simple pass-through read expected for this CSR.
+  | target_ulong mseccfg_csr_read(CPURISCVState *env)
+  | {
+  |     trace_mseccfg_csr_read(env->mhartid, env->mseccfg);
+  |     return env->mseccfg;
+  | }
+
+[bug_confirmed] target/riscv/machine.c:426-504  vmstate_riscv_cpu
+  env.mseccfg is NOT included in vmstate_riscv_cpu or any subsection (vmstate_pmp only migrates pmp_entry_t array, not mseccfg). On live migration, the destination QEMU instance will receive mseccfg=0 (default/reset value), silently dropping the MMWP/MMAP allowlist policy, MML lockdown, and RLB bits. This means: (1) if MMWP/MMAP was set on the source, M-mode accesses will incorrectly succeed without PMP rules on the destination; (2) if MML was set, PMP entry lock bits lose their lockdown effect. This is a privilege-escalation window during and after live migration until the guest OS re-programs mseccfg.
+  | const VMStateDescription vmstate_riscv_cpu = {
+  |     .name = "cpu",
+  |     .version_id = 11,
+  |     .fields = (const VMStateField[]) {
+  |         ...
+  |         VMSTATE_UINT64(env.mscratch, RISCVCPU),
+  |         VMSTATE_UINT64(env.stimecmp, RISCVCPU),
+  |         VMSTATE_END_OF_LIST()
+  |     },
+  |     .subsections = (const VMStateDescription * const []) {
+  |         &vmstate_pmp,
+  |         ...
+  |     }
+  | };
+
+[compliant] target/riscv/cpu.c:757-764  riscv_cpu_reset_hold
+  Reset correctly clears mseccfg to 0 when smepmp is enabled, matching the privileged spec requirement that all mseccfg bits (MML, MMWP/MMAP, RLB) reset to 0. pmp_unlock_entries() is called afterward to clear any stale PMP lock bits. Correct reset behavior.
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |     env->mseccfg = 0;
+  | }
+  | pmp_unlock_entries(env);
+
+[compliant] target/riscv/csr.c:775-780  have_mseccfg
+  mseccfg CSR access is correctly gated: available when smepmp is present (which defines MMWP/MMAP, MML, RLB) or when zkr is present (which uses USEED/SSEED fields). The CSR is properly discoverable under the extensions that define its fields. No MMWP-specific gating issue.
+  | static RISCVException have_mseccfg(CPURISCVState *env, int csrno)
+  | {
+  |     if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+

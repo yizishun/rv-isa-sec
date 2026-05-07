@@ -1,0 +1,32 @@
+PR #2901  target=linux  overall=compliant
+Spec: Zisb barriers (TEB/MDB/DPB) are Zimop-encoded unprivileged instructions that silently become NOPs on hardware lacking Zisb but implementing Zimop; kernel relies on them for in-domain Spectre-V1 mitigation without ISA-extension guards, creating a silent information-leak vulnerability on non-Zisb hardware.
+Violation: The Linux kernel emits a Zisb barrier instruction (TEB, MDB, or DPB) in a security-critical speculation boundary (e.g., bounds-check-then-access pattern in syscall handlers, seccomp filter evaluation, or eBPF JIT output) on a CPU that implements Zimop but not Zisb, treating the barrier as effective when it becomes a silent NOP. Speculative execution then crosses the barrier and leaks kernel data through a cache-based side channel observable by userspace.
+Consequence: info_leak
+Pattern: kernel code uses TEB, MDB, or DPB (or a macro expanding to them) without a preceding riscv_isa_extension_available() / RISCV_ISA_EXT_ZISB guard or fallback to architected speculation-barrier sequences (e.g., fence-based or CSR-based barriers). Search for '.insn' or '.word' encodings in the Zimop major opcode space alongside security-sensitive arrays indexed by user-controlled values.
+------------------------------------------------------------
+[compliant] arch/riscv/include/asm/barrier.h:1-87  (none — arch-level speculation barrier)
+  RISC-V does not define barrier_nospec() or spec_bar(), falling through to the generic barrier_nospec() no-op in include/linux/nospec.h:14-16. This is compliant because no Zisb barrier instructions (TEB/MDB/DPB) are emitted anywhere in arch/riscv/ — there is no silent-NOP-on-Zimop risk. The data-masking mitigation (array_index_nospec) used in the syscall path and KVM provides the Spectre-v1 defense without needing instruction barriers.
+  | #ifndef barrier_nospec
+  | # define barrier_nospec() do { } while (0)
+  | #endif
+
+[compliant] arch/riscv/kernel/traps.c:342-344  do_syscall_by_trace
+  Syscall dispatch uses array_index_nospec() to mask the user-controlled syscall number against NR_syscalls. This is the correct data-masking mitigation for Spectre-v1 and does not require a Zisb barrier instruction. No TEB/MDB/DPB instruction is emitted here, so there is no silent-NOP-on-Zimop risk.
+  | if (syscall >= 0 && syscall < NR_syscalls) {
+  |     syscall = array_index_nospec(syscall, NR_syscalls);
+  |     syscall_handler(regs, syscall);
+
+[potential_risk] arch/riscv/net/bpf_jit_comp64.c:1920-1922  emit_insn (BPF JIT emission)
+  BPF_ST|BPF_NOSPEC ('speculation barrier' eBPF instruction) is compiled to a no-op in the RISC-V BPF JIT (both 64-bit and 32-bit). While this does not explicitly emit Zisb barrier instructions (and thus doesn't trigger the silent-NOP-on-Zimop vulnerability directly), it means eBPF seccomp filters and eBPF programs loaded by unprivileged users cannot add speculation barriers on RISC-V. The data-masking approach in array_index_nospec() still applies in the kernel's own bounds-check paths, but eBPF programs performing their own bounds checks have no speculation barrier available.
+  | /* speculation barrier */
+  | case BPF_ST | BPF_NOSPEC:
+  |     break;
+
+[potential_risk] arch/riscv/kernel/sys_hwprobe.c:136-136  hwprobe_one_pair (via EXT_KEY macro)
+  Zimop is exposed to userspace via hwprobe (EXT_ZIMOP, bit 42) and the ISA string, but Zisb is NOT exposed (has no extension ID). If the PR adding Zisb detection introduces hwprobe/KVM exposure of Zisb without synchronization, a race between extension detection and mitigation selection could briefly expose a window where userspace thinks Zisb barriers work but the kernel hasn't patched in the alternatives. However, this is a forward-looking concern for the PR; currently Zisb is absent so there is no violation.
+  | EXT_KEY(isainfo->isa, ZIMOP, pair->value, missing);
+
+[compliant] arch/riscv/kvm/vcpu_onereg.c:131-131  kvm_riscv_vcpu_isa_disable
+  KVM uses array_index_nospec() when indexing into kvm_isa_ext_arr based on a guest-controlled extension ID. This is correctly masked. No Zisb barrier instruction is emitted, so no silent-NOP-on-Zimop risk exists.
+  | kvm_ext = array_index_nospec(kvm_ext, ARRAY_SIZE(kvm_isa_ext_arr));
+

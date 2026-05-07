@@ -1,0 +1,140 @@
+{
+  "pr_number": 81,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 81,
+    "violation_condition": "Kernel context-switch or trap handler writes to the now-WPRI bits 24 (SPTTCD) or 42 (MPTTCD) in mstatus/sstatus, or kernel relies on mret/sret to restore a TTCD state that no longer exists — causing silent corruption of adjacent fields if hardware repurposes these bits.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "mstatus.*0x[0-9a-fA-F].*24|sstatus.*BIT\\(24\\)|MPTTCD|SPTTCD|TTCD|nietc|TAG_CHECK_ELIDE",
+    "affected_entities": [
+      "mstatus",
+      "sstatus",
+      "vsstatus",
+      "nietc"
+    ],
+    "summary": "Zitagelide removal reclaims mstatus[42] and sstatus[24] as WPRI; kernel must not touch these bits — any stale save/restore of the now-nonexistent TTCD state would corrupt CSR fields across context switches or VM exits."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "SR_* definitions",
+        "line_start": 12,
+        "line_end": 66,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "No CSR bit definitions exist for SPTTCD (bit 24), MPTTCD (bit 42), or any TTCD-related field in sstatus/mstatus. The zitagelide extension is fully absent from the CSR bit definitions in both the main kernel header and the tools/ copy. The only bit-24 use is SR_VS_CLEAN_THEAD (0x01000000) for XTheadVector, an unrelated vendor extension.",
+      "snippet": "#define SR_FS    _AC(0x00006000, UL) /* Floating-point Status */\n#define SR_VS    _AC(0x00000600, UL) /* Vector Status */\n#define SR_XS    _AC(0x00018000, UL) /* Extension Status */\n/* No SPTTCD, MPTTCD, TTCD, or zitagelide definitions anywhere */"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 176,
+        "line_end": 190,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Trap entry reads CSR_STATUS via csrrc clearing only SR_SUM|SR_FS_VS|SR_ELP. Bits 24 and 42 are NOT in the clear mask, so they pass through unchanged as opaque bits in the save/restore cycle. The saved status is stored in pt_regs->status and restored verbatim at line 301 via csrw CSR_STATUS. No explicit manipulation of TTCD bits occurs.",
+      "snippet": "li t0, SR_SUM | SR_FS_VS\n#ifdef CONFIG_64BIT\nli t1, SR_ELP\nor t0, t0, t1\n#endif\nREG_L s0, TASK_TI_USER_SP(tp)\ncsrrc s1, CSR_STATUS, t0"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "ret_from_exception",
+        "line_start": 298,
+        "line_end": 316,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Trap return restores CSR_STATUS from pt_regs->status as a full opaque write, then executes sret. No TTCD-specific logic. The sret instruction does not rely on any TTCD state restoration semantics since the kernel never configures TTCD behavior.",
+      "snippet": "csrw CSR_STATUS, a0\ncsrw CSR_EPC, a2\nREG_L x1,  PT_RA(sp)\n...\nsret"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 442,
+        "line_end": 451,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Context-switch __switch_to reads CSR_STATUS to save the SUM bit state, then conditionally sets SR_SUM into CSR_STATUS via csrs. Does not read, write, or manipulate bits 24 or 42. The full status (including any opaque bits) was already saved in pt_regs->status by the trap entry path.",
+      "snippet": "csrr  s0, CSR_STATUS\nREG_S s0, TASK_THREAD_SUM_RA(a3)\n...\nREG_L s0,  TASK_THREAD_SUM_RA(a4)\nli    s1,  SR_SUM\nand   s0,  s0, s1\ncsrs  CSR_STATUS, s0"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "SAVE_HOST_AND_RESTORE_GUEST_CSRS / SAVE_GUEST_AND_RESTORE_HOST_CSRS",
+        "line_start": 41,
+        "line_end": 161,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM VCPU switch correctly saves and restores the full SSTATUS CSR via csrrw atomic swap. The guest sstatus is loaded from guest_csr and host sstatus is saved. Bits 24/42 are treated as opaque fields passed through save/restore. Neither the host nor guest paths write specific values to TTCD bit positions.",
+      "snippet": "SAVE_HOST_AND_RESTORE_GUEST_CSRS:\n  REG_L t0, (KVM_ARCH_GUEST_SSTATUS)(a0)\n  csrrw t0, CSR_SSTATUS, t0\n  ...\n  REG_S t0, (KVM_ARCH_HOST_SSTATUS)(a0)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load / kvm_arch_vcpu_put",
+        "line_start": 578,
+        "line_end": 683,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VCPU load writes csr->vsstatus to CSR_VSSTATUS (VS-Status, not sstatus/mstatus). VCPU put reads CSR_VSSTATUS back into csr->vsstatus. This is proper virtualization — the guest's view of sstatus is managed through VSSTATUS, with no direct writes to the host's sstatus/mstatus bits 24/42 beyond what the trap save/restore already handles.",
+      "snippet": "csr_write(CSR_VSSTATUS, csr->vsstatus);\n...\ncsr->vsstatus = csr_read(CSR_VSSTATUS);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_context_reset",
+        "line_start": 54,
+        "line_end": 76,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VCPU reset initializes sstatus to SR_SPP | SR_SPIE (0x120). Neither bit 24 nor bit 42 is set. This is a clean reset state with no TTCD-related bits asserted.",
+      "snippet": "cntx->sstatus = SR_SPP | SR_SPIE;\ncntx->hstatus |= HSTATUS_VTW;\ncntx->hstatus |= HSTATUS_SPVP;\ncntx->hstatus |= HSTATUS_SPV;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/suspend_entry.S / arch/riscv/include/asm/assembler.h",
+        "function_name": "suspend_restore_csrs",
+        "line_start": 22,
+        "line_end": 26,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CPU suspend/resume saves CSR_STATUS to suspend context and restores it verbatim. No TTCD-specific handling. The suspend entry at line 48-49 reads the live CSR_STATUS (including any opaque bits at 24/42) and saves them; resume writes them back. This is correct opaque-state preservation.",
+      "snippet": ".macro suspend_restore_csrs\n  REG_L t0, (SUSPEND_CONTEXT_REGS + PT_EPC)(a0)\n  csrw CSR_EPC, t0\n  REG_L t0, (SUSPEND_CONTEXT_REGS + PT_STATUS)(a0)\n  csrw CSR_STATUS, t0"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "start_thread / signal delivery paths",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Searched the full arch/riscv/ tree for 'TAG_CHECK', 'tag.elide', 'tagelide', 'nietc', 'SPTTCD', 'MPTTCD', 'TTCD', 'zitagelide', 'BIT(24)', 'BIT(42)' — zero matches in arch/riscv/. No code location references these bits. The kernel has no awareness of the removed zitagelide extension in any path (signal delivery, start_thread, ptrace, etc.).",
+      "snippet": "/* grep for TTCD|TAG_CHECK_ELIDE|zitagelide|SPTTCD|MPTTCD|nietc|BIT(24)|BIT(42)\n   across arch/riscv/ returned zero matches */"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "SR_VS_CLEAN_THEAD / SR_VS_DIRTY_THEAD overlap with bit 24",
+        "line_start": 42,
+        "line_end": 46,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "XTheadVector uses bits 23-24 of sstatus for VS status (SR_VS_CLEAN_THEAD=0x01000000, SR_VS_DIRTY_THEAD=0x01800000). Bit 24 (0x01000000) is the former SPTTCD position. On hardware that supports XTheadVector, bit 24 will be actively toggled by context-switch. This is NOT a TTCD violation — XTheadVector is a vendor extension with known semantics — but if future spec revisions repurpose bit 24 for a different mandatory feature, the XTheadVector usage at this bit position could conflict. Currently low risk since XTheadVector and zitagelide cannot coexist on the same hart.",
+      "snippet": "#define SR_VS_THEAD      _AC(0x01800000, UL) /* xtheadvector Status */\n#define SR_VS_OFF_THEAD   _AC(0x00000000, UL)\n#define SR_VS_INITIAL_THEAD _AC(0x00800000, UL)\n#define SR_VS_CLEAN_THEAD _AC(0x01000000, UL)\n#define SR_VS_DIRTY_THEAD _AC(0x01800000, UL)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

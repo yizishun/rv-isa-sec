@@ -1,0 +1,283 @@
+diff --git a/src/integrated-matrix.adoc b/src/integrated-matrix.adoc
+index 3f58156ad..8a6c27fb1 100644
+--- a/src/integrated-matrix.adoc
++++ b/src/integrated-matrix.adoc
+@@ -42,15 +42,16 @@ The three matrices in the multiply-accumulate operation C ← A × B^T^ + C are
+   If MUL_C = 16, the only allowed vector register indices are 0 and 16.
+ 
+ * The _input matrices_ A and B are stored in vector register groups with element width determined by the instruction:
+-  equal to SEW for non-packing variants, SEW/2 for double-packing, SEW/4 for quad-packing, and SEW/8 for octo-packing variants.
+-  The effective K dimension of the multiply (K_eff) equals λ × W × LMUL, where W is 1 for non-packing,
+-  2 for double-packing, 4 for quad-packing, and 8 for octo-packing instructions.
++  equal to SEW for non-widening variants, SEW/2 for double-widening, SEW/4 for quad-widening, and SEW/8 for octo-widening variants.
++  For widening variants, the narrow input elements are packed W per SEW-wide register slot.
++  The effective K dimension of the multiply (K_eff) equals λ × W × LMUL, where W is 1 for non-widening,
++  2 for double-widening, 4 for quad-widening, and 8 for octo-widening instructions.
+   LMUL scales the A and B register groups along the K dimension only and does not affect C.
+   Only integer values of LMUL are supported by the Zvvm family of Integrated Matrix extensions: LMUL ∈ {1, 2, 4, 8}.
+   Fractional LMUL settings (LMUL < 1) are reserved and shall raise an illegal-instruction exception when used with any IME instruction.
+ 
+ [#ime-geometry-fig]
+-.Geometry of matrix tiles and element ordering for 32 element vector registers and λ=4. VRs are interpreted as 2D tiles. Vector element indices show the tile element order. (a) Non-widening case with A, B, C having the same SEW. (b) Widening case with A and B having half the SEW of C (double-packing).
++.Geometry of matrix tiles and element ordering for 32 element vector registers and λ=4. VRs are interpreted as 2D tiles. Vector element indices show the tile element order. (a) Non-widening case (W=1) with A, B, C having the same SEW. (b) Double-widening case (W=2) with A and B at half the SEW of C, packed two per SEW-wide slot.
+ image::png/ime-geometry.png[width=100%, align=center, alt="Diagram of matrix tile geometry and multiplier configuration parameters."]
+ 
+ The K-dimension of the multiplication (shared inner dimension of A and B^T^) is determined by λ from `vtype`, scaled by a per-instruction widening factor W and further multiplied by LMUL:
+@@ -281,14 +282,14 @@ immediate field.
+ For non-widening multiply-accumulate instructions (W=1), the input elements
+ A and B have the same width as the accumulator (SEW) and no packing occurs.
+ 
+-For widening instructions (W=2 or W=4), each input register group holds
++For widening instructions (W=2, W=4, or W=8), each input register group holds
+ elements at the effective input element width EEW = SEW ÷ W.  Because
+ tile load instructions always transfer data at SEW granularity, every loaded
+ SEW-bit position contains W contiguous narrow elements that the
+ multiply-accumulate instruction consumes as a sub-dot-product.
+ 
+ [#ime-tile-widening-fig]]
+-.Element distribution and tile geometry example for L=32, SEW wide elements (left), two SEW/2 wide elements packed per SEW (middle), and four SEW/4 wide elements per SEW (right). Packing/widening by W increases the effective K dimension of the tile by a factor of W.
++.Element distribution and tile geometry example for L=32, SEW wide elements (left), two SEW/2 wide elements packed per SEW (middle), and four SEW/4 wide elements per SEW (right). Widening by a factor W (with the corresponding packing of W narrow elements per SEW-wide slot) increases the effective K dimension of the tile by a factor of W.
+ image::png/ime-tile-widening.png[align="center"]
+ 
+ ===== Byte-sized and wider elements (EEW ≥ 8)
+@@ -351,6 +352,11 @@ instructions (see <<integrated-matrix-microscaling>> and <<tbl-intmx-encoding-ma
+ For floating-point multiply-accumulate instructions, `vm=0` enables
+ microscaling (see <<integrated-matrix-microscaling>>).
+ 
++Matrix multiply-accumulate instructions can not be interrupted and resumed:
++they require `vstart` = 0 at the start of execution, and if `vstart` is
++non-zero when such an instruction begins, an illegal-instruction exception
++is raised.
++
+ ==== Arithmetic Considerations
+ 
+ ===== Integer accumulation
+@@ -388,6 +394,11 @@ Vector masking is not supported on matrix multiply-accumulate instructions:
+ the vm bit in the encoding selects between normal, unscaled arguments (`vm=1`)
+ and microscaled MX* matrix tile arguments. For details see <<integrated-matrix-microscaling>>.
+ 
++Matrix multiply-accumulate instructions can not be interrupted and resumed:
++they require `vstart` = 0 at the start of execution, and if `vstart` is
++non-zero when such an instruction begins, an illegal-instruction exception
++is raised.
++
+ The floating-point format of each operand tile is controlled by fields in `vtype`:
+ 
+ * `altfmt_A` and `altfmt_B` select the FP format for A and B input elements, interpreted in conjunction with the input element width SEW÷W (see <<integrated-matrix-altfmt-inputs>>).
+@@ -501,7 +512,7 @@ not apply.
+ 
+ All multiply and add operations use the dynamic rounding mode from `frm`; floating-point exception flags are accumulated into `fflags`.
+ 
+-The K-dimension, tile-dimension formulae, MUL_C, and instruction-to-widening-factor mapping are the same as for the integer family (see <<zvvmm>>); the floating-point mnemonics are `vfmmacc.vv` (W=1), `vfwmmacc.vv` (W=2), and `vfqwmmacc.vv` (W=4).
++The K-dimension, tile-dimension formulae, MUL_C, and instruction-to-widening-factor mapping are the same as for the integer family (see <<zvvmm>>); the floating-point mnemonics are `vfmmacc.vv` (W=1), `vfwmmacc.vv` (W=2), `vfqwmmacc.vv` (W=4), and `vf8wmmacc.vv` (W=8).
+ 
+ As with the integer multiply-accumulate instructions, vector masking is not
+ supported.  When `vm=0`, the instruction does not apply a vector mask;
+@@ -524,7 +535,7 @@ This section specifies how the K_eff product terms may be grouped and when inter
+ 
+ ===== Sub-dot-products
+ 
+-For widening instructions (W = 2 or W = 4), the W narrow input-element pairs packed within one accumulator-width (SEW-bit) position form a natural computational unit called a _sub-dot-product_.
++For widening instructions (W = 2, W = 4, or W = 8), the W narrow input-element pairs packed within one accumulator-width (SEW-bit) position form a natural computational unit called a _sub-dot-product_.
+ The W multiplications of (SEW÷W)-bit elements are performed and their products summed.
+ 
+ Each product of two (SEW÷W)-bit values is _exact_ at SEW precision: the significand has at most 2 × p~input~ − 1 bits, which fits in the wider SEW format.
+@@ -1255,8 +1266,9 @@ Key observations:
+   and `altfmt_B` in `vtype` to select the desired operand signedness.
+   The load instructions are unchanged.
+ 
+-* For widening variants (W=2 or W=4), use `vfwmmacc.vv`/`vfqwmmacc.vv` or
+-  `vwmmacc.vv`/`vqwmmacc.vv`.
++* For widening variants (W=2, W=4, or W=8), use `vfwmmacc.vv`,
++  `vfqwmmacc.vv`, or `vf8wmmacc.vv` (FP), or `vwmmacc.vv`, `vqwmmacc.vv`,
++  or `v8wmmacc.vv` (integer).
+   The narrower A and B element widths are encoded in the multiply-accumulate
+   instruction; the tile load instructions require no modification.
+ 
+@@ -2057,6 +2069,7 @@ Only SEW ∈ {32, 64} is valid (giving EEW = 4 or 8); SEW ∈ {8, 16} is _reserv
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * `vm` = 0 (_reserved_).
+ * SEW < 32 (EEW = SEW÷8 would be sub-nibble).
+ * VL is not a multiple of λ × LMUL.
+@@ -2067,6 +2080,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ if vm == 0 then return Illegal_Instruction();
+ if (2 ^ get_sew_pow()) < 32 then return Illegal_Instruction();
+ 
+@@ -2142,6 +2157,7 @@ Only SEW ∈ {32, 64} is valid (giving EEW = 4 or 8); SEW ∈ {8, 16} is _reserv
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * SEW < 32 (EEW = SEW÷8 would be sub-nibble).
+ * VL is not a multiple of λ × LMUL.
+ * MUL_C (= VLEN ÷ (SEW × λ²)) is not in \{1, 2, 4, 8, 16}.
+@@ -2154,6 +2170,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ if (2 ^ get_sew_pow()) < 32 then return Illegal_Instruction();
+ 
+ let g : gemm_geom = decode_gemm_geometry(8);
+@@ -2229,6 +2247,7 @@ multiply-accumulate; `vm=0` is _reserved_.
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * `vm` = 0 (_reserved_).
+ * VL is not a multiple of λ × LMUL.
+ * MUL_C (= VLEN ÷ (SEW × λ²)) is not in \{1, 2, 4, 8, 16}.
+@@ -2238,6 +2257,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ if vm == 0 then return Illegal_Instruction();
+ 
+ let g : gemm_geom = decode_gemm_geometry(1);
+@@ -2316,6 +2337,7 @@ selects the block size (32 or 16 elements).
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * VL is not a multiple of λ × LMUL.
+ * MUL_C (= VLEN ÷ (SEW × λ²)) is not in \{1, 2, 4, 8, 16}.
+ * _vs1_ or _vs2_ is not aligned for LMUL.
+@@ -2327,6 +2349,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ let g : gemm_geom = decode_gemm_geometry(4);
+ 
+ if vm == 0 then check_microscaling_legality(4, g.LMUL, g.EEW_C, g.lambda, E8M0);
+@@ -2412,6 +2436,7 @@ selects the block size (32 or 16 elements).
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * VL is not a multiple of λ × LMUL.
+ * MUL_C (= VLEN ÷ (SEW × λ²)) is not in \{1, 2, 4, 8, 16}.
+ * _vs1_ or _vs2_ is not aligned for LMUL.
+@@ -2423,6 +2448,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ let g : gemm_geom = decode_gemm_geometry(2);
+ 
+ if vm == 0 then check_microscaling_legality(2, g.LMUL, g.EEW_C, g.lambda, E8M0);
+@@ -2511,6 +2538,7 @@ The encodings SEW=8 (EEW=4, Int4 inputs into OFP8 accumulator), SEW=32, and SEW=
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * SEW = 8 (reserved encoding).
+ * SEW = 32 (reserved encoding).
+ * SEW = 64 (reserved encoding).
+@@ -2527,6 +2555,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ let EEW_C_check : int = 2 ^ get_sew_pow();
+ if EEW_C_check == 8  then return Illegal_Instruction();
+ if EEW_C_check == 32 then return Illegal_Instruction();
+@@ -2614,6 +2644,7 @@ Only SEW ∈ {32, 64} is valid; SEW ∈ {8, 16} is _reserved_.
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * SEW < 32 (reserved encoding).
+ * `altfmt_A` = 1 (reserved; MXINT inputs are signed).
+ * `altfmt_B` = 1 (reserved; MXINT inputs are signed).
+@@ -2628,6 +2659,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ if (2 ^ get_sew_pow()) < 32 then return Illegal_Instruction();
+ 
+ let g : gemm_geom = decode_gemm_geometry(8);
+@@ -2712,6 +2745,7 @@ The encodings SEW=8 (EEW=2), altfmt=1 with SEW=32, and SEW=64 are _reserved_.
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * SEW = 8 (reserved encoding).
+ * SEW = 32 and `altfmt` = 1 (reserved).
+ * SEW = 64 (reserved encoding).
+@@ -2728,6 +2762,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ let EEW_C_check : int = 2 ^ get_sew_pow();
+ if EEW_C_check == 8  then return Illegal_Instruction();
+ if EEW_C_check == 32 & vtype[altfmt] == 0b1 then return Illegal_Instruction();
+@@ -2803,6 +2839,7 @@ Accumulation is modular (wraps at 2^SEW^).
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * `vm` = 0 (_reserved_).
+ * VL is not a multiple of λ × LMUL.
+ * MUL_C (= VLEN ÷ (SEW × λ²)) is not in \{1, 2, 4, 8, 16}.
+@@ -2812,6 +2849,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ if vm == 0 then return Illegal_Instruction();
+ 
+ let g : gemm_geom = decode_gemm_geometry(1);
+@@ -3282,6 +3321,7 @@ Accumulation is modular (wraps at 2^SEW^).
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * VL is not a multiple of λ × LMUL.
+ * MUL_C (= VLEN ÷ (SEW × λ²)) is not in \{1, 2, 4, 8, 16}.
+ * _vs1_ or _vs2_ is not aligned for LMUL.
+@@ -3290,6 +3330,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ if vm == 0 then return Illegal_Instruction();
+ 
+ let g : gemm_geom = decode_gemm_geometry(4);
+@@ -3355,6 +3397,7 @@ Accumulation is modular (wraps at 2^SEW^).
+ Exceptions::
+ _Illegal Instruction_ is raised if any of the following conditions holds:
+ +
++* `vstart` ≠ 0.
+ * VL is not a multiple of λ × LMUL.
+ * MUL_C (= VLEN ÷ (SEW × λ²)) is not in \{1, 2, 4, 8, 16}.
+ * _vs1_ or _vs2_ is not aligned for LMUL.
+@@ -3363,6 +3406,8 @@ _Illegal Instruction_ is raised if any of the following conditions holds:
+ Operation::
+ [source,sail]
+ --
++if vstart != 0 then return Illegal_Instruction();
++
+ if vm == 0 then return Illegal_Instruction();
+ 
+ let g : gemm_geom = decode_gemm_geometry(2);

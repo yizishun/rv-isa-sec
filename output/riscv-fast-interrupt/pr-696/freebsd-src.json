@@ -1,0 +1,106 @@
+{
+  "pr_number": 696,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 696,
+    "violation_condition": "FreeBSD kernel code or bhyve VMM uses the pre-PR#696 IPRIO derivation rules (distinguishing iprio[i]=0 cases as 'higher/lower than machine external interrupt') to compute threshold comparisons when hardware implements the simplified IPRIO-delegated-to-AIA definition, causing xtopi-reported priority to diverge from the kernel's expected masking behavior",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "iprio.*0|threshold.*priority.*default|xtopi.*iprio|mip.*threshold|xithreshold.*compare|PR_HIGHER_THAN|PR_LOWER_THAN|default_priority.*external",
+    "affected_entities": [
+      "xithreshold",
+      "xtopi",
+      "miprio",
+      "siprio",
+      "mviprio",
+      "hviprio"
+    ],
+    "summary": "Delegating IPRIO derivation entirely to AIA breaks hardcoded default-priority assumptions in FreeBSD's interrupt masking logic: if bhyve or the kernel caches old iprio[i]=0 rules, threshold gating may silence critical interrupts or leak masked ones through"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_aplic.c",
+        "function_name": "aplic_handle_idc",
+        "line_start": 247,
+        "line_end": 262,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "IDC_ITHRESHOLD and IDC_TOPI registers are no-ops: guest writes to the interrupt-priority threshold are silently discarded, and reads of TOPI return uninitialized/zeroed data. The VMM APLIC does not implement the AIA priority-threshold masking model at all, meaning a guest OS that writes iprio[i] and expects threshold-based interrupt filtering will observe that all interrupts are delivered regardless of configured priority. This directly corresponds to the spec's xtopi-priority-divergence condition.",
+      "snippet": "case IDC_IDELIVERY(0):\ncase IDC_IFORCE(0):\ncase IDC_ITHRESHOLD(0):\ncase IDC_TOPI(0):\n\terror = 0;\n\tbreak;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_aplic.c",
+        "function_name": "aplic_handle_idc_claimi",
+        "line_start": 220,
+        "line_end": 232,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "CLAIMI always reports priority 0: the priority field is hardcoded to zero in the claimi response regardless of any per-interrupt priority that may have been configured by the guest via sourcecfg or target registers. This means the VMM APLIC cannot represent the AIA simplified-IPRIO model where the hardware (AIA) autonomously derives xtopi from iprio, because the VMM never stores or consults per-irq priority values.",
+      "snippet": "*val = (i << CLAIMI_IRQ_S) | (0 << CLAIMI_PRIO_S);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_aplic.c",
+        "function_name": "aplic_check_pending",
+        "line_start": 449,
+        "line_end": 480,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "aplic_check_pending only tests enabled && pending; it does not compare interrupt priority against the threshold register (which is itself unimplemented). This means all pending enabled interrupts are treated equally, with no priority-based masking. A guest OS expecting the AIA simplified-IPRIO threshold model will receive interrupts that hardware (or a correct VMM) would have masked.",
+      "snippet": "if ((irq->state & APLIC_IRQ_STATE_ENABLED) &&\n    (irq->state & APLIC_IRQ_STATE_PENDING)) {\n\tmtx_unlock_spin(&aplic->mtx);\n\t/* Found. */\n\treturn (1);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_restore_csrs",
+        "line_start": 161,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The hypcsr struct (riscv.h:56-68) and its save/restore paths do not include hviprio1 or hviprio2 CSRs. These AIA-dedicated priority CSRs are neither saved, restored, nor intercepted. If a guest attempts to program per-cause interrupt priorities via hviprio1/hviprio2, the VMM has no visibility and the guest's priority configuration is lost across VM-exit/VM-entry transitions.",
+      "snippet": "csr_write(vsstatus, csrs->vsstatus);\ncsr_write(vsie, csrs->vsie);\ncsr_write(vstvec, csrs->vstvec);\n/* ... hviprio1, hviprio2 absent ... */\ncsr_write(hvip, csrs->hvip);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "N/A (header definitions)",
+        "line_start": 161,
+        "line_end": 165,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The riscvreg.h header defines HVIP_VSSIP/VSTIP/VSEIP bits but does not define hviprio1, hviprio2, or hvictl CSR bit layouts. None of the kernel's CSR inline-assembly macros reference these AIA priority CSRs. This confirms the kernel has no awareness of the simplified-IPRIO-delegated-to-AIA CSR interface, so neither the VMM nor the bare-metal interrupt path can correctly virtualize or configure priority-based masking.",
+      "snippet": "#define HVIP_VSSIP (1 << 2)\n#define HVIP_VSTIP (1 << 6)\n#define HVIP_VSEIP (1 << 10)\n/* hviprio1, hviprio2, hvictl: absent */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/aplic.c",
+        "function_name": "aplic_setup_direct_mode",
+        "line_start": 405,
+        "line_end": 411,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The bare-metal APLIC driver sets threshold=0 (accept all) and uses a uniform default priority of 1 for all interrupts. It delegates all priority/threshold comparison to the hardware APLIC, which implements the correct AIA IPRIO model. No special-case handling of iprio=0 vs. machine-external-interrupt priority comparisons exists in this driver.",
+      "snippet": "aplic_write(sc, APLIC_IDC_IDELIVERY(sc, cpu),\n    APLIC_IDC_IDELIVERY_DISABLE);\naplic_write(sc, APLIC_IDC_ITHRESHOLD(sc, cpu),\n    APLIC_IDC_ITHRESHOLD_DISABLE);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/plic.c",
+        "function_name": "plic_attach",
+        "line_start": 434,
+        "line_end": 436,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PLIC driver sets threshold to 0 (accept all priorities) on all CPUs. Priority is treated as binary (0=disabled, 1=enabled). The PLIC has no AIA IPRIO concept and is unaffected by the simplified-IPRIO definition change.",
+      "snippet": "/* Set the threshold for each CPU to accept all priorities. */\nCPU_FOREACH(cpu)\n\tWR4(sc, PLIC_THRESHOLD(sc, cpu), 0);"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

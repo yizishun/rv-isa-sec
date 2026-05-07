@@ -1,0 +1,126 @@
+PR #2601  target=qemu  overall=bug_confirmed
+Spec: mseccfg.MML redefines PMP rule semantics (M-mode-only, S/U-only, Shared-Region) with sticky lockdown; QEMU failing to gate PMP checks on MML state would break guest Smepmp M-mode isolation, letting S/U-mode access M-mode-only regions or M-mode execute from unapproved memory
+Violation: QEMU's PMP check logic (likely in target/riscv/pmp.c) does not re-evaluate PMP rule classification when mseccfg.MML is set, causing M-mode-only rules (pmpcfg.L=1 under MML) to still be enforced in S/U-mode, or S/U-mode-only rules (pmpcfg.L=0 under MML) to incorrectly grant M-mode access, or Shared-Region encodings (pmpcfg.RW=01, pmpcfg.LRWX=1111) to be treated as reserved/ignored instead of enforced with correct access semantics. Additionally, M-mode instruction fetch restrictions under MML=1 (only M-mode-only or locked Shared-Region with X) may not be enforced in TCG-translated code, allowing M-mode to execute from unapproved memory regions.
+Consequence: privilege_escape
+Pattern: pmpcfg_L.*mseccfg|mseccfg.*MML|pmp_is_.*|pmp_hart_has_privs|mseccfg_mml|Smepmp|pmpcfg.*locked|shared.region|M-mode.only
+------------------------------------------------------------
+[bug_confirmed] target/riscv/machine.c:426-504  vmstate_riscv_cpu
+  mseccfg CSR is NOT migrated in vmstate_riscv_cpu. The VMState fields array (lines 432-483) has no VMSTATE_UINTTL(env.mseccfg, ...) entry. On live migration, mseccfg resets to 0 on the destination. If the source had MML=1 (Smepmp lockdown), MMWP=1 (whitelist policy), RLB=1 (rule lock bypass), USEED/SSEED (Zkr entropy access), or PMM (pointer masking) bits set, all these protections/state are silently dropped. Consequence: privilege_escape — Smepmp-mandated M-mode-only regions become writable from S/U-mode, M-mode exec restrictions are lifted, locked PMP entries can be modified, and pointer-masking configurations are lost.
+  | const VMStateDescription vmstate_riscv_cpu = {
+  |     .name = "cpu",
+  |     .version_id = 11,
+  |     .minimum_version_id = 11,
+  |     .post_load = riscv_cpu_post_load,
+  |     .fields = (const VMStateField[]) {
+  |         VMSTATE_UINTTL_ARRAY(env.gpr, RISCVCPU, 32),
+  |         ...
+  |         /* mseccfg is MISSING here — no VMSTATE_UINTTL(env.mseccfg, ...) */
+  |         VMSTATE_UINT64(env.stimecmp, RISCVCPU),
+  |         VMSTATE_END_OF_LIST()
+  |     },
+
+[compliant] target/riscv/pmp.c:375-523  pmp_hart_has_privs
+  Smepmp MML-mode PMP access checks correctly implement the spec truth table. The operation encoding via pmp_get_smepmp_operation() maps {L,R,W,X} to a 4-bit index matching the RISC-V privileged spec. M-mode access table (lines 445-475) and non-M-mode access table (lines 477-508) both match the spec exactly for all 16 operation codes. M-mode-only regions (ops 8,9,12,13,14) correctly deny S/U-mode. Shared-Region rules (ops 1,2,3,4,5,6,7,10,11,15) correctly grant S/U-mode access per spec. Default behavior when no PMP rule matches (pmp_hart_has_privs_default) correctly enforces MML restrictions: M-mode gets R+W for data but no X without a matching rule; S/U-mode is fully denied.
+  | if (!MSECCFG_MML_ISSET(env)) {
+  |     /* regular PMP */
+  |     *allowed_privs = PMP_READ | PMP_WRITE | PMP_EXEC;
+  |     if ((mode != PRV_M) || pmp_is_locked(env, i)) {
+  |         *allowed_privs &= env->pmp_state.pmp[i].cfg_reg;
+  |     }
+  | } else {
+  |     /* Smepmp enhanced check */
+  |     const uint8_t smepmp_operation =
+  |         pmp_get_smepmp_operation(env->pmp_state.pmp[i].cfg_reg);
+  |     if (mode == PRV_M) {
+  |         switch (smepmp_operation) { ... }
+
+[compliant] target/riscv/pmp.c:311-359  pmp_hart_has_privs_default
+  Default PMP behavior when no rule matches correctly handles all mseccfg configurations: (1) MMWP=1 → deny all including M-mode, (2) MML=1 → M-mode gets R+W for non-exec, S/U-mode denied, (3) Neither set → M-mode gets RWX unconditionally, S/U-mode denied if PMP rules exist. The MML path at line 330 correctly refuses exec access to M-mode when no matching rule grants it, enforcing the 'M-mode can only execute from M-mode-only or Shared-Region with X' requirement.
+  | if (MSECCFG_MMWP_ISSET(env)) {
+  |     *allowed_privs = 0;
+  |     return false;
+  | } else if (MSECCFG_MML_ISSET(env)) {
+  |     if (mode == PRV_M && !(privs & PMP_EXEC)) {
+  |         *allowed_privs = PMP_READ | PMP_WRITE;
+  |     } else {
+  |         *allowed_privs = 0;
+  |     }
+
+[compliant] target/riscv/pmp.c:150-198  pmp_write_cfg
+  pmpcfg write validation correctly enforces Smepmp constraints: read-only check (locked && !RLB) rejects writes to locked entries when RLB is clear; pmp_is_invalid_smepmp_cfg rejects writes of reserved Smepmp encodings (ops 9,10,11,13: executable M-mode-only or locked Shared-Region) when MML=1 and RLB=0; smpmpmt MT field reserved value (0x3) triggers WARL preservation of previous MT value; NA4 mode rejection when granularity > 4 bytes is correctly enforced.
+  | if (pmp_is_readonly(env, pmp_index)) {
+  |     qemu_log_mask(LOG_GUEST_ERROR, "ignoring pmpcfg write - read only\n");
+  | } else if (pmp_is_invalid_smepmp_cfg(env, val)) {
+  |     qemu_log_mask(LOG_GUEST_ERROR, "ignoring pmpcfg write - invalid\n");
+  | } else {
+  |     ...
+  |     env->pmp_state.pmp[pmp_index].cfg_reg = val;
+  |     pmp_update_rule_addr(env, pmp_index);
+
+[compliant] target/riscv/pmp.c:662-703  mseccfg_csr_write
+  mseccfg CSR write handler correctly implements: (1) MMWP/MML sticky bits (0→1 only, never 1→0) when ext_smepmp, (2) RLB cannot be set when locked entries exist, (3) TLB flush triggered when MMWP or MML transitions, (4) PMM field only writable when ext_smmpm + RV64 + non-reserved value, (5) without Smepmp, RLB/MMWP/MML are forced to 0. The mask-based sticky-bit implementation correctly uses val |= (env->mseccfg & mask) to preserve any previously-set bits in the mask.
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |     /* Sticky bits */
+  |     val |= (env->mseccfg & mask);
+  |     if ((val ^ env->mseccfg) & mask) {
+  |         tlb_flush(env_cpu(env));
+  |     }
+  | } else {
+  |     mask |= MSECCFG_RLB;
+  |     val &= ~(mask);
+  | }
+
+[compliant] target/riscv/pmp.c:574-617  pmpaddr_csr_write
+  pmpaddr write correctly handles TOR mode constraint: when the next entry uses TOR matching AND is read-only (locked and !RLB), the write is rejected since both pmpaddr[i] and pmpaddr[i+1] must be writable to change a TOR region boundary. On write success, both current and next TOR entry addresses are updated, and TLB is flushed.
+  | if (pmp_is_readonly(env, addr_index + 1) && is_next_cfg_tor) {
+  |     qemu_log_mask(LOG_GUEST_ERROR,
+  |                   "ignoring pmpaddr write - pmpcfg+1 read only\n");
+  |     return;
+  | }
+
+[compliant] target/riscv/pmp.c:77-110  pmp_is_invalid_smepmp_cfg
+  Smepmp invalid config validation is correct. When MML=1 and RLB=0, operations 9 (M-mode-only X), 10 (locked Shared-Region X), 11 (locked Shared-Region X w/ R), and 13 (M-mode-only R+X) are properly flagged as invalid/reserved. The check correctly returns 0 (not invalid) when MML=0 or RLB=1, allowing those encodings when MML is inactive or RLB bypasses the restriction. All 16 Smepmp operations are exhaustively handled with g_assert_not_reached() for impossible values.
+  | if (!MSECCFG_MML_ISSET(env) || MSECCFG_RLB_ISSET(env)) {
+  |     return 0;
+  | }
+  | switch (pmp_get_smepmp_operation(val)) {
+  | case 9: case 10: case 11: case 13:
+  |     return 1;
+  | ...
+
+[potential_risk] target/riscv/cpu.c:757-766  riscv_cpu_reset_hold
+  mseccfg is only zeroed during reset when ext_smepmp is true (line 762-764). When Smepmp is disabled but other extensions using mseccfg bits are enabled (Zkr for USEED/SSEED, Zjpm for PMM, Zicfilp for MLPE), mseccfg is NOT cleared. Stale mseccfg values from a previous boot or migration could persist across reset. While PMP entries are unlocked via pmp_unlock_entries() unconditionally (line 766), the mseccfg register itself retains potentially dangerous values for non-Smepmp configurations.
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |     env->mseccfg = 0;
+  | }
+  | pmp_unlock_entries(env);
+
+[compliant] target/riscv/cpu_helper.c:1142-1164  get_physical_address_pmp
+  PMP integration point in MMU translation is correct. PMP check is performed after page table walk succeeds. When PMP is disabled, full RWX is granted. On PMP failure, *prot is set to 0 and TRANSLATE_PMP_FAIL is returned, triggering pmp_violation flag in riscv_cpu_tlb_fill which raises the correct exception type (INST_ACCESS_FAULT, LOAD_ACCESS_FAULT, or STORE_AMO_ACCESS_FAULT). TLB size is constrained by pmp_get_tlb_size to prevent caching across PMP region boundaries.
+  | pmp_has_privs = pmp_hart_has_privs(env, addr, size, 1 << access_type,
+  |                                    &pmp_priv, mode);
+  | if (!pmp_has_privs) {
+  |     *prot = 0;
+  |     return TRANSLATE_PMP_FAIL;
+  | }
+  | *prot = pmp_priv_to_page_prot(pmp_priv);
+
+[compliant] target/riscv/pmp.c:38-42  pmp_get_smepmp_operation
+  Smepmp operation encoding is correct. The function maps cfg_reg byte {L[7], 0[6], A1[5], A0[4], X[3], W[2], R[1]} — actually pmpcfg is {L[7], 0, A[5:4], X[3], W[2], R[1]} wait no, the byte layout is [L, 0, A1, A0, X, W, R] = bits[7:0]. The encoding computes {L(b3), R(b2), W(b1), X(b0)} which matches the Smepmp spec operation encoding. Cross-referenced against the full 16-entry truth table in the Privileged ISA spec for both M-mode and S/U-mode — all entries produce correct operation numbers.
+  | static inline uint8_t pmp_get_smepmp_operation(uint8_t cfg)
+  | {
+  |     return ((cfg & PMP_LOCK) >> 4) | ((cfg & PMP_READ) << 2) |
+  |            (cfg & PMP_WRITE) | ((cfg & PMP_EXEC) >> 2);
+  | }
+
+[compliant] target/riscv/machine.c:34-47  pmp_post_load
+  PMP migration post_load callback correctly reconstructs cached address ranges (sa/ea) and num_rules from the raw cfg_reg/addr_reg fields. The PMP state is properly included as a subsection conditioned on cpu->cfg.pmp, ensuring migration compatibility with non-PMP configurations. Both cfg_reg and addr_reg are migrated for all MAX_RISCV_PMPS entries.
+  | static int pmp_post_load(void *opaque, int version_id)
+  | {
+  |     for (i = 0; i < pmp_regions; i++) {
+  |         pmp_update_rule_addr(env, i);
+  |     }
+  |     pmp_update_rule_nums(env);
+  |     return 0;
+  | }
+

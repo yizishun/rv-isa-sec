@@ -1,0 +1,92 @@
+{
+  "pr_number": 2901,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2901,
+    "violation_condition": "FreeBSD kernel executes Zisb speculation barrier instructions (TEB/MDB/DPB) on hardware that either lacks Zisb—treating them as Zimop no-ops—or incorrectly implements the barrier semantics, so transient speculation leaks kernel data through cache-based side channels across context-switch (swtch.S savectx), copyin/copyout bounds checks (copyinout.S), signal-delivery (exec_machdep.c), or bhyve VM-entry/exit (vmm_riscv.c henvcfg paths) boundaries.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "isb|fence|teb|mdb|dpb|SPECULATION|spectre|cache.side.channel|transient.execution|Zimop|Zisb",
+    "affected_entities": [
+      "TEB",
+      "MDB",
+      "DPB",
+      "Zimop"
+    ],
+    "summary": "Zisb barrier instructions encoded via Zimop silently no-op on non-Zisb hardware, defeating Spectre mitigations FreeBSD places around bounds checks, context switches, and VM boundaries"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 357,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Context-switch path (cpu_switch/savectx) performs no speculation barrier between saving old thread state and restoring new thread state. On hardware susceptible to transient-execution attacks, predictor state from the old thread could leak into the new thread's execution without a Zisb TEB/MDB/DPB barrier. Currently the kernel emits no Zisb instructions at all, so the specific violation condition (executing Zisb on non-Zisb HW) is not triggered; however the absence of any speculation barrier is a gap.",
+      "snippet": "ENTRY(cpu_switch)\n        /* Store the new curthread */\n        sd      a1, PC_CURTHREAD(tp)\n        /* And the new pcb */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "savectx() saves all callee-saved registers and FPU state without any speculation barrier before/after. In crash-dump or debug paths this could snapshot predictor-influenced register values without flushing transient state. Same pattern as cpu_switch—no Zisb instructions exist to be silently no-opped, but no speculation defense exists either.",
+      "snippet": "ENTRY(savectx)\n        /* Store ra, sp and the callee-saved registers */\n        sd      ra, (PCB_RA)(a0)\n        sd      sp, (PCB_SP)(a0)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/copyinout.S",
+        "function_name": "copycommon",
+        "line_start": 60,
+        "line_end": 108,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "copyin/copyout uses ENTER_USER_ACCESS (sets SSTATUS_SUM) and EXIT_USER_ACCESS (clears SSTATUS_SUM) to toggle user memory accessibility. No speculation barrier separates the user-access window from kernel-only execution. On hardware with speculative SUM-bypass, transient loads past the bounds-check at lines 117-119 could leak kernel data before the fault handler fires. No Zisb barrier instructions exist in this code path.",
+      "snippet": "ENTRY(copyout)\n        beqz    a2, copyout_end   /* If len == 0 then skip loop */\n        add     a3, a1, a2\n        li      a4, VM_MAXUSER_ADDRESS\n        bgeu    a3, a4, copyio_fault_nopcb"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sendsig",
+        "line_start": 337,
+        "line_end": 413,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sendsig() copies out signal frame to user stack via copyout() at line 387 with no speculation barrier before modifying tf_sepc/tf_sp/tf_ra for signal delivery. Transient execution could train predictors on the old user context before the new signal-handler context is fully installed. set_mcontext() in sys_sigreturn() (line 326) similarly lacks barriers when restoring user-controlled register state from the signal frame.",
+      "snippet": "sendsig(sig_t catcher, ksiginfo_t *ksi, sigset_t *mask)\n        ...\n        if (copyout(&frame, fp, sizeof(*fp)) != 0) {\n                CTR2(KTR_SIG, \"sendsig: sigexit td=%p fp=%p\", td, fp);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 41,
+        "line_end": 204,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmm_switch() performs VM-entry (sret to guest at line 120) and VM-exit (return via .Lswitch_return at line 123) with CSR swaps (sstatus, hstatus, scounteren) but no speculation barrier. On VM-exit, guest-controlled predictor state could influence host execution before the CSR restore completes. henvcfg in vmmops_run() (vmm_riscv.c:632) is only set with HENVCFG_STCE for Sstc timer delegation—no speculation-related henvcfg bits are configured. No Zisb barriers exist in the VM-entry/exit path.",
+      "snippet": "ENTRY(vmm_switch)\n        sd      ra, (HYP_H_RA)(a0)\n        ...\n        sret\n\n        .align 2\n.Lswitch_return:"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/identcpu.c",
+        "function_name": "(global state)",
+        "line_start": 82,
+        "line_end": 104,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ISA extension detection infrastructure exists (z_extensions bitmask) but Zisb is not enumerated. S-mode extensions track only SV_SSTC/SV_SVNAPOT/SV_SVPBMT/SV_SVINVAL/SV_SSCOFPMF. This is compliant with current state because the kernel does not emit Zisb instructions—if Zisb barriers were added, this detection layer would need to be extended to conditionally gate their emission.",
+      "snippet": "struct cpu_desc {\n        ...\n        u_int           z_extensions;\n#define  Z_ZICBOM       (1 << 0)\n#define  Z_ZICBOZ       (1 << 1)\n#define  Z_ZICBOP       (1 << 2)"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

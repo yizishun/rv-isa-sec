@@ -1,0 +1,4 @@
+-Used same template for threat model as CoVE-IO.
+-Expanded on the summary of the threat model per the template. 
+-Collapsed the summary table in the section into details for each of the threat scenarios.
+-Separated the arch overview from threat model.

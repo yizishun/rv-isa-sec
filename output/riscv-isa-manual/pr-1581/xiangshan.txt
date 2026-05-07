@@ -1,0 +1,57 @@
+PR #1581  target=xiangshan  overall=compliant
+Spec: CSRRS/CSRRC read-modify-write on pmpaddr spuriously clears 'reads as' G-bits when modifying unrelated writable bits, because the read path returns architecturally-masked values instead of underlying physical register state, corrupting PMP region boundaries
+Violation: When CSRRS or CSRRC executes on a pmpaddr CSR, the CSR read path returns the architecturally-masked value (e.g., pmpaddr[G-1]=0 when underlying physical bit is 1). The read-modify-write datapath uses this masked read value as the base for bit-set/bit-clear, then writes back, inadvertently clearing the underlying G-bit because 0 was read and written back instead of the physical 1.
+Consequence: privilege_escape
+Pattern: CSR read-modify-write datapath that sources read data from the architecturally-masked read port (i.e., after applying "reads as" bit masking) rather than the raw physical register state for bits that read-as-zero/write-legal but hold nonzero underlying values; specifically grep for pmpaddr read mux logic combined with CSRRC/CSRRS writeback in Chisel CSR module
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/wrapper/CSR.scala:71-76  CSR (wdata calculation for CSRRS/CSRRC)
+  CSRRS/CSRRC wdata calculation correctly sources read-base from regOut (raw physical register value via csrMod.io.out.bits.regOut) rather than rdata (architecturally-masked read port). Lines 75-76: set -> (regOut | src1), clr -> (regOut & (~src1).asUInt). The raw unmasked physical register value is used as the RMW base, so grain-size-zeroed bits that 'read as zero' are preserved correctly when CSRRS sets additional bits or CSRRC clears them.
+  | private val regOut = csrMod.io.out.bits.regOut
+  | private val wdata = LookupTree(func, Seq(
+  |   CSROpType.set  -> (regOut | src1),
+  |   CSROpType.clr  -> (regOut & (~src1).asUInt),
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1011-1019  NewCSR (regOut Mux1H sourcing from pmpCSROutMap)
+  The regOut output Mux queries csrOutMap which for pmpaddr maps to pmpCSROutMap (CSRPMP.scala:65-67). This sources from csr.regOut.asInstanceOf[CSRBundle].asUInt, which is the raw physical register (CSRModule.scala:49: regOut := reg), NOT the rdata masked read port. This ensures the wrapper CSR gets the unmasked register value for RMW calculations.
+  | private val regOut = Mux1H(csrOutMapFilter.map { case (id, regOut) =>
+  |   if (vsMapS.contains(id)) {
+  |     ((isModeVS && addr === vsMapS(id).U) || !isModeVS && addr === id.U) -> regOut
+  |   } else if (sMapVS.contains(id)) {
+  |     (!isModeVS && addr === id.U) -> regOut
+  |   } else {
+  |     (raddr === id.U) -> regOut
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPMP.scala:43-67  CSRPMP (pmpaddr rdata vs regOut separation)
+  pmpaddr CSR modules override only rdata (via HasPMPAddrSink: rdata := addrRData(num)) with the grain-size-masked read value from readAddr(). The regOut path is NOT overridden, so it continues to reflect the raw physical register (ADDRESS field). The pmpCSROutMap correctly maps to csr.regOut (raw), while the pmpCSRMap maps to csr.rdata (masked, used for the register-file return value only). This clean separation is exactly what prevents the described vulnerability.
+  | val pmpaddr: Seq[CSRModule[_]] = Range(0, p(PMParameKey).NumPMP).map(num =>
+  |   if (num < p(PMParameKey).NumPMPReal) {
+  |     Module(new CSRModule(s"Pmpaddr$num", new PMPAddrBundle) with HasPMPAddrSink {
+  |       rdata := addrRData(num)
+  |     })
+  | 
+  | val pmpCSROutMap: SeqMap[Int, UInt] = SeqMap.from(
+  |   pmpCSRMods.map(csr => csr.addr -> csr.regOut.asInstanceOf[CSRBundle].asUInt).iterator
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRModule.scala:45-49  CSRModule (rdata vs regOut assignment)
+  rdata and regOut are defined as separate output ports with separate sources: rdata := rdataFields.asUInt (with mask applied by rdataFields :|= regOut, and potentially overridden by mixin traits), regOut := reg (raw physical register, never masked). The WARL write path (lines 29-41) writes legal values into reg based on wen && wfield.isLegal, correctly applying WARL write filtering. Both CSRRW and CSRRS/CSRRC write data arrives through the same wdata port with WARL filtering.
+  | val rdataFields = IO(Output(bundle))
+  | rdataFields :|= regOut
+  | rdata := rdataFields.asUInt
+  | regOut := reg
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/PMPEntryModule.scala:61-86  PMPEntryHandleModule (pmpAddrR vs pmpAddrW separation)
+  The PMPEntryHandleModule correctly separates the read path (pmpAddrR, conditioned on ren, applies readAddr() grain-masking) from the write path (pmpAddrW, conditioned on wen, applies lock-check and stores raw wdata). The read and write are independent Wire vectors that can be active simultaneously, but the read and write go to different destinations: pmpAddrRData drives the CSR read port, pmpAddrWData drives the CSR write port. The RMW-constructed wdata from wrapper/CSR.scala arrives at pmpAddrW through the wen path and bypasses the readAddr() masking entirely.
+  | pmpAddrW(i) := Mux(!addrNextLocked, wdata, pmpEntry(i).addr.ADDRESS.asUInt)
+  | ...
+  | when(ren && (addr === (CSRs.pmpaddr0 + i).U)) {
+  |   pmpAddrR(i) := pmpEntry(i).readAddr(pmpEntry(i).cfg, pmpEntry(i).addr.ADDRESS.asUInt)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:352-362  PMP (distributed CSR instances, old MaskedRegMap path)
+  The independent PMP instances in Frontend, L2TLB, and MemBlock receive distributed CSR writes from the wrapper. These writes are the already-RMW-processed wdata from wrapper/CSR.scala (which used regOut as the RMW base). The MaskedRegMap.generate handles writes through wfn (which stores raw wdata without masking) and reads through rfn (which applies grain-masking). Since the RMW is done upstream in the wrapper before the data reaches these modules, these PMP instances always receive correct, unmasked write data.
+  | val pmpMapping = pmp_gen_mapping(pmp_init, NumPMPReal, CSRs.pmpcfg0, CSRs.pmpaddr0, pmp)
+  | val pmaMapping = pmp_gen_mapping(pma_init, NumPMAReal, PmacfgBase, PmaaddrBase, pma)
+  | val mapping = pmpMapping ++ pmaMapping
+  | val rdata = Wire(UInt(PMXLEN.W))
+  | MaskedRegMap.generate(mapping, w.bits.addr, rdata, w.valid, w.bits.data)
+

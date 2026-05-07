@@ -1,0 +1,65 @@
+`ValueType` allows Booleans, but Booleans were not handled in the comparison code. They were assumed to be integers, which Ruby does not seem to like. This explicitly checks for booleans and compares them appropriately.
+
+Fixes the following error:
+
+```
+/home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/casts.rb:18:in 'T::Private::Casts.cast': T.cast: Expected type Integer, got type TrueClass (TypeError)
+Caller: /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1062
+
+        raise TypeError.new("#{cast_method}: #{error}\n#{suffix}")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/_types.rb:137:in 'T.cast'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1062:in 'Udb::ParameterTerm#<=>'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1087:in 'Udb::ParameterTerm#eql?'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1380:in 'Hash#key?'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1380:in 'block (2 levels) in Udb::LogicNode#literals'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1379:in 'Array#each'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1379:in 'block in Udb::LogicNode#literals'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1378:in 'Array#each'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1378:in 'Enumerable#each_with_object'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1378:in 'Udb::LogicNode#literals'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/logic.rb:1347:in 'Udb::LogicNode#terms'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/condition.rb:647:in 'Udb::Condition#expand_term_requirements'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:179:in 'UnboundMethod#bind_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:179:in 'T::Private::Methods::CallValidation.validate_call_skip_block_type'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:121:in 'block in Udb::Condition#create_validator_slow_skip_block_type'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/condition.rb:604:in 'Udb::Condition#expand_parameter_term_requirements'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation_2_7.rb:1653:in 'UnboundMethod#bind_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation_2_7.rb:1653:in 'block in Udb::Condition#create_validator_procedure_medium3'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/condition.rb:654:in 'block in Udb::Condition#expand_term_requirements'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/condition.rb:649:in 'Array#each'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/condition.rb:649:in 'Udb::Condition#expand_term_requirements'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'UnboundMethod#bind_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'T::Private::Methods::CallValidation.validate_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/_methods.rb:259:in 'block in Udb::Condition#_on_method_added'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/condition.rb:728:in 'Udb::Condition#solver'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'UnboundMethod#bind_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'T::Private::Methods::CallValidation.validate_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/_methods.rb:259:in 'block in Udb::Condition#_on_method_added'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/condition.rb:930:in 'Udb::Condition#satisfiable?'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'UnboundMethod#bind_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'T::Private::Methods::CallValidation.validate_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/_methods.rb:259:in 'block in Udb::Condition#_on_method_added'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/cfg_arch.rb:325:in 'Udb::ConfiguredArchitecture#full_config_valid?'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'UnboundMethod#bind_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'T::Private::Methods::CallValidation.validate_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/_methods.rb:259:in 'block in Udb::ConfiguredArchitecture#_on_method_added'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/cfg_arch.rb:253:in 'Udb::ConfiguredArchitecture#valid?'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'UnboundMethod#bind_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/call_validation.rb:282:in 'T::Private::Methods::CallValidation.validate_call'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/sorbet-runtime-0.6.13055/lib/types/private/methods/_methods.rb:259:in 'block in Udb::ConfiguredArchitecture#_on_method_added'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/lib/udb/cli.rb:107:in 'Udb::CliCommands::Validate#cfg'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/thor-1.5.0/lib/thor/command.rb:28:in 'Thor::Command#run'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/thor-1.5.0/lib/thor/invocation.rb:127:in 'Thor::Invocation#invoke_command'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/thor-1.5.0/lib/thor.rb:538:in 'Thor.dispatch'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/thor-1.5.0/lib/thor/invocation.rb:116:in 'Thor::Invocation#invoke'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/thor-1.5.0/lib/thor.rb:338:in 'block in Udb::Cli#subcommand'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/thor-1.5.0/lib/thor/command.rb:28:in 'Thor::Command#run'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/thor-1.5.0/lib/thor/invocation.rb:127:in 'Thor::Invocation#invoke_command'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/thor-1.5.0/lib/thor.rb:538:in 'Thor.dispatch'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/thor-1.5.0/lib/thor/base.rb:585:in 'Thor::Base::ClassMethods#start'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/lib/ruby/gems/3.4.0/gems/udb-0.1.3/bin/udb:11:in '<top (required)>'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/bin/udb:25:in 'Kernel#load'
+	from /home/runner/.local/share/mise/installs/ruby/3.4.8/bin/udb:25:in '<main>'
+```
+

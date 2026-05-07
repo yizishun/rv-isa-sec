@@ -1,0 +1,149 @@
+PR #2598  target=linux  overall=compliant
+Spec: Ziccid scopes instruction-fetch coherence guarantees to cacheable+coherent PMAs only; kernel must not optimize away FENCE.I synchronization based on Ziccid eventuality without verifying PMA attributes, or non-coherent regions will silently execute stale instructions
+Violation: Linux kernel code writes to instruction memory in a region that lacks both cacheability and coherence PMAs, then relies on Ziccid's eventuality guarantee (stores eventually visible to all harts' instruction fetches without explicit FENCE.I) to execute the modified code on a remote hart. The spec scopes Ziccid exclusively to cacheable+coherent PMA regions; non-coherent/uncacheable regions proceed as if Ziccid were not implemented, where stores may never become instruction-visible without FENCE.I.
+Consequence: data_corruption
+Pattern: flush_icache_all|flush_icache_mm|flush_icache_range|local_flush_icache_all|fence\.i|__patch_insn_write|patch_text|sbi_remote_fence_i
+------------------------------------------------------------
+[compliant] arch/riscv/include/asm/cacheflush.h:11-14  local_flush_icache_all
+  Always emits fence.i unconditionally. No Ziccid conditionalization exists. Correctly guarantees instruction visibility on local hart after code modification.
+  | static inline void local_flush_icache_all(void)
+  | {
+  | 	asm volatile ("fence.i" ::: "memory");
+  | }
+
+[compliant] arch/riscv/mm/cacheflush.c:21-44  flush_icache_all
+  Issues local fence.i, then RISCV_FENCE(w,o) ordering barrier before MMIO-triggered IPI, then sbi_remote_fence_i() or on_each_cpu(fence.i) for all remote harts. Full cross-hart I-cache coherence is guaranteed with explicit fence.i on every hart.
+  | local_flush_icache_all();
+  | if (num_online_cpus() < 2)
+  | 	return;
+  | RISCV_FENCE(w, o);
+  | if (riscv_use_sbi_for_rfence())
+  | 	sbi_remote_fence_i(NULL);
+
+[compliant] arch/riscv/mm/cacheflush.c:57-95  flush_icache_mm
+  Uses icache_stale_mask deferred-flush mechanism with local_flush_icache_all() on local CPU and sbi_remote_fence_i()/on_each_cpu() for remote harts executing the MM. smp_mb() ordering when no IPI sent. No reliance on implicit visibility guarantees.
+  | cpumask_setall(mask);
+  | cpu = smp_processor_id();
+  | cpumask_clear_cpu(cpu, mask);
+  | local_flush_icache_all();
+  | ...
+  | sbi_remote_fence_i(&others);
+
+[compliant] arch/riscv/kernel/patch.c:111-163  __patch_insn_write
+  After memset/copy_to_kernel_nofault writes to text via fixmap, immediately calls local_flush_icache_range() which invokes fence.i on the local hart before unmapping. Correct for local-hart text patching.
+  | ret = copy_to_kernel_nofault(waddr, insn, len);
+  | local_flush_icache_range((unsigned long)waddr,
+  |                          (unsigned long)waddr + len);
+  | patch_unmap(FIX_TEXT_POKE0);
+
+[compliant] arch/riscv/kernel/patch.c:277-300  patch_text
+  Uses stop_machine() for cross-CPU text patching: one CPU writes, all CPUs spin then call local_flush_icache_all() (fence.i). atomic_inc_return_release()/atomic_read() pairing ensures the store is visible before any CPU returns. Fully synchronized across all harts.
+  | ret = patch_insn_write(patch->addr, patch->insns, patch->len);
+  | atomic_inc_return_release(&patch->cpu_count);
+  | ...
+  | while (atomic_read(&patch->cpu_count) <= num_online_cpus())
+  | 	cpu_relax();
+  | local_flush_icache_all();
+
+[compliant] arch/riscv/kernel/patch.c:239-248  patch_text_nosync
+  patch_insn_write() does local fence.i, then flush_icache_range() calls flush_icache_all() which sends fence.i IPI to all remote harts. Full cross-hart I-cache flush.
+  | ret = patch_insn_write(addr, insns, len);
+  | if (!ret)
+  | 	flush_icache_range((uintptr_t)addr, (uintptr_t)addr + len);
+
+[compliant] arch/riscv/kernel/jump_label.c:52-55  arch_jump_label_transform_apply
+  After batch-applying jump label patches, calls flush_icache_all() which invokes fence.i on all online CPUs. Correct for deferred batch patching.
+  | void arch_jump_label_transform_apply(void)
+  | {
+  | 	flush_icache_all();
+  | }
+
+[compliant] arch/riscv/kernel/ftrace.c:42-47  arch_ftrace_update_code
+  After ftrace_modify_all_code() modifies text in bulk, explicitly calls flush_icache_all() to execute fence.i on all harts. No reliance on implicit coherence.
+  | void arch_ftrace_update_code(int command)
+  | {
+  | 	command |= FTRACE_MAY_SLEEP;
+  | 	ftrace_modify_all_code(command);
+  | 	flush_icache_all();
+  | }
+
+[compliant] arch/riscv/mm/context.c:298-316  flush_icache_deferred
+  Deferred icache flush on context switch: checks icache_stale_mask, executes smp_mb() paired with flush_icache_mm() barrier, then local_flush_icache_all() (fence.i). Also avoids double-flush when switch_to() already did it. Correct deferred mechanism.
+  | cpumask_test_and_clear_cpu(cpu, &mm->context.icache_stale_mask);
+  | smp_mb();
+  | if (!(task && switch_to_should_flush_icache(task)))
+  | 	local_flush_icache_all();
+
+[compliant] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  On context switch, if the incoming task has force_icache_flush set (either per-process or per-thread) and migrated across CPUs, executes local_flush_icache_all() (fence.i) before switching envcfg. Correct for userspace fence.i permission migration guarantee.
+  | if (switch_to_should_flush_icache(__next))
+  | 	local_flush_icache_all();
+  | __switch_to_envcfg(__next);
+  | ((last) = __switch_to(__prev, __next));
+
+[compliant] arch/riscv/net/bpf_jit_core.c:179-192  bpf_int_jit_compile
+  After bpf_jit_binary_pack_finalize() copies JITed code from RW to ROX region, calls bpf_flush_icache() which invokes flush_icache_range() → flush_icache_all() → fence.i on all CPUs. BPF JIT code is cacheable+coherent kernel memory, and fence.i is always executed.
+  | bpf_jit_binary_pack_finalize(jit_data->ro_header, jit_data->header);
+  | bpf_flush_icache(jit_data->ro_header, ctx->ro_insns + ctx->ninsns);
+
+[compliant] arch/riscv/kvm/tlb.c:191-195  kvm_riscv_fence_i_process
+  KVM handler for guest fence.i WFI: calls local_flush_icache_all() which emits fence.i on the host hart. The VCPU can't migrate mid-emulation, so fence.i on the current hart is sufficient. KVM_REQ_FENCE_I cross-VCPU mechanism also triggers local_flush_icache_all() on each target VCPU hart.
+  | void kvm_riscv_fence_i_process(struct kvm_vcpu *vcpu)
+  | {
+  | 	kvm_riscv_vcpu_pmu_incr_fw(vcpu, SBI_PMU_FW_FENCE_I_RCVD);
+  | 	local_flush_icache_all();
+  | }
+
+[compliant] arch/riscv/kernel/machine_kexec.c:148-182  machine_kexec
+  Before jumping to kexec relocation code (written to control_code_buffer which is marked executable via set_memory_x()), executes local_flush_icache_all() (fence.i). On kexec all other CPUs are down, so local flush is sufficient.
+  | /* Make sure the relocation code is visible to the hart */
+  | local_flush_icache_all();
+  | ...
+  | kexec_method(first_ind_entry, jump_addr, fdt_addr,
+  |              this_hart_id, kernel_map.va_pa_offset);
+
+[compliant] arch/riscv/kernel/kgdb.c:120-151  do_single_step
+  After writing breakpoint instruction to text via copy_to_kernel_nofault(), calls flush_icache_range() → flush_icache_all() → fence.i on all online CPUs. KGDB stops all other CPUs, so all harts will see the instruction modification. undo_single_step() does the same for restoration.
+  | error = copy_to_kernel_nofault((void *)stepped_address,
+  | 			   arch_kgdb_ops.gdb_bpt_instr,
+  | 			   BREAK_INSTR_SIZE);
+  | if (!error) {
+  | 	flush_icache_range(addr, addr + BREAK_INSTR_SIZE);
+
+[compliant] arch/riscv/errata/thead/errata.c:189-224  thead_errata_patch_func
+  Early-boot alternatives (stage==RISCV_ALTERNATIVES_EARLY_BOOT) use raw memcpy() with MMU-off, then call local_flush_icache_all() (fence.i) after all patches applied. Later-stage alternatives use patch_text_nosync() which does full flush_icache_all(). Correct.
+  | if (stage == RISCV_ALTERNATIVES_EARLY_BOOT) {
+  | 	memcpy(oldptr, altptr, alt->alt_len);
+  | } else {
+  | 	mutex_lock(&text_mutex);
+  | 	patch_text_nosync(oldptr, altptr, alt->alt_len);
+  | 	mutex_unlock(&text_mutex);
+  | }
+  | ...
+  | if (stage == RISCV_ALTERNATIVES_EARLY_BOOT)
+  | 	local_flush_icache_all();
+
+[compliant] arch/riscv/kernel/sys_riscv.c:69-79  sys_riscv_flush_icache
+  Userspace icache flush syscall: calls flush_icache_mm() which performs fence.i locally and sbi_remote_fence_i() on all harts executing the current MM. No reliance on implicit coherence. The comment correctly notes that userspace fence.i alone is insufficient because the kernel may migrate threads.
+  | SYSCALL_DEFINE3(riscv_flush_icache, uintptr_t, start, uintptr_t, end,
+  | 	uintptr_t, flags)
+  | {
+  | 	flush_icache_mm(current->mm, flags & SYS_RISCV_FLUSH_ICACHE_LOCAL);
+  | 	return 0;
+  | }
+
+[compliant] arch/riscv/include/asm/cacheflush.h:16-20  local_flush_icache_range
+  RISC-V has no range-based icache flush instruction, so local_flush_icache_range() falls through to local_flush_icache_all() → fence.i. Conservative but correct. No range arguments are ignored in a way that would create a security gap.
+  | static inline void local_flush_icache_range(unsigned long start,
+  |                                             unsigned long end)
+  | {
+  | 	local_flush_icache_all();
+  | }
+
+[compliant] arch/riscv/include/asm/cacheflush.h:80-84  flush_icache_range
+  flush_icache_range() calls flush_icache_all() unconditionally, which always invokes fence.i on all online CPUs. No conditional path that could skip fence.i. Correct for both SMP and UP configurations.
+  | static inline void flush_icache_range(unsigned long start, unsigned long end)
+  | {
+  | 	flush_icache_all();
+  | }
+

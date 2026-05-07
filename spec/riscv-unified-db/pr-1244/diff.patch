@@ -1,0 +1,94 @@
+diff --git a/backends/cpp_hart_gen/lib/gen_cpp.rb b/backends/cpp_hart_gen/lib/gen_cpp.rb
+index 9fb62c6b73..16bc493ca2 100644
+--- a/backends/cpp_hart_gen/lib/gen_cpp.rb
++++ b/backends/cpp_hart_gen/lib/gen_cpp.rb
+@@ -270,6 +270,8 @@ def gen_cpp(symtab, indent = 2, indent_spaces: 2)
+       if csr_obj.nil?
+         if function_name == "sw_read"
+           "#{' ' * indent}__UDB_CSR_BY_ADDR(#{csr.idx_expr.gen_cpp(symtab, 0, indent_spaces:)}).#{function_name}(__UDB_XLEN)"
++        elsif function_name == "reset_value"
++          "#{' ' * indent}__UDB_CSR_BY_ADDR(#{csr.idx_expr.gen_cpp(symtab, 0, indent_spaces:)})._#{function_name}()"
+         else
+           "#{' ' * indent}__UDB_CSR_BY_ADDR(#{csr.idx_expr.gen_cpp(symtab, 0, indent_spaces:)}).#{function_name.gsub('?', '_Q_')}(#{args_cpp.join(', ')})"
+         end
+@@ -280,6 +282,8 @@ def gen_cpp(symtab, indent = 2, indent_spaces: 2)
+           else
+             "#{' ' * indent}__UDB_CSR_BY_NAME(#{csr_obj.name})._#{function_name}()"
+           end
++        elsif function_name == "reset_value"
++          "#{' ' * indent}__UDB_CSR_BY_NAME(#{csr_obj.name})._#{function_name}()"
+         else
+           "#{' ' * indent}__UDB_CSR_BY_NAME(#{csr_obj.name}).#{function_name.gsub('?', '_Q_')}(#{args_cpp.join(', ')})"
+         end
+diff --git a/backends/cpp_hart_gen/templates/csrs.hxx.erb b/backends/cpp_hart_gen/templates/csrs.hxx.erb
+index a4ba44afae..0fb5ec20f5 100644
+--- a/backends/cpp_hart_gen/templates/csrs.hxx.erb
++++ b/backends/cpp_hart_gen/templates/csrs.hxx.erb
+@@ -213,6 +213,17 @@ namespace udb {
+     const std::string name() const override { return "<%= csr.name %>"; }
+     PrivilegeMode mode() const override { return PrivilegeMode::<%= csr.priv_mode %>; }
+     bool writable() const override { return <%= csr.writable %>; }
++    ValueType _reset_value() const {
++      if (defined()) {
++        return 0_b
++        <%- fields_for_xlen.each do |field| -%>
++        | (m_<%= field.name %>.reset_value() << _Bits<64, false>(m_<%= field.name %>.location().lsb))
++        <%- end -%>
++        ;
++      } else {
++        "x"_xb;
++      }
++    }
+ 
+     bool defined() override {
+       return <%= csr.defined_by_condition.to_cxx { |ext_name, ext_req|
+diff --git a/spec/std/isa/csr/sstatus.yaml b/spec/std/isa/csr/sstatus.yaml
+index f634c71795..e22a88cf85 100644
+--- a/spec/std/isa/csr/sstatus.yaml
++++ b/spec/std/isa/csr/sstatus.yaml
+@@ -28,7 +28,7 @@ fields:
+       Alias of `mstatus.SD`.
+ 
+     type: RO-H
+-    reset_value: UNDEFINED_LEGAL
++    reset_value(): return CSR[mstatus].reset_value();
+     affectedBy: [F, D, V]
+   UXL:
+     location: 33-32
+diff --git a/tools/ruby-gems/idlc/lib/idlc/ast.rb b/tools/ruby-gems/idlc/lib/idlc/ast.rb
+index ea179764b1..5af63d647f 100644
+--- a/tools/ruby-gems/idlc/lib/idlc/ast.rb
++++ b/tools/ruby-gems/idlc/lib/idlc/ast.rb
+@@ -7450,6 +7450,8 @@ def type_check(symtab)
+       elsif ["implemented_without?"].include?(function_name)
+         type_error "Expecting one argument" unless args.size == 1
+         type_error "Expecting an ExtensionName" unless args[0].type(symtab).kind == :enum_ref && args[0].class_name == "ExtensionName"
++      elsif function_name == "reset_value"
++        type_error "unexpected argument(s)" unless args.empty?
+       else
+         type_error "'#{function_name}' is not a supported CSR function call"
+       end
+@@ -7458,7 +7460,7 @@ def type_check(symtab)
+     def type(symtab)
+ 
+       case function_name
+-      when "sw_read"
++      when "sw_read", "reset_value"
+         if csr_known?(symtab)
+           l = symtab.csr(csr.csr_name).length
+           Type.new(:bits, width: (l.nil? ? :unknown : l))
+@@ -7506,6 +7508,14 @@ def value(symtab)
+         ext_name = extension_name_enum_type.element_names[idx]
+ 
+         cd.implemented_without?(ext_name)
++      when "reset_value"
++        value_error "CSR not knowable" unless csr_known?(symtab)
++        cd = csr_def(symtab)
++        v = cd.reset_value
++        if v == "UNDEFINED_LEGAL"
++          value_error "undefined reset value"
++        end
++        v
+       else
+         internal_error "TODO: #{function_name}"
+       end

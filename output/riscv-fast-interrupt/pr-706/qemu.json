@@ -1,0 +1,116 @@
+{
+  "pr_number": 706,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 706,
+    "violation_condition": "QEMU exposes MIPU/SIPU bits as writable in mstatus/sstatus (once encoding is allocated) but does not implement automatic hardware context stacking on interrupt entry at the corresponding privilege level, OR QEMU incorrectly applies automatic stacking behavior to mipopret/sipopret return paths despite the spec explicitly exempting them",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "write_mstatus.*MIPU|write_mstatus.*SIPU|mstatus.*stack|riscv_cpu_do_interrupt.*SMCLIC|clc_save.*mstatus|smstateen.*clc",
+    "affected_entities": [
+      "mstatus",
+      "sstatus",
+      "mipopret",
+      "sipopret"
+    ],
+    "summary": "Unimplemented or incorrectly gated automatic stacking on interrupt entry corrupts guest hardware context when MIPU/SIPU bits are set, and misapplication to popret return paths violates the spec exemption that these bits do not influence mipopret/sipopret behavior"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "(mstatus bit definitions)",
+        "line_start": 610,
+        "line_end": 641,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MIPU/SIPU bits are NOT defined in mstatus/sstatus bitmask. Bits 0-42 and 63 (SD) are fully allocated to known extensions (UIE, SIE, MIE, UPIE, SPIE, UBE, MPIE, SPP, VS, MPP, FS, XS, MPRV, SUM, MXR, TVM, TW, TSR, SPELP, SDT, MPELP, GVA, MPV, MDT). No CLIC-spec MIPU/SIPU bits exist, so they cannot be improperly exposed as writable.",
+      "snippet": "#define MSTATUS_TW          0x00200000\n#define MSTATUS_TSR         0x00400000\n#define MSTATUS_SPELP       0x00800000\n#define MSTATUS_SDT         0x01000000\n#define MSTATUS_MPELP       0x020000000000"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_mstatus",
+        "line_start": 1995,
+        "line_end": 2066,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "write_mstatus uses a strict whitelist-based mask. Only explicitly defined bits (SIE, SPIE, MIE, MPIE, SPP, MPRV, SUM, MPP, MXR, TVM, TSR, TW + conditional FS, VS, SDT, MDT, MPV, GVA, UXL, MPELP, SPELP) are writable. All undefined/reserved bits (including any hypothetical MIPU/SIPU encoding) are write-ignored by default. No MIPU/SIPU bits in the mask.",
+      "snippet": "mask = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_MIE | MSTATUS_MPIE |\n    MSTATUS_SPP | MSTATUS_MPRV | MSTATUS_SUM |\n    MSTATUS_MPP | MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TSR |\n    MSTATUS_TW;\n...\nmstatus = (mstatus & ~mask) | (val & mask);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_sstatus",
+        "line_start": 3984,
+        "line_end": 4003,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "write_sstatus delegates to write_mstatus via read-modify-write of env->mstatus using sstatus_v1_10_mask plus conditional UXL, SPELP, SDT fields. No MIPU/SIPU bits are in the sstatus mask. Correct proxy through write_mstatus ensures consistent side-effect handling (TLB flush, SDT/SIE mutual exclusion).",
+      "snippet": "target_ulong mask = (sstatus_v1_10_mask);\n...\ntarget_ulong newval = (env->mstatus & ~mask) | (val & mask);\nreturn write_mstatus(env, CSR_MSTATUS, newval, ra);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2370,
+        "line_end": 2511,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Interrupt entry correctly implements standard RISC-V trap behavior: S-mode saves SPIE←SIE, SPP←priv, clears SIE (line 2407-2414); M-mode saves MPIE←MIE, MPP←priv, clears MIE (line 2470-2487). No hardware context stacking (register push to memory) is performed, which is spec-correct since SMCLIC/CLC extension is not enabled. No MIPU/SIPU-dependent behavior exists.",
+      "snippet": "s = env->mstatus;\ns = set_field(s, MSTATUS_SPIE, get_field(s, MSTATUS_SIE));\ns = set_field(s, MSTATUS_SPP, env->priv);\ns = set_field(s, MSTATUS_SIE, 0);\nenv->mstatus = s;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "helper_sret",
+        "line_start": 286,
+        "line_end": 369,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SRET handler restores SIE from SPIE, sets SPIE=1, SPP=PRV_U. No automatic hardware context unstacking is applied to the sret return path, which is spec-correct since SMCLIC is not enabled. The 'sipopret' / 'mipopret' return instructions defined by CLIC do not exist in this codebase, so the exemption clause in the security spec is moot.",
+      "snippet": "target_ulong retpc = env->sepc;\ntarget_ulong prev_priv = get_field(env->mstatus, MSTATUS_SPP);\ntarget_ulong prev_virt = get_field(env->hstatus, HSTATUS_SPV);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "helper_mret",
+        "line_start": 407,
+        "line_end": 455,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MRET handler restores MIE from MPIE, sets MPIE=1, MPP appropriately. No automatic hardware context unstacking is applied to the mret return path, which is spec-correct. Neither mipopret nor sipopret instructions exist, so the security spec's concern about incorrect stacking on popret return paths is not applicable.",
+      "snippet": "target_ulong retpc = env->mepc;\ntarget_ulong prev_priv = get_field(env->mstatus, MSTATUS_MPP);\nenv->mstatus = set_field(env->mstatus, MSTATUS_MIE,\n                         get_field(env->mstatus, MSTATUS_MPIE));"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_smstateen",
+        "line_start": 264,
+        "line_end": 282,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "smstateen (mstateen/hstateen/sstateen) arrays are included in migration vmstate. Since MIPU/SIPU CSR bits don't exist, there are no missing migration fields related to the security spec. The smstateen migration subsection is correctly gated on ext_smstateen and includes all three arrays.",
+      "snippet": "VMSTATE_UINT64_ARRAY(env.mstateen, RISCVCPU, 4),\nVMSTATE_UINT64_ARRAY(env.hstateen, RISCVCPU, 4),\nVMSTATE_UINT64_ARRAY(env.sstateen, RISCVCPU, 4),"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/kvm/kvm-cpu.c",
+        "function_name": "(kvm_ext_config)",
+        "line_start": 345,
+        "line_end": 345,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM path only maps ext_smstateen to KVM_RISCV_ISA_EXT_SMSTATEEN capability flag. No MIPU/SIPU CSR synchronization code exists since these bits are not implemented. KVM manages mstateen/hstateen/sstateen values kernel-side, which is the correct approach for this extension.",
+      "snippet": "KVM_EXT_CFG(\"smstateen\", ext_smstateen, KVM_RISCV_ISA_EXT_SMSTATEEN),"
+    }
+  ],
+  "overall_severity": "compliant"
+}

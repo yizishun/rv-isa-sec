@@ -1,0 +1,3 @@
+This pr is to introduce how to name the vector function associated to the scalar function decorated with an OpenMP `declare simd` directive.  It' s important because library vendor and compilers must follow this rule to interface with each other. For example, now risc-v doesn't support libmvec in glibc, if we want to support it, we need to know how to name the vectorized math functions.
+
+I have referenced the aarch64 name manling rule` vfabia64` in <https://github.com/ARM-software/abi-aa/blob/main/vfabia64/vfabia64.rst#vector-function-signature>. The main difference is that the `lmul` in risc-v replace the `isa` in aarch64.

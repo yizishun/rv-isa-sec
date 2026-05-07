@@ -1,0 +1,105 @@
+PR #729  target=freebsd-src  overall=compliant
+Spec: CLIC IVT mode cannot reliably clear mip/sip pending bits on trap entry for level-triggered interrupts; FreeBSD dispatch logic that re-examines pending-bit state after hardware vectored entry risks infinite re-trap storm before PLIC acknowledgment, halting the hart
+Violation: FreeBSD's RISC-V hart runs in CLIC IVT (Interrupt Vector Table) mode with a level-sensitive external interrupt source (e.g., PLIC-wired IRQ). Hardware vectors to the handler via VTBASE lookup and *attempts* to clear the interrupt-pending bit in mip/sip per the new spec, but cannot do so because the device still physically asserts the level line. After the FreeBSD handler returns (mret) or when the kernel's dispatch loop polls mip/sip/mnxti pending bits, the still-set bit triggers immediate re-trapping into the same handler. This forms a tight re-trap loop where the handler is invoked indefinitely before it ever reaches the PLIC claim/complete register write or the inthand_add()/intr_event_handle() stage that would deassert the source.
+Consequence: denial_of_service
+Pattern: RISC-V CLIC/IVT-mode interrupt paths where: (a) the trap entry path or dispatch loop in sys/riscv/riscv/intr_machdep.c or sys/riscv/riscv/trap.c polls mip/sip/mnxti pending bits as a loop condition; (b) no software masking (PLIC threshold/IE or mie CSR bits) occurs at the handler prologue before the pending-bit is (re)examined; (c) the pattern of 'csrr mie / csrr mip / csrrw sip' near a bnez loop or XINTR dispatch without prior PLIC claim. Look for mcause polling loops that assume pending-bit auto-clear on entry.
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/exception.S:219-225  cpu_exception_handler_supervisor
+  Trap entry uses standard stvec-based dispatch (cpu_exception_handler), not CLIC IVT/VTBASE mode. scause is saved to trapframe once in save_registers macro; no auto-clear of pending bits occurs because the PLIC claim register read is the sole mechanism for deasserting interrupts. The sret at line 224 returns to the interrupted context without any mip/sip polling loop.
+  | ENTRY(cpu_exception_handler_supervisor)
+  | 	save_registers 1
+  | 	mv	a0, sp
+  | 	call	_C_LABEL(do_trap_supervisor)
+  | 	load_registers 1
+  | 	sret
+
+[compliant] sys/riscv/riscv/trap.c:318-323  do_trap_supervisor
+  Interrupt dispatch reads scause bits once from the trapframe (saved at exception entry) and calls intr_irq_handler exactly once. No loop re-examining mip/sip/mnxti; no bnez on CSR pending bits after handler return. The function returns immediately after intr_irq_handler, relying on sret to resume execution.
+  | exception = frame->tf_scause & SCAUSE_CODE;
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  | 	/* Interrupt */
+  | 	intr_irq_handler(frame, INTR_ROOT_IRQ);
+  | 	return;
+  | }
+
+[compliant] sys/riscv/riscv/trap.c:399-404  do_trap_user
+  User-mode interrupt path is structurally identical to supervisor path: single read of scause from frame, single call to intr_irq_handler, no polling loop. Same compliance as do_trap_supervisor.
+  | exception = frame->tf_scause & SCAUSE_CODE;
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  | 	/* Interrupt */
+  | 	intr_irq_handler(frame, INTR_ROOT_IRQ);
+  | 	return;
+  | }
+
+[compliant] sys/riscv/riscv/intc.c:263-289  intc_intr
+  Root interrupt controller filter reads scause code from trapframe (line 276), not from live mip/sip CSRs. Dispatches directly to intr_isrc_dispatch. For strays, disables the interrupt source via csr_clear(sie, ...) rather than spinning. No mip/sip/mnxti polling loop present.
+  | active_irq = frame->tf_scause & SCAUSE_CODE;
+  | if (active_irq >= INTC_NIRQS)
+  | 	return (FILTER_HANDLED);
+  | src = &sc->isrcs[active_irq];
+  | if (intr_isrc_dispatch(&src->isrc, frame) != 0) {
+  | 	intc_disable_intr(sc->dev, &src->isrc);
+  | 	device_printf(sc->dev, "Stray irq %lu disabled\n", active_irq);
+  | }
+
+[compliant] sys/riscv/riscv/plic.c:171-188  plic_intr
+  PLIC handler correctly implements claim-then-dispatch protocol. The while loop at line 182 reads the PLIC claim register (not mip/sip), which atomically returns the highest pending IRQ and clears it from the PLIC. Returns 0 when no more interrupts are pending. This is the correct and spec-compliant mechanism for level-sensitive interrupt sources — the claim register read itself deasserts the interrupt within the PLIC, preventing re-trap.
+  | while ((pending = RD4(sc, PLIC_CLAIM(sc, cpu))) != 0) {
+  | 	tf = curthread->td_intr_frame;
+  | 	plic_irq_dispatch(sc, pending, tf);
+  | }
+  | return (FILTER_HANDLED);
+
+[compliant] sys/riscv/riscv/plic.c:447-452  plic_pre_ithread
+  Before ithread scheduling, disables the interrupt at PLIC priority level (sets priority to 0). This prevents re-assertion while the ithread runs, and also serves as a software masking step that would prevent any hypothetical CLIC IVT re-trap from level-sensitive sources.
+  | static void
+  | plic_pre_ithread(device_t dev, struct intr_irqsrc *isrc)
+  | {
+  | 	plic_disable_intr(dev, isrc);
+  | }
+
+[compliant] sys/riscv/riscv/plic.c:454-469  plic_post_ithread
+  Posts completion to PLIC claim register (line 467) to signal EOI, then re-enables the interrupt priority. This correctly deasserts the level-sensitive interrupt at the PLIC before re-enabling, completing the proper claim/complete protocol.
+  | /* Complete the interrupt. */
+  | WR4(sc, PLIC_CLAIM(sc, cpu), src->irq);
+  | plic_enable_intr(dev, isrc);
+
+[compliant] sys/riscv/riscv/aplic.c:222-246  aplic_intr
+  APLIC handler implements correct claimi-based protocol. The while loop reads APLIC_IDC_CLAIMI register (not mip/sip), which returns claimi value containing irq+priority. Returns 0 when no pending interrupts. Same claim-then-dispatch pattern as PLIC, correctly preventing re-trap loops for level-sensitive sources.
+  | while ((claimi = aplic_read(sc, APLIC_IDC_CLAIMI(sc, cpu))) != 0) {
+  | 	prio = APLIC_IDC_CLAIMI_PRIO(claimi);
+  | 	irq = APLIC_IDC_CLAIMI_IRQ(claimi);
+  | 	KASSERT((irq != 0), ("Invalid IRQ 0"));
+  | 	tf = curthread->td_intr_frame;
+  | 	aplic_irq_dispatch(sc, irq, prio, tf);
+  | }
+
+[compliant] sys/kern/subr_intr.c:331-359  intr_irq_handler
+  Generic dispatch function wraps the root filter call in critical_enter/exit. Sets td_intr_frame, calls root filter exactly once, restores. No pending-bit polling, no bnez on CSR reads, no loop control flow dependent on interrupt status registers. This is a single-pass dispatch.
+  | critical_enter();
+  | td = curthread;
+  | oldframe = td->td_intr_frame;
+  | td->td_intr_frame = tf;
+  | (root->filter)(root->arg);
+  | td->td_intr_frame = oldframe;
+  | critical_exit();
+
+[compliant] sys/riscv/riscv/machdep.c:174-187  cpu_idle
+  Idle loop uses fence+wfi, not mip/sip polling. The fence before wfi ensures prior stores are visible before sleeping. WFI wakes on any enabled interrupt without software polling. This is the correct RISC-V recommended idle pattern.
+  | if (!sched_runnable())
+  | 	__asm __volatile(
+  | 	    "fence \n"
+  | 	    "wfi   \n");
+
+[compliant] sys/riscv/riscv/sbi_ipi.c:96-126  sbi_ipi_intr
+  SBI IPI handler clears SIP_SSIP (line 106) before reading the software-maintained pending_ipis bitmap. The while loop iterates over the local bitmap, not over live CSR values. This is a software-demux of batched IPIs, not a CSR pending-bit poll that could cause re-trap.
+  | csr_clear(sip, SIP_SSIP);
+  | ...
+  | ipi_bitmap = atomic_readandclear_32(&sc->pending_ipis[cpu]);
+  | ...
+  | while ((bit = ffs(ipi_bitmap))) {
+  | 	ipi = (bit - 1);
+  | 	ipi_bitmap &= ~(1u << ipi);
+  | 	intr_ipi_dispatch(ipi);
+  | }
+

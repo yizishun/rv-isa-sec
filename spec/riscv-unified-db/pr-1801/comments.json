@@ -1,0 +1,623 @@
+[
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126556087",
+    "pull_request_review_id": 4157540637,
+    "id": 3126556087,
+    "node_id": "PRRC_kwDOMVmcaM66W3W3",
+    "diff_hunk": "@@ -128,62 +200,121 @@ def cmd_run_single_test(test_name)\n \n     @logger.info \"Running regression \\\"#{test_name}\\\" --------\"\n     test = test_data.fetch(\"tests\").fetch(test_name)\n-    cmd = TTY::Command.new(uuid: false, pty: true)\n-    test.fetch(\"test\").each do |step|\n-      @logger.info \"Running regression \\\"#{test_name}\\\" step \\\"#{step.fetch(\"name\")}\\\" --------\"\n-      env = test.key?(\"env\") ? test.fetch(\"env\") : {}\n-      if step.key?(\"env\")\n-        env.merge!(step.fetch(\"env\"))\n+    matrix_filter = nil\n+    if test.key?(\"strategy\") && params[:matrix]\n+      k, v = params[:matrix].split(\"=\").map(&:strip)\n+      matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n+      unless matrix.key?(k)\n+        @logger.warn \"'#{k}' is not a matrix type\"\n+        exit_with(:data_error)\n       end\n-      if test.key?(\"strategy\")\n-        matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n-        if params[:matrix]\n-          k, v = params[:matrix].split(\"=\").map(&:strip)\n-          unless matrix.key?(k)\n-            @logger.warn \"'#{k}' is not a matrix type\"\n-            exit_with(:data_error)\n-          end\n-          unless matrix.fetch(k).include?(v)\n-            @logger.warn \"'#{v}' is not an option for matrix '#{k}'\"\n-            exit_with(:data_error)\n+      unless matrix.fetch(k).include?(v)\n+        @logger.warn \"'#{v}' is not an option for matrix '#{k}'\"\n+        exit_with(:data_error)\n+      end\n+      matrix_filter = { key: k, value: v }\n+    end\n+\n+    cmd = TTY::Command.new(uuid: false, pty: true, printer: RawStreamPrinter)\n+    expand_jobs([test_name], matrix_filter: matrix_filter).each do |job|\n+      job.steps.each do |step|\n+        cmd.run step[:env], \"bash -c \\\"#{step[:command]}\\\"\"\n+      end\n+    end\n+  end\n+\n+  # Run jobs in parallel with a per-job spinner UI. Output is captured and only\n+  # printed for failed jobs. COVERAGE=0 is injected into all job environments to\n+  # prevent SimpleCov write races across concurrent processes.\n+  def cmd_run_tests_parallel(jobs, n_workers)\n+    n_workers = [n_workers, jobs.size].min\n+    failures_mutex = Mutex.new\n+    failures = []\n+\n+    multi = TTY::Spinner::Multi.new(\n+      \"[:spinner] Running #{jobs.size} regression#{\"s\" unless jobs.size == 1}\",\n+      format: :dots\n+    )\n+    spinner_map = jobs.each_with_object({}) do |job, h|\n+      h[job] = multi.register(\n+        \"  [:spinner] #{job.label}\",\n+        format: :dots,\n+        success_mark: \"\\e[32m✓\\e[0m\",\n+        error_mark: \"\\e[31m✗\\e[0m\"\n+      )\n+    end\n+\n+    queue = Queue.new\n+    jobs.each { |j| queue << j }\n+\n+    threads = n_workers.times.map do\n+      Thread.new do\n+        while (job = (queue.pop(true) rescue nil))\n+          spinner = spinner_map.fetch(job)\n+          spinner.auto_spin\n+          start = Process.clock_gettime(Process::CLOCK_MONOTONIC)\n+          cmd = TTY::Command.new(uuid: false, pty: false, printer: :null)\n+          output = \"\"\n+          job_passed = true\n+          job.steps.each do |step|\n+            parallel_env = step[:env].merge(\"COVERAGE\" => \"0\")\n+            result = cmd.run!(parallel_env, \"bash -c \\\"#{step[:command]}\\\"\", err: :out)\n+            output += result.out\n+            unless result.success?\n+              job_passed = false\n+              break",
+    "path": "tools/test/regress-cli.rb",
+    "commit_id": "6cc5e88d92dfcde25c11ffad736966641af7871b",
+    "original_commit_id": "bda7d7a3384040c6f180518c93d94e8dcb29b875",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "`TTY::Command#run!` raises on non-zero exit, so a failing step will likely abort the worker thread before `result.success?` is checked and before the spinner/failures array is updated. Use `run` (non-bang) and check `result.success?`, or rescue the command failure exception here and mark the job as failed while still capturing/printing its output.",
+    "created_at": "2026-04-22T19:55:37Z",
+    "updated_at": "2026-04-22T19:55:38Z",
+    "html_url": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126556087",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126556087"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126556087"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126556087/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": 268,
+    "original_start_line": 259,
+    "start_side": "RIGHT",
+    "line": 274,
+    "original_line": 265,
+    "side": "RIGHT",
+    "author_association": "CONTRIBUTOR",
+    "original_position": 216,
+    "position": 224,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126556110",
+    "pull_request_review_id": 4157540637,
+    "id": 3126556110,
+    "node_id": "PRRC_kwDOMVmcaM66W3XO",
+    "diff_hunk": "@@ -128,62 +200,121 @@ def cmd_run_single_test(test_name)\n \n     @logger.info \"Running regression \\\"#{test_name}\\\" --------\"\n     test = test_data.fetch(\"tests\").fetch(test_name)\n-    cmd = TTY::Command.new(uuid: false, pty: true)\n-    test.fetch(\"test\").each do |step|\n-      @logger.info \"Running regression \\\"#{test_name}\\\" step \\\"#{step.fetch(\"name\")}\\\" --------\"\n-      env = test.key?(\"env\") ? test.fetch(\"env\") : {}\n-      if step.key?(\"env\")\n-        env.merge!(step.fetch(\"env\"))\n+    matrix_filter = nil\n+    if test.key?(\"strategy\") && params[:matrix]\n+      k, v = params[:matrix].split(\"=\").map(&:strip)\n+      matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n+      unless matrix.key?(k)\n+        @logger.warn \"'#{k}' is not a matrix type\"\n+        exit_with(:data_error)\n       end\n-      if test.key?(\"strategy\")\n-        matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n-        if params[:matrix]\n-          k, v = params[:matrix].split(\"=\").map(&:strip)\n-          unless matrix.key?(k)\n-            @logger.warn \"'#{k}' is not a matrix type\"\n-            exit_with(:data_error)\n-          end\n-          unless matrix.fetch(k).include?(v)\n-            @logger.warn \"'#{v}' is not an option for matrix '#{k}'\"\n-            exit_with(:data_error)\n+      unless matrix.fetch(k).include?(v)\n+        @logger.warn \"'#{v}' is not an option for matrix '#{k}'\"\n+        exit_with(:data_error)\n+      end\n+      matrix_filter = { key: k, value: v }\n+    end\n+\n+    cmd = TTY::Command.new(uuid: false, pty: true, printer: RawStreamPrinter)\n+    expand_jobs([test_name], matrix_filter: matrix_filter).each do |job|\n+      job.steps.each do |step|\n+        cmd.run step[:env], \"bash -c \\\"#{step[:command]}\\\"\"\n+      end\n+    end\n+  end\n+\n+  # Run jobs in parallel with a per-job spinner UI. Output is captured and only\n+  # printed for failed jobs. COVERAGE=0 is injected into all job environments to\n+  # prevent SimpleCov write races across concurrent processes.\n+  def cmd_run_tests_parallel(jobs, n_workers)",
+    "path": "tools/test/regress-cli.rb",
+    "commit_id": "6cc5e88d92dfcde25c11ffad736966641af7871b",
+    "original_commit_id": "bda7d7a3384040c6f180518c93d94e8dcb29b875",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "`--jobs` accepts any integer, including 0 or negative values. Because `0` is truthy in Ruby, `params[:jobs] || Etc.nprocessors` will pass `0` through, and `n_workers.times` will spawn no threads, causing the runner to report success without running any jobs. Add validation/clamping so `--jobs` must be >= 1 (and ideally emit a usage/data error when invalid).\n```suggestion\n  def cmd_run_tests_parallel(jobs, n_workers)\n    raise ArgumentError, \"--jobs must be >= 1\" if n_workers < 1\n```",
+    "created_at": "2026-04-22T19:55:38Z",
+    "updated_at": "2026-04-22T19:55:38Z",
+    "html_url": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126556110",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126556110"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126556110"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126556110/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": 233,
+    "original_line": 229,
+    "side": "RIGHT",
+    "author_association": "CONTRIBUTOR",
+    "original_position": 180,
+    "position": 180,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126556131",
+    "pull_request_review_id": 4157540637,
+    "id": 3126556131,
+    "node_id": "PRRC_kwDOMVmcaM66W3Xj",
+    "diff_hunk": "@@ -128,62 +200,121 @@ def cmd_run_single_test(test_name)\n \n     @logger.info \"Running regression \\\"#{test_name}\\\" --------\"\n     test = test_data.fetch(\"tests\").fetch(test_name)\n-    cmd = TTY::Command.new(uuid: false, pty: true)\n-    test.fetch(\"test\").each do |step|\n-      @logger.info \"Running regression \\\"#{test_name}\\\" step \\\"#{step.fetch(\"name\")}\\\" --------\"\n-      env = test.key?(\"env\") ? test.fetch(\"env\") : {}\n-      if step.key?(\"env\")\n-        env.merge!(step.fetch(\"env\"))\n+    matrix_filter = nil\n+    if test.key?(\"strategy\") && params[:matrix]\n+      k, v = params[:matrix].split(\"=\").map(&:strip)\n+      matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n+      unless matrix.key?(k)\n+        @logger.warn \"'#{k}' is not a matrix type\"\n+        exit_with(:data_error)\n       end\n-      if test.key?(\"strategy\")\n-        matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n-        if params[:matrix]\n-          k, v = params[:matrix].split(\"=\").map(&:strip)\n-          unless matrix.key?(k)\n-            @logger.warn \"'#{k}' is not a matrix type\"\n-            exit_with(:data_error)\n-          end\n-          unless matrix.fetch(k).include?(v)\n-            @logger.warn \"'#{v}' is not an option for matrix '#{k}'\"\n-            exit_with(:data_error)\n+      unless matrix.fetch(k).include?(v)\n+        @logger.warn \"'#{v}' is not an option for matrix '#{k}'\"\n+        exit_with(:data_error)\n+      end\n+      matrix_filter = { key: k, value: v }\n+    end\n+\n+    cmd = TTY::Command.new(uuid: false, pty: true, printer: RawStreamPrinter)\n+    expand_jobs([test_name], matrix_filter: matrix_filter).each do |job|\n+      job.steps.each do |step|\n+        cmd.run step[:env], \"bash -c \\\"#{step[:command]}\\\"\"\n+      end\n+    end\n+  end\n+\n+  # Run jobs in parallel with a per-job spinner UI. Output is captured and only\n+  # printed for failed jobs. COVERAGE=0 is injected into all job environments to\n+  # prevent SimpleCov write races across concurrent processes.\n+  def cmd_run_tests_parallel(jobs, n_workers)\n+    n_workers = [n_workers, jobs.size].min\n+    failures_mutex = Mutex.new\n+    failures = []\n+\n+    multi = TTY::Spinner::Multi.new(\n+      \"[:spinner] Running #{jobs.size} regression#{\"s\" unless jobs.size == 1}\",\n+      format: :dots\n+    )\n+    spinner_map = jobs.each_with_object({}) do |job, h|\n+      h[job] = multi.register(\n+        \"  [:spinner] #{job.label}\",\n+        format: :dots,\n+        success_mark: \"\\e[32m✓\\e[0m\",\n+        error_mark: \"\\e[31m✗\\e[0m\"\n+      )\n+    end\n+\n+    queue = Queue.new\n+    jobs.each { |j| queue << j }\n+\n+    threads = n_workers.times.map do\n+      Thread.new do\n+        while (job = (queue.pop(true) rescue nil))",
+    "path": "tools/test/regress-cli.rb",
+    "commit_id": "bda7d7a3384040c6f180518c93d94e8dcb29b875",
+    "original_commit_id": "bda7d7a3384040c6f180518c93d94e8dcb29b875",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "`queue.pop(true) rescue nil` rescues all exceptions, which can hide unexpected errors in the worker loop. Narrow this to rescuing `ThreadError` (the expected exception when the queue is empty) so other exceptions still surface.\n```suggestion\n        loop do\n          begin\n            job = queue.pop(true)\n          rescue ThreadError\n            break\n          end\n```",
+    "created_at": "2026-04-22T19:55:38Z",
+    "updated_at": "2026-04-22T19:55:38Z",
+    "html_url": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126556131",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126556131"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126556131"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126556131/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": null,
+    "original_line": 252,
+    "side": "RIGHT",
+    "author_association": "CONTRIBUTOR",
+    "original_position": 203,
+    "position": 1,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618163",
+    "pull_request_review_id": 4157613526,
+    "id": 3126618163,
+    "node_id": "PRRC_kwDOMVmcaM66XGgz",
+    "diff_hunk": "@@ -205,19 +209,23 @@ def resolve_arch(config_yaml)\n       @mutex.synchronize do\n         config_name = config_yaml[\"name\"]\n \n-        deps = Dir[merged_spec_path(config_name) / \"**\" / \"*.yaml\"].map { |p| Pathname.new(p) }\n-        if any_newer?(resolved_spec_path(config_name) / \".stamp\", deps)\n-          # Use Ruby YAML resolver instead of Python\n-          yaml_resolver = Udb::Yaml::Resolver.new(quiet: @quiet, compile_idl: @compile_idl)\n-          yaml_resolver.resolve_files(\n-            merged_spec_path(config_name).to_s,\n-            resolved_spec_path(config_name).to_s,\n-            no_checks: false\n-          )\n-          FileUtils.touch(resolved_spec_path(config_name) / \".stamp\")\n-        end\n+        FileUtils.mkdir_p(@gen_path / \"resolved_spec\")\n+        File.open(@gen_path / \"resolved_spec\" / \".#{config_name}.lock\", File::CREAT | File::RDWR) do |f|\n+          f.flock(File::LOCK_EX)\n+          deps = Dir[merged_spec_path(config_name) / \"**\" / \"*.yaml\"].map { |p| Pathname.new(p) }\n+          if any_newer?(resolved_spec_path(config_name) / \".stamp\", deps)\n+            # Use Ruby YAML resolver instead of Python\n+            yaml_resolver = Udb::Yaml::Resolver.new(quiet: @quiet, compile_idl: @compile_idl)\n+            yaml_resolver.resolve_files(\n+              merged_spec_path(config_name).to_s,\n+              resolved_spec_path(config_name).to_s,\n+              no_checks: false\n+            )\n+            FileUtils.touch(resolved_spec_path(config_name) / \".stamp\")\n+          end\n \n-        FileUtils.cp_r(std_path / \"isa\", resolved_spec_path(config_name))\n+          FileUtils.cp_r(std_path / \"isa\", resolved_spec_path(config_name))\n+        end",
+    "path": "tools/ruby-gems/udb/lib/udb/resolver.rb",
+    "commit_id": "6cc5e88d92dfcde25c11ffad736966641af7871b",
+    "original_commit_id": "fb7620cca553199135ef80ed92f85e467ee8051d",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "Same locking issue as `merge_arch`: `resolved_spec_path(config_name)` can be the shared `resolved_spec/_` directory for configs without overlays, but the lock file is still `.{config_name}.lock`. Two no-overlay configs can concurrently write/copy into `resolved_spec/_` while holding different locks. Use a lock name derived from the resolved output path so all writers of `resolved_spec/_` share the same lock.",
+    "created_at": "2026-04-22T20:07:26Z",
+    "updated_at": "2026-04-22T20:07:28Z",
+    "html_url": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618163",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618163"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618163"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618163/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": 213,
+    "original_start_line": 212,
+    "start_side": "RIGHT",
+    "line": 230,
+    "original_line": 228,
+    "side": "RIGHT",
+    "author_association": "CONTRIBUTOR",
+    "original_position": 61,
+    "position": 63,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618198",
+    "pull_request_review_id": 4157613526,
+    "id": 3126618198,
+    "node_id": "PRRC_kwDOMVmcaM66XGhW",
+    "diff_hunk": "@@ -110,6 +148,39 @@ def gh_sub(str, sub: nil)\n   end\n   private :gh_sub\n \n+  # Expand +test_names+ into Job structs. For matrix tests, produces one Job per\n+  # matrix variant. +matrix_filter+ ({ key:, value: }) restricts to one variant.\n+  def expand_jobs(test_names, matrix_filter: nil)\n+    jobs = []\n+    test_names.each do |tname|\n+      test = test_data.fetch(\"tests\").fetch(tname)\n+      if test.key?(\"strategy\")\n+        matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n+        matrix.each do |k, values|\n+          values.each do |v|\n+            next if matrix_filter && matrix_filter[:key] == k && matrix_filter[:value] != v\n+            label = \"#{tname} (#{k}=#{v})\"\n+            steps = test.fetch(\"test\").map do |step|\n+              env = test.key?(\"env\") ? test.fetch(\"env\").dup : {}\n+              env.merge!(step.fetch(\"env\")) if step.key?(\"env\")\n+              { env: env, command: gh_sub(step.fetch(\"run\"), sub: { \"matrix.#{k}\" => v }) }\n+            end\n+            jobs << Job.new(tname, label, steps)\n+          end",
+    "path": "tools/test/regress-cli.rb",
+    "commit_id": "6cc5e88d92dfcde25c11ffad736966641af7871b",
+    "original_commit_id": "fb7620cca553199135ef80ed92f85e467ee8051d",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "`expand_jobs` iterates each matrix key independently (`matrix.each do |k, values| ...`) and creates jobs for one axis at a time. GitHub Actions matrix semantics (and your schema docs) are a Cartesian product across all matrix keys, so this will run the wrong set of variants if a test ever defines multiple matrix dimensions. Consider generating combinations across all keys (and applying `--matrix k=v` as a filter on just that key while still expanding the other keys).",
+    "created_at": "2026-04-22T20:07:27Z",
+    "updated_at": "2026-04-22T20:07:28Z",
+    "html_url": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618198",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618198"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618198"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618198/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": 156,
+    "original_start_line": 156,
+    "start_side": "RIGHT",
+    "line": 171,
+    "original_line": 169,
+    "side": "RIGHT",
+    "author_association": "CONTRIBUTOR",
+    "original_position": 107,
+    "position": 109,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618230",
+    "pull_request_review_id": 4157613526,
+    "id": 3126618230,
+    "node_id": "PRRC_kwDOMVmcaM66XGh2",
+    "diff_hunk": "@@ -128,62 +201,126 @@ def cmd_run_single_test(test_name)\n \n     @logger.info \"Running regression \\\"#{test_name}\\\" --------\"\n     test = test_data.fetch(\"tests\").fetch(test_name)\n-    cmd = TTY::Command.new(uuid: false, pty: true)\n-    test.fetch(\"test\").each do |step|\n-      @logger.info \"Running regression \\\"#{test_name}\\\" step \\\"#{step.fetch(\"name\")}\\\" --------\"\n-      env = test.key?(\"env\") ? test.fetch(\"env\") : {}\n-      if step.key?(\"env\")\n-        env.merge!(step.fetch(\"env\"))\n+    matrix_filter = nil\n+    if test.key?(\"strategy\") && params[:matrix]\n+      k, v = params[:matrix].split(\"=\").map(&:strip)\n+      matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n+      unless matrix.key?(k)\n+        @logger.warn \"'#{k}' is not a matrix type\"\n+        exit_with(:data_error)\n       end\n-      if test.key?(\"strategy\")\n-        matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n-        if params[:matrix]\n-          k, v = params[:matrix].split(\"=\").map(&:strip)\n-          unless matrix.key?(k)\n-            @logger.warn \"'#{k}' is not a matrix type\"\n-            exit_with(:data_error)\n+      unless matrix.fetch(k).include?(v)\n+        @logger.warn \"'#{v}' is not an option for matrix '#{k}'\"\n+        exit_with(:data_error)\n+      end\n+      matrix_filter = { key: k, value: v }\n+    end\n+\n+    cmd = TTY::Command.new(uuid: false, pty: true, printer: RawStreamPrinter)\n+    expand_jobs([test_name], matrix_filter: matrix_filter).each do |job|\n+      job.steps.each do |step|\n+        cmd.run step[:env], \"bash -c \\\"#{step[:command]}\\\"\"",
+    "path": "tools/test/regress-cli.rb",
+    "commit_id": "fb7620cca553199135ef80ed92f85e467ee8051d",
+    "original_commit_id": "fb7620cca553199135ef80ed92f85e467ee8051d",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "The command is wrapped as `bash -c \"#{step[:command]}\"`, which will break when the YAML `run:` string contains double quotes (common in existing specs) and can change shell parsing semantics. Prefer passing the script as a separate argument (e.g., `['bash','-c', step[:command]]`) so quoting is handled safely and consistently.\n```suggestion\n        cmd.run step[:env], \"bash\", \"-c\", step[:command]\n```",
+    "created_at": "2026-04-22T20:07:27Z",
+    "updated_at": "2026-04-22T20:07:28Z",
+    "html_url": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618230",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618230"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618230"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618230/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": null,
+    "original_line": 222,
+    "side": "RIGHT",
+    "author_association": "CONTRIBUTOR",
+    "original_position": 169,
+    "position": 1,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618271",
+    "pull_request_review_id": 4157613526,
+    "id": 3126618271,
+    "node_id": "PRRC_kwDOMVmcaM66XGif",
+    "diff_hunk": "@@ -128,62 +201,126 @@ def cmd_run_single_test(test_name)\n \n     @logger.info \"Running regression \\\"#{test_name}\\\" --------\"\n     test = test_data.fetch(\"tests\").fetch(test_name)\n-    cmd = TTY::Command.new(uuid: false, pty: true)\n-    test.fetch(\"test\").each do |step|\n-      @logger.info \"Running regression \\\"#{test_name}\\\" step \\\"#{step.fetch(\"name\")}\\\" --------\"\n-      env = test.key?(\"env\") ? test.fetch(\"env\") : {}\n-      if step.key?(\"env\")\n-        env.merge!(step.fetch(\"env\"))\n+    matrix_filter = nil\n+    if test.key?(\"strategy\") && params[:matrix]\n+      k, v = params[:matrix].split(\"=\").map(&:strip)\n+      matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n+      unless matrix.key?(k)\n+        @logger.warn \"'#{k}' is not a matrix type\"\n+        exit_with(:data_error)\n       end\n-      if test.key?(\"strategy\")\n-        matrix = test.fetch(\"strategy\").fetch(\"matrix\")\n-        if params[:matrix]\n-          k, v = params[:matrix].split(\"=\").map(&:strip)\n-          unless matrix.key?(k)\n-            @logger.warn \"'#{k}' is not a matrix type\"\n-            exit_with(:data_error)\n+      unless matrix.fetch(k).include?(v)\n+        @logger.warn \"'#{v}' is not an option for matrix '#{k}'\"\n+        exit_with(:data_error)\n+      end\n+      matrix_filter = { key: k, value: v }\n+    end\n+\n+    cmd = TTY::Command.new(uuid: false, pty: true, printer: RawStreamPrinter)\n+    expand_jobs([test_name], matrix_filter: matrix_filter).each do |job|\n+      job.steps.each do |step|\n+        cmd.run step[:env], \"bash -c \\\"#{step[:command]}\\\"\"\n+      end\n+    end\n+  end\n+\n+  # Run jobs in parallel with a per-job spinner UI. Output is captured and only\n+  # printed for failed jobs. COVERAGE=0 is injected into all job environments to\n+  # prevent SimpleCov write races across concurrent processes.\n+  def cmd_run_tests_parallel(jobs, n_workers)\n+    n_workers = [n_workers, jobs.size].min\n+    failures_mutex = Mutex.new\n+    failures = []\n+\n+    multi = TTY::Spinner::Multi.new(\n+      \"[:spinner] Running #{jobs.size} regression#{\"s\" unless jobs.size == 1}\",\n+      format: :dots\n+    )\n+    spinner_map = jobs.each_with_object({}) do |job, h|\n+      h[job] = multi.register(\n+        \"  [:spinner] #{job.label}\",\n+        format: :dots,\n+        success_mark: \"\\e[32m✓\\e[0m\",\n+        error_mark: \"\\e[31m✗\\e[0m\"\n+      )\n+    end\n+\n+    queue = Queue.new\n+    jobs.each { |j| queue << j }\n+\n+    threads = n_workers.times.map do\n+      Thread.new do\n+        loop do\n+          begin\n+            job = queue.pop(true)\n+          rescue ThreadError\n+            break\n           end\n-          unless matrix.fetch(k).include?(v)\n-            @logger.warn \"'#{v}' is not an option for matrix '#{k}'\"\n-            exit_with(:data_error)\n+          spinner = spinner_map.fetch(job)\n+          spinner.auto_spin\n+          start = Process.clock_gettime(Process::CLOCK_MONOTONIC)\n+          cmd = TTY::Command.new(uuid: false, pty: false, printer: :null)\n+          output = \"\"\n+          job_passed = true\n+          job.steps.each do |step|\n+            parallel_env = step[:env].merge(\"COVERAGE\" => \"0\")\n+            result = cmd.run!(parallel_env, \"bash -c \\\"#{step[:command]}\\\"\", err: :out)",
+    "path": "tools/test/regress-cli.rb",
+    "commit_id": "fb7620cca553199135ef80ed92f85e467ee8051d",
+    "original_commit_id": "fb7620cca553199135ef80ed92f85e467ee8051d",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "In the parallel runner, `TTY::Command#run!` is used and the result is checked via `result.success?`. In `tty-command`, the bang form typically raises on non-zero exit, which would skip your `job_passed` bookkeeping and can leave failures unreported (thread just terminates with an exception). Use the non-bang `run` API (or rescue the command exception) and base pass/fail on the returned status.\n```suggestion\n            result = cmd.run(parallel_env, \"bash -c \\\"#{step[:command]}\\\"\", err: :out)\n```",
+    "created_at": "2026-04-22T20:07:27Z",
+    "updated_at": "2026-04-22T20:07:28Z",
+    "html_url": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618271",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618271"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618271"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618271/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": null,
+    "original_start_line": null,
+    "start_side": null,
+    "line": null,
+    "original_line": 267,
+    "side": "RIGHT",
+    "author_association": "CONTRIBUTOR",
+    "original_position": 217,
+    "position": 1,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618297",
+    "pull_request_review_id": 4157613526,
+    "id": 3126618297,
+    "node_id": "PRRC_kwDOMVmcaM66XGi5",
+    "diff_hunk": "@@ -82,6 +111,15 @@ class Cli\n     desc \"Run all regression tests\"\n   end\n \n+  option :jobs do\n+    T.bind(self, TTY::Option::Parameter::Option)\n+    short \"-j\"\n+    long \"--jobs=N\"\n+    desc \"Number of parallel workers for --tag and --all (default: CPU count)\"\n+    convert :integer\n+    validate ->(val) { val >= 1 }",
+    "path": "tools/test/regress-cli.rb",
+    "commit_id": "6cc5e88d92dfcde25c11ffad736966641af7871b",
+    "original_commit_id": "fb7620cca553199135ef80ed92f85e467ee8051d",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "`--jobs` accepts any integer; if the user passes `0` or a negative value, `cmd_run_tests_parallel` will spawn 0 threads and report all jobs as passed without running anything. Add validation to require `N >= 1` (or clamp to 1 / exit_with usage_error when invalid).",
+    "created_at": "2026-04-22T20:07:27Z",
+    "updated_at": "2026-04-22T20:07:28Z",
+    "html_url": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618297",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618297"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618297"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618297/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": 114,
+    "original_start_line": 114,
+    "start_side": "RIGHT",
+    "line": 120,
+    "original_line": 120,
+    "side": "RIGHT",
+    "author_association": "CONTRIBUTOR",
+    "original_position": 79,
+    "position": 79,
+    "subject_type": "line"
+  },
+  {
+    "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618314",
+    "pull_request_review_id": 4157613526,
+    "id": 3126618314,
+    "node_id": "PRRC_kwDOMVmcaM66XGjK",
+    "diff_hunk": "@@ -186,15 +186,19 @@ def merge_arch(config_yaml)\n           end\n         raise \"custom directory '#{overlay_path}' does not exist\" if !overlay_path.nil? && !overlay_path.directory?\n \n-        if any_newer?(merged_spec_path(config_name) / \".stamp\", deps)\n-          # Use Ruby YAML resolver instead of Python\n-          yaml_resolver = Udb::Yaml::Resolver.new(quiet: @quiet, compile_idl: @compile_idl)\n-          yaml_resolver.merge_files(\n-            std_path.to_s,\n-            overlay_path&.to_s,\n-            merged_spec_path(config_name).to_s\n-          )\n-          FileUtils.touch(merged_spec_path(config_name) / \".stamp\")\n+        FileUtils.mkdir_p(@gen_path / \"spec\")\n+        File.open(@gen_path / \"spec\" / \".#{config_name}.lock\", File::CREAT | File::RDWR) do |f|\n+          f.flock(File::LOCK_EX)\n+          if any_newer?(merged_spec_path(config_name) / \".stamp\", deps)\n+            # Use Ruby YAML resolver instead of Python\n+            yaml_resolver = Udb::Yaml::Resolver.new(quiet: @quiet, compile_idl: @compile_idl)\n+            yaml_resolver.merge_files(\n+              std_path.to_s,\n+              overlay_path&.to_s,\n+              merged_spec_path(config_name).to_s\n+            )\n+            FileUtils.touch(merged_spec_path(config_name) / \".stamp\")",
+    "path": "tools/ruby-gems/udb/lib/udb/resolver.rb",
+    "commit_id": "6cc5e88d92dfcde25c11ffad736966641af7871b",
+    "original_commit_id": "fb7620cca553199135ef80ed92f85e467ee8051d",
+    "user": {
+      "login": "Copilot",
+      "id": 175728472,
+      "node_id": "BOT_kgDOCnlnWA",
+      "avatar_url": "https://avatars.githubusercontent.com/in/946600?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/Copilot",
+      "html_url": "https://github.com/apps/copilot-pull-request-reviewer",
+      "followers_url": "https://api.github.com/users/Copilot/followers",
+      "following_url": "https://api.github.com/users/Copilot/following{/other_user}",
+      "gists_url": "https://api.github.com/users/Copilot/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/Copilot/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/Copilot/subscriptions",
+      "organizations_url": "https://api.github.com/users/Copilot/orgs",
+      "repos_url": "https://api.github.com/users/Copilot/repos",
+      "events_url": "https://api.github.com/users/Copilot/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/Copilot/received_events",
+      "type": "Bot",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "The lock file name is based on `config_name`, but `merged_spec_path(config_name)` can resolve to the shared `_` directory when the config has no overlay. Different no-overlay configs would then take different locks while writing the same output directory, reintroducing the race this lock is meant to prevent. Consider keying the lock on the actual target directory (e.g., `merged_spec_path(...).basename`) so all writers of `spec/_` serialize together.\n```suggestion\n        merged_spec_dir = merged_spec_path(config_name)\n\n        FileUtils.mkdir_p(@gen_path / \"spec\")\n        File.open(@gen_path / \"spec\" / \".#{merged_spec_dir.basename}.lock\", File::CREAT | File::RDWR) do |f|\n          f.flock(File::LOCK_EX)\n          if any_newer?(merged_spec_dir / \".stamp\", deps)\n            # Use Ruby YAML resolver instead of Python\n            yaml_resolver = Udb::Yaml::Resolver.new(quiet: @quiet, compile_idl: @compile_idl)\n            yaml_resolver.merge_files(\n              std_path.to_s,\n              overlay_path&.to_s,\n              merged_spec_dir.to_s\n            )\n            FileUtils.touch(merged_spec_dir / \".stamp\")\n```",
+    "created_at": "2026-04-22T20:07:28Z",
+    "updated_at": "2026-04-22T20:07:28Z",
+    "html_url": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618314",
+    "pull_request_url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801",
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618314"
+      },
+      "html": {
+        "href": "https://github.com/riscv/riscv-unified-db/pull/1801#discussion_r3126618314"
+      },
+      "pull_request": {
+        "href": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/1801"
+      }
+    },
+    "reactions": {
+      "url": "https://api.github.com/repos/riscv/riscv-unified-db/pulls/comments/3126618314/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "start_line": 189,
+    "original_start_line": 189,
+    "start_side": "RIGHT",
+    "line": 201,
+    "original_line": 200,
+    "side": "RIGHT",
+    "author_association": "CONTRIBUTOR",
+    "original_position": 24,
+    "position": 25,
+    "subject_type": "line"
+  }
+]

@@ -1,0 +1,141 @@
+{
+  "pr_number": 470,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 470,
+    "violation_condition": "Kernel writes raw instruction bytes to userspace-accessible memory (e.g., sigreturn trampoline on stack, vDSO code pages, uprobes xol slot) but uses the target process's data endianness instead of the architectural requirement that all RISC-V instructions are always little-endian, causing the bytes to be byte-swapped relative to correct instruction encoding",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "arch/riscv/**/signal.c or arch/riscv/**/vdso/* or arch/riscv/**/probes/* where __kernel_rt_sigreturn[] or equivalent instruction-byte arrays are written to memory using store instructions that assume data-endianness—check for memcpy() or word stores of instruction immediates without an explicit LE-encode assertion",
+    "affected_entities": [
+      "__kernel_rt_sigreturn trampoline",
+      "vdso code pages",
+      "uprobes xol slot",
+      "BPF JIT code buffer",
+      "kprobes instruction buffer"
+    ],
+    "summary": "On RISC-V big-endian (BE) systems, instructions remain little-endian regardless of data endianness; the kernel's signal trampoline, vDSO, and code-patching paths must emit LE-encoded instruction bytes into what is otherwise BE data memory, and failure to decouple the two results in corrupted instructions being executed by userspace"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "setup_rt_frame",
+        "line_start": 450,
+        "line_end": 451,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "copy_to_user() copies the __user_rt_sigreturn trampoline (defined in entry.S:504-507 as 'li a7, __NR_rt_sigreturn; ecall') as raw bytes onto the user stack for nommu configs. The assembler unconditionally emits LE instruction encoding for RISC-V regardless of target data endianness. copy_to_user() performs a raw byte copy with no byte-swap, so the user-visible instructions are always correct LE. Only active under !CONFIG_MMU; MMU configs use the VDSO path (line 438-439) which is pointer-based, not byte-copying.",
+      "snippet": "if (copy_to_user(&frame->sigreturn_code, __user_rt_sigreturn,\n                 sizeof(frame->sigreturn_code)))\n    return -EFAULT;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/vdso/vdso.S",
+        "function_name": "vdso_start",
+        "line_start": 16,
+        "line_end": 21,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The VDSO binary (vdso.so) is embedded verbatim via .incbin into kernel .data, then mapped RX into userspace via _install_special_mapping() (vdso.c:142-145). All VDSO .text objects (rt_sigreturn.S, flush_icache.S, getcpu.S, sys_hwprobe.S, vgettimeofday.c, etc.) are compiled by the RISC-V toolchain which always produces LE instruction encoding. No byte-level manipulation occurs between compilation and mapping.",
+      "snippet": "vdso_start:\n    .incbin __VDSO_PATH\n    .balign PAGE_SIZE\nvdso_end:"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/vdso.c",
+        "function_name": "__setup_additional_pages",
+        "line_start": 142,
+        "line_end": 145,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VDSO code pages are installed as VM_READ|VM_EXEC special mapping. The pages come from __vdso_init() (line 63) which uses sym_to_pfn() to reference the kernel-embedded vdso.so binary pages directly — no intermediate byte copy that could introduce endianness artifacts.",
+      "snippet": "ret = _install_special_mapping(mm, vdso_base, vdso_text_len,\n    (VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC | VM_SEALED_SYSMAP),\n    vdso_info->cm);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/probes/uprobes.c",
+        "function_name": "arch_uprobe_copy_ixol",
+        "line_start": 164,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "memcpy() on line 172 copies raw instruction bytes from arch.ixol (populated by copy_insn() in kernel/events/uprobes.c:1070-1094 reading from the target binary's inode) into the XOL slot page. memcpy() is a byte-copy with no endianness interpretation. The source binary always contains LE instruction encoding. No byte-swap occurs.",
+      "snippet": "memcpy(dst, src, len);\n\n/* Add ebreak behind opcode to simulate singlestep */\nif (vaddr) {\n    dst += GET_INSN_LENGTH(*(probe_opcode_t *)src);\n    *(uprobe_opcode_t *)dst = __BUG_INSN_32;\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/probes/uprobes.c",
+        "function_name": "arch_uprobe_copy_ixol",
+        "line_start": 175,
+        "line_end": 178,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The ebreak insertion on line 177 uses '*(uprobe_opcode_t *)dst = __BUG_INSN_32' (0x00100073) — a native-endian u32 store. Currently harmless because RISC-V has no big-endian support, making native-endian == little-endian by definition. If CONFIG_CPU_BIG_ENDIAN were ever enabled on RISC-V, this u32 store would write bytes {0x00,0x10,0x00,0x73} in memory-order, which is NOT the correct LE instruction encoding {0x73,0x00,0x10,0x00}. The same pattern exists in patch_insn_write() → copy_to_kernel_nofault() for kernel text, and in kprobes.c:28-33 which writes __BUG_INSN_32 via patch_text_nosync(). These would all need LE-explicit stores (e.g., put_unaligned_le32() or __BUG_INSN_32_LE) if big-endian support is added.",
+      "snippet": "*(uprobe_opcode_t *)dst = __BUG_INSN_32;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/uprobes.h",
+        "function_name": "(macro)",
+        "line_start": 12,
+        "line_end": 18,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "UPROBE_SWBP_INSN is defined as __BUG_INSN_32 (0x00100073) or __BUG_INSN_16 (0x9002). These are native-endian integer literals. The weak arch_uretprobe_trampoline() in kernel/events/uprobes.c:1743-1749 returns a pointer to a static UPROBE_SWBP_INSN that gets written to the XOL slot via arch_uprobe_copy_ixol(). Under a hypothetical big-endian RISC-V kernel, the u32 literal 0x9002 would be stored as bytes {0x00,0x00,0x90,0x02} instead of the correct c.ebreak LE encoding {0x02,0x90}. Currently compliant since big-endian is not supported on RISC-V.",
+      "snippet": "#define UPROBE_SWBP_INSN    __BUG_INSN_16        /* c.ebreak = 0x9002 */\n#define UPROBE_SWBP_INSN    __BUG_INSN_32        /* ebreak   = 0x00100073 */"
+    },
+    {
+      "location": {
+        "file_path": "kernel/events/uprobes.c",
+        "function_name": "__uprobe_write",
+        "line_start": 431,
+        "line_end": 433,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "copy_to_page() on line 433 writes the breakpoint instruction (UPROBE_SWBP_INSN) into the user text page as raw bytes — no endianness conversion. The source value is the native-endian integer relevant to the breakpoint. Currently correct because RISC-V is always LE. copy_to_page() performs memcpy, which is byte-order transparent.",
+      "snippet": "flush_cache_page(vma, vaddr, pte_pfn(fw->pte));\nfw->pte = ptep_clear_flush(vma, vaddr, fw->ptep);\ncopy_to_page(fw->page, insn_vaddr, insn, nbytes);"
+    },
+    {
+      "location": {
+        "file_path": "kernel/events/uprobes.c",
+        "function_name": "copy_insn",
+        "line_start": 1070,
+        "line_end": 1094,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "copy_insn() reads instruction bytes from the probed binary's inode via __copy_insn() into arch.insn[]. The source binary always has LE instruction encoding on RISC-V. __copy_insn() uses uprobe_copy_from_page() which calls memcpy() — a raw byte copy. No endianness reinterpretation occurs.",
+      "snippet": "void *insn = &uprobe->arch.insn;\nint size = sizeof(uprobe->arch.insn);\n...\nerr = __copy_insn(mapping, filp, insn, len, offs);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/kexec_image.c",
+        "function_name": "(image loader)",
+        "line_start": 54,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "kexec image loader checks endianness compatibility via the RISCV_IMAGE_FLAG_BE header flag (le64_to_cpu() on line 55) and compares against IS_ENABLED(CONFIG_CPU_BIG_ENDIAN). Since CONFIG_CPU_BIG_ENDIAN is not configurable on RISC-V, this is always false and the comparison always rejects BE images. This is correct — a LE kernel cannot kexec a BE image. The instruction bytes within the loaded kernel image are not reinterpreted, just copied as raw data.",
+      "snippet": "flags = le64_to_cpu(h->flags);\nbe_image = riscv_image_flag_field(flags, RISCV_IMAGE_FLAG_BE);\nbe_kernel = IS_ENABLED(CONFIG_CPU_BIG_ENDIAN);\nif (be_image != be_kernel) {\n    ret = -EINVAL;\n    goto out;\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/probes/kprobes.c",
+        "function_name": "arch_prepare_ss_slot",
+        "line_start": 25,
+        "line_end": 34,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "arch_prepare_ss_slot() writes __BUG_INSN_32 (0x00100073) to the kprobes single-step slot (kernel memory, not userspace) via patch_text_nosync() which calls copy_to_kernel_nofault(). The UPROBE_XOL_SLOT_BYTES-adjacent ebreak in the nommu sigreturn trampoline at signal.c:39 uses __user_rt_sigreturn[] defined by the assembler in entry.S, which always produces correct LE encoding. These kernel-mode writes are outside the spec scope but share the same pattern as the uprobes user-visible case.",
+      "snippet": "u32 insn = __BUG_INSN_32;\n...\npatch_text_nosync((void *)p->ainsn.api.insn + len, &insn, GET_INSN_LENGTH(insn));"
+    }
+  ],
+  "overall_severity": "compliant"
+}

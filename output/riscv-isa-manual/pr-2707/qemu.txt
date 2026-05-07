@@ -1,0 +1,143 @@
+PR #2707  target=qemu  overall=bug_confirmed
+Spec: Missing or incomplete WARL bit-masking in QEMU's hypervisor, supervisor, and RNMI CSR emulation allows guest reads to observe unwritable bits that the spec mandates as read-only zero, leaking implementation details about which interrupt types and delegation paths are supported
+Violation: QEMU's CSR read/write handlers for sip/sie, vsip/vsie, hip/hie, hvip, hedeleg, hideleg, hgeie, stvec/vstvec, mnepc, mncause, or mnstatus do not apply per-bit WARL masking on writes (silently dropping writes to read-only-zero bits) and do not apply WARL legalization on reads (returning only the constrained legal value). A guest write to an unimplemented interrupt bit in sie that persists on read-back, or a write to a read-only-zero delegation bit in hedeleg/hideleg that is not silently ignored, violates the spec's WARL contract.
+Consequence: info_leak
+Pattern: riscv_csr_read|riscv_csr_write.*(sip|sie|vsip|vsie|hip|hie|hvip|hedeleg|hideleg|hgeie|stvec|vstvec|mnepc|mncause|mnstatus).*[^W]ARL|warl_mask|write_mask.*(sip|sie|vsip|vsie|hip|hie|hvip|hedeleg|hideleg|hgeie|stvec|vstvec|mnepc|mncause|mnstatus)
+------------------------------------------------------------
+[bug_confirmed] target/riscv/csr.c:5467-5472  write_mnepc
+  mnepc write accepts raw val without any WARL masking. mepc uses get_xepc_mask() to enforce alignment (bit 0 clear) and bit XLEN-1 constraint, but mnepc applies no legalization at all. A guest can write arbitrary unaligned addresses to mnepc, violating the WARL contract.
+  | static RISCVException write_mnepc(CPURISCVState *env, int csrno,
+  |                                  target_ulong val, uintptr_t ra)
+  | {
+  |     env->mnepc = val;
+  |     return RISCV_EXCP_NONE;
+  | }
+
+[bug_confirmed] target/riscv/csr.c:5481-5486  write_mncause
+  mncause write accepts raw val without WARL masking. The header comment in cpu.h says 'mncause without bit XLEN-1 set to 1' (line 506) implying bit XLEN-1 should be read-only zero, but the write handler does not enforce this constraint. A guest write setting bit XLEN-1 would persist, violating the WARL contract.
+  | static RISCVException write_mncause(CPURISCVState *env, int csrno,
+  |                                     target_ulong val, uintptr_t ra)
+  | {
+  |     env->mncause = val;
+  |     return RISCV_EXCP_NONE;
+  | }
+
+[bug_confirmed] target/riscv/machine.c:485-499  vmstate_riscv_cpu (subsections)
+  RNMI CSRs (mnepc, mncause, mnstatus) are not included in any vmstate subsection. No vmstate_rnmi subsection exists in the entire codebase. The subsection list includes pmp, hyper, vector, pointermasking, rv128, kvmtimer, envcfg, debug, smstateen, jvt, elp, ssp but NOT rnmi. On live migration, mnepc/mncause/mnstatus values will silently reset to zero on the destination, causing corrupted RNMI state.
+  | .subsections = (const VMStateDescription * const []) {
+  |         &vmstate_pmp,
+  |         &vmstate_hyper,
+  |         &vmstate_vector,
+  |         &vmstate_pointermasking,
+  |         &vmstate_rv128,
+  |         ...
+  |         &vmstate_ssp,
+
+[bug_confirmed] target/riscv/csr.c:5460-5465  read_mnepc
+  mnepc read returns raw env->mnepc without WARL legalization. mepc does '*val = env->mepc & get_xepc_mask(env)' to return only legal bits, but mnepc returns the raw stored value without masking. If a bug elsewhere stores an illegal value, it will be exposed on read.
+  | static RISCVException read_mnepc(CPURISCVState *env, int csrno,
+  |                                  target_ulong *val)
+  | {
+  |     *val = env->mnepc;
+  |     return RISCV_EXCP_NONE;
+  | }
+
+[bug_confirmed] target/riscv/csr.c:5474-5479  read_mncause
+  mncause read returns raw env->mncause without WARL legalization. The cpu.h comment states bit XLEN-1 should not be set to 1, but the read path does not enforce this constraint, meaning an illegal stored value will be exposed on read.
+  | static RISCVException read_mncause(CPURISCVState *env, int csrno,
+  |                                    target_ulong *val)
+  | {
+  |     *val = env->mncause;
+  |     return RISCV_EXCP_NONE;
+  | }
+
+[compliant] target/riscv/csr.c:5495-5512  write_mnstatus
+  mnstatus write correctly applies WARL masking using a mask of MNSTATUS_NMIE | MNSTATUS_MNPP (plus MNSTATUS_MNPV when RVH is present). MNSTATUS_NMIE is preserved from the old value (hardware-only clear, WLRL behavior). Reserved bits are correctly write-ignored and read-as-zero.
+  | target_ulong mask = (MNSTATUS_NMIE | MNSTATUS_MNPP);
+  | if (riscv_has_ext(env, RVH)) {
+  |     mask |= MNSTATUS_MNPV;
+  | }
+  | env->mnstatus = (env->mnstatus & MNSTATUS_NMIE) | (val & mask);
+
+[compliant] target/riscv/csr.c:4075-4113  rmw_sie64
+  sie read/write correctly applies complex WARL masking via alias_mask (bits delegated via mideleg) and nalias_mask (non-delegated bits visible through mvien). Bits where both mideleg=0 and mvien=0 are read-only zero. In virt mode, properly delegates to rmw_vsie64. WARL contract is fully enforced.
+  | uint64_t nalias_mask = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS) &
+  |     (~env->mideleg & env->mvien);
+  | uint64_t alias_mask = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS) & env->mideleg;
+  | uint64_t sie_mask = wr_mask & nalias_mask;
+
+[compliant] target/riscv/csr.c:4321-4343  rmw_sip64
+  sip correctly applies WARL masking. Write mask constrains writable bits to (mideleg | mvien) & sip_writable_mask (SIP_SSIP | LOCAL_INTERRUPTS). Read return value is masked to (mideleg | mvien) & (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS). Bits where both delegation and mvien are 0 are correctly read-only zero.
+  | uint64_t mask = (env->mideleg | env->mvien) & sip_writable_mask;
+  | ...
+  | *ret_val &= (env->mideleg | env->mvien) &
+  |     (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS);
+
+[compliant] target/riscv/csr.c:4005-4042  rmw_vsie64
+  vsie correctly applies alias (delegated via hideleg) and non-alias (hvien without hideleg) WARL masking with proper VS-mode bit position remapping. Bits in neither mask are read-only zero. WARL contract fully enforced.
+  | uint64_t alias_mask = (LOCAL_INTERRUPTS | VS_MODE_INTERRUPTS) &
+  |                         env->hideleg;
+  | uint64_t nalias_mask = LOCAL_INTERRUPTS & (~env->hideleg & env->hvien);
+
+[compliant] target/riscv/csr.c:4259-4288  rmw_vsip64
+  vsip correctly applies WARL masking through hideleg/hvien-based alias/nalias masks, filtered by vsip_writable_mask (MIP_VSSIP | LOCAL_INTERRUPTS). VS* bits not delegated via hideleg are zeroed out. Read return value is properly split between alias bits from mip and non-alias bits from hvip.
+  | uint64_t rval, mask = env->hideleg & VS_MODE_INTERRUPTS;
+  | mask |= env->hvien & ~env->hideleg;
+  | ret = rmw_hvip64(env, csrno, &rval, new_val,
+  |                  wr_mask & mask & vsip_writable_mask);
+
+[compliant] target/riscv/csr.c:4891-4901  rmw_hip
+  hip correctly constrains writes via hip_writable_mask (MIP_VSSIP only). Read value is masked to HS_MODE_INTERRUPTS. WARL contract enforced.
+  | int ret = rmw_mip(env, csrno, ret_value, new_value,
+  |                   write_mask & hip_writable_mask);
+  | if (ret_value) {
+  |     *ret_value &= HS_MODE_INTERRUPTS;
+  | }
+
+[compliant] target/riscv/csr.c:4904-4917  rmw_hie
+  hie correctly constrains writes and reads to HS_MODE_INTERRUPTS (SGEIP | VSSIP | VSTIP | VSEIP). WARL contract fully enforced.
+  | ret = rmw_mie64(env, csrno, &rval, new_val, wr_mask & HS_MODE_INTERRUPTS);
+  | if (ret_val) {
+  |     *ret_val = rval & HS_MODE_INTERRUPTS;
+  | }
+
+[compliant] target/riscv/csr.c:4642-4647  write_hedeleg
+  hedeleg correctly masks writes to vs_delegable_excps (all DELEGABLE_EXCPS minus S_ECALL, VS_ECALL, M_ECALL, and guest-page-fault/virtual-instruction exceptions). Non-delegable exception bits are silently dropped on write. WARL contract enforced.
+  | env->hedeleg = val & vs_delegable_excps;
+
+[compliant] target/riscv/csr.c:4722-4734  rmw_hideleg64
+  hideleg correctly masks writes to vs_delegable_ints (VS_MODE_INTERRUPTS | LOCAL_INTERRUPTS, minus MIP_LCOFIP). Read value is also masked. WARL contract enforced.
+  | uint64_t mask = wr_mask & vs_delegable_ints;
+  | if (ret_val) {
+  |     *ret_val = env->hideleg & vs_delegable_ints;
+  | }
+  | env->hideleg = (env->hideleg & ~mask) | (new_val & mask);
+
+[compliant] target/riscv/csr.c:4946-4956  write_hgeie
+  hgeie correctly masks writes to GEILEN:1 implemented bits (BIT0 never implemented). Has proper side-effect of updating mip.SGEIP. WARL contract enforced.
+  | val &= ((((target_ulong)1) << env->geilen) - 1) << 1;
+  | env->hgeie = val;
+  | riscv_cpu_update_mip(env, MIP_SGEIP,
+  |                      BOOL_TO_MASK(!!(env->hgeie & env->hgeip)));
+
+[compliant] target/riscv/csr.c:4153-4163  write_stvec
+  stvec correctly WARL-constrains mode field bits [1:0]: 0=direct and 1=vectored are accepted, reserved modes >=2 are silently ignored. BASE field has 4-byte alignment. WARL contract enforced.
+  | if ((val & 3) < 2) {
+  |     env->stvec = val;
+  | } else {
+  |     qemu_log_mask(LOG_UNIMP, "CSR_STVEC: reserved mode not supported\n");
+  | }
+
+[compliant] target/riscv/csr.c:5215-5225  write_vstvec
+  vstvec correctly WARL-constrains mode field identically to stvec. Reserved modes are silently ignored. WARL contract enforced.
+  | if ((val & 3) < 2) {
+  |     env->vstvec = val;
+  | } else {
+  |     qemu_log_mask(LOG_UNIMP, "CSR_VSTVEC: reserved mode not supported\n");
+  | }
+
+[compliant] target/riscv/csr.c:4776-4858  rmw_hvip64
+  hvip correctly applies alias/nalias WARL masking through hideleg/hvien, filtered by hvip_writable_mask. Has proper side-effect of calling riscv_cpu_interrupt() on hvip change. WARL contract fully enforced.
+  | wr_mask_hvip = wr_mask & nalias_mask & hvip_writable_mask;
+  | wr_mask_mip = wr_mask & alias_mask & hvip_writable_mask;
+

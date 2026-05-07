@@ -1,0 +1,142 @@
+{
+  "pr_number": 2729,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2729,
+    "violation_condition": "Linux kernel saves/restores vtype CSR without preserving bits lambda[2:0] (vtype[XLEN-2:XLEN-4]), altfmt_A (vtype[9]), altfmt_B (vtype[10]), or bs (vtype[11]) across context switch, trap handling, or signal delivery, causing these Zvvm-defined fields to be clobbered to zero on any kernel entry/exit",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "__riscv_v_state_save|__riscv_v_state_restore|vtype_save|vtype_restore|VSETVL.*vtype|vtype_mask",
+    "affected_entities": [
+      "vtype",
+      "lambda[2:0]",
+      "altfmt_A",
+      "altfmt_B",
+      "bs",
+      "vsetvli",
+      "vmmacc.vv",
+      "vwmmacc.vv",
+      "vqwmmacc.vv",
+      "vfmmacc.vv",
+      "vfwmmacc.vv",
+      "vfqwmmacc.vv",
+      "vfwimmacc.vv",
+      "vfqwimmacc.vv",
+      "vmtl.v",
+      "vmts.v",
+      "vmttl.v",
+      "vmtts.v"
+    ],
+    "summary": "Zvvm adds 6 new bits to vtype CSR (lambda[2:0] at high bits, altfmt_A/B at bits 9-10, bs at bit 11) controlling matrix tile geometry and microscaling; kernel vtype save/restore paths must preserve these bits or userspace IME context is silently corrupted across context switches"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__vstate_csr_restore",
+        "line_start": 167,
+        "line_end": 194,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vtype CSR restoration uses 'vsetvl x0, %2, %1' (line 172) which per RISC-V spec only writes standard vtype fields (VSEW[5:3], VLMUL[2:0], VTA[6], VMA[7], VILL[XLEN-1]). Bits [8] through [XLEN-2], where Zvvm defines lambda[2:0] (vtype[XLEN-2:XLEN-4]), altfmt_A (vtype[9]), altfmt_B (vtype[10]), and bs (vtype[11]), are NOT written by vsetvl and get zeroed on any kernel entry/exit. No Zvvm hardware exists today so no actual data corruption occurs, but the save/restore infrastructure is architecturally incapable of preserving tile format state.",
+      "snippet": "asm volatile (\n\t\".option push\\n\\t\"\n\t\".option arch, +zve32x\\n\\t\"\n\t\"vsetvl\t x0, %2, %1\\n\\t\"\n\t\".option pop\\n\\t\"\n\t\"csrw\t\" __stringify(CSR_VSTART) \", %0\\n\\t\"\n\t: : \"r\" (src->vstart), \"r\" (src->vtype), \"r\" (src->vl));"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__riscv_v_vstate_save",
+        "line_start": 196,
+        "line_end": 231,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Save path executes 'vsetvli %0, x0, e8, m8, ta, ma' (line 219) for vector register data transfer BEFORE the vtype save happens. While __vstate_csr_save is called first and reads the full vtype CSR including Zvvm bits, the subsequent vsetvli clobbers Zvvm tile format bits in hardware vtype CSR to zero. The in-memory save_to->vtype correctly captures tile bits, but hardware vtype state is destroyed here even on the save side.",
+      "snippet": "\"vsetvli\t%0, x0, e8, m8, ta, ma\\n\\t\"\n\"vse8.v\t\tv0, (%1)\\n\\t\"\n\"add\t\t%1, %1, %0\\n\\t\"\n\"vse8.v\t\tv8, (%1)\\n\\t\""
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__riscv_v_vstate_restore",
+        "line_start": 233,
+        "line_end": 268,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Restore path first runs 'vsetvli %0, x0, e8, m8, ta, ma' (line 255) for VLE8.V data transfer which zeros Zvvm tile bits in hardware vtype before __vstate_csr_restore attempts to restore vtype via vsetvl. Combined with the vsetvl limitation in __vstate_csr_restore, this means Zvvm tile format bits are doubly clobbered (first by vsetvli for data transfer, then vsetvl cannot write them back).",
+      "snippet": "\"vsetvli\t%0, x0, e8, m8, ta, ma\\n\\t\"\n\"vle8.v\t\tv0, (%1)\\n\\t\"\n\"add\t\t%1, %1, %0\\n\\t\"\n\"vle8.v\t\tv8, (%1)\\n\\t\""
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__vstate_csr_save",
+        "line_start": 129,
+        "line_end": 165,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Save correctly reads full vtype CSR via 'csrr %1, CSR_VTYPE' (line 133) which captures all bits including Zvvm tile fields lambda[2:0], altfmt_A, altfmt_B, bs into dest->vtype. The in-memory snapshot is complete.",
+      "snippet": "\"csrr\t%0, \" __stringify(CSR_VSTART) \"\\n\\t\"\n\"csrr\t%1, \" __stringify(CSR_VTYPE) \"\\n\\t\"\n\"csrr\t%2, \" __stringify(CSR_VL) \"\\n\\t\"\n: \"=r\" (dest->vstart), \"=r\" (dest->vtype), \"=r\" (dest->vl), \"=r\" (dest->vcsr) : :);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/ptrace.c",
+        "function_name": "invalid_ptrace_v_csr",
+        "line_start": 148,
+        "line_end": 152,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Ptrace vtype validation mask 'reserved = ~(VTYPE_VSEW | VTYPE_VLMUL | VTYPE_VMA | VTYPE_VTA)' (line 150) correctly rejects writes to bits [8] through [XLEN-1] (except VILL). While this means a Zvvm-aware ptracer cannot set tile format bits, this is defensive since the kernel cannot restore those bits anyway. The mask should be relaxed only alongside a proper save/restore fix.",
+      "snippet": "/* do not allow to set vtype reserved bits and vill bit */\nreserved = ~(VTYPE_VSEW | VTYPE_VLMUL | VTYPE_VMA | VTYPE_VTA);\nif (ptrace->vtype & reserved)\n\treturn 1;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_vector.c",
+        "function_name": "kvm_riscv_vcpu_guest_vector_save",
+        "line_start": 43,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM VCPU vector save/restore delegates to __kvm_riscv_vector_save/__kvm_riscv_vector_restore, which directly call __riscv_v_vstate_save/__riscv_v_vstate_restore. Guest Zvvm tile format vtype bits will be zeroed on VM exit (save path) and cannot be restored on VM entry (restore path) due to the same vsetvl limitation.",
+      "snippet": "if ((cntx->sstatus & SR_VS) == SR_VS_DIRTY) {\n\tif (riscv_isa_extension_available(isa, v))\n\t\t__kvm_riscv_vector_save(cntx);\n\tkvm_riscv_vcpu_vector_clean(cntx);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "setup_sigcontext (save path)",
+        "line_start": 92,
+        "line_end": 94,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Signal delivery calls riscv_v_vstate_save() (line 93) which saves vtype correctly to memory, then the vsetvli in __riscv_v_vstate_save clobbers hardware vtype tile bits. When the process resumes after signal handler returns, deferred restore via arch_exit_to_user_mode_prepare calls riscv_v_vstate_restore, which cannot restore Zvvm tile bits through vsetvl.",
+      "snippet": "get_cpu_vector_context();\nriscv_v_vstate_save(&current->thread.vstate, regs);\nput_cpu_vector_context();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/entry-common.h",
+        "function_name": "arch_exit_to_user_mode_prepare",
+        "line_start": 10,
+        "line_end": 21,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Deferred vector restore on return to userspace calls riscv_v_vstate_restore() (line 19) which invokes __vstate_csr_restore -> vsetvl. Any Zvvm tile format bits saved in current->thread.vstate.vtype will NOT be written back to hardware vtype CSR because vsetvl does not cover those bit positions.",
+      "snippet": "if (ti_work & _TIF_RISCV_V_DEFER_RESTORE) {\n\tclear_thread_flag(TIF_RISCV_V_DEFER_RESTORE);\n\triscv_v_vstate_restore(&current->thread.vstate, regs);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__switch_to_vector",
+        "line_start": 369,
+        "line_end": 400,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Context-switch path calls riscv_v_vstate_save() on prev and riscv_v_vstate_set_restore() on next. The deferred restore mechanism (TIF_RISCV_V_DEFER_RESTORE) means next's vstate will be restored via arch_exit_to_user_mode_prepare -> vsetvl on return to userspace, which cannot restore Zvvm tile format bits. Affects both non-preemptive and CONFIG_RISCV_ISA_V_PREEMPTIVE paths.",
+      "snippet": "regs = task_pt_regs(prev);\nriscv_v_vstate_save(&prev->thread.vstate, regs);\n...\nriscv_v_vstate_set_restore(next, task_pt_regs(next));"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

@@ -1,0 +1,138 @@
+{
+  "pr_number": 2790,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2790,
+    "violation_condition": "QEMU's rmw_mie64 write handler masks incoming writes with `all_ints` which includes `LOCAL_INTERRUPTS` (~0x1FFFULL, i.e. all bits 13-63). This accepts writes to every local interrupt bit regardless of whether the corresponding interrupt source is actually implemented. A guest can write 1 to a non-existent interrupt bit, and subsequent CSR reads return the written value unchanged — violating the WARL requirement that unimplemented bits must read back as legal (zero) values.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "rmw_mie64.*all_ints|LOCAL_INTERRUPTS.*mask|env->mie.*all_ints",
+    "affected_entities": [
+      "mie",
+      "mieh"
+    ],
+    "summary": "mie CSR write path accepts writes to all local interrupt bits (13-63) via overly-broad all_ints mask, allowing guest to set and read back non-existent interrupt bits — WARL contract violation causing guest kernel to misidentify available interrupt sources"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_mie64",
+        "line_start": 2259,
+        "line_end": 2276,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "rmw_mie64 masks writes with 'all_ints' which includes LOCAL_INTERRUPTS (~0x1FFFULL), accepting writes to every bit 13:63 regardless of whether the corresponding interrupt source exists. A guest can write 1 to a non-existent local interrupt bit, and subsequent CSR reads return the written value — violating the WARL principle that unimplemented bits should read back as legal (zero) values. However, the RISC-V spec explicitly allows bits 13:63 to be RO or RW (per AIA 5.3), and QEMU documents this design choice at line 1823-1833 as intentional for virtual interrupt support. The risk is info_leak: a malicious guest can distinguish QEMU's permissive implementation from real hardware.",
+      "snippet": "static RISCVException rmw_mie64(CPURISCVState *env, int csrno,\n                                uint64_t *ret_val,\n                                uint64_t new_val, uint64_t wr_mask)\n{\n    uint64_t mask = wr_mask & all_ints;\n    ...\n    env->mie = (env->mie & ~mask) | (new_val & mask);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "LOCAL_INTERRUPTS (macro, used in sip/sie/vsip/vsie/hvip writable masks)",
+        "line_start": 1783,
+        "line_end": 1847,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "LOCAL_INTERRUPTS = ~0x1FFFULL treats ALL bits 13:63 as writable across sip_writable_mask (line 1841), vsip_writable_mask (line 1847), hvip_writable_mask (line 1843-1844), hvien_writable_mask (line 1845), mvip_writable_mask (line 1836-1837), mvien_writable_mask (line 1838-1839), and the dynamic masks in rmw_sie64/rmw_vsie64. The only implemented interrupt in this range is LCOFIP (bit 13). Bits 14:63 in LOCAL_INTERRUPTS are treated as 'virtual only' per the comment, but the writable mask never constrains them to zero on hardware without virtual interrupt support. The spec is ambiguous about bits 13:63 WARL behavior, making this a portability concern rather than a spec violation.",
+      "snippet": "#define LOCAL_INTERRUPTS   (~0x1FFFULL)\nstatic const uint64_t sip_writable_mask = SIP_SSIP | LOCAL_INTERRUPTS;\nstatic const uint64_t vsip_writable_mask = MIP_VSSIP | LOCAL_INTERRUPTS;\nstatic const uint64_t hvip_writable_mask = MIP_VSSIP | MIP_VSTIP | MIP_VSEIP | LOCAL_INTERRUPTS;\nstatic const uint64_t hvien_writable_mask = LOCAL_INTERRUPTS;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_sie64",
+        "line_start": 4075,
+        "line_end": 4113,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "rmw_sie64 uses '(S_MODE_INTERRUPTS | LOCAL_INTERRUPTS)' for both alias_mask and nalias_mask. Non-aliased writes (hvien=1, mideleg=0) to bits 14:63 flow directly into env->sie without hardware-level WARL constraining. Alias writes delegate to rmw_mie64 which also accepts LOCAL_INTERRUPTS. The combined effect: sie exposes the same over-permissive LOCAL_INTERRUPTS behavior as mie, doubled through two independent writable paths.",
+      "snippet": "uint64_t nalias_mask = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS) &\n    (~env->mideleg & env->mvien);\nuint64_t alias_mask = (S_MODE_INTERRUPTS | LOCAL_INTERRUPTS) & env->mideleg;\n...\nret = rmw_mie64(env, csrno, ret_val, new_val, wr_mask & alias_mask);\n...\nenv->sie = (env->sie & ~sie_mask) | (new_val & sie_mask);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_vsie64",
+        "line_start": 4005,
+        "line_end": 4042,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "rmw_vsie64 uses 'LOCAL_INTERRUPTS | VS_MODE_INTERRUPTS' for alias_mask and 'LOCAL_INTERRUPTS' for nalias_mask. Same pattern as rmw_sie64 — non-aliased writes to bits 14:63 land in env->vsie without WARL constraining. Alias writes delegate to rmw_mie64 which also accepts all LOCAL_INTERRUPTS. The H-extension virtual interrupt infrastructure depends on this permissiveness (AIA 6.3.2), making the design choice defensible but still a deviation from strict WARL semantics.",
+      "snippet": "uint64_t alias_mask = (LOCAL_INTERRUPTS | VS_MODE_INTERRUPTS) &\n                        env->hideleg;\nuint64_t nalias_mask = LOCAL_INTERRUPTS & (~env->hideleg & env->hvien);\n...\nret = rmw_mie64(env, csrno, &rval, new_val, wr_mask_mie);\n...\nenv->vsie = (env->vsie & ~wr_mask_vsie) | (new_val & wr_mask_vsie);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_mip64",
+        "line_start": 3724,
+        "line_end": 3774,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "rmw_mip64 correctly constrains its writable mask to 'delegable_ints' (S_MODE_INTERRUPTS | VS_MODE_INTERRUPTS | MIP_LCOFIP) rather than LOCAL_INTERRUPTS. It also correctly handles sstc-imposed STIP/VSTIP write restrictions via menvcfg.STCE/henvcfg.STCE checks, mvien-mediated SEIP read-only behavior, and the vstime_irq/hgeip/vgein aliasing for reads. This is a well-constrained implementation — notably stricter than the mie path.",
+      "snippet": "uint64_t old_mip, mask = wr_mask & delegable_ints;\n...\nif (riscv_cpu_cfg(env)->ext_sstc && (env->priv == PRV_M) &&\n    get_field(env->menvcfg, MENVCFG_STCE)) {\n    mask = mask & ~MIP_STIP;\n    if (get_field(env->henvcfg, HENVCFG_STCE)) {\n        mask = mask & ~MIP_VSTIP;\n    }\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_hvip64",
+        "line_start": 4776,
+        "line_end": 4858,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "rmw_hvip64 applies hvip_writable_mask (which includes LOCAL_INTERRUPTS) on top of the alias/nalias split. The nalias_mask path writes bits 14:63 directly to env->hvip without WARL constraining. For CSR_VSIP reads, the code corrects by zeroing bits where both hideleg=0 and hvien=0 (line 4822), providing read-side WARL. However, the env->hvip storage itself retains the unconstrained written value. The read-side masking mitigates the info_leak for vsip but hvip reads directly expose the stored value.",
+      "snippet": "wr_mask_hvip = wr_mask & nalias_mask & hvip_writable_mask;\nwr_mask_mip = wr_mask & alias_mask & hvip_writable_mask;\nret = rmw_mip64(env, csrno, &ret_mip, new_val, wr_mask_mip);\n...\nenv->hvip = (env->hvip & ~wr_mask_hvip) | (new_val & wr_mask_hvip);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_reset_hold",
+        "line_start": 684,
+        "line_end": 773,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "riscv_cpu_reset_hold does NOT explicitly clear env->mie or env->mip. The reset function relies on zero-initialization of the CPURISCVState struct at object creation for cold boot. On warm reset (system reset without object reallocation), stale mie/mip values would persist across the reset boundary. The RISC-V privileged spec requires mie to be 0 on reset. This is a reset correctness bug that could leave interrupts unexpectedly enabled after warm reset.",
+      "snippet": "static void riscv_cpu_reset_hold(Object *obj, ResetType type)\n{\n    ...\n    env->mcause = 0;\n    env->miclaim = MIP_SGEIP;\n    env->pc = env->resetvec;\n    /* NOTE: env->mie and env->mip are NOT cleared here */\n    ...\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/kvm/kvm-cpu.c",
+        "function_name": "kvm_riscv_reset_regs_csr",
+        "line_start": 695,
+        "line_end": 709,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The KVM reset path correctly sets env->mie = 0 and env->mip = 0 on reset. The KVM sync maps KVM's 'sie' CSR to QEMU's env->mie (line 247) and KVM's 'sip' CSR to env->mip (line 253). WARL enforcement is delegated to the KVM kernel, which applies its own hardware-correct masking. The naming is unconventional (KVM sie → QEMU mie) but functionally correct because the kernel owns the authoritative CSR state.",
+      "snippet": "static void kvm_riscv_reset_regs_csr(CPURISCVState *env)\n{\n    env->mstatus = 0;\n    env->mie = 0;\n    ...\n    env->mip = 0;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_riscv_cpu",
+        "line_start": 453,
+        "line_end": 455,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Both env->mip and env->mie are included in the VMStateDescription for live migration. No missing fields — migrated guest state correctly preserves interrupt enable and pending state. The vmstate version (11) has been stable, and the post_load callback ensures consistency.",
+      "snippet": "VMSTATE_UINT64(env.mip, RISCVCPU),\n...\nVMSTATE_UINT64(env.mie, RISCVCPU),"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_mie (generic path, CSR table)",
+        "line_start": 5929,
+        "line_end": 5929,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR_MIE uses NULL for its read callback, falling through to the generic CSR read path which returns env->mie verbatim. Since rmw_mie64 stores writes masked only by all_ints (including LOCAL_INTERRUPTS), any bit 14:63 written by the guest is directly readable. The read path applies zero WARL re-constraining — completing the info_leak round-trip: write non-existent interrupt bit → read it back → confirm QEMU's permissive implementation.",
+      "snippet": "[CSR_MIE]         = { \"mie\",        any,   NULL, NULL,   rmw_mie       },"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

@@ -1,0 +1,37 @@
+PR #2162  target=qemu  overall=bug_confirmed
+Spec: QEMU applies ror32 before SubBytes (old spec order) and uses full AES round with ShiftRows, but the corrected SAIL spec does SubBytes first then rotate without ShiftRows — all rnum values produce diverging cipher output, corrupting guest key schedule generation
+Violation: QEMU's aes64ks1i helper applies ror32 BEFORE SubBytes and uses the full AES round function (aesenc_SB_SR_AK with ShiftRows) when the corrected spec mandates SubBytes-first-then-rotate with no ShiftRows. For rnum == 0xA, QEMU skips rotation and uses XOR with zero-valued round key, but still applies ShiftRows, while the corrected spec requires only aes_subword_fwd with neither rotation nor rcon XOR. Additionally, trans_aes64ks1i rejects rnum > 0xA as illegal, but the spec now defines valid (zero-valued) rcon entries for 0xB-0xF, changing the illegal-instruction boundary.
+Consequence: data_corruption
+Pattern: ror32.*temp.*8.*aesenc_SB_SR_AK|aes64ks1i.*imm\s*>\s*0xA|round_consts\[enc_rnum\].*aes64ks1i
+------------------------------------------------------------
+[bug_confirmed] target/riscv/crypto_helper.c:141-161  HELPER(aes64ks1i)
+  ror32-before-SubBytes order violation: The helper applies ror32(temp, 8) at
+  line 153 BEFORE calling aesenc_SB_SR_AK at line 158. The corrected SAIL spec
+  mandates SubBytes-first-then-rotate. This produces a different output for all
+  rnum != 0xA because rotating first shuffles bytes into different positions
+  before the S-box lookup, yielding wrong S-box outputs per byte position.
+  | if (enc_rnum != 0xA) {
+  |     temp = ror32(temp, 8); /* Rotate right by 8 */
+  |     rc.w[0] = rc.w[1] = round_consts[enc_rnum];
+  | }
+  | t.w[0] = t.w[1] = t.w[2] = t.w[3] = temp;
+  | aesenc_SB_SR_AK(&t, &t, &rc, false);
+
+[bug_confirmed] target/riscv/crypto_helper.c:157-158  HELPER(aes64ks1i)
+  ShiftRows incorrectly applied: aesenc_SB_SR_AK (SubBytes+ShiftRows+AddRoundKey) is used at line 158, but the corrected spec requires only SubBytes (aes_subword_fwd) with no ShiftRows. The ShiftRows permutation (AES_SH macro: byte[i] -> byte[(i*5) & 15]) is unconditionally applied, corrupting the key schedule output. For rnum==0xA, ShiftRows is still applied despite no rotation and zero round key, whereas the spec requires only aes_subword_fwd with neither ShiftRows nor rcon XOR.
+  | t.w[0] = t.w[1] = t.w[2] = t.w[3] = temp;
+  | aesenc_SB_SR_AK(&t, &t, &rc, false);
+
+[bug_confirmed] target/riscv/crypto_helper.c:152-155  HELPER(aes64ks1i)
+  rnum==0xA special-case mismatch: When rnum==0xA, the helper skips rotation and sets rc to zero (implicit via ={}), so the AddRoundKey XOR becomes a no-op. However aesenc_SB_SR_AK still applies ShiftRows on the SubBytes output. The corrected spec requires only aes_subword_fwd (pure SubBytes) for rnum==0xA, with no ShiftRows and no rcon XOR.
+  | if (enc_rnum != 0xA) {
+  |     temp = ror32(temp, 8); /* Rotate right by 8 */
+  |     rc.w[0] = rc.w[1] = round_consts[enc_rnum];
+  | }
+
+[bug_confirmed] target/riscv/insn_trans/trans_rvk.c.inc:126-136  trans_aes64ks1i
+  Illegal-instruction boundary too restrictive: The translate function rejects rnum > 0xA as illegal (return false at line 132). The updated spec defines valid rcon entries for rnum 0xB-0xF (zero-valued), meaning these are legal instruction encodings that should execute. Additionally, the round_consts[] table only has 10 entries, so extending the boundary would also require extending the table to avoid out-of-bounds reads.
+  | if (a->imm > 0xA) {
+  |     return false;
+  | }
+

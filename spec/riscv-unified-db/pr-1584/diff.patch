@@ -1,0 +1,1615 @@
+diff --git a/.github/workflows/regress.yml b/.github/workflows/regress.yml
+index f1bde326e7..556271f786 100644
+--- a/.github/workflows/regress.yml
++++ b/.github/workflows/regress.yml
+@@ -480,6 +480,8 @@ jobs:
+         - yaml_loader
+         - cfg_arch
+         - cfg
++        - mmr
++        - mmr_schema
+   regress-gen-go:
+     runs-on: ubuntu-latest
+     needs: build-container
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index bc59480488..88361e8ba4 100755
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -60,6 +60,12 @@ repos:
+         alias: check-jsonschema-csr
+         files: ^spec/std/isa/csr/.*\.(yaml|yml)$
+         args: ["--schemafile", "spec/schemas/csr_schema.json"]
++      - id: check-jsonschema
++        name: Validate MMR files with jsonschema
++        stages: [pre-commit]
++        alias: check-jsonschema-mmr
++        files: ^spec/.*/isa/.*/mmr/.*\.(yaml|yml)$
++        args: ["--schemafile", "spec/schemas/mmr_schema.json"]
+       - id: check-jsonschema
+         name: Validate extension files with jsonschema
+         stages: [pre-commit]
+diff --git a/spec/schemas/mmr_schema.json b/spec/schemas/mmr_schema.json
+new file mode 100644
+index 0000000000..4a4c419df1
+--- /dev/null
++++ b/spec/schemas/mmr_schema.json
+@@ -0,0 +1,76 @@
++{
++  "$schema": "http://json-schema.org/draft-07/schema#",
++
++  "title": "MMR description",
++  "description": "A memory-mapped register specification",
++
++  "type": "object",
++  "required": [
++    "$schema",
++    "kind",
++    "name",
++    "long_name",
++    "length",
++    "description",
++    "writable",
++    "physical_address",
++    "definedBy"
++  ],
++
++  "properties": {
++    "$schema": {
++      "format": "uri-reference",
++      "const": "mmr_schema.json#",
++      "description": "Path to schema, relative to <UDB ROOT>/schemas"
++    },
++    "kind": {
++      "const": "mmr",
++      "description": "Object type"
++    },
++    "name": {
++      "type": "string",
++      "pattern": "^[a-z][a-z0-9_.]+$",
++      "description": "MMR name"
++    },
++    "long_name": {
++      "type": "string",
++      "description": "One line description for the MMR"
++    },
++    "description": {
++      "$ref": "schema_defs.json#/definitions/spec_text",
++      "description": "Function of the register"
++    },
++    "definedBy": {
++      "$ref": "schema_defs.json#/definitions/condition",
++      "description": "Extension(s) that define the MMR"
++    },
++    "physical_address": {
++      "type": "integer",
++      "minimum": 0,
++      "description": "Physical memory address of the register"
++    },
++    "writable": {
++      "type": "boolean",
++      "description": "Whether or not the register can be written by software"
++    },
++    "length": {
++      "description": "Length, in bits, of the register. Must be a fixed integer (no XLEN-dependent lengths for MMIO).",
++      "enum": [8, 16, 32, 64, 128]
++    },
++    "fields": {
++      "type": "object",
++      "patternProperties": {
++        "^[a-zA-Z].*$": {
++          "$ref": "csr_schema.json#/definitions/csr_field"
++        }
++      },
++      "description": "fields of this MMR",
++      "additionalProperties": false
++    },
++    "$source": {
++      "description": "Path to the source file this definition came from; used by downstream tooling -- not expected to be in handwritten files",
++      "type": "string"
++    }
++  },
++  "additionalProperties": false
++}
+diff --git a/tools/ruby-gems/udb-gen/templates/common/mmr.adoc.erb b/tools/ruby-gems/udb-gen/templates/common/mmr.adoc.erb
+new file mode 100644
+index 0000000000..8b2f0e5a20
+--- /dev/null
++++ b/tools/ruby-gems/udb-gen/templates/common/mmr.adoc.erb
+@@ -0,0 +1,71 @@
++<%#
++  Copyright (c) AINEKKO.
++  SPDX-License-Identifier: BSD-3-Clause-Clear
++%>
++<%= anchor_for_udb_doc_mmr(mmr.name) %>
++= <%= mmr.name %>
++
++*<%= mmr.long_name %>*
++
++<%= mmr.description %>
++
++== Attributes
++[%autowidth]
++|===
++h| Defining Extension a| <%= mmr.defined_by_condition.to_asciidoc %>
++h| Physical Address    | <%= "0x#{mmr.physical_address.to_s(16).upcase}" %>
++h| Length         | <%= mmr.length_pretty %>
++|===
++
++== Format
++<%# MMR has a known static length, so there is only one format to display -%>
++.<%= mmr.name %> format
++[wavedrom, ,svg,subs='attributes',width="100%"]
++....
++<%= JSON.dump mmr.wavedrom_desc(cfg_arch, mmr.length) %>
++....
++
++== Field Summary
++
++[%autowidth,separator=@,float="center",align="center",cols="^,<,<,<",options="header",role="stretch"]
++|===
++@Name @ Location @ Type @ Reset Value
++
++<%- mmr.fields.each do |field| -%>
++@ <%= link_to_udb_doc_mmr_field(mmr.name, field.name) %>
++@ <%= field.location_pretty %>
++@ <%= field.type_pretty %>
++@ <%= field.reset_value_pretty %>
++
++<%- end -%>
++|===
++
++
++== Fields
++
++<%- if mmr.fields.empty? -%>
++This MMR has no fields.
++<%- else -%>
++
++<%- mmr.fields.each do |field| -%>
++[[<%=mmr.name%>-<%=field.name%>-def]]
++=== `<%= field.name %>`
++
++[example]
++****
++Location::
++<%= field.location_pretty %>
++
++Description::
++<%= field.description %>
++
++Type::
++<%= field.type_pretty %>
++
++Reset value::
++<%= field.reset_value_pretty %>
++
++****
++
++<%- end -%>
++<%- end -%>
+diff --git a/tools/ruby-gems/udb/lib/udb/architecture.rb b/tools/ruby-gems/udb/lib/udb/architecture.rb
+index 60d5840a78..e5efffca9d 100644
+--- a/tools/ruby-gems/udb/lib/udb/architecture.rb
++++ b/tools/ruby-gems/udb/lib/udb/architecture.rb
+@@ -20,6 +20,7 @@
+ #   Extension       extensions()        extension_hash()        extension(name)
+ #   Instruction     instructions()      instruction_hash()      instruction(name)
+ #   Csr             csrs()              csr_hash()              csr(name)
++#   Mmr             mmrs()              mmr_hash()              mmr(name)
+ #   ProcCertClass   proc_cert_classes() proc_cert_class_hash()  proc_cert_class(name)
+ #   ProcCertModel   proc_cert_models()  proc_cert_model_hash()  proc_cert_model(name)
+ #   ProfileFamily   profile_families()  profile_family_hash()   profile_family(name)
+@@ -52,6 +53,7 @@
+ require_relative "obj/csr_field"
+ require_relative "obj/register_file"
+ require_relative "obj/exception_code"
++require_relative "obj/mmr"
+ require_relative "obj/extension"
+ require_relative "obj/instruction"
+ require_relative "obj/manual"
+@@ -130,6 +132,12 @@ def validate(resolver, show_progress: true)
+         klass: RegisterFile,
+         kind: DatabaseObject::Kind::RegisterFile
+       },
++      {
++        fn_name: "mmr",
++        arch_dir: "mmr",
++        klass: Mmr,
++        kind: DatabaseObject::Kind::Mmr
++      },
+       {
+         fn_name: "param",
+         arch_dir: "param",
+@@ -286,6 +294,9 @@ def ref(uri)
+         when /^csr.*/
+           csr_name = File.basename(file_path, ".yaml")
+           csr(csr_name)
++        when /^mmr.*/
++          mmr_name = File.basename(file_path, ".yaml")
++          mmr(mmr_name)
+         when /^ext.*/
+           ext_name = File.basename(file_path, ".yaml")
+           extension(ext_name)
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/csr.rb b/tools/ruby-gems/udb/lib/udb/obj/csr.rb
+index 0bbd452e77..12e2071471 100644
+--- a/tools/ruby-gems/udb/lib/udb/obj/csr.rb
++++ b/tools/ruby-gems/udb/lib/udb/obj/csr.rb
+@@ -9,6 +9,7 @@
+ 
+ require_relative "database_obj"
+ require_relative "certifiable_obj"
++require_relative "has_fields"
+ 
+ module Udb
+ 
+@@ -16,6 +17,7 @@ module Udb
+   class Csr < TopLevelDatabaseObject
+     # Add all methods in this module to this type of database object.
+     include CertifiableObject
++    include HasFields
+ 
+     include Idl::Csr
+ 
+@@ -85,10 +87,6 @@ def value
+     end
+     alias reset_value value
+ 
+-    def writable
+-      @data["writable"]
+-    end
+-
+     # @return [Integer] 32 or 64, the XLEN this CSR is exclusively defined in
+     # @return [nil] if this CSR is defined in all bases
+     sig { returns(T.nilable(Integer)) }
+@@ -450,66 +448,11 @@ def defining_extension_requirements
+         end
+     end
+ 
+-    # @param effective_xlen [Integer or nil] 32 or 64 for fixed xlen, nil for dynamic
+-    # @return [Array<CsrField>] All implemented fields for this CSR at the given effective XLEN, sorted by location (smallest location first)
+-    #                           Excluded any fields that are defined by unimplemented extensions or a base that is not effective_xlen
+-    def possible_fields_for(effective_xlen)
+-
+-      raise ArgumentError, "effective_xlen is non-nil and is a #{effective_xlen.class} but must be an Integer" unless effective_xlen.nil? || effective_xlen.is_a?(Integer)
+-
+-      @possible_fields_for ||= {}
+-      @possible_fields_for[effective_xlen] ||=
+-        possible_fields.select do |f|
+-          f.base.nil? || f.base == effective_xlen
+-        end
+-    end
+-
+-    # @return [Array<CsrField>] All implemented fields for this CSR
+-    #                           Excluded any fields that are defined by unimplemented extensions
+-    sig { returns(T::Array[CsrField]) }
+-    def possible_fields
+-      @possible_fields ||= fields.select do |f|
+-        f.exists_in_cfg?(cfg_arch)
+-      end
+-    end
+-
+-    # @return [Array<CsrField>] All known fields of this CSR
++    # Sorbet override to satisfy Idl::Csr abstract method.
++    # HasFields#fields returns CsrField instances but Sorbet can't see through
++    # the untyped module, so we cast explicitly.
+     sig { override.returns(T::Array[CsrField]) }
+-    def fields
+-      return @fields unless @fields.nil?
+-
+-      @fields = @data["fields"].map { |field_name, field_data| CsrField.new(self, field_name, field_data) }
+-    end
+-
+-    # @param effective_xlen [Integer or nil] 32 or 64 for fixed xlen, nil for dynamic
+-    # @return [Array<CsrField>] All known fields of this CSR when XLEN == +effective_xlen+
+-    # equivalent to {#fields} if +effective_xlen+ is nil
+-    sig { params(effective_xlen: T.nilable(Integer)).returns(T::Array[CsrField]) }
+-    def fields_for(effective_xlen)
+-      fields.select { |f| effective_xlen.nil? || f.base.nil? || f.base == effective_xlen }
+-    end
+-
+-    # @return [Hash<String,CsrField>] Hash of fields, indexed by field name
+-    def field_hash
+-      return @field_hash unless @field_hash.nil?
+-
+-      @field_hash = {}
+-      fields.each do |field|
+-        @field_hash[field.name] = field
+-      end
+-
+-      @field_hash
+-    end
+-
+-    # @return [Boolean] true if a field named 'field_name' is defined in the csr, and false otherwise
+-    def field?(field_name)
+-      field_hash.key?(field_name.to_s)
+-    end
+-
+-    # returns [CsrField,nil] field named 'field_name' if it exists, and nil otherwise
+-    def field(field_name)
+-      field_hash[field_name.to_s]
+-    end
++    def fields = T.unsafe(super)
+ 
+     # @param effective_xlen [Integer or nil] 32 or 64 for fixed xlen, nil for dynamic
+     # @return [Idl::BitfieldType] A bitfield type that can represent all fields of the CSR
+@@ -648,89 +591,12 @@ def pruned_sw_read_ast(effective_xlen)
+       @pruned_sw_read_ast[effective_xlen] = ast
+     end
+ 
+-    # @example Result for an I-type instruction
+-    #   {reg: [
+-    #     {bits: 7,  name: 'OP-IMM',    attr: ['{op_major_name}'], type: 8},
+-    #     {bits: 5,  name: 'rd',        attr: [''], type: 2},
+-    #     {bits: 3,  name: {funct3},    attr: ['{mnemonic}'], type: 8},
+-    #     {bits: 5,  name: 'rs1',       attr: [''], type: 4},
+-    #     {bits: 12, name: 'imm12',     attr: [''], type: 6}
+-    #   ]}
+-    #
+-    # @param cfg_arch [ConfiguredArchitecture] A configuration
+-    # @param effective_xlen [Integer,nil] Effective XLEN to use when CSR length is dynamic
+-    # @param exclude_unimplemented [Boolean] If true, do not create include unimplemented fields in the figure
+-    # @param optional_type [Integer] Wavedrom type (Fill color) for fields that are optional (not mandatory) in a partially-specified cfg_arch
+-    # @return [Hash] A representation of the WaveDrom drawing for the CSR (should be turned into JSON for wavedrom)
+-    def wavedrom_desc(cfg_arch, effective_xlen, exclude_unimplemented: false, optional_type: 2)
+-      unless cfg_arch.is_a?(ConfiguredArchitecture)
+-        raise ArgumentError, "cfg_arch is a class #{cfg_arch.class} but must be a ConfiguredArchitecture"
+-      end
+-      raise ArgumentError, "effective_xlen is non-nil and is a #{effective_xlen.class} but must be an Integer" unless effective_xlen.nil? || effective_xlen.is_a?(Integer)
+-
+-      desc = {
+-        "reg" => []
+-      }
+-      last_idx = -1
+-
+-      field_list =
+-        if exclude_unimplemented
+-          possible_fields_for(effective_xlen)
+-        else
+-          fields_for(effective_xlen)
+-        end
+-
+-      field_list.sort! { |a, b| a.location(effective_xlen).min <=> b.location(effective_xlen).min }
+-      field_list.each do |field|
+-
+-        if field.location(effective_xlen).min != last_idx + 1
+-          # have some reserved space
+-          n = field.location(effective_xlen).min - last_idx - 1
+-          raise "negative reserved space? #{n} #{name} #{field.location(effective_xlen).min} #{last_idx + 1}" if n <= 0
+-
+-          desc["reg"] << { "bits" => n, :type => 1 }
+-        end
+-        if cfg_arch.partially_configured? && field.optional_in_cfg?(cfg_arch)
+-          desc["reg"] << { "bits" => field.location(effective_xlen).size, "name" => field.name, :type => optional_type }
+-        else
+-          desc["reg"] << { "bits" => field.location(effective_xlen).size, "name" => field.name, :type => 3 }
+-        end
+-        last_idx = T.cast(field.location(effective_xlen).max, Integer)
+-      end
+-      if !field_list.empty? && (field_list.last.location(effective_xlen).max != (T.must(length(effective_xlen)) - 1))
+-        # reserved space at the end
+-        desc["reg"] << { "bits" => (T.must(length(effective_xlen)) - 1 - last_idx), :type => 1 }
+-        # desc['reg'] << { 'bits' => 1, type: 1 }
+-      end
+-      desc["config"] = { "bits" => length(effective_xlen) }
+-      desc["config"]["lanes"] = T.must(length(effective_xlen)) / 16
+-      desc
+-    end
+-
+     # @param cfg_arch [ConfiguredArchitecture] Architecture def
+     # @return [Boolean] whether or not the CSR is possibly implemented given the supplied config options
+     sig { params(cfg_arch: ConfiguredArchitecture).returns(T::Boolean) }
+     def exists_in_cfg?(cfg_arch)
+       @exists_in_cfg ||= defined_by_condition.could_be_satisfied_by_cfg_arch?(cfg_arch)
+     end
+-
+-    # @param cfg_arch [ConfiguredArchitecture] Architecture def
+-    # @return [Boolean] whether or not the CSR is optional in the config
+-    sig { params(cfg_arch: ConfiguredArchitecture).returns(T::Boolean) }
+-    def optional_in_cfg?(cfg_arch)
+-      raise "optional_in_cfg? should only be used by a partially-specified arch def" unless cfg_arch.partially_configured?
+-
+-      # exists in config and isn't satisfied by some combo of mandatory extensions
+-      @optional_in_cfg ||=
+-        exists_in_cfg?(cfg_arch) &&
+-          (defined_by_condition.satisfied_by_cfg_arch?(cfg_arch) == SatisfiedResult::Maybe)
+-    end
+-
+-    # @return [Boolean] Whether or not the presence of ext_ver affects this CSR definition
+-    def affected_by?(ext_ver)
+-      defined_by_condition.satisfiability_depends_on_ext_req?(ext_ver.to_ext_req) || \
+-        fields.any? { |field| field.affected_by?(ext_ver) }
+-    end
+   end
+ 
+ end
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/csr_field.rb b/tools/ruby-gems/udb/lib/udb/obj/csr_field.rb
+index d298a6beed..1ae636453b 100644
+--- a/tools/ruby-gems/udb/lib/udb/obj/csr_field.rb
++++ b/tools/ruby-gems/udb/lib/udb/obj/csr_field.rb
+@@ -21,8 +21,8 @@ class CsrField < DatabaseObject
+ 
+     include Idl::CsrField
+ 
+-    # @return [Csr] The Csr that defines this field
+-    sig { returns(Csr) }
++    # @return [Csr, Mmr] The Csr or Mmr that defines this field
++    sig { returns(T.any(Csr, Mmr)) }
+     attr_reader :parent
+ 
+     # @!attribute field
+@@ -51,9 +51,9 @@ class MemoizedState < T::Struct
+       prop :reachable_functions, T::Hash[T.any(Symbol, Integer), T::Array[Idl::FunctionDefAst]]
+     end
+ 
+-    # @param parent_csr [Csr] The Csr that defined this field
++    # @param parent_csr [Csr, Mmr] The Csr or Mmr that defined this field
+     # @param field_data [Hash<String,Object>] Field data from the arch spec
+-    sig { params(parent_csr: Csr, field_name: String, field_data: T::Hash[String, T.untyped]).void }
++    sig { params(parent_csr: T.any(Csr, Mmr), field_name: String, field_data: T::Hash[String, T.untyped]).void }
+     def initialize(parent_csr, field_name, field_data)
+       super(field_data, parent_csr.data_path, parent_csr.arch, DatabaseObject::Kind::CsrField, name: field_name)
+       @parent = parent_csr
+@@ -352,8 +352,12 @@ def dynamic_location?
+       # if there is no location_rv32, the the field never changes
+       return false unless @data["location"].nil?
+ 
++      # MMR fields never have dynamic locations (no privilege modes)
++      parent_reg = parent
++      return false unless parent_reg.is_a?(Csr)
++
+       # the field changes *if* some mode with access can change XLEN
+-      csr.modes_with_access.any? { |mode| @cfg_arch.multi_xlen_in_mode?(mode) }
++      parent_reg.modes_with_access.any? { |mode| @cfg_arch.multi_xlen_in_mode?(mode) }
+     end
+ 
+     # @return [Idl::FunctionBodyAst] Abstract syntax tree of the reset_value function
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb b/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb
+index 2415abea89..99b3fe8a43 100644
+--- a/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb
++++ b/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb
+@@ -27,6 +27,7 @@ class Kind < T::Enum
+         CsrField = new("csr_field")
+         Extension = new("extension")
+         RegisterFile = new("register_file")
++        Mmr = new("mmr")
+         Parameter = new("parameter")
+         ExceptionCode = new("exception_code")
+         InterruptCode = new("interrupt_code")
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/extension.rb b/tools/ruby-gems/udb/lib/udb/obj/extension.rb
+index b85c791af9..593a6a5806 100644
+--- a/tools/ruby-gems/udb/lib/udb/obj/extension.rb
++++ b/tools/ruby-gems/udb/lib/udb/obj/extension.rb
+@@ -358,6 +358,35 @@ def csrs_that_must_be_implemented
+       @csrs_that_must_be_implemented ||= csrs + implied_csrs
+     end
+ 
++    # @return the list of MMRs implemented by *any version* of this extension (may be empty)
++    sig { returns(T::Array[Mmr]) }
++    def mmrs
++      @mmrs ||=
++        begin
++          pb =
++            Udb.create_progressbar(
++              "Finding mmrs for #{name} [:bar] :current/:total",
++              total: cfg_arch.mmrs.size,
++              clear: true
++            )
++          cfg_arch.mmrs.select do |mmr|
++            pb.advance
++            mmr_defined = mmr.defined_by_condition
++            next unless mmr_defined.mentions?(self)
++            requirement_met = to_condition
++            preconditions_met = requirements_condition
++
++            # mmr is defined exclusively by self if:
++            (
++              (-mmr_defined & requirement_met) # it must be defined when self is met, and
++            ).unsatisfiable? &
++            (
++              (-mmr_defined & preconditions_met)  # it may not be defined when only self's requirements are met
++            ).satisfiable?
++          end
++        end
++    end
++
+     # return the set of reachable functions from any of this extensions's CSRs or instructions in the given evaluation context
+     #
+     # @return Array of IDL functions reachable from any instruction or CSR in the extension
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/has_fields.rb b/tools/ruby-gems/udb/lib/udb/obj/has_fields.rb
+new file mode 100644
+index 0000000000..0201f418d3
+--- /dev/null
++++ b/tools/ruby-gems/udb/lib/udb/obj/has_fields.rb
+@@ -0,0 +1,151 @@
++# Copyright (c) AINEKKO.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# frozen_string_literal: true
++
++require_relative "csr_field"
++
++module Udb
++
++# Shared field-management methods for register-like objects (CSR, MMR).
++#
++# Includers must provide:
++#   - length(effective_xlen)  — register width in bits
++#   - max_length              — largest possible width
++#   - cfg_arch                — ConfiguredArchitecture
++#   - name                    — register name (String)
++#   - defined_by_condition    — ExtensionRequirement condition
++#   - exists_in_cfg?(cfg_arch)
++module HasFields
++  # @return [Array<CsrField>] All known fields of this register
++  def fields
++    return @fields unless @fields.nil?
++
++    @fields =
++      if @data["fields"].nil?
++        []
++      else
++        @data["fields"].map { |field_name, field_data| CsrField.new(self, field_name, field_data) }
++      end
++  end
++
++  # @param effective_xlen [Integer or nil] 32 or 64 for fixed xlen, nil for dynamic
++  # @return [Array<CsrField>] All known fields when XLEN == +effective_xlen+
++  def fields_for(effective_xlen)
++    fields.select { |f| effective_xlen.nil? || f.base.nil? || f.base == effective_xlen }
++  end
++
++  # @return [Hash<String,CsrField>] Hash of fields, indexed by field name
++  def field_hash
++    @field_hash unless @field_hash.nil?
++
++    @field_hash = {}
++    fields.each do |field|
++      @field_hash[field.name] = field
++    end
++
++    @field_hash
++  end
++
++  # @return [Boolean] true if a field named 'field_name' is defined
++  def field?(field_name)
++    field_hash.key?(field_name.to_s)
++  end
++
++  # @return [CsrField,nil] field named 'field_name' if it exists, and nil otherwise
++  def field(field_name)
++    field_hash[field_name.to_s]
++  end
++
++  # @return [Array<CsrField>] All implemented fields, excluding fields defined by unimplemented extensions
++  def possible_fields
++    @possible_fields ||= fields.select do |f|
++      f.exists_in_cfg?(cfg_arch)
++    end
++  end
++
++  # @param effective_xlen [Integer or nil] 32 or 64 for fixed xlen, nil for dynamic
++  # @return [Array<CsrField>] All implemented fields at the given effective XLEN
++  def possible_fields_for(effective_xlen)
++    raise ArgumentError, "effective_xlen is non-nil and is a #{effective_xlen.class} but must be an Integer" unless effective_xlen.nil? || effective_xlen.is_a?(Integer)
++
++    @possible_fields_for ||= {}
++    @possible_fields_for[effective_xlen] ||=
++      possible_fields.select do |f|
++        f.base.nil? || f.base == effective_xlen
++      end
++  end
++
++  # @return [Boolean] Whether or not the register can be written by software
++  def writable
++    @data["writable"]
++  end
++
++  # @param cfg_arch [ConfiguredArchitecture] Architecture definition
++  # @param effective_xlen [Integer,nil] Effective XLEN to use
++  # @param exclude_unimplemented [Boolean] If true, do not include unimplemented fields
++  # @param optional_type [Integer] Wavedrom type (fill color) for optional fields
++  # @return [Hash] A representation of the WaveDrom drawing for the register
++  def wavedrom_desc(cfg_arch, effective_xlen, exclude_unimplemented: false, optional_type: 2)
++    unless cfg_arch.is_a?(ConfiguredArchitecture)
++      raise ArgumentError, "cfg_arch is a class #{cfg_arch.class} but must be a ConfiguredArchitecture"
++    end
++    raise ArgumentError, "effective_xlen is non-nil and is a #{effective_xlen.class} but must be an Integer" unless effective_xlen.nil? || effective_xlen.is_a?(Integer)
++
++    desc = {
++      "reg" => []
++    }
++    last_idx = -1
++
++    field_list =
++      if exclude_unimplemented
++        possible_fields_for(effective_xlen)
++      else
++        fields_for(effective_xlen)
++      end
++
++    field_list.sort! { |a, b| a.location(effective_xlen).min <=> b.location(effective_xlen).min }
++    field_list.each do |field|
++      if field.location(effective_xlen).min != last_idx + 1
++        # reserved space
++        n = field.location(effective_xlen).min - last_idx - 1
++        raise "negative reserved space? #{n} #{name} #{field.location(effective_xlen).min} #{last_idx + 1}" if n <= 0
++
++        desc["reg"] << { "bits" => n, type: 1 }
++      end
++      if cfg_arch.partially_configured? && field.optional_in_cfg?(cfg_arch)
++        desc["reg"] << { "bits" => field.location(effective_xlen).size, "name" => field.name, type: optional_type }
++      else
++        desc["reg"] << { "bits" => field.location(effective_xlen).size, "name" => field.name, type: 3 }
++      end
++      last_idx = field.location(effective_xlen).max
++    end
++    if !field_list.empty? && (field_list.last.location(effective_xlen).max != (length(effective_xlen) - 1))
++      desc["reg"] << { "bits" => (length(effective_xlen) - 1 - last_idx), type: 1 }
++    end
++    desc["config"] = { "bits" => length(effective_xlen) }
++    desc["config"]["lanes"] = length(effective_xlen) / 16
++    desc
++  end
++
++  # @param cfg_arch [ConfiguredArchitecture] Architecture def
++  # @return [Boolean] whether or not the register is optional in the config
++  def optional_in_cfg?(cfg_arch)
++    unless cfg_arch.is_a?(ConfiguredArchitecture)
++      raise ArgumentError, "cfg_arch is a class #{cfg_arch.class} but must be a ConfiguredArchitecture"
++    end
++    raise "optional_in_cfg? should only be used by a partially-specified arch def" unless cfg_arch.partially_configured?
++
++    @optional_in_cfg ||=
++      exists_in_cfg?(cfg_arch) &&
++      (defined_by_condition.satisfied_by_cfg_arch?(cfg_arch) == SatisfiedResult::Maybe)
++  end
++
++  # @return [Boolean] Whether or not the presence of ext_ver affects this register definition
++  def affected_by?(ext_ver)
++    defined_by_condition.satisfiability_depends_on_ext_req?(ext_ver.to_ext_req) || \
++      fields.any? { |field| field.affected_by?(ext_ver) }
++  end
++end
++
++end
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/mmr.rb b/tools/ruby-gems/udb/lib/udb/obj/mmr.rb
+new file mode 100644
+index 0000000000..0f666c2b10
+--- /dev/null
++++ b/tools/ruby-gems/udb/lib/udb/obj/mmr.rb
+@@ -0,0 +1,104 @@
++# Copyright (c) AINEKKO.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# typed: true
++# frozen_string_literal: true
++
++require_relative "database_obj"
++require_relative "csr_field"
++require_relative "has_fields"
++
++module Udb
++
++# Memory-Mapped Register (MMR) definition
++#
++# MMRs are registers accessed via physical memory addresses rather than the
++# CSR address space. They reuse the same field definitions as CSRs but have
++# a physical address instead of a 12-bit CSR address, and no privilege mode
++# or IDL sw_read/sw_write integration.
++class Mmr < TopLevelDatabaseObject
++  include HasFields
++
++  sig { override.returns(String) }
++  attr_reader :name
++
++  def ==(other)
++    if other.is_a?(Mmr)
++      name == other.name
++    else
++      raise ArgumentError, "Mmr is not comparable to #{other.class.name}"
++    end
++  end
++
++  # @return [Integer] Physical memory address of the register
++  def physical_address
++    @data["physical_address"]
++  end
++
++  def long_name
++    @data["long_name"]
++  end
++
++  # @return [Integer] Length in bits of the register
++  def length(_effective_xlen = nil)
++    @data["length"]
++  end
++
++  # @return [Integer] The largest length of this MMR (same as length since it's always fixed)
++  sig { returns(Integer) }
++  def max_length
++    @data["length"]
++  end
++
++  # @return [Integer] Smallest length of the MMR (same as length since it's always fixed)
++  def min_length
++    @data["length"]
++  end
++
++  # @return [String] Pretty-printed length string
++  def length_pretty(_effective_xlen = nil)
++    "#{@data['length']}-bit"
++  end
++
++  # @return [Boolean] false -- MMR lengths are always static
++  def dynamic_length?
++    false
++  end
++
++  # @return [Boolean] true if this MMR is defined when XLEN is 32
++  def defined_in_base32? = true
++
++  # @return [Boolean] true if this MMR is defined when XLEN is 64
++  def defined_in_base64? = true
++
++  # @return [Boolean] true if this MMR is defined regardless of the effective XLEN
++  def defined_in_all_bases? = true
++
++  # @return [Boolean] true if this MMR is defined when XLEN is xlen
++  def defined_in_base?(xlen) = true
++
++  # @return [nil] MMRs have no base restriction
++  def base = nil
++
++  # @return [Boolean] Whether or not the format changes with XLEN (always false for MMR)
++  def format_changes_with_xlen?
++    false
++  end
++
++  # @param cfg_arch [ConfiguredArchitecture] Architecture def
++  # @return [Boolean] whether or not the MMR is possibly implemented given the supplied config options
++  sig { params(cfg_arch: ConfiguredArchitecture).returns(T::Boolean) }
++  def exists_in_cfg?(cfg_arch)
++    @exists_in_cfg ||= defined_by_condition.could_be_satisfied_by_cfg_arch?(cfg_arch)
++  end
++
++  # Stubs for Sorbet — CsrField.parent is T.any(Csr, Mmr) but these methods
++  # are only called on CSR-backed fields, never on MMR fields.
++  sig { returns(String) }
++  def priv_mode = raise NotImplementedError, "MMR does not have a privilege mode"
++
++  sig { params(cfg_arch: ConfiguredArchitecture, effective_xlen: T.nilable(Integer)).returns(T.untyped) }
++  def bitfield_type(cfg_arch, effective_xlen = nil) = raise NotImplementedError, "MMR does not have a bitfield type"
++end
++
++end
+diff --git a/tools/ruby-gems/udb/sorbet/rbi/dsl/udb/architecture.rbi b/tools/ruby-gems/udb/sorbet/rbi/dsl/udb/architecture.rbi
+index c40af8c762..d1842b4da3 100644
+--- a/tools/ruby-gems/udb/sorbet/rbi/dsl/udb/architecture.rbi
++++ b/tools/ruby-gems/udb/sorbet/rbi/dsl/udb/architecture.rbi
+@@ -87,6 +87,15 @@ class Udb::Architecture
+   sig { returns(T::Array[Udb::Manual]) }
+   def manuals; end
+ 
++  sig { params(name: String).returns(T.nilable(Udb::Mmr)) }
++  def mmr(name); end
++
++  sig { returns(T::Hash[String, Udb::Mmr]) }
++  def mmr_hash; end
++
++  sig { returns(T::Array[Udb::Mmr]) }
++  def mmrs; end
++
+   sig { params(name: String).returns(T.nilable(Udb::Parameter)) }
+   def param(name); end
+ 
+diff --git a/tools/ruby-gems/udb/test/run.rb b/tools/ruby-gems/udb/test/run.rb
+index 433c3d0af6..646416489c 100644
+--- a/tools/ruby-gems/udb/test/run.rb
++++ b/tools/ruby-gems/udb/test/run.rb
+@@ -11,4 +11,6 @@
+ require_relative "test_cli"
+ require_relative "test_conditions"
+ require_relative "test_logic"
++require_relative "test_mmr"
++require_relative "test_mmr_schema"
+ require_relative "test_yaml_loader"
+diff --git a/tools/ruby-gems/udb/test/test_mmr.rb b/tools/ruby-gems/udb/test/test_mmr.rb
+new file mode 100644
+index 0000000000..c88bdaae40
+--- /dev/null
++++ b/tools/ruby-gems/udb/test/test_mmr.rb
+@@ -0,0 +1,459 @@
++# Copyright (c) AINEKKO.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# typed: false
++# frozen_string_literal: true
++
++require_relative "test_helper"
++
++require "fileutils"
++require "tmpdir"
++require "yaml"
++
++require "udb/logic"
++require "udb/cfg_arch"
++require "udb/resolver"
++
++class TestMmr < Minitest::Test
++  include Udb
++
++  def cfg_arch
++    return @cfg_arch unless @cfg_arch.nil?
++
++    udb_gem_root = (Pathname.new(__dir__) / "..").realpath
++    @gen_path = Pathname.new(Dir.mktmpdir)
++    $resolver ||= Udb::Resolver.new(
++      schemas_path_override: udb_gem_root / "schemas",
++      cfgs_path_override: udb_gem_root / "test" / "mock_cfgs",
++      gen_path_override: @gen_path,
++      std_path_override: udb_gem_root / "test" / "mock_spec" / "isa",
++      quiet: false
++    )
++    @cfg_arch = T.let(nil, T.nilable(ConfiguredArchitecture))
++    capture_io do
++      @cfg_arch = $resolver.cfg_arch_for("_")
++    end
++    T.must(@cfg_arch)
++  end
++
++  def partial_cfg_arch
++    return @partial_cfg_arch unless @partial_cfg_arch.nil?
++
++    udb_gem_root = (Pathname.new(__dir__) / "..").realpath
++    @partial_gen_path = Pathname.new(Dir.mktmpdir)
++    $partial_resolver ||= Udb::Resolver.new(
++      schemas_path_override: udb_gem_root / "schemas",
++      cfgs_path_override: udb_gem_root / "test" / "mock_cfgs",
++      gen_path_override: @partial_gen_path,
++      std_path_override: udb_gem_root / "test" / "mock_spec" / "isa",
++      quiet: false
++    )
++    @partial_cfg_arch = T.let(nil, T.nilable(ConfiguredArchitecture))
++    capture_io do
++      @partial_cfg_arch = $partial_resolver.cfg_arch_for("little_is_better")
++    end
++    T.must(@partial_cfg_arch)
++  end
++
++  def make_mmr(overrides = {})
++    data = {
++      "$schema" => "mmr_schema.json#",
++      "kind" => "mmr",
++      "name" => "test_reg0",
++      "long_name" => "Test Register 0",
++      "length" => 32,
++      "description" => "A test memory-mapped register.",
++      "writable" => true,
++      "physical_address" => 0x1000,
++      "definedBy" => { "extension" => { "name" => "A" } }
++    }.merge(overrides)
++    arch = overrides.delete(:arch) || cfg_arch
++    Mmr.new(data, Pathname.new("/mock/test_reg.yaml"), arch)
++  end
++
++  # ── Mmr-specific methods ──
++
++  def test_name
++    mmr = make_mmr
++    assert_equal "test_reg0", mmr.name
++  end
++
++  def test_long_name
++    mmr = make_mmr
++    assert_equal "Test Register 0", mmr.long_name
++  end
++
++  def test_physical_address
++    mmr = make_mmr
++    assert_equal 0x1000, mmr.physical_address
++  end
++
++  def test_physical_address_zero
++    mmr = make_mmr("physical_address" => 0)
++    assert_equal 0, mmr.physical_address
++  end
++
++  def test_length_32
++    mmr = make_mmr("length" => 32)
++    assert_equal 32, mmr.length
++    assert_equal 32, mmr.length(32)
++    assert_equal 32, mmr.length(64)
++  end
++
++  def test_length_64
++    mmr = make_mmr("length" => 64)
++    assert_equal 64, mmr.length
++    assert_equal 64, mmr.max_length
++    assert_equal 64, mmr.min_length
++  end
++
++  def test_length_pretty
++    mmr = make_mmr("length" => 32)
++    assert_equal "32-bit", mmr.length_pretty
++  end
++
++  def test_dynamic_length_always_false
++    mmr = make_mmr
++    refute mmr.dynamic_length?
++  end
++
++  def test_defined_in_all_bases
++    mmr = make_mmr
++    assert mmr.defined_in_base32?
++    assert mmr.defined_in_base64?
++    assert mmr.defined_in_all_bases?
++    assert mmr.defined_in_base?(32)
++    assert mmr.defined_in_base?(64)
++  end
++
++  def test_base_always_nil
++    mmr = make_mmr
++    assert_nil mmr.base
++  end
++
++  def test_format_changes_with_xlen_always_false
++    mmr = make_mmr
++    refute mmr.format_changes_with_xlen?
++  end
++
++  def test_writable_true
++    mmr = make_mmr("writable" => true)
++    assert mmr.writable
++  end
++
++  def test_writable_false
++    mmr = make_mmr("writable" => false)
++    refute mmr.writable
++  end
++
++  def test_kind
++    mmr = make_mmr
++    assert_equal "mmr", mmr.kind
++  end
++
++  def test_exists_in_cfg
++    mmr = make_mmr("definedBy" => { "extension" => { "name" => "A" } })
++    assert mmr.exists_in_cfg?(cfg_arch)
++  end
++
++  def test_equality
++    mmr1 = make_mmr("name" => "reg_a")
++    mmr2 = make_mmr("name" => "reg_a")
++    mmr3 = make_mmr("name" => "reg_b")
++    assert_equal mmr1, mmr2
++    refute_equal mmr1, mmr3
++  end
++
++  def test_priv_mode_raises
++    mmr = make_mmr
++    assert_raises(NotImplementedError) { mmr.priv_mode }
++  end
++
++  def test_bitfield_type_raises
++    mmr = make_mmr
++    assert_raises(NotImplementedError) { mmr.bitfield_type(cfg_arch) }
++  end
++
++  # ── HasFields methods ──
++
++  def test_fields_empty_when_no_fields
++    mmr = make_mmr  # no "fields" key
++    assert_equal [], mmr.fields
++  end
++
++  def test_fields_with_single_field
++    mmr = make_mmr(
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable bit",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    assert_equal 1, mmr.fields.size
++    assert_equal "EN", mmr.fields[0].name
++  end
++
++  def test_fields_with_multiple_fields
++    mmr = make_mmr(
++      "length" => 32,
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable bit",
++          "type" => "RW",
++          "reset_value" => 0
++        },
++        "STATUS" => {
++          "location" => "7-1",
++          "description" => "Status field",
++          "type" => "RO",
++          "reset_value" => 0
++        }
++      }
++    )
++    assert_equal 2, mmr.fields.size
++    names = mmr.fields.map(&:name).sort
++    assert_equal %w[EN STATUS], names
++  end
++
++  def test_field_hash
++    mmr = make_mmr(
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    assert_instance_of Hash, mmr.field_hash
++    assert mmr.field_hash.key?("EN")
++    assert_equal "EN", mmr.field_hash["EN"].name
++  end
++
++  def test_field_lookup
++    mmr = make_mmr(
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    assert mmr.field?("EN")
++    refute mmr.field?("NONEXISTENT")
++    assert_equal "EN", mmr.field("EN").name
++    assert_nil mmr.field("NONEXISTENT")
++  end
++
++  def test_fields_for_xlen
++    mmr = make_mmr(
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    # MMR fields have no base restriction, so they appear for any XLEN
++    assert_equal 1, mmr.fields_for(32).size
++    assert_equal 1, mmr.fields_for(64).size
++    assert_equal 1, mmr.fields_for(nil).size
++  end
++
++  def test_possible_fields
++    mmr = make_mmr(
++      "definedBy" => { "extension" => { "name" => "A" } },
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    assert_equal 1, mmr.possible_fields.size
++  end
++
++  def test_possible_fields_for_xlen
++    mmr = make_mmr(
++      "definedBy" => { "extension" => { "name" => "A" } },
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    assert_equal 1, mmr.possible_fields_for(32).size
++    assert_equal 1, mmr.possible_fields_for(64).size
++  end
++
++  def test_wavedrom_desc
++    mmr = make_mmr(
++      "length" => 32,
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        },
++        "DATA" => {
++          "location" => "15-8",
++          "description" => "Data field",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    desc = mmr.wavedrom_desc(cfg_arch, 32)
++    assert_instance_of Hash, desc
++    assert desc.key?("reg")
++    assert desc.key?("config")
++    assert_equal 32, desc["config"]["bits"]
++    # Should contain field entries and reserved-space entries
++    assert desc["reg"].size >= 2
++  end
++
++  def test_wavedrom_desc_exclude_unimplemented
++    mmr = make_mmr(
++      "length" => 32,
++      "definedBy" => { "extension" => { "name" => "A" } },
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    desc = mmr.wavedrom_desc(cfg_arch, 32, exclude_unimplemented: true)
++    assert_instance_of Hash, desc
++    assert desc.key?("reg")
++    assert_equal 32, desc["config"]["bits"]
++  end
++
++  def test_wavedrom_desc_with_partial_cfg
++    mmr = make_mmr(
++      "length" => 32,
++      "definedBy" => { "extension" => { "name" => "A" } },
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      },
++      :arch => partial_cfg_arch
++    )
++    desc = mmr.wavedrom_desc(partial_cfg_arch, 32)
++    assert_instance_of Hash, desc
++    assert desc.key?("reg")
++  end
++
++  def test_equality_raises_for_non_mmr
++    mmr = make_mmr
++    assert_raises(ArgumentError) { mmr == "not_an_mmr" }
++  end
++
++  def test_optional_in_cfg_with_partial_arch
++    mmr = make_mmr(
++      "definedBy" => { "extension" => { "name" => "A" } },
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      },
++      :arch => partial_cfg_arch
++    )
++    # Should not raise — returns a boolean
++    result = mmr.optional_in_cfg?(partial_cfg_arch)
++    assert_includes [true, false], result
++  end
++
++  def test_affected_by
++    mmr = make_mmr(
++      "definedBy" => { "extension" => { "name" => "A" } },
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    # Get an extension version from the arch to test with
++    a_ext = cfg_arch.extension("A")
++    refute_nil a_ext
++    a_ver = a_ext.versions.first
++    refute_nil a_ver
++    result = mmr.affected_by?(a_ver)
++    assert_includes [true, false], result
++  end
++
++  # ── Extension#mmrs integration ──
++
++  def test_extension_mmrs_returns_array
++    a_ext = cfg_arch.extension("A")
++    refute_nil a_ext
++    result = a_ext.mmrs
++    assert_instance_of Array, result
++  end
++
++  # ── HasFields argument validation ──
++
++  def test_wavedrom_desc_raises_for_bad_cfg_arch
++    mmr = make_mmr(
++      "length" => 32,
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    assert_raises(ArgumentError) { mmr.wavedrom_desc("not_an_arch", 32) }
++  end
++
++  # ── CsrField integration (coverage for csr_field.rb dynamic_location? fix) ──
++
++  def test_mmr_field_dynamic_location_always_false
++    # An MMR field without an explicit location triggers the dynamic_location?
++    # code path (line 353 passes through), then hits our MMR guard (lines 356-357)
++    mmr = make_mmr(
++      "fields" => {
++        "DYN" => {
++          "location_rv32" => 0,
++          "location_rv64" => 0,
++          "description" => "Field with no fixed location",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    field = mmr.field("DYN")
++    refute_nil field
++    # MMR fields should never be dynamic (no privilege modes)
++    refute field.dynamic_location?
++  end
++end
+diff --git a/tools/ruby-gems/udb/test/test_mmr_schema.rb b/tools/ruby-gems/udb/test/test_mmr_schema.rb
+new file mode 100644
+index 0000000000..2c291d508f
+--- /dev/null
++++ b/tools/ruby-gems/udb/test/test_mmr_schema.rb
+@@ -0,0 +1,260 @@
++# Copyright (c) AINEKKO.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# typed: false
++# frozen_string_literal: true
++
++require_relative "test_helper"
++
++require "json"
++require "json_schemer"
++require "yaml"
++
++class TestMmrSchema < Minitest::Test
++  SCHEMA_DIR = (Pathname.new(__dir__) / ".." / ".." / ".." / ".." / "spec" / "schemas").realpath
++  SCHEMA_PATH = SCHEMA_DIR / "mmr_schema.json"
++
++  def setup
++    schema_json = JSON.parse(File.read(SCHEMA_PATH))
++    @schemer = JSONSchemer.schema(
++      schema_json,
++      ref_resolver: proc { |uri|
++        path = SCHEMA_DIR / File.basename(uri.path)
++        data = JSON.parse(File.read(path))
++        # json_schemer 2.x enforces Draft-07 strictly: $defs is not recognised
++        # (Draft-07 uses "definitions"). Copy $defs so both keywords work.
++        data["definitions"] = data["$defs"] if data["$defs"] && !data.key?("definitions")
++        data
++      }
++    )
++  end
++
++  # ── helpers ──
++
++  def valid_mmr
++    {
++      "$schema" => "mmr_schema.json#",
++      "kind" => "mmr",
++      "name" => "example_reg0",
++      "long_name" => "Example Register 0",
++      "length" => 32,
++      "description" => "A simple test register for unit testing.",
++      "writable" => true,
++      "physical_address" => 0x1000,
++      "definedBy" => { "extension" => { "name" => "Xexample" } }
++    }
++  end
++
++  def assert_valid(data, msg = nil)
++    errors = @schemer.validate(data).to_a
++    assert errors.empty?, "Expected VALID but got errors#{msg ? " (#{msg})" : ""}:\n#{errors.map { |e| "  #{e["data_pointer"]}: #{e["type"]}" }.join("\n")}"
++  end
++
++  def assert_invalid(data, msg = nil)
++    errors = @schemer.validate(data).to_a
++    refute errors.empty?, "Expected INVALID but schema passed#{msg ? " (#{msg})" : ""}"
++  end
++
++  # ════════════════════════════════════════════════════════════════════
++  # TESTS THAT SHOULD PASS (valid MMR definitions)
++  # ════════════════════════════════════════════════════════════════════
++
++  # SHOULD PASS: minimal valid MMR with all required fields
++  def test_valid_minimal_mmr
++    assert_valid(valid_mmr, "minimal valid MMR with all required fields")
++  end
++
++  # SHOULD PASS: valid MMR with 64-bit length
++  def test_valid_mmr_64bit
++    data = valid_mmr.merge("length" => 64)
++    assert_valid(data, "64-bit MMR")
++  end
++
++  # SHOULD PASS: valid read-only MMR
++  def test_valid_readonly_mmr
++    data = valid_mmr.merge("writable" => false)
++    assert_valid(data, "read-only MMR")
++  end
++
++  # SHOULD PASS: valid MMR with fields
++  def test_valid_mmr_with_fields
++    data = valid_mmr.merge(
++      "fields" => {
++        "EN" => {
++          "location" => 0,
++          "description" => "Enable bit",
++          "type" => "RW",
++          "reset_value" => 0
++        }
++      }
++    )
++    assert_valid(data, "MMR with fields")
++  end
++
++  # SHOULD PASS: valid MMR with zero physical address
++  def test_valid_mmr_zero_address
++    data = valid_mmr.merge("physical_address" => 0)
++    assert_valid(data, "MMR with physical_address 0")
++  end
++
++  # SHOULD PASS: valid MMR with large physical address
++  def test_valid_mmr_large_address
++    data = valid_mmr.merge("physical_address" => 0xFFFF_FFFF)
++    assert_valid(data, "MMR with large physical_address")
++  end
++
++  # SHOULD PASS: valid MMR with definedBy as allOf-style
++  def test_valid_mmr_defined_by_complex
++    data = valid_mmr.merge(
++      "definedBy" => {
++        "allOf" => [
++          { "extension" => { "name" => "Xext1" } },
++          { "extension" => { "name" => "Xext2" } }
++        ]
++      }
++    )
++    assert_valid(data, "MMR with complex definedBy")
++  end
++
++  # ════════════════════════════════════════════════════════════════════
++  # TESTS THAT SHOULD FAIL (invalid MMR definitions)
++  # ════════════════════════════════════════════════════════════════════
++
++  # SHOULD FAIL: missing $schema
++  def test_invalid_missing_schema
++    data = valid_mmr.tap { |d| d.delete("$schema") }
++    assert_invalid(data, "missing $schema")
++  end
++
++  # SHOULD FAIL: missing kind
++  def test_invalid_missing_kind
++    data = valid_mmr.tap { |d| d.delete("kind") }
++    assert_invalid(data, "missing kind")
++  end
++
++  # SHOULD FAIL: wrong kind value
++  def test_invalid_wrong_kind
++    data = valid_mmr.merge("kind" => "csr")
++    assert_invalid(data, "kind is 'csr' instead of 'mmr'")
++  end
++
++  # SHOULD FAIL: missing name
++  def test_invalid_missing_name
++    data = valid_mmr.tap { |d| d.delete("name") }
++    assert_invalid(data, "missing name")
++  end
++
++  # SHOULD FAIL: name with uppercase letters (must match ^[a-z][a-z0-9_.]+$)
++  def test_invalid_name_uppercase
++    data = valid_mmr.merge("name" => "MyRegister")
++    assert_invalid(data, "name with uppercase")
++  end
++
++  # SHOULD FAIL: name starting with digit
++  def test_invalid_name_starts_with_digit
++    data = valid_mmr.merge("name" => "0reg")
++    assert_invalid(data, "name starting with digit")
++  end
++
++  # SHOULD FAIL: single-char name (pattern requires 2+ chars)
++  def test_invalid_name_single_char
++    data = valid_mmr.merge("name" => "x")
++    assert_invalid(data, "single character name")
++  end
++
++  # SHOULD FAIL: missing long_name
++  def test_invalid_missing_long_name
++    data = valid_mmr.tap { |d| d.delete("long_name") }
++    assert_invalid(data, "missing long_name")
++  end
++
++  # SHOULD FAIL: missing length
++  def test_invalid_missing_length
++    data = valid_mmr.tap { |d| d.delete("length") }
++    assert_invalid(data, "missing length")
++  end
++
++  # SHOULD PASS: valid MMR with 8-bit length
++  def test_valid_mmr_8bit
++    data = valid_mmr.merge("length" => 8)
++    assert_valid(data, "8-bit MMR")
++  end
++
++  # SHOULD PASS: valid MMR with 16-bit length
++  def test_valid_mmr_16bit
++    data = valid_mmr.merge("length" => 16)
++    assert_valid(data, "16-bit MMR")
++  end
++
++  # SHOULD PASS: valid MMR with 128-bit length
++  def test_valid_mmr_128bit
++    data = valid_mmr.merge("length" => 128)
++    assert_valid(data, "128-bit MMR")
++  end
++
++  # SHOULD FAIL: length is 256 (must be 8, 16, 32, 64, or 128)
++  def test_invalid_length_256
++    data = valid_mmr.merge("length" => 256)
++    assert_invalid(data, "length is 256")
++  end
++
++  # SHOULD FAIL: length is a string
++  def test_invalid_length_string
++    data = valid_mmr.merge("length" => "MXLEN")
++    assert_invalid(data, "length is string 'MXLEN', MMRs must be a fixed integer")
++  end
++
++  # SHOULD FAIL: missing description
++  def test_invalid_missing_description
++    data = valid_mmr.tap { |d| d.delete("description") }
++    assert_invalid(data, "missing description")
++  end
++
++  # SHOULD FAIL: missing writable
++  def test_invalid_missing_writable
++    data = valid_mmr.tap { |d| d.delete("writable") }
++    assert_invalid(data, "missing writable")
++  end
++
++  # SHOULD FAIL: writable is a string instead of boolean
++  def test_invalid_writable_string
++    data = valid_mmr.merge("writable" => "yes")
++    assert_invalid(data, "writable is string instead of boolean")
++  end
++
++  # SHOULD FAIL: missing physical_address
++  def test_invalid_missing_physical_address
++    data = valid_mmr.tap { |d| d.delete("physical_address") }
++    assert_invalid(data, "missing physical_address")
++  end
++
++  # SHOULD FAIL: negative physical_address
++  def test_invalid_negative_physical_address
++    data = valid_mmr.merge("physical_address" => -1)
++    assert_invalid(data, "negative physical_address")
++  end
++
++  # SHOULD FAIL: physical_address is string
++  def test_invalid_physical_address_string
++    data = valid_mmr.merge("physical_address" => "0x1000")
++    assert_invalid(data, "physical_address is string instead of integer")
++  end
++
++  # SHOULD FAIL: missing definedBy
++  def test_invalid_missing_defined_by
++    data = valid_mmr.tap { |d| d.delete("definedBy") }
++    assert_invalid(data, "missing definedBy")
++  end
++
++  # SHOULD FAIL: wrong $schema value
++  def test_invalid_wrong_schema_value
++    data = valid_mmr.merge("$schema" => "csr_schema.json#")
++    assert_invalid(data, "wrong $schema reference")
++  end
++
++  # SHOULD FAIL: additional unknown property
++  def test_invalid_additional_property
++    data = valid_mmr.merge("unknown_field" => "surprise")
++    assert_invalid(data, "unknown additional property")
++  end
++end
+diff --git a/tools/ruby-gems/udb_helpers/lib/udb_helpers/backend_helpers.rb b/tools/ruby-gems/udb_helpers/lib/udb_helpers/backend_helpers.rb
+index 19a86d6079..dbfa3815a9 100644
+--- a/tools/ruby-gems/udb_helpers/lib/udb_helpers/backend_helpers.rb
++++ b/tools/ruby-gems/udb_helpers/lib/udb_helpers/backend_helpers.rb
+@@ -154,6 +154,19 @@ def link_to_udb_doc_csr_field(csr_name, field_name)
+     "%%UDB_DOC_LINK%csr_field;#{csr_name.sanitize}.#{field_name.sanitize};#{csr_name}.#{field_name}%%"
+   end
+ 
++  # @return [String] A hyperlink to UDB MMR documentation
++  # @param mmr_name [String] Name of the MMR
++  def link_to_udb_doc_mmr(mmr_name)
++    "%%UDB_DOC_LINK%mmr;#{mmr_name.sanitize};#{mmr_name}%%"
++  end
++
++  # @return [String] A hyperlink to UDB MMR field documentation
++  # @param mmr_name [String] Name of the MMR
++  # @param field_name [String] Name of the MMR field
++  def link_to_udb_doc_mmr_field(mmr_name, field_name)
++    "%%UDB_DOC_LINK%mmr_field;#{mmr_name.sanitize}.#{field_name.sanitize};#{mmr_name}.#{field_name}%%"
++  end
++
+   # @return [String] A hyperlink to UDB IDL function documentation
+   # @param func_name [String] Name of the IDL function
+   def link_to_udb_doc_idl_func(func_name)
+@@ -213,6 +226,19 @@ def anchor_for_udb_doc_csr_field(csr_name, field_name)
+     "[#udb:doc:csr_field:#{csr_name.sanitize}:#{field_name.sanitize}]"
+   end
+ 
++  # @return [String] An anchor for UDB MMR documentation
++  # @param name [String] Name of the MMR
++  def anchor_for_udb_doc_mmr(name)
++    "[#udb:doc:mmr:#{name.sanitize}]"
++  end
++
++  # @return [String] An anchor for UDB MMR field documentation
++  # @param mmr_name [String] Name of the MMR
++  # @param field_name [String] Name of the MMR field
++  def anchor_for_udb_doc_mmr_field(mmr_name, field_name)
++    "[#udb:doc:mmr_field:#{mmr_name.sanitize}:#{field_name.sanitize}]"
++  end
++
+   # @return [String] An anchor for an IDL function documentation
+   # @param name [String] Name of the function
+   def anchor_for_udb_doc_idl_func(name)
+@@ -289,6 +315,11 @@ def resolve_links(path_or_str)
+         when "csr_field"
+           csr_name, field_name = name.split('.')
+           "<<udb:doc:csr_field:#{csr_name}:#{field_name},#{link_text}>>"
++        when "mmr"
++          "<<udb:doc:mmr:#{name},#{link_text}>>"
++        when "mmr_field"
++          mmr_name, field_name = name.split('.')
++          "<<udb:doc:mmr_field:#{mmr_name}:#{field_name},#{link_text}>>"
+         when "func"
+           "<<udb:doc:func:#{name},#{link_text}>>"
+         else
+diff --git a/tools/test/regress-tests.yaml b/tools/test/regress-tests.yaml
+index 72e71bb413..78fbc89b67 100644
+--- a/tools/test/regress-tests.yaml
++++ b/tools/test/regress-tests.yaml
+@@ -111,6 +111,8 @@ tests:
+           - yaml_loader
+           - cfg_arch
+           - cfg
++          - mmr
++          - mmr_schema
+     test:
+       - name: Run udb gem ${{ matrix.test }} unit tests
+         run: ./bin/ruby tools/ruby-gems/udb/test/test_${{ matrix.test }}.rb

@@ -1,0 +1,290 @@
+diff --git a/.devcontainer/Dockerfile b/.devcontainer/Dockerfile
+index 94497f52fb..11f992e97a 100644
+--- a/.devcontainer/Dockerfile
++++ b/.devcontainer/Dockerfile
+@@ -1,7 +1,13 @@
+ FROM ubuntu:24.04
+ LABEL org.opencontainers.image.source=https://github.com/riscv/riscv-unified-db
+ 
+-ENV DEBIAN_FRONTEND=noninteractive
++ENV DEBIAN_FRONTEND=noninteractive \
++    MISE_DATA_DIR="/opt/mise" \
++    MISE_CONFIG_DIR="/opt/mise/config" \
++    MISE_CACHE_DIR="/opt/mise/cache" \
++    MISE_STATE_DIR="/opt/mise/state" \
++    MISE_INSTALL_PATH="/usr/local/bin/mise" \
++    MISE_YES=1
+ 
+ WORKDIR /workspace
+ 
+@@ -21,6 +27,7 @@ RUN apt-get update && \
+   gh \
+   git \
+   gpg \
++  gpg-agent \
+   less \
+   libc6-dev-riscv64-cross \
+   libelf-dev \
+@@ -29,12 +36,7 @@ RUN apt-get update && \
+   libyaml-dev \
+   libz3-dev \
+   minisat \
+-  nodejs \
+-  npm \
+   parallel \
+-  python3 \
+-  python3-pip \
+-  python3.12-venv \
+   rustc \
+   shellcheck \
+   sudo \
+@@ -44,14 +46,27 @@ RUN apt-get update && \
+   && apt-get autoremove -y \
+   && rm -rf /var/lib/{apt,dpkg,cache,log}/*
+ 
+-  # build / install ruby
+-COPY .ruby-version /opt/.ruby-version
+-ENV RUBY_YJIT_ENABLE=1
+-RUN git clone --depth=1 https://github.com/rbenv/ruby-build.git && \
+-    cd ruby-build && \
+-    ./bin/ruby-build $(cat /opt/.ruby-version | tr -d "\n") /usr && \
+-    cd .. && \
+-    rm -rf ruby-build
++RUN curl https://mise.run | sh
++
++COPY .mise.toml .ruby-version /workspace/
++
++# - 'mise install -y': Installs tools defined in .mise.toml
++RUN mise settings set trusted_config_paths '~' && \
++    mise trust /workspace/.mise.toml && \
++    mise install -y && \
++    mise prune -y
++
++# Set installed versions as global defaults (dynamically, no hardcoded versions!)
++# This creates latest symlinks that we can use in PATH
++RUN for tool in node python ruby; do \
++        version=$(ls /opt/mise/installs/$tool | head -1); \
++        mise use --global ${tool}@${version}; \
++    done && \
++    chmod -R 777 /opt/mise
++
++# Set PATH using latest symlinks (avoids shim overhead and ARG_MAX limit)
++# mise use --global created /opt/mise/installs/{tool}/latest symlinks for us
++ENV PATH="/workspace/bin/container:/opt/node/node_modules/.bin:/opt/venv/bin:/opt/mise/installs/node/latest/bin:/opt/mise/installs/python/latest/bin:/opt/mise/installs/ruby/latest/bin:$PATH"
+ 
+ # build/install eqntott
+ RUN git clone --depth=1 https://github.com/TheProjecter/eqntott.git && \
+@@ -82,7 +97,7 @@ RUN git clone https://github.com/jar-ben/mustool.git && \
+ 
+ # Create Python virtual environment and install packages
+ COPY requirements.txt /opt/requirements.txt
+-RUN /usr/bin/python3 -m venv /opt/venv && \
++RUN python -m venv /opt/venv && \
+   /opt/venv/bin/pip install -r /opt/requirements.txt && \
+   rm /opt/requirements.txt
+ ENV PATH="/opt/venv/bin:$PATH"
+@@ -90,7 +105,7 @@ ENV PATH="/opt/venv/bin:$PATH"
+ # Install npm packages globally in the container
+ COPY package.json package-lock.json /opt/node/
+ RUN cd /opt/node && \
+-  /usr/bin/npm ci && \
++  npm ci && \
+   rm /opt/node/package.json /opt/node/package-lock.json
+ ENV NODE_PATH="/opt/node/node_modules"
+ ENV PATH="/opt/node/node_modules/.bin:$PATH"
+@@ -124,3 +139,5 @@ ENV PATH="/workspace/bin/container:$PATH"
+ # Grant the default ubuntu user sudo access
+ RUN echo ubuntu ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/ubuntu \
+     && chmod 0440 /etc/sudoers.d/ubuntu
++
++USER ubuntu
+diff --git a/.gitignore b/.gitignore
+index 17cb5ff521..deffb115b8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -35,3 +35,7 @@ coverage
+ 
+ # emacs backup files
+ *~
++
++# mise local configuration
++.mise.local.toml
++.mise/
+diff --git a/.mise.toml b/.mise.toml
+new file mode 100644
+index 0000000000..803c5850fa
+--- /dev/null
++++ b/.mise.toml
+@@ -0,0 +1,14 @@
++# RISC-V Unified Database - Tool Version Management
++# https://mise.jdx.dev
++
++[tools]
++node = "24"
++python = "3.12"
++
++[env]
++_.path = ["./bin"]
++RUBY_YJIT_ENABLE = "1"
++
++[settings]
++# tools can read the versions files used by other version managers
++idiomatic_version_file_enable_tools = ['ruby']
+diff --git a/container.def b/container.def
+index 5f2fa63049..c65098f4c7 100644
+--- a/container.def
++++ b/container.def
+@@ -6,6 +6,7 @@ From: ubuntu:24.04
+ Stage: spython-base
+ 
+ %files
++.mise.toml /opt/.mise.toml
+ .ruby-version /opt/.ruby-version
+ requirements.txt /opt/requirements.txt
+ package.json /opt/node/
+@@ -29,7 +30,7 @@ tools/ruby-gems/idlc/bin/idlc /workspace/bin/container
+ tools/ruby-gems/udb/bin/udb /workspace/bin/container
+ tools/ruby-gems/udb-gen/bin/udb-gen /workspace/bin/container
+ %labels
+-org.opencontainers.image.source=https://github.com/riscv-software-src/riscv-unified-db
++org.opencontainers.image.source=https://github.com/riscv/riscv-unified-db
+ %post -c /bin/bash
+ 
+ DEBIAN_FRONTEND=noninteractive
+@@ -53,6 +54,7 @@ gdb \
+ gh \
+ git \
+ gpg \
++gpg-agent \
+ less \
+ libc6-dev-riscv64-cross \
+ libelf-dev \
+@@ -61,12 +63,7 @@ libnewlib-dev \
+ libyaml-dev \
+ libz3-dev \
+ minisat \
+-nodejs \
+-npm \
+ parallel \
+-python3 \
+-python3-pip \
+-python3.12-venv \
+ rustc \
+ shellcheck \
+ sudo \
+@@ -76,13 +73,30 @@ zlib1g-dev \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/{apt,dpkg,cache,log}/*
+ 
+-  # build / install ruby
+-RUBY_YJIT_ENABLE=1
+-git clone --depth=1 https://github.com/rbenv/ruby-build.git && \
+-cd ruby-build && \
+-./bin/ruby-build $(cat /opt/.ruby-version | tr -d "\n") /usr && \
+-cd .. && \
+-rm -rf ruby-build
++MISE_DATA_DIR="/mise"
++MISE_CONFIG_DIR="/mise"
++MISE_CACHE_DIR="/mise/cache"
++# MISE_STATE_DIR needed to prevent permission errors in CI when mise tries to track configs
++# Without this, mise defaults to ~/.local/state which isn't writable by non-root CI users
++MISE_STATE_DIR="/mise/state"
++MISE_INSTALL_PATH="/usr/local/bin/mise"
++MISE_YES=1
++
++curl https://mise.run | sh
++
++
++mkdir -p /opt
++cd /opt
++mise trust /opt/.mise.toml && \
++mise settings set trusted_config_paths '~' && \
++mise install --yes
++
++chmod -R 777 /mise
++
++# Verify tools work after mise installation
++cd /opt && \
++mise env --shell bash | grep '^export PATH=' > /etc/profile.d/mise-path-temp.sh && \
++bash -c 'source /etc/profile.d/mise-path-temp.sh && ruby --version && node --version && npm --version && python3 --version'
+ 
+ # build/install eqntott
+ git clone --depth=1 https://github.com/TheProjecter/eqntott.git && \
+@@ -112,21 +126,34 @@ cd .. && \
+ rm -rf mustool
+ 
+ # Create Python virtual environment and install packages
+-/usr/bin/python3 -m venv /opt/venv && \
+-/opt/venv/bin/pip install -r /opt/requirements.txt && \
+-rm /opt/requirements.txt
++bash -l -c 'python3 -m venv /opt/venv && \
++/opt/venv/bin/pip install --no-cache-dir -r /opt/requirements.txt && \
++rm /opt/requirements.txt'
+ PATH="/opt/venv/bin:$PATH"
+ 
+ # Install npm packages globally in the container
+-cd /opt/node && \
+-/usr/bin/npm ci && \
+-rm /opt/node/package.json /opt/node/package-lock.json
++bash -l -c 'cd /opt/node && \
++npm ci --no-audit --no-fund && \
++chown -R root:root /opt/node/node_modules && \
++rm /opt/node/package.json /opt/node/package-lock.json'
+ NODE_PATH="/opt/node/node_modules"
+ PATH="/opt/node/node_modules/.bin:$PATH"
+ IN_UDB_CONTAINER=true
+ 
+ # install gems
+-bundle install --gemfile /opt/Gemfile
++bash -l -c 'bundle install --gemfile /opt/Gemfile'
++
++# Remove mise binary and unset MISE_* env vars to prevent workspace .mise.toml detection
++# Replace mise wrapper scripts (npm/npx) with direct symlinks to avoid "mise: command not found"
++# Tools remain accessible via the PATH extracted earlier to /etc/profile.d/mise-path.sh
++rm -f /usr/local/bin/mise && \
++rm -rf /mise/cache /mise/downloads && \
++echo 'unset MISE_DATA_DIR MISE_CONFIG_DIR MISE_CACHE_DIR MISE_STATE_DIR MISE_INSTALL_PATH MISE_YES' >> /etc/bash.bashrc && \
++for node_dir in /mise/installs/node/*/bin; do \
++rm -f "$node_dir/npm" "$node_dir/npx" && \
++ln -s ../lib/node_modules/npm/bin/npm-cli.js "$node_dir/npm" && \
++ln -s ../lib/node_modules/npm/bin/npx-cli.js "$node_dir/npx"; \
++done
+ 
+ # the binaries for gems need to be copied in
+ mkdir -p /workspace/bin/container
+@@ -135,11 +162,34 @@ PATH="/workspace/bin/container:$PATH"
+ # Grant the default ubuntu user sudo access
+ echo ubuntu ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/ubuntu \
+ && chmod 0440 /etc/sudoers.d/ubuntu
++
++# Set complete PATH as ENV for Singularity compatibility (doesn't support ENTRYPOINT)
++# We use mise's 'latest' symlinks for Node and Ruby to avoid hardcoding versions
++# Python uses /opt/venv (with packages) instead of mise Python (without packages)
++PATH="/workspace/bin/container:/opt/node/node_modules/.bin:/opt/venv/bin:/opt/bin:/mise/installs/node/latest/bin:/mise/installs/ruby/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
++
++# Create mise-path.sh with the final PATH for Docker ENTRYPOINT (matches ENV above)
++echo "export PATH='/workspace/bin/container:/opt/node/node_modules/.bin:/opt/venv/bin:/opt/bin:/mise/installs/node/latest/bin:/mise/installs/ruby/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'" > /etc/profile.d/mise-path.sh && \
++chmod +x /etc/profile.d/mise-path.sh
++
++# Create a wrapper script that sources profile and executes commands
++echo '#!/bin/bash' > /entrypoint.sh && \
++echo 'source /etc/profile.d/mise-path.sh' >> /entrypoint.sh && \
++echo 'exec "$@"' >> /entrypoint.sh && \
++chmod +x /entrypoint.sh
++
++# Set ENTRYPOINT to the wrapper script
+ %environment
+ export DEBIAN_FRONTEND=noninteractive
+-export RUBY_YJIT_ENABLE=1
++export MISE_DATA_DIR="/mise"
++export MISE_CONFIG_DIR="/mise"
++export MISE_CACHE_DIR="/mise/cache"
++export MISE_STATE_DIR="/mise/state"
++export MISE_INSTALL_PATH="/usr/local/bin/mise"
++export MISE_YES=1
+ export PATH="/opt/venv/bin:$PATH"
+ export NODE_PATH="/opt/node/node_modules"
+ export PATH="/opt/node/node_modules/.bin:$PATH"
+ export IN_UDB_CONTAINER=true
+ export PATH="/workspace/bin/container:$PATH"
++export PATH="/workspace/bin/container:/opt/node/node_modules/.bin:/opt/venv/bin:/opt/bin:/mise/installs/node/latest/bin:/mise/installs/ruby/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

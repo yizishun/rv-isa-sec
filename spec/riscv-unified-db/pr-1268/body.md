@@ -1,0 +1,69 @@
+- **start vset**
+- **update vset**
+- **start adding CSRs**
+- **start adding CSRs**
+- **add skeleton for remaining CSRs**
+- **add skeleton for remaining CSRs**
+- **update CSRs based on comments**
+- **add remaining csr details**
+- **update csr read in vset**
+- **address comments**
+- **add pretty tables in csr descriptions**
+- **break up csr write fields in vset**
+- **feat(idl): add constraints to IDL**
+- **feat: add mock spec to udb gem for testing, add Condition classes**
+- **docs: document schema conditions and idl implications**
+- **refactor: move parameters into their own YAML files**
+- **feat: wip**
+- **feat: wip**
+- **update vl assignment in ranged case**
+- **add vxsat and vxrm sw_write**
+- **set vill in unsupported cases**
+- **fix idl compile errors**
+- **adress dhower's feedback**
+- **Update spec/std/isa/ext/V.yaml**
+- **Update spec/std/isa/csr/V/vxsat.yaml**
+- **Update spec/std/isa/csr/V/vxrm.yaml**
+- **Update spec/std/isa/csr/V/vcsr.yaml**
+- **Update spec/std/isa/inst/V/vsetivli.yaml**
+- **adress thinkopenly's comments**
+- **fix:(vector): restructuring vset instructions operation()**
+- **chore: dependency update**
+- **feat: wip**
+- **fix: merge errors**
+- **feat(vector): add rv32 vector configuration based on rv32-riscv-tests cfg**
+- **wip**
+- **feat(vector): add skeleton of vadd.vv**
+- **wip**
+- **add regress job dependency**
+- **Fix path in regression for udb unit tests**
+- **wip**
+- **wip**
+- **wip**
+- **wip**
+- **wip**
+- **wip**
+- **fix(vector): fix vset* failures**
+- **wip**
+- **wip**
+- **wip**
+- **wip**
+- **wip**
+- **feat(vector): add skeleton of vadd.vv**
+- **fix(vector): fix vset* failures**
+- **wip**
+- **wip**
+- **fix(vector): implement vadd.vv**
+- **fix(vector): extract V parameters into their own files**
+- **fix(vector): get iss through compilation after changes from issue 891**
+- **fix(vector): add launch config for vsetvli debug**
+- **fix(vector): sort param topologically w.r.t. dependence**
+- **fix(vector): add 64 to SXLEN as a workaround to get ISS to run a test**
+- **fix(vector): use const refs with std::find() in param_value() and defined()**
+- **fix(vector): handle rs1==x0 case in vsetvli**
+- **fix(vector): fix indentation in vsetvli**
+- **feat: infrastructure to extend the riscv-tests suite without modifying ext repo**
+- **fix: corrected copy paste errors**
+- **fix(vector): move vector tests from ext/riscv-tests/ submodule to tests/**
+- **fix(build): fix Gem path for bundler & ignore generated test/dump files**
+

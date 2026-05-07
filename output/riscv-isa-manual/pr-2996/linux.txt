@@ -1,0 +1,86 @@
+PR #2996  target=linux  overall=compliant
+Spec: WRS interrupt-wakeup criterion tightened from 'any pending interrupt even if disabled' to 'locally enabled pending interrupt regardless of global IE' (matching WFI); kernel __cmpwait() depends on reservation-break not interrupt-wakeup, but KVM emulation and future WRS uses must align with the clarified per-*ie-bit semantics.
+Violation: Kernel executes wrs.nto/wrs.sto in __cmpwait() or any WRS-based wait while all sie bits are cleared and no other hart will break the reservation set (e.g., UP context or lock-holder preempted), causing indefinite stall because disabled-in-sie interrupts no longer qualify as wakeup sources under the clarified spec.
+Consequence: denial_of_service
+Pattern: wrs\.nto|wrs\.sto|ZAWRS_WRS_NTO|ZAWRS_WRS_STO in code paths where sie CSR may have zero relevant enables (e.g., local_irq_disable combined with sie clearing, or preempt_disable nested inside __cmpwait when no reservation-break expected).
+------------------------------------------------------------
+[potential_risk] arch/riscv/include/asm/cmpxchg.h:367-441  __cmpwait
+  wrs.nto with no timeout used inside __cmpwait(). Under the clarified spec, WRS wakeup from interrupts requires both sie bit AND sstatus.SIE to be set. All current call sites are safe because they wait for another hart's store (reservation-set change), not for interrupt-driven events. However, the 'no timeout' semantics mean any future caller that calls __cmpwait() with sstatus.SIE=0 expecting interrupt wakeup would stall indefinitely. The comment at line 361-365 acknowledges this dependency on 'implementation-specific other reason' or 'locally-enabled interrupt' as termination guarantees — neither of which is architecturally guaranteed under the clarified spec when sstatus.SIE=0.
+  | static __always_inline void __cmpwait(volatile void *ptr,
+  | 				      unsigned long val,
+  | 				      int size)
+  | {
+  | 	...
+  | 			ZAWRS_WRS_NTO "\n"
+  | 	...
+
+[compliant] arch/riscv/include/asm/barrier.h:70-80  smp_cond_load_relaxed
+  smp_cond_load_relaxed() consumes __cmpwait_relaxed() only after the condition-expression check fails. In all current call sites (qspinlock slowpath line 368, osq_lock line 146, csd_lock_wait line 342, try_to_wake_up line 3749/4228/4278), the condition becomes true through a concurrent store from another hart, which breaks the reservation set and wakes wrs.nto. The need_resched() guard in osq_lock (line 146) short-circuits before __cmpwait if reschedule is pending, so an incoming IPI is handled on the next iteration without requiring WRS interrupt-wakeup.
+  | #define smp_cond_load_relaxed(ptr, cond_expr) ({			\
+  | 	typeof(ptr) __PTR = (ptr);					\
+  | 	__unqual_scalar_typeof(*ptr) VAL;				\
+  | 	for (;;) {							\
+  | 		VAL = READ_ONCE(*__PTR);				\
+  | 		if (cond_expr)						\
+  | 			break;						\
+  | 		__cmpwait_relaxed(ptr, VAL);				\
+  | 	}								\
+  | 	(typeof(*ptr))VAL;						\
+  | })
+
+[compliant] arch/riscv/kvm/vcpu_insn.c:83-88  wrs_insn
+  KVM intercepts guest WRS via system_opcode_funcs dispatch (line 266-268: INSN_MASK_WRS / INSN_MATCH_WRS matches wrs.nto and wrs.sto) and delegates to kvm_vcpu_on_spin(). This correctly yields the vCPU rather than executing WRS on the host. The guest's sie/sstatus state is virtualized and the host never stalls on guest WRS. ZAWRS is listed as an extension 'which don't have any mechanism to disable' (vcpu_onereg.c:197), meaning it's always advertised if host supports it, which is safe because the trap-and-emulate path handles it.
+  | static int wrs_insn(struct kvm_vcpu *vcpu, struct kvm_run *run, ulong insn)
+  | {
+  | 	vcpu->stat.wrs_exit_stat++;
+  | 	kvm_vcpu_on_spin(vcpu, vcpu->arch.guest_context.sstatus & SR_SPP);
+  | 	return KVM_INSN_CONTINUE_NEXT_SEPC;
+  | }
+
+[compliant] arch/riscv/kernel/entry.S:247-317  ret_from_exception
+  Exception return path restores sstatus via csrw CSR_STATUS, a0 (line 301). The SR_IE alias is SR_SIE (csr.h:530). Kernel never directly clears the sie CSR register itself during normal operation. arch_local_irq_disable() (irqflags.h:25-28) clears SR_IE in sstatus, not the sie CSR. The sie register retains its interrupt-enable bitmask (STIE|SEIE|SSIE) across irq-disable/enable sequences. This means when sstatus.SIE is restored to 1 at line 301, interrupts become locally-enabled again, satisfying the WRS wakeup condition on the next __cmpwait call. No fp/vector state leak risk. The LR/SC reservation is explicitly cleared at lines 298-299 before context restore.
+  | SYM_CODE_START_NOALIGN(ret_from_exception)
+  | 	...
+  | 	csrw CSR_STATUS, a0
+  | 	csrw CSR_EPC, a2
+  | 	...
+  | 	sret
+
+[compliant] arch/riscv/kernel/entry.S:421-471  __switch_to
+  Context switch saves/restores callee-saved integer registers and sstatus via thread_struct. No CSR_SIE is saved/restored because sie is per-hart and consistent across all tasks on the same hart (the kernel never modifies sie per-task). The SR_SUM bit is preserved across switch (lines 442-451). No ZAWRS-specific state needs saving because WRS only stalls the hart and has no persistent architectural state beyond the reservation set, which is explicitly cleared at ret_from_exception lines 298-299. For SMP correctness, wrs.nto on the new task will see a fresh reservation — any stale reservation from the previous task was already cleared.
+  | SYM_FUNC_START(__switch_to)
+  | 	...
+  | 	csrr  s0, CSR_STATUS
+  | 	REG_S s0, TASK_THREAD_SUM_RA(a3)
+  | 	...
+  | 	REG_L s0,  TASK_THREAD_SUM_RA(a4)
+  | 	li    s1,  SR_SUM
+  | 	and   s0,  s0, s1
+  | 	csrs  CSR_STATUS, s0
+  | 	...
+  | 	ret
+
+[compliant] kernel/locking/osq_lock.c:140-148  osq_lock
+  The comment at lines 140-144 correctly documents that need_resched() comes with an IPI which wakes smp_cond_load_relaxed() via monitor-wait. In practice, need_resched() is checked BEFORE __cmpwait in the cond_expr, so if a reschedule is pending, the loop exits immediately without executing wrs.nto. The remaining wait is for node->locked being set by the lock holder (another hart), which breaks the reservation set. Even under the clarified spec where sstatus.SIE=0 blocks interrupt-based WRS wakeup, this is safe because the wakeup comes from a store to the monitored variable by another hart.
+  | if (smp_cond_load_relaxed(&node->locked, VAL || need_resched() ||
+  | 			  vcpu_is_preempted(node_cpu(node->prev))))
+  | 	return true;
+
+[compliant] kernel/locking/qspinlock.c:196-197  queued_spin_lock_slowpath
+  Pending-bit optimistic spinning uses smp_cond_load_acquire(&lock->locked, !VAL). On RISC-V with ZAWRS, this resolves to smp_cond_load_relaxed + smp_acquire__after_ctrl_dep, where smp_cond_load_relaxed uses __cmpwait/wrs.nto. The wait is for the lock-holder (another hart) to clear _Q_LOCKED_MASK via a store-release. This store breaks the reservation set across harts, waking the local wrs.nto. Safe regardless of local sstatus.SIE state.
+  | if (val & _Q_LOCKED_MASK)
+  | 	smp_cond_load_acquire(&lock->locked, !VAL);
+
+[compliant] kernel/locking/qspinlock.c:367-368  queued_spin_lock_slowpath
+  MCS unlock path waits for next->next to become non-NULL via smp_cond_load_relaxed(&node->next, (VAL)). The next pointer is written by the successor CPU's qspinlock slowpath entry. This write breaks the reservation set. Safe.
+  | if (!next)
+  | 	next = smp_cond_load_relaxed(&node->next, (VAL));
+
+[compliant] kernel/sched/core.c:4228-4228  try_to_wake_up
+  smp_cond_load_acquire(&p->on_cpu, !VAL) waits for p->on_cpu to become 0, which is written via smp_store_release in finish_task() on the target CPU. The target CPU is a different hart doing a store to the monitored memory location, breaking the reservation set. The surrounding comment at lines 4016-4032 documents the store-release/cond-load-acquire pairing. WRS wakeup via reservation-set change, not interrupt. Safe even under clarified spec.
+  | smp_cond_load_acquire(&p->on_cpu, !VAL);
+
+[compliant] kernel/smp.c:342-342  csd_lock_wait
+  smp_cond_load_acquire(&csd->node.u_flags, !(VAL & CSD_FLAG_LOCK)) waits for another CPU to clear CSD_FLAG_LOCK after completing the IPI handler. The store from the other hart breaks the reservation set. Safe.
+  | smp_cond_load_acquire(&csd->node.u_flags, !(VAL & CSD_FLAG_LOCK));
+

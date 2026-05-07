@@ -1,0 +1,61 @@
+PR #786  target=freebsd-src  overall=compliant
+Spec: FreeBSD does not yet implement ACLIC/Smidctrl indirect CSR access, but if/when it does, code must treat only aclicsourcecfg[0][15:0] as read-only zero — not the full register — to avoid corrupting source configuration for interrupts 1–3 (XLEN=64) or interrupt 1 (XLEN=32) that share the same xireg2/xireg3 window.
+Violation: Kernel code treats the entire aclicsourcecfg[0] indirect register as read-only zero (e.g., skipping save/restore of xireg2/xireg3 when xiselect=0x1000, or writing zero to all 32/64 bits expecting it to be ignored), when in fact only bits [15:0] (sourcecfg[0][15:0]) are read-only zero — the upper bits map to live sourcecfg[1] (XLEN=32) or sourcecfg[1..3] (XLEN=64) and control real interrupt source configuration.
+Consequence: data_corruption
+Pattern: "xiselect.*0x1000" OR "xireg[23].*read.only.zero" OR "aclicsourcecfg.*zero" OR "sourcecfg\[0\].*zero" AND NOT "\[15:0\]" — code that assumes full-register read-only-zero semantics for indirect sourcecfg[0] access instead of the partial [15:0]-only zeroing corrected in this PR.
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/aplic.c:450-459  aplic_attach
+  APLIC driver explicitly rejects IMSIC-based configurations ('APLIC with IMSIC is unsupported'), meaning the AIA indirect CSR mechanism (siselect/sireg for aclicsourcecfg) is never exercised. No code in this file accesses CSR-based indirect registers.
+  | /* APLIC with IMSIC on hart is not supported */
+  | if (ofw_bus_has_prop(dev, "msi-parent")) {
+  |     device_printf(dev, "APLIC with IMSIC is unsupported\n");
+  |     return (ENXIO);
+  | }
+
+[compliant] sys/riscv/include/encoding.h:567-575  (global CSR definitions)
+  CSR definitions for SISELECT (0x150) and SIREG (0x151) are entirely absent from encoding.h. No AIA indirect-register CSR constants exist, confirming the kernel has zero code capable of accessing aclicsourcecfg[] via the xiselect/xireg indirect mechanism.
+  | #define CSR_SSTATUS 0x100
+  | #define CSR_SIE 0x104
+  | #define CSR_STVEC 0x105
+  | #define CSR_SCOUNTEREN 0x106
+  | ...
+  | #define CSR_SATP 0x180
+
+[compliant] sys/riscv/vmm/riscv.h:56-68  (struct hypcsr definition)
+  VMM hypcsr structure saves/restores only basic supervisor CSRs (hvip, vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, vsatp, scounteren, senvcfg). No vsiselect/vsireg or siselect/sireg fields exist, which is consistent with the VMM's lack of AIA support. The vulnerability condition (misinterpreting aclicsourcecfg[0] layout) cannot occur because no guest-visible AIA indirect CSR path exists.
+  | struct hypcsr {
+  |     uint64_t hvip;
+  |     uint64_t vsstatus;
+  |     uint64_t vsie;
+  |     ...
+  |     uint64_t vsatp;
+  |     uint64_t scounteren;
+  |     uint64_t senvcfg;
+  | };
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:179-195  vmmops_vcpu_save_csrs
+  VMM CSR save/restore only covers the CSRs listed in hypcsr. No siselect/sireg or vsiselect/vsireg save/restore is performed, which is safe because the VMM does not expose AIA indirect CSR functionality to guests.
+  | csrs->vsstatus = csr_read(vsstatus);
+  | csrs->vsie = csr_read(vsie);
+  | csrs->vstvec = csr_read(vstvec);
+  | csrs->vsscratch = csr_read(vsscratch);
+  | csrs->vsepc = csr_read(vsepc);
+  | ...
+
+[compliant] sys/riscv/vmm/vmm_aplic.c:264-324  aplic_mmio_access
+  VMM APLIC emulation handles only MMIO-mapped APLIC registers (domaincfg, sourcecfg per-IRQ words, target, IDC delivery/claim/etc.). It does not emulate CSR-based AIA indirect register access (siselect/sireg). The sourcecfg[] array entries are per-IRQ MMIO words with standard AIA sourcecfg semantics, unrelated to the CSR-based aclicsourcecfg indirect register layout issue.
+  | if ((reg >= APLIC_SOURCECFG(1)) &&
+  |     (reg <= APLIC_SOURCECFG(aplic->nirqs))) {
+  |     i = ((reg - APLIC_SOURCECFG(1)) >> 2) + 1;
+  |     error = aplic_handle_sourcecfg(aplic, i, write, val);
+  |     return (error);
+  | }
+
+[compliant] sys/riscv/vmm/vmm_switch.S:41-120  vmm_switch
+  The VMM world-switch assembly does not save/restore siselect, sireg, vsiselect, or vsireg. This is consistent with the VMM's lack of AIA indirect CSR support and therefore does not violate the spec — there is no code that could misinterpret aclicsourcecfg[0] semantics.
+  | csrrw   t0, sstatus, t0
+  | csrrw   t1, hstatus, t1
+  | csrrw   t2, scounteren, t2
+  | csrrw   t3, sscratch, a0
+  | csrrw   t4, stvec, t4
+

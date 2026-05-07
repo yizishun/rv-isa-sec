@@ -1,0 +1,75 @@
+PR #2504  target=freebsd-src  overall=bug_confirmed
+Spec: bhyve guest stimecmp CSR state leaks across VM boundaries because vstimecmp is not saved/restored on VM transitions even though HENVCFG_STCE is set to enable direct VS-mode access
+Violation: FreeBSD bhyve VMM sets HENVCFG_STCE to expose stimecmp to VS-mode guests but never saves/restores vstimecmp across VM transitions. When vstimecmp from a prior guest is stale and (time + htimedelta) exceeds it, hardware asserts VSTIP for the incoming guest who did not request it. Conversely, a prior guest's vstimecmp far in the future suppresses a legitimate timer interrupt the incoming guest expects. The spec mandates VSTIP = hvip.VSTIP OR vstimecmp_timer_signal, so both sources must agree; bhyve's dual-track injection (callout-driven HVIP writes AND hardware vstimecmp) creates a conflict where VSTIP can be asserted by vstimecmp after hvip.VSTIP is cleared, or vice versa.
+Consequence: info_leak
+Pattern: csr_write.*stimecmp|HENVCFG_STCE|vstimecmp|VTIMER.*sstc|hcounteren.*TM
+------------------------------------------------------------
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:631-632  vmmops_run
+  HENVCFG_STCE is written to henvcfg, enabling VS-mode direct stimecmp access and hardware-driven VSTIP assertion via vstimecmp comparison. However, vstimecmp is never saved/restored across VM transitions (missing from both hypcsr struct and save/restore functions). A prior guest's vstimecmp value persists in hardware across VM switches, causing spurious or suppressed timer interrupts for the incoming guest.
+  | if (has_sstc)
+  |     csr_write(henvcfg, HENVCFG_STCE);
+
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:162-177  vmmops_vcpu_restore_csrs
+  vCPU CSR restore saves 9 CSRs (vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, vsatp) but omits vstimecmp. When HENVCFG_STCE is active, the incoming guest inherits the prior guest's stale vstimecmp hardware state, causing hardware to assert VSTIP based on the wrong guest's timer.
+  | csr_write(vsstatus, csrs->vsstatus);
+  | csr_write(vsie, csrs->vsie);
+  | csr_write(vstvec, csrs->vstvec);
+  | csr_write(vsscratch, csrs->vsscratch);
+  | csr_write(vsepc, csrs->vsepc);
+  | /* ... vstimecmp missing ... */
+  | csr_write(vscause, csrs->vscause);
+  | csr_write(vstval, csrs->vstval);
+  | csr_write(hvip, csrs->hvip);
+  | csr_write(vsatp, csrs->vsatp);
+
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:180-195  vmmops_vcpu_save_csrs
+  vCPU CSR save captures 9 CSRs but omits vstimecmp. The outgoing guest's vstimecmp is never stored, making it impossible to restore later. On next VM entry on this physical CPU, the stale hardware vstimecmp persists.
+  | csrs->vsstatus = csr_read(vsstatus);
+  | csrs->vsie = csr_read(vsie);
+  | csrs->vstvec = csr_read(vstvec);
+  | csrs->vsscratch = csr_read(vsscratch);
+  | csrs->vsepc = csr_read(vsepc);
+  | /* ... vstimecmp missing ... */
+  | csrs->vscause = csr_read(vscause);
+  | csrs->vstval = csr_read(vstval);
+  | csrs->hvip = csr_read(hvip);
+  | csrs->vsatp = csr_read(vsatp);
+
+[bug_confirmed] sys/riscv/vmm/riscv.h:56-68  hypcsr
+  The hypcsr struct has no vstimecmp field. Even if save/restore CSRs functions were updated, there is no storage allocated for vstimecmp state. This is the root data-structure gap.
+  | struct hypcsr {
+  |     uint64_t hvip;
+  |     uint64_t vsstatus;
+  |     /* ... 7 other CSRs ... */
+  |     uint64_t scounteren;
+  |     uint64_t senvcfg;
+  |     /* vstimecmp missing */
+  | };
+
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:594-597  riscv_sync_interrupts
+  Dual-track VSTIP conflict: riscv_sync_interrupts() manages HVIP_VSTIP solely via the host-callout-driven interrupts_pending flag. It clears HVIP_VSTIP when interrupts_pending is 0. However, per the RISC-V spec, VSTIP = hvip.VSTIP OR vstimecmp_timer_signal. The hardware vstimecmp mechanism independently asserts VSTIP regardless of the hvip CSR bit, so clearing hvip.VSTIP does not actually suppress a pending hardware vstimecmp interrupt.
+  | if (riscv_check_interrupts_pending(hypctx))
+  |     hypctx->guest_csrs.hvip |= HVIP_VSTIP;
+  | else
+  |     hypctx->guest_csrs.hvip &= ~HVIP_VSTIP;
+
+[bug_confirmed] sys/riscv/vmm/vmm_vtimer.c:98-119  vtimer_set_timer
+  vtimer_set_timer implements a host-callout-based virtual timer (Track 1), clearing interrupts_pending (line 112) when a future timer is set, and scheduling a callout to set interrupts_pending later. This operates entirely on the host-callout path and never touches vstimecmp. Meanwhile, if the guest directly writes stimecmp via the SSTC CSR (Track 2), vstimecmp is updated in hardware without vtimer_set_timer knowing, creating a split-brain between the two timer injection tracks.
+  | atomic_clear_32(&hypctx->interrupts_pending, HVIP_VSTIP);
+  | callout_reset_sbt(&vtimer->callout, time, 0,
+  |     vtimer_inject_irq_callout, hypctx, 0);
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:664-667  vmmops_run
+  Existing TODO comment explicitly acknowledges the race window: a timer interrupt from the previous VM could fire between interrupt synchronization and VM entry. This comment confirms the developers are aware of the issue but have not implemented a fix.
+  | /*
+  |  * TODO: What happens if a timer interrupt is asserted exactly
+  |  * here, but for the previous VM?
+  |  */
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:155-158  vmmops_delegate
+  hideleg delegates IRQ_TIMER_HYPERVISOR (bit 5) to VS-mode. Combined with HENVCFG_STCE enabling hardware vstimecmp, this means any spurious VSTIP asserted by stale vstimecmp will be delivered directly to the guest as a timer interrupt — the hypervisor has no opportunity to intercept and suppress it.
+  | hideleg  = (1UL << IRQ_SOFTWARE_HYPERVISOR);
+  | hideleg |= (1UL << IRQ_TIMER_HYPERVISOR);
+  | hideleg |= (1UL << IRQ_EXTERNAL_HYPERVISOR);
+  | csr_write(hideleg, hideleg);
+

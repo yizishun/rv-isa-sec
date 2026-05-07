@@ -1,0 +1,108 @@
+{
+  "pr_number": 2482,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2482,
+    "violation_condition": "If the TlbCmd multiplexer at NewStoreUnit.scala:225 incorrectly assigns TlbCmd (e.g., cbo.clean/cbo.flush/cbo.inval receive TlbCmd.write instead of TlbCmd.read due to inverted isCboNoZero gate, or cbo.zero receives TlbCmd.read), the TLB permission check at TLB.scala:421-427 will verify the wrong access type (w instead of r or vice versa), and the PMP checker at PMP.scala:405-406 will apply the wrong permission bit (cfg.w instead of cfg.r). The hardware would grant access through PMP/TLB with insufficient or incorrect privilege verification.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "Mux\\(isCbo.*TlbCmd\\.(read|write)|LSUOpType\\.isCbo.*cmd|pmp_check.*cfg\\.(r|w).*cbo|TlbCmd\\.is(Read|Write).*cbo",
+    "affected_entities": [
+      "cbo.clean",
+      "cbo.flush",
+      "cbo.inval",
+      "cbo.zero",
+      "pmpcfg",
+      "menvcfg.CBCFE",
+      "menvcfg.CBIE",
+      "menvcfg.CBZE"
+    ],
+    "summary": "XiangShan currently implements CBO permission checks correctly via implicit TlbCmd routing (read for cbo.clean/flush/inval, write for cbo.zero) in NewStoreUnit dispatch, with TLB/PMP both deriving access type from TlbCmd; violation would occur if TlbCmd assignment is corrupted, silently granting unprivileged access to cache-block operations across PMP/page-table boundaries"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/pipeline/NewStoreUnit.scala",
+        "function_name": "StoreUnitS0 (Stage 0 store issue)",
+        "line_start": 225,
+        "line_end": 225,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TlbCmd multiplexer correctly assigns TlbCmd.read to cbo.clean/flush/inval (isCboNoZero=true) and TlbCmd.write to cbo.zero (isCboNoZero=false). LSUOpType.isCbo (line 580) matches op(3,2)==='b11' && op(6,4)==='b000', which covers cbo_clean=0b1100, cbo_flush=0b1101, cbo_inval=0b1110 but NOT cbo_zero=0b0111 (bits 3:2=01). The Mux gate is NOT inverted — write path is the else/default, which is correct because cbo.zero writes zeros to the cache line and requires write permission per RISC-V spec.",
+      "snippet": "io.tlbReq.bits.cmd := Mux(isCboNoZero, TlbCmd.read, TlbCmd.write)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/TLB.scala",
+        "function_name": "perm_check",
+        "line_start": 421,
+        "line_end": 429,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TLB permission check correctly classifies TlbCmd-based CBO access. cbo.clean/flush/inval (TlbCmd.read) → isLd=true → checked against perm.r (load path, line 428). cbo.zero (TlbCmd.write) → isSt=true → checked against perm.w (store path, line 429). No bypass: the cmd value from the store unit's Mux flows directly into isLd/isSt classification.",
+      "snippet": "val isLd = TlbCmd.isRead(cmd) && !TlbCmd.isAmo(cmd)\nval isSt = TlbCmd.isWrite(cmd) || TlbCmd.isAmo(cmd)\n...\nval ldPermFail = !(modeCheck && Mux(hlvx, perm.x, perm.r || mxr(idx) && perm.x))\nval stPermFail = !(modeCheck && perm.w)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "pmp_check (PMPCheckMethod trait)",
+        "line_start": 404,
+        "line_end": 412,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PMP checker correctly derives permission bits from TlbCmd. cbo.clean/flush/inval (TlbCmd.read) → resp.ld = (!cfg.r) — treated as load, checked against cfg.r. cbo.zero (TlbCmd.write) → resp.st = (!cfg.w) — treated as store, checked against cfg.w. No cbo-specific bypass or short-circuit.",
+      "snippet": "resp.ld := TlbCmd.isRead(cmd) && !TlbCmd.isAmo(cmd) && !cfg.r\nresp.st := (TlbCmd.isWrite(cmd) || TlbCmd.isAmo(cmd)) && !cfg.w"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/pipeline/NewStoreUnit.scala",
+        "function_name": "StoreUnitS1 (Stage 1 permission consolidation)",
+        "line_start": 625,
+        "line_end": 625,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PMP inaccessible flag correctly handles both CBO categories. Operator precedence (&& > ||) gives: pmp.st || (pmp.ld && isCboNoZero). cbo.zero (isCboNoZero=false) → only pmp.st applies (correct: write permission). cbo.clean/flush/inval (isCboNoZero=true) → pmp.ld applies (correct: read permission). Note: lack of explicit parentheses around pmp.ld && isCboNoZero is a minor readability concern but produces correct hardware.",
+      "snippet": "val pmpInaccessible = tlbHit && (pmp.st || pmp.ld && isCboNoZero)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/pipeline/NewStoreUnit.scala",
+        "function_name": "StoreUnitS0",
+        "line_start": 231,
+        "line_end": 232,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The memidx.is_st field is hardwired to true.B for all store-unit TLB requests (including CBO reads). However, TLB.scala's perm_check function does NOT reference memidx bits for permission decisions — it uses only the cmd field (TlbCmd.isRead/isWrite). Verified via grep: no memidx.is_st or memidx.is_ld references in TLB.scala. This field is metadata-only and does not affect the hardware permission path.",
+      "snippet": "io.tlbReq.bits.memidx.is_ld := false.B\nio.tlbReq.bits.memidx.is_st := true.B"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/package.scala",
+        "function_name": "LSUOpType object",
+        "line_start": 570,
+        "line_end": 584,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CBO fuOpType bit-field definitions are internally consistent. cbo_zero=0b0111 has bits 3:2=01 (distinct from clean/flush/inval which all have bits 3:2=11). isCbo() requires op(3,2)==='b11' AND op(6,4)==='b000', correctly distinguishing CBO from other operations sharing the b11 prefix in bits 3:2 (e.g., prefetch subtypes via bits 6:4). isCboAll() is the OR of isCbo and cbo_zero. No off-by-one errors in bit positions.",
+      "snippet": "def cbo_zero  = \"b0111\".U\ndef cbo_clean = \"b1100\".U\ndef cbo_flush = \"b1101\".U\ndef cbo_inval = \"b1110\".U\ndef isCbo(op: UInt): Bool = op(3, 2) === \"b11\".U && (op(6, 4) === \"b000\".U)\ndef isCboAll(op: UInt): Bool = isCbo(op) || op(3,0) === cbo_zero"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/DecodeUnit.scala",
+        "function_name": "DecodeUnit (decode table)",
+        "line_start": 479,
+        "line_end": 482,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Decoder maps CBO instructions to correct LSUOpType values: CBO_CLEAN→cbo_clean, CBO_FLUSH→cbo_flush, CBO_INVAL→cbo_inval, CBO_ZERO→cbo_zero. All dispatched to FuType.stu. The decode-to-fuOpType mapping is consistent with the LSUOpType definitions — no encoding mismatch between decode and the TlbCmd Mux classification.",
+      "snippet": "CBO_ZERO  -> XSDecode(SrcType.reg, SrcType.DC, SrcType.X, FuType.stu, LSUOpType.cbo_zero , ...)\nCBO_CLEAN -> XSDecode(SrcType.reg, SrcType.DC, SrcType.X, FuType.stu, LSUOpType.cbo_clean, ...)\nCBO_FLUSH -> XSDecode(SrcType.reg, SrcType.DC, SrcType.X, FuType.stu, LSUOpType.cbo_flush, ...)\nCBO_INVAL -> XSDecode(SrcType.reg, SrcType.DC, SrcType.X, FuType.stu, LSUOpType.cbo_inval, ...)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

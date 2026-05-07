@@ -1,0 +1,465 @@
+diff --git a/iopmp_ref_model/include/iopmp.h b/iopmp_ref_model/include/iopmp.h
+index d60397c..505f88c 100644
+--- a/iopmp_ref_model/include/iopmp.h
++++ b/iopmp_ref_model/include/iopmp.h
+@@ -107,10 +107,31 @@ typedef struct iopmp_cfg_t {
+     bool imp_msi;                       // IOPMP implements message-signaled interrupts (MSI)
+ } iopmp_cfg_t;
+ 
++// Enumerates specific match and error statuses for transactions
++typedef enum {
++    ENTRY_NOTMATCH,                     // Entry doesn't match any byte of a transation
++    ENTRY_PARTIAL_MATCH,                // Entry matches partial bytes of a transation
++    ENTRY_MATCH,                        // Entry matches all bytes of a transation
++    ENTRY_MATCH_NOTGRANT,               // Entry matches all bytes of a transaction, but doesn't grant transaction permission
++    ENTRY_MATCH_GRANT,                  // Entry matches all bytes of a transaction and grants transaction permission
++} iopmpMatchStatus_t;
++
++// Enumerates the type of violation for transactions
++typedef enum {
++    NO_ERROR                = 0x00,     // No error
++    ILLEGAL_READ_ACCESS     = 0x01,     // Illegal read access attempted
++    ILLEGAL_WRITE_ACCESS    = 0x02,     // Illegal write access attempted
++    ILLEGAL_INSTR_FETCH     = 0x03,     // Illegal instruction fetch attempted
++    PARTIAL_HIT_ON_PRIORITY = 0x04,     // Partial hit on a priority entry
++    NOT_HIT_ANY_RULE        = 0x05,     // No rule matched the transaction
++    UNKNOWN_RRID            = 0x06,     // Unknown requester ID in transaction
++    STALLED_TRANSACTION     = 0x07,     // Error due to a stalled transaction
++} iopmpErrorType_t;
++
+ uint8_t write_memory(uint64_t *data, uint64_t addr, uint32_t size);
+ 
+ // Function Declarations: Core IOPMP operations
+-iopmpMatchStatus_t iopmpRuleAnalyzer(iopmp_dev_t *iopmp, iopmp_trans_req_t trans_req, uint64_t prev_iopmpaddr, uint64_t iopmpaddr, entry_cfg_t iopmpcfg, uint8_t md, int is_priority);
++iopmpMatchStatus_t iopmpRuleAnalyzer(iopmp_dev_t *iopmp, iopmp_trans_req_t trans_req, uint64_t prev_iopmpaddr, uint64_t iopmpaddr, entry_cfg_t iopmpcfg, uint8_t md);
+ void errorCapture(iopmp_dev_t *iopmp, perm_type_e trans_type, uint8_t error_type, uint16_t rrid, uint16_t entry_id, uint64_t err_addr, uint8_t *intrpt);
+ void generate_interrupt(iopmp_dev_t *iopmp, uint8_t *intrpt);
+ 
+diff --git a/iopmp_ref_model/include/iopmp_req_rsp.h b/iopmp_ref_model/include/iopmp_req_rsp.h
+index ae3c438..959ec69 100644
+--- a/iopmp_ref_model/include/iopmp_req_rsp.h
++++ b/iopmp_ref_model/include/iopmp_req_rsp.h
+@@ -44,25 +44,12 @@ typedef enum {
+     IOPMP_ERROR   = 1   // Transaction encountered an error
+ } status_e;
+ 
+-// Enumerates specific match and error statuses for transactions
+-typedef enum {
+-    ILLEGAL_READ_ACCESS    = 0x01,  // Illegal read access attempted
+-    ILLEGAL_WRITE_ACCESS   = 0x02,  // Illegal write access attempted
+-    ILLEGAL_INSTR_FETCH    = 0x03,  // Illegal instruction fetch attempted
+-    PARTIAL_HIT_ON_PRIORITY= 0x04,  // Partial hit on a priority entry
+-    NOT_HIT_ANY_RULE       = 0x05,  // No rule matched the transaction
+-    UNKNOWN_RRID           = 0x06,  // Unknown requester ID in transaction
+-    STALLED_TRANSACTION    = 0x07,  // Error due to a stalled transaction
+-    ENTRY_MATCH            = 0x10,  // Entry matched in access control
+-    ENTRY_NOTMATCH         = 0x11   // No matching entry found
+-} iopmpMatchStatus_t;
+-
+ // Structure for IOPMP transaction responses
+ typedef struct __attribute__((__packed__)) {
+     uint32_t rrid;          // Requester ID
+     uint8_t  user;          // User mode indicator
+     uint8_t  rrid_stalled;  // Requester ID stall status
+-    uint16_t rrid_transl;
++    uint16_t rrid_transl;   // The RRID tagged to outgoing transactions
+     status_e status;        // Transaction status (success or error)
+ } iopmp_trans_rsp_t;
+ 
+diff --git a/iopmp_ref_model/src/iopmp_rule_analyzer.c b/iopmp_ref_model/src/iopmp_rule_analyzer.c
+index 866998e..3bfc4b6 100644
+--- a/iopmp_ref_model/src/iopmp_rule_analyzer.c
++++ b/iopmp_ref_model/src/iopmp_rule_analyzer.c
+@@ -68,15 +68,17 @@ static int iopmpAddrRange(uint64_t *startAddr, uint64_t *endAddr, uint64_t prev_
+ }
+ 
+ /**
+-  * @brief Matches transaction request address against IOPMP entry range.
++  * @brief Determine the matching status of transaction request address against IOPMP entry range.
+   *
+   * @param trans_req Transaction request containing address, size, and length
+   * @param lo Lower bound of the IOPMP range
+   * @param hi Upper bound of the IOPMP range
+-  * @param is_priority Flag indicating if the entry has priority
+-  * @return 0 for a full match, ENTRY_NOTMATCH for no match, or PARTIAL_HIT_ON_PRIORITY for a partial match with priority
++  * @return iopmpMatchStatus_t Status of the match:
++  *         - ENTRY_MATCH: Entry matches all bytes of a transaction
++  *         - ENTRY_PARTIAL_MATCH: Entry matches partial bytes of a transation
++  *         - ENTRY_NOTMATCH: Entry doesn't cover any byte of the transaction
+  **/
+-static int iopmpMatchAddr(iopmp_trans_req_t trans_req, uint64_t lo, uint64_t hi, int is_priority) {
++static iopmpMatchStatus_t iopmpMatchAddr(iopmp_trans_req_t trans_req, uint64_t lo, uint64_t hi) {
+     // Validate range
+     if (hi < lo) { return ENTRY_NOTMATCH; }  // Invalid range, no match
+ 
+@@ -87,14 +89,13 @@ static int iopmpMatchAddr(iopmp_trans_req_t trans_req, uint64_t lo, uint64_t hi,
+     if (trans_end <= lo || trans_req.addr >= hi) { return ENTRY_NOTMATCH; } // No match, transaction outside range
+ 
+     // Determine if there's a full match
+-    if (trans_req.addr >= lo && trans_end <= hi) { return 0; } // Full Match
++    if (trans_req.addr >= lo && trans_end <= hi) { return ENTRY_MATCH; }
+ 
+-    // Check for partial match if entry has priority
+-    return is_priority ? PARTIAL_HIT_ON_PRIORITY : ENTRY_NOTMATCH;
++    return ENTRY_PARTIAL_MATCH;
+ }
+ 
+ /**
+-  * @brief Checks IOPMP permissions based on request and configuration.
++  * @brief Checks IOPMP permissions based on request and configuration of a fully matching entry
+   *
+   * @param iopmp The IOPMP instance.
+   * @param rrid Requestor Role ID
+@@ -102,7 +103,9 @@ static int iopmpMatchAddr(iopmp_trans_req_t trans_req, uint64_t lo, uint64_t hi,
+   * @param iopmpcfg IOPMP configuration for the entry
+   * @param md Respective Memory Domain
+   * @param is_amo Indicates the AMO Access
+-  * @return ENTRY_MATCH if permission is granted, specific ILLEGAL_* code if denied
++  * @return iopmpMatchStatus_t Status of the match and permission check:
++  *         - ENTRY_MATCH_GRANT: Entry matches all bytes of a transaction and grants transation permission
++  *         - ENTRY_MATCH_NOTGRANT: Entry matches all bytes of a transaction but doesn't grant transation permission
+  **/
+ static iopmpMatchStatus_t iopmpCheckPerms(iopmp_dev_t *iopmp, uint16_t rrid, perm_type_e req_perm, entry_cfg_t iopmpcfg, uint8_t md, bool is_amo) {
+     // Common permission checks
+@@ -153,14 +156,14 @@ static iopmpMatchStatus_t iopmpCheckPerms(iopmp_dev_t *iopmp, uint16_t rrid, per
+             iopmp->intrpt_suppress = iopmpcfg.sire;
+             iopmp->error_suppress  = iopmpcfg.sere | iopmp->reg_file.err_cfg.rs;
+         }
+-        return read_allowed ? ENTRY_MATCH : ILLEGAL_READ_ACCESS;
++        return read_allowed ? ENTRY_MATCH_GRANT : ENTRY_MATCH_NOTGRANT;
+ 
+     case WRITE_ACCESS:
+         if (!write_allowed) {
+             iopmp->intrpt_suppress = iopmpcfg.siwe;
+             iopmp->error_suppress  = iopmpcfg.sewe | iopmp->reg_file.err_cfg.rs;
+         }
+-        return write_allowed ? ENTRY_MATCH : ILLEGAL_WRITE_ACCESS;
++        return write_allowed ? ENTRY_MATCH_GRANT : ENTRY_MATCH_NOTGRANT;
+ 
+     case INSTR_FETCH:
+         if (iopmp->reg_file.hwcfg2.chk_x) {
+@@ -168,21 +171,21 @@ static iopmpMatchStatus_t iopmpCheckPerms(iopmp_dev_t *iopmp, uint16_t rrid, per
+                 iopmp->intrpt_suppress = iopmpcfg.sixe;
+                 iopmp->error_suppress  = iopmpcfg.sexe | iopmp->reg_file.err_cfg.rs;
+             }
+-            return execute_allowed ? ENTRY_MATCH : ILLEGAL_INSTR_FETCH;
++            return execute_allowed ? ENTRY_MATCH_GRANT : ENTRY_MATCH_NOTGRANT;
+         } else if (read_allowed) {
+-            return ENTRY_MATCH;  // Grant Execute permission via Read fallback
++            return ENTRY_MATCH_GRANT;   // Grant Execute permission via Read fallback
+         }
+         iopmp->intrpt_suppress = iopmpcfg.sixe;
+         iopmp->error_suppress  = iopmpcfg.sexe | iopmp->reg_file.err_cfg.rs;
+-        return ILLEGAL_INSTR_FETCH;
++        return ENTRY_MATCH_NOTGRANT;
+ 
+     default:
+-        return ILLEGAL_READ_ACCESS;  // Default case for invalid permission request
++        return ENTRY_MATCH_NOTGRANT;    // Default case for invalid permission request
+     }
+ }
+ 
+ /**
+-  * @brief Matches the transaction request to an IOPMP entry, handling priority and permissions.
++  * @brief Analyze the matching status and permissions of a transaction request
+   *
+   * @param iopmp The IOPMP instance.
+   * @param trans_req Transaction request containing address, permissions, etc.
+@@ -190,33 +193,28 @@ static iopmpMatchStatus_t iopmpCheckPerms(iopmp_dev_t *iopmp, uint16_t rrid, per
+   * @param iopmpaddr Current IOPMP address
+   * @param iopmpcfg IOPMP entry configuration
+   * @param md Respective Memory Domain
+-  * @param is_priority Flag indicating if the entry has priority
+-  * @return iopmpMatchStatus_t Status of the match:
+-  *         - ENTRY_MATCH: Full match, access granted.
+-  *         - ENTRY_NOTMATCH: No match or access denied.
+-  *         - PARTIAL_HIT_ON_PRIORITY: Partial match found with priority.
+-  *         - ILLEGAL_* status: Access denied based on permission type (e.g., read/write/execute).
++  * @return iopmpMatchStatus_t Status of the match and permission check:
++  *         - ENTRY_NOTMATCH: Entry doesn't cover any byte of the transaction
++  *         - ENTRY_PARTIAL_MATCH: Entry matches partial bytes of a transation
++  *         - ENTRY_MATCH_NOTGRANT: Entry matches all bytes of a transaction, but doesn't grant transaction permission
++  *         - ENTRY_MATCH_GRANT: Entry matches all bytes of a transaction and grants transaction permission
+  **/
+-iopmpMatchStatus_t iopmpRuleAnalyzer(iopmp_dev_t *iopmp, iopmp_trans_req_t trans_req, uint64_t prev_iopmpaddr, uint64_t iopmpaddr, entry_cfg_t iopmpcfg, uint8_t md, int is_priority) {
++iopmpMatchStatus_t iopmpRuleAnalyzer(iopmp_dev_t *iopmp, iopmp_trans_req_t trans_req, uint64_t prev_iopmpaddr, uint64_t iopmpaddr, entry_cfg_t iopmpcfg, uint8_t md) {
+     iopmpMatchStatus_t match_status = ENTRY_MATCH;  // Default to full match
+     uint64_t start_addr, end_addr;
+-    bool no_w  = iopmp->reg_file.hwcfg3.no_w;     // Write restriction
+-    bool no_x  = iopmp->reg_file.hwcfg3.no_x;     // Execute restriction
+-    bool chk_x = iopmp->reg_file.hwcfg2.chk_x;    // Execute permission check enable
+-    if ((no_w && (trans_req.perm == WRITE_ACCESS)) || (no_x && (trans_req.perm == INSTR_FETCH) && chk_x)) { return ENTRY_NOTMATCH; }
+ 
+     // Set up the address range; if range setup fails, return not matched
+     if (iopmpAddrRange(&start_addr, &end_addr, prev_iopmpaddr, iopmpaddr, iopmpcfg)) { return ENTRY_NOTMATCH; }
+ 
+     // Match transaction address to the IOPMP address range
+     // Multiply the addresses with 4 is equivalent to (Address << 2)
+-    int addr_match_status = iopmpMatchAddr(trans_req, (start_addr * 4), (end_addr * 4), is_priority);
+-    if (addr_match_status == PARTIAL_HIT_ON_PRIORITY) {
+-        iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+-        return PARTIAL_HIT_ON_PRIORITY;  // Priority entry partial match
++    iopmpMatchStatus_t addr_match_status = iopmpMatchAddr(trans_req, (start_addr * 4), (end_addr * 4));
++    if (addr_match_status == ENTRY_NOTMATCH || addr_match_status == ENTRY_PARTIAL_MATCH) {
++        // It's unnecessary to check entry permissions in these two cases
++        return addr_match_status;
+     }
+-    if (addr_match_status) { return ENTRY_NOTMATCH; } // No match found
+ 
++    // iopmpMatchAddr() returns ENTRY_MATCH. Further checks entry permissions
+     #if (SRC_ENFORCEMENT_EN)
+         match_status = iopmpCheckPerms(iopmp, 0, trans_req.perm, iopmpcfg, md, trans_req.is_amo);
+     #else
+diff --git a/iopmp_ref_model/src/iopmp_validate.c b/iopmp_ref_model/src/iopmp_validate.c
+index 1173413..b6d3d52 100644
+--- a/iopmp_ref_model/src/iopmp_validate.c
++++ b/iopmp_ref_model/src/iopmp_validate.c
+@@ -14,6 +14,21 @@
+ 
+ #include "iopmp.h"
+ 
++/**
++* @brief Translate the type of requested permission by transaction to IOPMP error type
++*
++* @param perm Type of permission requested by transaction
++* @return iopmpErrorType_t enum representing the IOPMP error type
++ */
++static iopmpErrorType_t perm_to_etype(perm_type_e perm)
++{
++    if (perm == WRITE_ACCESS)
++        return ILLEGAL_WRITE_ACCESS;
++    else if (perm == INSTR_FETCH)
++        return ILLEGAL_INSTR_FETCH;
++    return ILLEGAL_READ_ACCESS;
++}
++
+ /**
+   * @brief Processes the IOPMP transaction request, traversing the SRCMD and MDCFG tables
+   *        and entry array to match address and permissions.
+@@ -38,9 +53,7 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+     iopmp_trans_rsp->rrid_stalled = 0;
+     iopmp_trans_rsp->user         = 0;
+     iopmp_trans_rsp->status       = IOPMP_ERROR;
+-    if (iopmp->reg_file.hwcfg3.rrid_transl_en) {
+-        iopmp_trans_rsp->rrid_transl = iopmp->reg_file.hwcfg3.rrid_transl;
+-    }
++    iopmp_trans_rsp->rrid_transl  = trans_req->rrid;
+ 
+     // Check to block invalid combination
+     if (trans_req->perm == INSTR_FETCH && trans_req->is_amo) {
+@@ -48,6 +61,9 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+         assert(trans_req->is_amo == 0);
+     }
+ 
++    iopmpErrorType_t error_type = NO_ERROR;
++    uint16_t error_eid = 0;
++
+     iopmp->intrpt_suppress = 0;
+     iopmp->error_suppress  = 0;
+     int lwr_entry, upr_entry;
+@@ -59,25 +75,26 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+     int nonPrioErrorSup    = 0;
+     int nonPrioIntrSup     = 0;
+     int firstIllegalAccess = 1;
+-    iopmpMatchStatus_t nonPrioRuleStatus = NOT_HIT_ANY_RULE;
++    iopmpErrorType_t nonPrioRuleStatus = NOT_HIT_ANY_RULE;
+     int nonPrioRuleNum = 0;
+ 
+     // IOPMP always allow the transaction when enable = 0
+     if (!iopmp->reg_file.hwcfg0.enable) {
+-        iopmp_trans_rsp->status = IOPMP_SUCCESS;
+-        return ;
++        goto pass_checks;
+     }
++
++    // Tag a new RRID which represents that the transaction has been checked.
++    // The RRID translation takes effect when IOPMP checker is enabled.
++    if (iopmp->reg_file.hwcfg3.rrid_transl_en) {
++        iopmp_trans_rsp->rrid_transl = iopmp->reg_file.hwcfg3.rrid_transl;
++    }
++
+     // Check for valid RRID; if invalid, capture error and return
+     if (trans_req->rrid >= iopmp->reg_file.hwcfg1.rrid_num) {
+         // Initially, check for global error suppression
+         iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+-        if (iopmp->imp_error_capture) {
+-            errorCapture(iopmp, trans_req->perm, UNKNOWN_RRID, trans_req->rrid, 0, trans_req->addr, intrpt);
+-        }
+-        // In case of error suppression, success response is returned, with user defined value on initiator port
+-        // NOTE: You can change the `user` value
+-        if (iopmp->error_suppress) { iopmp_trans_rsp->status = IOPMP_SUCCESS; iopmp_trans_rsp->user = USER; }
+-        return ;
++        error_type = UNKNOWN_RRID;
++        goto stop_and_report_fault;
+     }
+ 
+     if (iopmp->rrid_stall[trans_req->rrid]) {
+@@ -88,11 +105,28 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+         }
+         else if (iopmp->reg_file.err_cfg.stall_violation_en) {
+             iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+-            if (iopmp->imp_error_capture) {
+-                errorCapture(iopmp, trans_req->perm, STALLED_TRANSACTION, trans_req->rrid, 0, trans_req->addr, intrpt);
+-            }
+-            if (iopmp->error_suppress) { iopmp_trans_rsp->status = IOPMP_SUCCESS; iopmp_trans_rsp->user = USER; }
+-            return ;
++            error_type = STALLED_TRANSACTION;
++            goto stop_and_report_fault;
++        }
++    }
++
++    // When no_w is set to 1, the IOPMP denies all write transactions regardless
++    // of entry rule configurations, reporting them with error type
++    // "not hit any rule" (0x05).
++    if (trans_req->perm == WRITE_ACCESS && iopmp->reg_file.hwcfg3.no_w) {
++        iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
++        error_type = NOT_HIT_ANY_RULE;
++        goto stop_and_report_fault;
++    }
++
++    if (trans_req->perm == INSTR_FETCH) {
++        // When chk_x and no_x are set to 1, the IOPMP denies all instruction
++        // fetch transactions regardless of entry rule configurations, reporting
++        // them with error type "not hit any rule" (0x05).
++        if (iopmp->reg_file.hwcfg2.chk_x && iopmp->reg_file.hwcfg3.no_x) {
++            iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
++            error_type = NOT_HIT_ANY_RULE;
++            goto stop_and_report_fault;
+         }
+     }
+ 
+@@ -137,53 +171,100 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+             uint64_t prev_addr     = (cur_entry == 0) ? 0 : CONCAT32(iopmp->iopmp_entries.entry_table[cur_entry - 1].entry_addrh.addrh, iopmp->iopmp_entries.entry_table[cur_entry - 1].entry_addr.addr);
+             uint64_t curr_addr     = CONCAT32(iopmp->iopmp_entries.entry_table[cur_entry].entry_addrh.addrh, iopmp->iopmp_entries.entry_table[cur_entry].entry_addr.addr);
+             entry_cfg_t entry_cfg  = iopmp->iopmp_entries.entry_table[cur_entry].entry_cfg;
+-            bool is_priority_entry;
+-
+-            if (iopmp->reg_file.hwcfg2.non_prio_en) {
+-                is_priority_entry = (cur_entry < iopmp->reg_file.hwcfg2.prio_entry);
+-            } else {
+-                is_priority_entry = true;
+-            }
+ 
+             // Analyze entry for match
+-            iopmpMatchStatus = iopmpRuleAnalyzer(iopmp, *trans_req, prev_addr, curr_addr, entry_cfg, cur_md, is_priority_entry);
+-
+-            if (iopmpMatchStatus == ENTRY_MATCH) {
+-                iopmp_trans_rsp->status = IOPMP_SUCCESS;
+-                return ;  // Return on successful match
+-            } else if (iopmpMatchStatus != ENTRY_NOTMATCH) {
+-                if (!is_priority_entry) {
+-                    if (iopmp->imp_error_capture) {
+-                        nonPrioErrorSup |= iopmp->error_suppress;
+-                        nonPrioIntrSup  |= iopmp->intrpt_suppress;
+-                        if (firstIllegalAccess) {
+-                            nonPrioRuleStatus = iopmpMatchStatus;
+-                            nonPrioRuleNum    = cur_entry;
+-                            firstIllegalAccess = 0;
+-                        }
++            iopmpMatchStatus = iopmpRuleAnalyzer(iopmp, *trans_req, prev_addr, curr_addr, entry_cfg, cur_md);
++            if (iopmpMatchStatus == ENTRY_MATCH_GRANT) {
++                // If the entry matches all bytes of the transaction and grants
++                // transaction permission to operate, the transaction is legal.
++                goto pass_checks;
++            } else if (iopmpMatchStatus == ENTRY_PARTIAL_MATCH) {
++                // If the partial matching entry is non-priority entry, just
++                // keep checking next entry.
++                if (iopmp->reg_file.hwcfg2.non_prio_en && cur_entry >= iopmp->reg_file.hwcfg2.prio_entry)
++                    goto check_next_entry;
++
++                // If the partial matching entry is priority entry, check fails.
++                // The priority entry must match all bytes of a transaction, or
++                // transaction is illegal with error type =
++                // "partial hit on a priority rule" (0x04).
++                iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
++                error_type = PARTIAL_HIT_ON_PRIORITY;
++                error_eid  = cur_entry;
++                goto stop_and_report_fault;
++            } else if (iopmpMatchStatus == ENTRY_MATCH_NOTGRANT) {
++                // If the matching entry is non-priority entry but doesn't grant
++                // transaction permission to operate, the model records this
++                // access as "first illegal access". This "first illegal access"
++                // will be reported if the subsequent entries still fail the
++                // checks. If no matching entry permits, the transaction is
++                // illegal.
++                if (iopmp->reg_file.hwcfg2.non_prio_en && cur_entry >= iopmp->reg_file.hwcfg2.prio_entry) {
++                    nonPrioErrorSup |= iopmp->error_suppress;
++                    nonPrioIntrSup  |= iopmp->intrpt_suppress;
++                    if (firstIllegalAccess) {
++                        nonPrioRuleStatus = perm_to_etype(trans_req->perm);
++                        nonPrioRuleNum    = cur_entry;
++                        firstIllegalAccess = 0;
+                     }
+-                    continue;
++                    goto check_next_entry;
+                 }
+-                if (iopmp->imp_error_capture) {
+-                    errorCapture(iopmp, trans_req->perm, iopmpMatchStatus, trans_req->rrid, cur_entry, trans_req->addr, intrpt);
+-                }
+-                // In case of error suppression, success response is returned, with user defined value on initiator port
+-                // NOTE: You can change the `user` value
+-                if (iopmp->error_suppress) { iopmp_trans_rsp->status = IOPMP_SUCCESS; iopmp_trans_rsp->user = USER; }
+-                return ;  // Error found, capture and return response
++
++                // If the matching entry is priority entry but doesn't grant
++                // transaction permission to operate, the transaction is illegal
++                // with error type = "illegal read access" (0x01) for read
++                // access transaction, "illegal write access/AMO" (0x02) for
++                // write access/atomic memory operation (AMO) transaction.
++                error_type = perm_to_etype(trans_req->perm);
++                error_eid  = cur_entry;
++                goto stop_and_report_fault;
+             }
++
++            // ENTRY_NOTMATCH: Keep checking next entry
++check_next_entry:
+         }
+     }
+ 
+     // If No rule hits, enable error suppression based on global error suppression bit
+-    if (nonPrioRuleStatus == NOT_HIT_ANY_RULE) { iopmp->error_suppress = iopmp->reg_file.err_cfg.rs; }
+-    else { iopmp->error_suppress = nonPrioErrorSup; iopmp->intrpt_suppress = nonPrioIntrSup; }
++    if (iopmp->reg_file.hwcfg2.non_prio_en) {
++        if (nonPrioRuleStatus == NOT_HIT_ANY_RULE) {
++            // None of the non-priority entries fully matches the transaction
++            iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
++            error_type = NOT_HIT_ANY_RULE;
++        } else {
++            // At least one non-priority entry fully matches the transaction but
++            // doesn't grant transaction permission.
++            // The IOPMP specification says:
++            // If no matching entry permits, the transaction is illegal with
++            // error type = "illegal read access" (0x01) for read access
++            // transaction or "illegal write access/AMO" (0x02) for write
++            // access/AMO transaction.
++            iopmp->error_suppress = nonPrioErrorSup;
++            iopmp->intrpt_suppress = nonPrioIntrSup;
++            error_type = nonPrioRuleStatus;
++            error_eid  = nonPrioRuleNum;
++        }
++    } else {
++        iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
++        error_type = NOT_HIT_ANY_RULE;
++    }
++    goto stop_and_report_fault;
++
++pass_checks:
++    iopmp_trans_rsp->status = IOPMP_SUCCESS;
++    return;
+ 
++stop_and_report_fault:
++    // If IOPMP implements error capture feature, IOPMP triggers error capture
++    // to log the error information into the registers.
+     if (iopmp->imp_error_capture) {
+-        errorCapture(iopmp, trans_req->perm, nonPrioRuleStatus, trans_req->rrid, nonPrioRuleNum, trans_req->addr, intrpt);
++        errorCapture(iopmp, trans_req->perm, error_type, trans_req->rrid, error_eid, trans_req->addr, intrpt);
+     }
+     // Return response with default status if no match/error occurs
+     // In case of error suppression, success response is returned, with user defined value on initiator port
+     // NOTE: You can change the `user` value
+-    if (iopmp->error_suppress) { iopmp_trans_rsp->status = IOPMP_SUCCESS; iopmp_trans_rsp->user = USER; }
++    if (iopmp->error_suppress) {
++        iopmp_trans_rsp->status = IOPMP_SUCCESS;
++        iopmp_trans_rsp->user = USER;
++    }
+ }

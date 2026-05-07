@@ -1,0 +1,148 @@
+{
+  "pr_number": 155,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 155,
+    "violation_condition": "On a RISC-V hart where hardware implements Ssamb (interrupt code 14 masked as local), FreeBSD's intc_init_secondary() unconditionally sets SIE[14] via csr_set(sie, 1<<14) during AP boot (iterating irq=0..15 in intc.c:243). If the hardware subsequently asserts MIP[14], the trap flows through exception.S -> trap.c do_trap_supervisor/do_trap_user -> intc_intr() where active_irq=14 passes the >=INTC_NIRQS(16) guard, but intr_isrc_dispatch on the handlerless isrcs[14] fails. The stray-isr path in intc.c:284 calls intc_disable_intr() which does csr_clear(sie, 1<<14), yet NOTHING clears the SIP[14] pending bit. If any code path re-enables SIE[14] (e.g., intc re-init across suspend/resume, or a driver blindly re-enabling all sources), the latched pending bit causes immediate re-entry, forming a tight interrupt storm. For bhyve: hideleg only delegates bits 2/6/10 (vmm_riscv.c:155), so interrupt 14 traps to HS-mode during guest execution where no handler exists, potentially halting the host.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csr_set\\(sie,\\s*1\\s*<<\\s*(1[4-5]|[89])\\s*\\)|csr_set\\(mie|INTC_NIRQS\\s*(<|<=)\\s*15|for.*irq.*INTC_NIRQS.*intc_enable_intr|hideleg\\s*(&=|\\|=).*IRQ",
+    "affected_entities": [
+      "mip",
+      "mie",
+      "sip",
+      "sie",
+      "mvien",
+      "mvip",
+      "hvien",
+      "hvip",
+      "hideleg",
+      "vsie",
+      "vsip",
+      "iprio"
+    ],
+    "summary": "Ssamb repurposes reserved interrupt 14 as a local interrupt; FreeBSD's intc blindly enables all 16 IRQ slots on AP boot without Ssamb awareness, creating a stray-interrupt storm if hardware asserts MIP[14] before a handler is registered—and bhyve's hideleg omits it, risking HS-mode traps from guest execution"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_init_secondary",
+        "line_start": 244,
+        "line_end": 259,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "INTC_NIRQS is hardcoded to 16, causing the AP boot loop (irq=0..15) to unconditionally call intc_enable_intr() → csr_set(sie, 1<<irq) for interrupt sources 12-15, which are beyond the standard RISC-V local interrupt definitions (0=USIP .. 11=MEIP) and include reserved/local-extension interrupts. On hardware implementing Ssamb (LAMBI, interrupt code 14), this enables a handlerless isrc[14] at boot.",
+      "snippet": "for (irq = 0; irq < INTC_NIRQS; irq++) {\n  isrc = &sc->isrcs[irq].isrc;\n  if (intr_isrc_init_on_cpu(isrc, cpu))\n    intc_enable_intr(dev, isrc);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_intr",
+        "line_start": 278,
+        "line_end": 286,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The guard `active_irq >= INTC_NIRQS` (line 278) passes for active_irq=14 (14 < 16). The stray-interrupt path at line 282-285 calls intc_disable_intr() → csr_clear(sie, 1<<14), which clears the SIE enable bit but does NOT clear the SIP[14] pending bit. If any code path subsequently re-enables SIE[14] (e.g., suspend/resume re-init, or a driver calling intc_enable_intr on all sources), the latched SIP[14] bit causes immediate re-trap, forming a tight interrupt storm with no exit condition.",
+      "snippet": "if (active_irq >= INTC_NIRQS)\n  return (FILTER_HANDLED);\nsrc = &sc->isrcs[active_irq];\nif (intr_isrc_dispatch(&src->isrc, frame) != 0) {\n  intc_disable_intr(sc->dev, &src->isrc);\n  device_printf(sc->dev, \"Stray irq %lu disabled\\n\", active_irq);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_disable_intr",
+        "line_start": 188,
+        "line_end": 197,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "intc_disable_intr() only clears the SIE enable bit via csr_clear(sie, 1ul<<irq) but never clears the corresponding SIP pending bit. Since the RISC-V spec requires SIP bits to be cleared by writing 1 to them (csr_set(sip, 1<<irq)), a stray interrupt's pending state survives the disable operation, enabling the interrupt-storm re-entry scenario.",
+      "snippet": "csr_clear(sie, 1ul << irq);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_enable_intr",
+        "line_start": 199,
+        "line_end": 209,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "intc_enable_intr() blindly performs csr_set(sie, 1ul<<irq) for any irq < INTC_NIRQS (0-15) without checking whether the interrupt source is architecturally valid or has a registered handler. Interrupt codes 12-15 correspond to reserved/local RISC-V extensions (COFI, LAMBI, etc.) that FreeBSD does not handle.",
+      "snippet": "csr_set(sie, 1ul << irq);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_attach",
+        "line_start": 168,
+        "line_end": 178,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "intc_attach registers isrc entries for all 16 interrupt sources (0-15). Interrupts 0 (IRQ_SOFTWARE_SUPERVISOR=1) is marked INTR_ISRCF_IPI; all others including undefined sources 12-15 are marked INTR_ISRCF_PPI. Since intr_isrc_init_on_cpu() only returns true when isrc_handlers>0, unregistered sources 12-15 are harmless until a handler is attached — but the isrc registration exists, allowing a hypothetical buggy driver to attach a handler to source 14.",
+      "snippet": "for (i = 0; i < INTC_NIRQS; i++) {\n  isrcs[i].irq = i;\n  flags = i == IRQ_SOFTWARE_SUPERVISOR\n    ? INTR_ISRCF_IPI : INTR_ISRCF_PPI;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_delegate",
+        "line_start": 141,
+        "line_end": 158,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "hideleg only delegates bits 2 (VSSIP), 6 (VSTIP), and 10 (VSEIP) to VS-mode. All other local interrupts including 14 (LAMBI) trap to HS-mode during guest execution. The bhyve vmmops_run() loop (line 460-467 in riscv_handle_world_switch) catches interrupt-triggered HS-mode traps and exits with VM_EXITCODE_BOGUS. This causes the guest to be kicked out on any LAMBI assertion, but the host's stray-handler path (intc_intr) inherits the same SIP[14]-not-cleared bug as the non-bhyve path. In HS-mode, the interrupt remains enabled via sie[14] set during intc_init_secondary.",
+      "snippet": "hideleg  = (1UL << IRQ_SOFTWARE_HYPERVISOR);\nhideleg |= (1UL << IRQ_TIMER_HYPERVISOR);\nhideleg |= (1UL << IRQ_EXTERNAL_HYPERVISOR);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 318,
+        "line_end": 323,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "do_trap_supervisor correctly dispatches all interrupt-cause traps to the intr_irq_handler framework without filtering. The framework's root handler (intc_intr) is responsible for dispatch/rejection. This is architecturally correct — the filtering belongs at the PIC layer.",
+      "snippet": "if ((frame->tf_scause & SCAUSE_INTR) != 0) {\n  intr_irq_handler(frame, INTR_ROOT_IRQ);\n  return;\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 399,
+        "line_end": 404,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "do_trap_user similarly dispatches all interrupt traps to the PIC framework. User-mode interrupt handling is architecturally correct.",
+      "snippet": "if ((frame->tf_scause & SCAUSE_INTR) != 0) {\n  intr_irq_handler(frame, INTR_ROOT_IRQ);\n  return;\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "cpu_exception_handler_supervisor",
+        "line_start": 219,
+        "line_end": 225,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The exception vectors save/restore the full trapframe (all GPRs, sepc, sstatus, stval, scause) and correctly transition between supervisor and user contexts. No CSR leakage across privilege boundaries.",
+      "snippet": "save_registers 1\nmv a0, sp\ncall _C_LABEL(do_trap_supervisor)\nload_registers 1\nsret"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The thread context-switch path saves/restores callee-saved registers via PCB and invokes pmap_activate_sw for ASID/PMAP transition. FPE state (sstatus.FS) is correctly tracked, saved on dirty, and restored on activation. No interrupt-related CSR leakage across thread switches.",
+      "snippet": "sd ra, (PCB_RA)(x13)\nsd sp, (PCB_SP)(x13)\n/* s[0-11] saved/restored */\ncall _C_LABEL(pmap_activate_sw)"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

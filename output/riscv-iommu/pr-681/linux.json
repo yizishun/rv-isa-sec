@@ -1,0 +1,65 @@
+{
+  "pr_number": 681,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 681,
+    "violation_condition": "The Linux kernel IOMMU fault handler reads iotval2 bit 1 from an implicit guest page fault record (G-stage page fault during two-stage translation) and interprets it as the implicit access write/read indicator, but the hardware set bit 1 based on SADE (S/VS-stage access/dirty exception flag) instead of the actual implicit access type, causing the kernel to misclassify a read access as a write or vice versa.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "drivers/iommu/riscv/iommu.c reads iotval2 and extracts bit 1 to determine read vs write for implicit guest page faults; any future fault handling code that uses iotval2[1] to update guest page dirty bits or perform write-specific recovery on implicit faults would be affected",
+    "affected_entities": [
+      "iotval2"
+    ],
+    "summary": "iotval2[1] was incorrectly set from SADE instead of is_implicit_write on implicit guest page faults; the kernel could misinterpret read implicit accesses as writes, corrupting guest page dirty tracking (marking pages dirty on reads or failing to mark them dirty on writes) in KVM/virtualized IOMMU contexts"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_fault",
+        "line_start": 514,
+        "line_end": 525,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The current fault handler is a placeholder that only logs; it does not extract or interpret iotval2 bit 1 as a read/write indicator for implicit guest page faults. The access type (read vs write) is correctly available through the HW fault cause field (RISCV_IOMMU_FQ_HDR_CAUSE) where RD_FAULT_VS=21 and WR_FAULT_VS=23 are distinct causes. iotval2 is only printed as a raw hex value in a dev_warn_ratelimited() call, with no bit-level extraction.",
+      "snippet": "static void riscv_iommu_fault(struct riscv_iommu_device *iommu,\n\t\t\t      struct riscv_iommu_fq_record *event)\n{\n\tunsigned int err = FIELD_GET(RISCV_IOMMU_FQ_HDR_CAUSE, event->hdr);\n\t/* Placeholder for future fault handling implementation, report only. */\n\tif (err)\n\t\tdev_warn_ratelimited(iommu->dev,\n\t\t\t     \"Fault %d devid: 0x%x iotval: %llx iotval2: %llx\\n\",\n\t\t\t     err, devid, event->iotval, event->iotval2);\n}"
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_fault",
+        "line_start": 520,
+        "line_end": 525,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The 'Placeholder for future fault handling implementation' comment on line 520 actively invites future code to be added here. When future guest page fault handling code is implemented (for causes 20-23: FAULT_VS), a developer unaware of the hardware behavior described in the RISC-V IOMMU spec could extract iotval2[1] assuming it indicates the implicit access type (read=0, write=1). In reality, when SADE (S/VS-stage Access/Dirty Exception) is enabled (set at line 1516 via RISCV_IOMMU_DC_TC_SADE), the hardware may report S/VS-stage A/D exceptions as guest page faults where iotval2[1] reflects the exception type (A-bit vs D-bit) rather than the original transaction's read/write direction. No comment or warning currently documents this pitfall in the code.",
+      "snippet": "\t/* Placeholder for future fault handling implementation, report only. */\n\tif (err)\n\t\tdev_warn_ratelimited(iommu->dev,\n\t\t\t     \"Fault %d devid: 0x%x iotval: %llx iotval2: %llx\\n\",\n\t\t\t     err, devid, event->iotval, event->iotval2);"
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu-bits.h",
+        "function_name": "enum riscv_iommu_fq_causes",
+        "line_start": 598,
+        "line_end": 600,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The fault cause enum correctly provides distinct encodings for read vs write guest page faults (RD_FAULT_VS=21, WR_FAULT_VS=23), as well as for non-guest faults (RD_FAULT=5/13, WR_FAULT=7/15). Any correct future implementation should use the cause field rather than iotval2[1] to determine access type. The infrastructure is already in place to do the right thing.",
+      "snippet": "\tRISCV_IOMMU_FQ_CAUSE_INST_FAULT_VS = 20,\n\tRISCV_IOMMU_FQ_CAUSE_RD_FAULT_VS = 21,\n\tRISCV_IOMMU_FQ_CAUSE_WR_FAULT_VS = 23,"
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_attach_dev",
+        "line_start": 1515,
+        "line_end": 1516,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SADE (S/VS-stage Access/Dirty Exception) is correctly enabled when the hardware capability AMO_HWAD (HW A/D-bit management) is present. This is the correct and intended use of SADE: the IOMMU hardware manages S/VS-stage A/D bits in hardware, and any exceptions are reported as guest page faults. This is standard two-stage address translation behavior per the RISC-V IOMMU spec.",
+      "snippet": "\tif (iommu->caps & RISCV_IOMMU_CAPABILITIES_AMO_HWAD)\n\t\ttc |= RISCV_IOMMU_DC_TC_SADE;"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

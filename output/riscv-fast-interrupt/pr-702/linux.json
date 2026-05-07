@@ -1,0 +1,169 @@
+{
+  "pr_number": 702,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 702,
+    "violation_condition": "Linux kernel context switch (__switch_to) or trap return path fails to save/restore the per-hart ssp architectural state (ssp.SP, ssp.PUSH, ssp.PPUSH) when the Ssip/Sscsps extension is enabled, causing one task's conditional-stack-swap state to be applied to another task's kernel stack on the same hart",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "ssp\\.(SP|PUSH|PPUSH)|scspspush|scspspop|sipopret|Ssip|Sscsps|__switch_to.*sst|context.*switch.*sst",
+    "affected_entities": [
+      "scspspush",
+      "scspspop",
+      "sipopret",
+      "ssp.SP",
+      "ssp.PUSH",
+      "ssp.PPUSH",
+      "mipopret",
+      "mcspspush",
+      "mcspspop"
+    ],
+    "summary": "Ssip/Sscsps introduces per-hart ssp.SP/ssp.PUSH/ssp.PPUSH state that the kernel must context-switch; failure to do so corrupts kernel stack usage across tasks sharing a hart"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 421,
+        "line_end": 471,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The __switch_to function does not directly save/restore CSR_SSP (the user-mode Zicfiss shadow stack pointer CSR at 0x011). This is compliant because CSR_SSP is saved to per-task thread_info on kernel entry via save_userssp (line 184) and will be restored from the incoming task's thread_info on kernel exit via restore_userssp (line 280). The context switch swaps tp to point to the next task's thread_info, which carries the next task's user_shdw_stk. ENVCFG (with SSE bit) is also switched via __switch_to_envcfg before __switch_to is called. No Ssip/Sscsps supervisor-mode CSRs exist in this kernel, so there is nothing to save/restore.",
+      "snippet": "SYM_FUNC_START(__switch_to)\n  REG_S ra,  TASK_THREAD_RA_RA(a3)\n  ...\n  scs_save_current\n  ...\n  move tp, a1\n  scs_load_current\n  ret"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "save_userssp",
+        "line_start": 99,
+        "line_end": 110,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The save_userssp macro correctly saves CSR_SSP (user shadow stack pointer) to TASK_TI_USER_SSP(tp) — which is current->thread_info.user_cfi_state.user_shdw_stk — and simultaneously zeros CSR_SSP via csrrw for sanitization. It uses ALTERNATIVE patching gated on RISCV_ISA_EXT_ZICFISS, so it only executes on harts with Zicfiss support. When the previous mode is S-mode (kernel-to-kernel exception), it skips the save because CSR_SSP is already sanitized.",
+      "snippet": "csrrw \\tmp, CSR_SSP, x0;\nREG_S \\tmp, TASK_TI_USER_SSP(tp);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "restore_userssp",
+        "line_start": 112,
+        "line_end": 123,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The restore_userssp macro correctly restores CSR_SSP from TASK_TI_USER_SSP(tp) — which after a context switch points to the next task's user_shdw_stk. It only executes when returning to U-mode. The CSR write is ungated by any fence; per the RISC-V spec, CSR writes are not speculative and take effect immediately, so no fence is needed before sret.",
+      "snippet": "REG_L \\tmp, TASK_TI_USER_SSP(tp);\ncsrw CSR_SSP, \\tmp;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/switch_to.h",
+        "function_name": "__switch_to_envcfg",
+        "line_start": 84,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The switch_to macro calls __switch_to_envcfg before __switch_to, which writes CSR_ENVCFG with the next task's envcfg. The SSE bit (ENVCFG_SSE, bit 3) in envcfg controls whether user-mode shadow stack is globally enabled for the task. This is correctly switched before the integer register context switch. The next task's envcfg is computed by set_shstk_status() in usercfi.c when shadow stack is enabled/disabled via prctl.",
+      "snippet": "asm volatile (ALTERNATIVE(\"nop\", \"csrw \" __stringify(CSR_ENVCFG) \", %0\",\n  0, RISCV_ISA_EXT_XLINUXENVCFG, 1)\n  :: \"r\" (next->thread.envcfg) : \"memory\");"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "save_cfiss_state",
+        "line_start": 145,
+        "line_end": 172,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Signal delivery correctly saves Zicfiss shadow stack state: it writes a restore token to the current shadow stack via save_user_shstk() (which uses ssamoswap.d to write a self-referencing token), then stores the token pointer in the signal frame. The token mechanism ensures that sigreturn cannot be tricked into restoring an arbitrary SSP — only a valid token pointing to the shadow stack itself is accepted. The magic number RISCV_ZICFISS_MAGIC ensures the extension frame is correctly identified.",
+      "snippet": "err |= save_user_shstk(current, &ss_ptr);\nerr |= __put_user(ss_ptr, &state->ss_ptr);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "__restore_cfiss_state",
+        "line_start": 174,
+        "line_end": 199,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Signal return correctly restores Zicfiss state: it reads the token pointer from the signal frame, then calls restore_user_shstk() which uses ssamoswap.d to atomically read and zero the token on the shadow stack, validating the token points to SSP+8 (self-referencing). The check at usercfi.c:216 (token - shstk_ptr == SHSTK_ENTRY_SIZE) prevents arbitrary SSP values from being restored. The active SSP is then set atomically via set_active_shstk().",
+      "snippet": "err = __copy_from_user(&ss_ptr, &state->ss_ptr, sizeof(unsigned long));\nreturn restore_user_shstk(current, ss_ptr);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/usercfi.c",
+        "function_name": "set_shstk_status",
+        "line_start": 62,
+        "line_end": 75,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "set_shstk_status correctly updates the per-task envcfg SSE bit AND immediately writes CSR_ENVCFG when called on current. However, for non-current tasks (e.g., during clone), only the in-memory envcfg is updated; the actual CSR write happens later during the first context switch via __switch_to_envcfg. This is the correct lazy-write pattern used throughout the kernel.",
+      "snippet": "if (enable)\n  task->thread.envcfg |= ENVCFG_SSE;\nelse\n  task->thread.envcfg &= ~ENVCFG_SSE;\ncsr_write(CSR_ENVCFG, task->thread.envcfg);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "copy_thread",
+        "line_start": 243,
+        "line_end": 266,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "copy_thread correctly allocates a new shadow stack for child tasks via shstk_alloc_thread_stack() and sets the active SSP via set_active_shstk() when a new shadow stack is allocated. The child's SSP is correctly initialized to a fresh value distinct from the parent's. For CLONE_VM tasks sharing an address space, the shadow stack is properly handled (the parent's shadow stack is reused if CLONE_VFORK is set, otherwise a new one is allocated).",
+      "snippet": "ssp = shstk_alloc_thread_stack(p, args);\nif (IS_ERR_VALUE(ssp))\n  return PTR_ERR((void *)ssp);\nif (ssp)\n  set_active_shstk(p, ssp);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "__kvm_riscv_switch_to",
+        "line_start": 198,
+        "line_end": 219,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM VCPU context switch (__kvm_riscv_switch_to and __kvm_riscv_nacl_switch_to) saves/restores sstatus, stvec, sscratch, sepc via SAVE_HOST_AND_RESTORE_GUEST_CSRS and SAVE_GUEST_AND_RESTORE_HOST_CSRS macros, but does NOT save/restore CSR_SSP (0x011). If a guest OS enables Zicfiss for its user processes, the guest's CSR_SSP value would leak to the host or vice-versa across VM exits, causing cross-VM shadow stack corruption. However, Ssip/Sscsps (supervisor shadow stack) CSRs are not implemented, so this gap only affects user-mode Zicfiss virtualization if the guest supports it.",
+      "snippet": "SAVE_HOST_AND_RESTORE_GUEST_CSRS .Lkvm_switch_return\nRESTORE_GUEST_GPRS\nsret\n.Lkvm_switch_return:\nSAVE_GUEST_GPRS\nSAVE_GUEST_AND_RESTORE_HOST_CSRS"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpu-hotplug.c",
+        "function_name": "",
+        "line_start": 1,
+        "line_end": 78,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The CPU hotplug path has no Ssip/Sscsps or Zicfiss-specific save/restore. This is compliant because: (1) no Ssip/Sscsps supervisor shadow stack CSRs exist in this kernel; (2) Zicfiss user shadow stack state is per-task (saved in thread_info), not per-CPU, so it travels with the task when it's migrated off a going-offline CPU; (3) tasks running on a CPU being offlined are migrated via the scheduler before CPU teardown, so their Zicfiss state is preserved through the normal context switch path.",
+      "snippet": "/* No SST/Zicfiss-specific code in this file */"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 125,
+        "line_end": 238,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The trap return path (handle_exception → ret_from_exception) correctly pairs save_userssp on entry with restore_userssp on exit. The save_userssp at line 184 uses s1 (which holds the result of csrrc CSR_STATUS, clearing SR_SUM|SR_FS_VS|SR_ELP) to check SR_SPP — this correctly identifies whether the exception came from U-mode or S-mode. The corresponding restore at line 280 uses a0 (PT_STATUS from the saved regs) to determine the return mode. The scs_save_current/scs_load_current pair for kernel shadow call stack is also correctly handled.",
+      "snippet": "csrrc s1, CSR_STATUS, t0\nsave_userssp s2, s1\n...\nREG_L a0, PT_STATUS(sp)\nrestore_userssp s3, a0"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "do_trap_software_check",
+        "line_start": 409,
+        "line_end": 423,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The software check exception handler correctly distinguishes user-mode CFI violations from kernel-mode bugs: user-mode violations are handled by handle_user_cfi_violation() which generates SIGSEGV/SEGV_CPERR with the faulting EPC; kernel-mode software check exceptions trigger die() as they indicate a kernel bug. This is correct because shadow stack mismatch (sspopchk failure) in kernel space should never happen under normal operation.",
+      "snippet": "if (user_mode(regs)) {\n  if (!handle_user_cfi_violation(regs))\n    do_trap_unknown(regs);\n} else {\n  die(regs, \"Kernel BUG\");\n}"
+    }
+  ],
+  "overall_severity": "compliant"
+}

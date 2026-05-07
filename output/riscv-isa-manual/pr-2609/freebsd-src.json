@@ -1,0 +1,108 @@
+{
+  "pr_number": 2609,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2609,
+    "violation_condition": "FreeBSD's bhyve VMM does not save/restore SPMP CSRs (spmpcfg, spmpaddr) on VM enter/exit, and has no guest-page fault handler for SPMP-induced faults. If Sspmpss is implemented in hardware and SPMP entries are configured with shadow-stack encodings (XWR=010, SHARED=0), VS/VU mode accesses to those regions raise guest-page faults that bhyve does not handle, causing an unhandled exception cascade to host panic.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "vmm_switch\\.S|vmmops_vcpu_save_csrs|vmmops_vcpu_restore_csrs|guest.page.fault|SCAUSE_STORE_GUEST_PAGE_FAULT",
+    "affected_entities": [
+      "spmpcfg",
+      "spmpaddr",
+      "mseccfg",
+      "menvcfg",
+      "shstk",
+      "ssp",
+      "cm.jt",
+      "cm.jalt"
+    ],
+    "summary": "FreeBSD RISC-V bhyve lacks SPMP save/restore and guest-page fault handling, so Sspmpss SPMP shadow-stack encodings can crash the VMM if hardware SPMP entries are pre-configured"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 41,
+        "line_end": 203,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "VM enter/exit assembly path saves/restores GPRs, sstatus, hstatus, scounteren, sscratch, stvec, sepc but has zero awareness of SPMP CSRs (spmpcfg, spmpaddr). If Sspmpss is implemented in hardware, guest VM SPMP state is neither saved on exit nor restored on entry, causing one VM's SPMP configuration to leak into another VM. No hypctx fields exist for SPMP state to be saved into.",
+      "snippet": "ENTRY(vmm_switch)\n\tsd ra, (HYP_H_RA)(a0)\n\t// ... GPR save/restore only, no SPMP CSR handling ...\n\tsret\n\n.Lswitch_return:\n\tcsrrw a0, sscratch, a0\n\t// ... GPR restore, no SPMP CSR handling ...\n\tret"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_save_csrs",
+        "line_start": 180,
+        "line_end": 195,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Save path reads vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, vsatp but does not read any SPMP CSRs (spmpcfg, spmpaddr). No SPMP fields exist in struct hypcsr to store them. When hardware supports Sspmpss, per-VM SPMP configuration is lost across VM exits.",
+      "snippet": "csrs->vsstatus = csr_read(vsstatus);\ncsrs->vsie = csr_read(vsie);\n// ... no csr_read(spmpcfg0) or csr_read(spmpaddr0) ...\ncsrs->vsatp = csr_read(vsatp);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_restore_csrs",
+        "line_start": 162,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Restore path writes vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, vsatp but does not write any SPMP CSRs (spmpcfg, spmpaddr). Guest VM inherits whatever SPMP state was left by the previous VM or host, causing SPMP-based isolation to fail silently.",
+      "snippet": "csr_write(vsstatus, csrs->vsstatus);\ncsr_write(vsie, csrs->vsie);\n// ... no csr_write(spmpcfg0, ...) or csr_write(spmpaddr0, ...) ...\ncsr_write(vsatp, csrs->vsatp);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/riscv.h",
+        "function_name": "struct hypcsr",
+        "line_start": 56,
+        "line_end": 68,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct hypcsr has no fields for SPMP CSRs (spmpcfg, spmpaddr). The structure defines storage for vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, vsatp, scounteren, senvcfg but lacks any SPMP state. This is the root cause of missing SPMP save/restore -- there is nowhere to store the state.",
+      "snippet": "struct hypcsr {\n\tuint64_t hvip;\n\tuint64_t vsstatus;\n\t// ... no spmpcfg, spmpaddr fields ...\n\tuint64_t senvcfg;\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "riscv_handle_world_switch",
+        "line_start": 470,
+        "line_end": 521,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Guest-page fault handler for scause 20/21/23 (FETCH/LOAD/STORE_GUEST_PAGE_FAULT) treats all faults as G-stage page table faults. It checks vm_mem_allocated() and routes to either VM_EXITCODE_PAGING (pmap_fault/vm_fault) or instruction emulation. There is no code path to recognize or handle SPMP-induced guest page faults. Per Sspmpss spec, SPMP entries with XWR=010 (shadow-stack encoding, SHARED=0) cause guest page faults in VS/VU mode. These faults would be misdiagnosed as ordinary page faults, and neither pmap_fault nor instruction emulation would resolve them, potentially cascading to the default 'unknown scause' panic path.",
+      "snippet": "case SCAUSE_FETCH_GUEST_PAGE_FAULT:\ncase SCAUSE_LOAD_GUEST_PAGE_FAULT:\ncase SCAUSE_STORE_GUEST_PAGE_FAULT:\n\tgpa = (vme->htval << 2) | (vme->stval & 0x3);\n\tif (vm_mem_allocated(hypctx->vcpu, gpa)) {\n\t\tvme->exitcode = VM_EXITCODE_PAGING;\n\t\tvme->u.paging.gpa = gpa;\n\t} else {\n\t\tret = riscv_gen_inst_emul_data(hypctx, vme, &trap);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "",
+        "line_start": 1,
+        "line_end": 286,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "riscvreg.h defines hypervisor CSR bitfields (HSTATUS_*, HIE_*, HVIP_*, HENVCFG_*, HCOUNTEREN_*, SATP_*) but contains zero definitions for SPMP CSRs (spmpcfg CSR numbers, spmpaddr CSR numbers, SPMP XWR field encodings, SPMP SHARED bit). Without these definitions, no kernel code can reference SPMP CSRs at all, confirming the FreeBSD RISC-V port has no SPMP support infrastructure whatsoever.",
+      "snippet": "#define HCOUNTEREN_CY (1UL << 0) /* Cycle */\n#define HCOUNTEN_TM  (1UL << 1) /* Time */\n// ... no spmpcfg/spmpaddr CSR definitions exist in entire file ...\n#define SATP_MODE_SV48 (9ULL << SATP_MODE_S)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_delegate",
+        "line_start": 141,
+        "line_end": 159,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "hedeleg configuration delegates only SCAUSE_INST_MISALIGNED, SCAUSE_ILLEGAL_INSTRUCTION, SCAUSE_BREAKPOINT, SCAUSE_ECALL_USER, and the three page fault exceptions (12/13/15) to VS-mode. The three GUEST_PAGE_FAULT exceptions (20/21/23) are NOT delegated and are handled by HS-mode (the host hypervisor), which is correct. However, no additional delegation or configuration exists to distinguish G-stage page table faults from SPMP-induced guest page faults, since SPMP is not recognized at all.",
+      "snippet": "hedeleg  = (1UL << SCAUSE_INST_MISALIGNED);\nhedeleg |= (1UL << SCAUSE_ILLEGAL_INSTRUCTION);\n// ... no SPMP-related delegation or configuration ...\nhedeleg |= (1UL << SCAUSE_STORE_PAGE_FAULT);"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

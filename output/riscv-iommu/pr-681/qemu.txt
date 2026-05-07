@@ -1,0 +1,34 @@
+PR #681  target=qemu  overall=potential_risk
+Spec: iotval2[1] incorrectly reports implicit write on all G-stage faults (e.g., gpte.V==0, gpte.N==1, PBMT violations) instead of only on gpte.W==0 faults, causing guest kernel to misattribute fault cause
+Violation: QEMU sets iotval2[1] (implicit write bit) unconditionally from the original transaction's R/W attribute for all implicit guest page faults, instead of setting it only when the G-stage write-permission check (gpte.W==0) caused the fault
+Consequence: function_loss
+Pattern: iotval2.*\|.*(write|SADE|is_write|rw).*<<.*1|iotval2.*write.*bit.*1|implicit.*guest.*page.*fault.*iotval2
+------------------------------------------------------------
+[potential_risk] hw/riscv/riscv-iommu.c:509-513  riscv_iommu_spa_fetch
+  iotval2[1] (IW / Implicit Write bit) is never explicitly encoded. iotval2 is set to raw GPA (iotlb->translated_addr) at riscv_iommu_translate:1658-1659, leaking GPA address bit 1 as iotval2[1] instead of setting it to 1 only when the G-stage fault was caused by gpte.W==0 during a read-for-write implicit access. A guest hypervisor relying on iotval2[1] to distinguish implicit-write G-stage faults from explicit G-stage faults will receive incorrect fault attribution.
+  | return (iotlb->perm & IOMMU_WO) ?
+  |                 (pass ? RISCV_IOMMU_FQ_CAUSE_WR_FAULT_VS :
+  |                         RISCV_IOMMU_FQ_CAUSE_WR_FAULT_S) :
+  |                 (pass ? RISCV_IOMMU_FQ_CAUSE_RD_FAULT_VS :
+  |                         RISCV_IOMMU_FQ_CAUSE_RD_FAULT_S);
+
+[potential_risk] hw/riscv/riscv-iommu.c:1658-1659  riscv_iommu_translate
+  Fault reporting passes iotlb->translated_addr directly as iotval2 without masking off bit 1 or encoding the IW (Implicit Write) indicator. Per RISC-V IOMMU spec, iotval2[1] must be 1 only when a G-stage write-permission check (gpte.W==0) caused the fault, and 0 otherwise. The current code preserves whatever GPA address bit 1 happens to be, making it indistinguishable from a properly encoded IW bit.
+  | riscv_iommu_report_fault(s, ctx, ttype, fault, enable_pid,
+  |                                  iotlb->iova, iotlb->translated_addr);
+
+[potential_risk] hw/riscv/riscv-iommu.c:450-457  riscv_iommu_spa_fetch
+  G-stage A/D bit checks (lines 454-457) use iotlb->perm which was overwritten at line 472 during S-stage completion to reflect the S-stage PTE permissions rather than the original transaction intent. For a nested translation where the S-stage PTE grants RW but D-bit is missing on the G-stage PTE, the fault cause is correctly WR_FAULT_VS. However, iotval2 is set to the S-stage derived GPA without the IW bit, so a guest hypervisor checking iotval2[1] cannot tell whether this was an implicit write (S-stage write → G-stage D-bit miss) vs. an explicit G-stage access.
+  | } else if ((iotlb->perm & IOMMU_RO) && !ade && !(pte & PTE_A)) {
+  |             break;                /* Access bit not set */
+  |         } else if ((iotlb->perm & IOMMU_WO) && !ade && !(pte & PTE_D)) {
+  |             break;                /* Dirty bit not set */
+
+[compliant] hw/riscv/riscv-iommu.c:753-759  riscv_iommu_validate_device_ctx
+  The diff adds a cross-field validation check: when iohgatp.MODE is Bare (G-stage disabled), msiptp.MODE must be Off. Without this check, a guest could configure MSI page tables through an undefined GSCID context when G-stage translation is disabled, potentially routing MSI writes to arbitrary physical addresses. This check correctly returns false (DDT_MISCONFIGURED / cause=259), closing a privilege_escape vulnerability documented in analysis_smip.md.
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |         get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |         RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |         return false;
+  |     }
+

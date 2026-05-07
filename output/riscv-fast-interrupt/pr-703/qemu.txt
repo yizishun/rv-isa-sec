@@ -1,0 +1,33 @@
+PR #703  target=qemu  overall=compliant
+Spec: CLIC-enabled interrupt trap modifications (GPR save on interrupted stack) are incompatible with mtvec.MODE=0 shared entry points; QEMU must reject or fault this configuration to prevent asymmetric state corruption when exceptions and interrupts share a handler
+Violation: QEMU permits CLIC (aclic) interrupt-trap modifications to be active when mtvec.MODE = 0 (direct mode), causing interrupts and synchronous exceptions to share a single trap entry point while CLIC applies asymmetric save/restore behavior only to interrupts — spec explicitly forbids this combination
+Consequence: privilege_escape
+Pattern: clic.*enabled|mclicbase.*enable|cliced.*enable without adjacent mtvec.mode != 0 guard; or CLIC trap-entry logic (GPR save/restore, stack switching) that does not branch on mtvec.MODE before applying interrupt-specific behavior
+------------------------------------------------------------
+[compliant] target/riscv/csr.c:2996-3005  write_mtvec
+  In the current codebase, write_mtvec only enforces the standard MODE validity check (val & 3) < 2. There is no CLIC/mscratchcsw/mnxti interaction — CLIC is not implemented anywhere in QEMU's RISC-V emulation, so no CLIC+mtvec.MODE=0 guard is needed or missing. If CLIC is later added, a guard checking mtvec MODE != 0 when CLIC is enabled must be inserted here or in a CLIC write handler.
+  | if ((val & 3) < 2) {
+  |     env->mtvec = val;
+  | } else {
+  |     qemu_log_mask(LOG_UNIMP, "CSR_MTVEC: reserved mode not supported\n");
+  | }
+
+[compliant] target/riscv/cpu_helper.c:2421-2422  riscv_cpu_do_interrupt
+  The S-mode trap-entry code checks (env->stvec & 3) == 1 for vectored mode — this is standard RISC-V behavior. No CLIC-specific save/restore (mscratchcsw, mnxti hardware update) exists because CLIC is unimplemented. The M-mode path (line 2488) similarly uses standard mcause/mepc save without any CLIC-specific logic.
+  | env->pc = (env->stvec >> 2 << 2) +
+  |           ((async && (env->stvec & 3) == 1) ? cause * 4 : 0);
+
+[compliant] target/riscv/cpu_bits.h:166-184  (CSR definitions)
+  The RISC-V Machine trap CSRs are defined from 0x340-0x35c, but CLIC CSRs (mnxti=0x345, mintstatus=0x346, mintthresh=0x347, mscratchcsw=0x348) are absent — no definitions exist. The address range is gapped (0x344 MIP then jumps to 0x350 MISELECT), confirming CLIC is unimplemented. No vulnerability possible without the CSRs.
+  | #define CSR_MIP             0x344
+  | 
+  | #define CSR_MISELECT        0x350
+
+[compliant] target/riscv/csr.c:5930-5930  (CSR table)
+  Only CSR_MTVEC is registered in the CSR dispatch table. No CLIC CSRs (mnxti, mintstatus, mintthresh, mscratchcsw) are registered — any access to those CSR addresses would return an illegal-instruction exception by default, preventing any CLIC state manipulation.
+  | [CSR_MTVEC]       = { "mtvec",      any,   read_mtvec,   write_mtvec   },
+
+[compliant] target/riscv/cpu.c:1-1  (ISA extension table)
+  The ISA extension table in cpu.c has no entry for Smclic, Ssclic, Zclic, or any CLIC extension. The cpu->cfg structure has no ext_smclic/ext_ssclic field. Without CLIC support, the CLIC+mtvec.MODE=0 vulnerability pattern cannot be triggered.
+  | (No smclic/ssclic/clic entry in ISA_EXT_DATA_ENTRY table)
+

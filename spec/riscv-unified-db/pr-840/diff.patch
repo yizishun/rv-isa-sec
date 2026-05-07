@@ -1,0 +1,318 @@
+diff --git a/arch/csr/misa.yaml b/arch/csr/misa.yaml
+index 1cc988f396..6257533759 100644
+--- a/arch/csr/misa.yaml
++++ b/arch/csr/misa.yaml
+@@ -8,16 +8,76 @@ address: 0x301
+ writable: true
+ priv_mode: M
+ length: MXLEN
+-description: Reports the XLEN and "major" extensions supported by the ISA.
+ definedBy: Sm
++prose:
++  Overview:
++    - type: informative
++      text: |
++        `misa` reports the base register size in M-mode and the set of single-letter
++        extensions supported by the hart.
++    - type: informative
++      text: |
++        The entire register may be read-only-0 in an implementation.
++        If `misa` is read-only-0, discovery of `misa` information should be provided through
++        non-standard mechanisms.
+ fields:
+   MXL:
+     location_rv32: 31-30
+     location_rv64: 63-62
+-    description: XLEN in M-mode.
++    synopsys: |
++      When `misa` is implemented, `misa.MXL` encodes the native base integer ISA width in M-mode,
++      called `MXLEN`, as follows:
++
++      |===
++      | MXL | MXLEN
++
++      | 1   | 32
++      | 2   | 64
++      |===
++
++      Other values are reserved.
++    rules:
++      - type: must
++        id: csr-misa.mxl-value-rv32
++        text: |
++          `misa.MXL` must be read-only-1
++        when(): return MISA_CSR_IMPLEMENTED && MXLEN == 32;
++      - type: must
++        id: csr-misa.mxl-value-rv64
++        text: |
++          `misa.MXL` must be read-only-2
++        when(): return MISA_CSR_IMPLEMENTED && MXLEN == 64;
++      - type: must
++        id: csr-misa.mxl-value-not-implemented
++        text: |
++          `misa.MXL` must be read-only-0
++        when(): return !MISA_CSR_IMPLEMENTED;
++    prose:
++      - type: informative
++        text: |
++          XLEN is never greater than MXLEN, but XLEN might be smaller than MXLEN in less-privileged
++          modes.
++
++      - type: informative
++        text: |
++          The base width can be quickly ascertained using branches on the sign of the returned `misa`
++          value, and possibly a shift left by one and a second branch on the sign.
++          These checks can be written in assembly code without knowing the register width (MXLEN)
++          of the hart.
++          The base width is given by MXLEN=2MXL+4.
++
++          The base width can also be found if `misa` is zero, by placing the immediate 4 in a
++          register, then shifting the register left by 31 bits at a time.
++          If zero after one shift, then the hart is RV32.
++          If zero after two shifts, then the hart is RV64, else RV128.
+     type: RO
+     reset_value(): |
+-      return (MXLEN == 32) ? 2'b01 : 2'b10;
++      if (MISA_CSR_IMPLEMENTED) {
++        return (MXLEN == 32) ? 2'b01 : 2'b10;
++      } else {
++        return 0;
++      }
++
+   A:
+     location: 0
+     description: |
+@@ -30,18 +90,60 @@ fields:
+     reset_value(): |
+       return implemented?(ExtensionName::A) ? 1 : 0;
+     definedBy: A
++
+   B:
+     location: 1
+-    description: |
++    synopsis: |
+       Indicates support for the `B` (bitmanip) extension.
++    rules:
++      - type: must
++        id: csr-misa.b-reset-set
++        text: |
++          When all of `Zba`, `Zbb`, and `Zbs` are implemented, bit 1 of the `misa` CSR (`misa.B`) MUST reset to 1.
++        when(): return MISA_CSR_IMPLEMENTED;
++
++      - type: must
++        id: csr-misa.b-reset-clear
++        text: |
++          When at least one of `Zba`, `Zbb`, and `Zbs` are not implemented, `misa.B` MUST be read-only-0.
++        when(): return MISA_CSR_IMPLEMENTED;
++
++      - type: may
++        id: csr-misa.b-mutable
++        text: |
++          If parameter `MUTABLE_MISA_B` is true, the `misa.B` bit is writable.
++        when(): return MISA_CSR_IMPLEMENTED;
++
++      - type: must
++        id: csr-misa.b-clear-effect
++        text: |
++          Decoding an instruction from `Zba`, `Zbb`, or `Zbs` when `misa.B` is clear causes an
++          `IllegalInstruction`.
++        when(): return MISA_CSR_IMPLEMENTED && !nonconforming_extensions_implemented?();
++
++      - type: must
++        id: csr-misa.b-clear-effect-non-conforming
++        text: |
++          Decoding an instruction from `Zba`, `Zbb`, or `Zbs` will either
++          cause an `IllegalInstruction` trap or execute a non-conforming instruction if
++          a non-conforming extension is supported that has an overlapping instruction with one from
++          `Zba`, `Zbb`, or `Zbs`.
++        when(): return MISA_CSR_IMPLEMENTED && nonconforming_extensions_implemented?();
+ 
+-      [when,"MUTABLE_MISA_B == true"]
+-      Writing 0 to this field will cause all bitmanip instructions to raise an `IllegalInstruction` exception.
+     type(): |
+-      return (implemented?(ExtensionName::B) && MUTABLE_MISA_B) ? CsrFieldType::RW : CsrFieldType::RO;
++      if (MISA_CSR_IMPLEMENTED) {
++        return (implemented?(ExtensionName::B) && MUTABLE_MISA_B) ? CsrFieldType::RW : CsrFieldType::RO;
++      } else {
++        return CsrFieldType::RO;
++      }
+     reset_value(): |
+-      return implemented?(ExtensionName::B) ? 1 : 0;
++      if (MISA_CSR_IMPLEMENTED) {
++        return implemented?(ExtensionName::B) ? 1 : 0;
++      } else {
++        return 0;
++      }
+     definedBy: B
++
+   C:
+     location: 2
+     description: |
+diff --git a/arch/ext/B.yaml b/arch/ext/B.yaml
+index ef3376ec93..3db2da91bc 100644
+--- a/arch/ext/B.yaml
++++ b/arch/ext/B.yaml
+@@ -1,6 +1,6 @@
+-# yaml-language-server: $schema=../../schemas/ext_schema.json
++# yaml-language-server: $schema=../../schemas/ext_schema_1.0.json
+ 
+-$schema: "ext_schema.json#"
++$schema: ext_schema_1.0.json#
+ kind: extension
+ name: B
+ type: unprivileged
+@@ -27,16 +27,71 @@ versions:
+         version: "1.0.0"
+       - name: Zbs
+         version: "1.0.0"
+-description: |
+-  The B standard extension comprises instructions provided by the `Zba`, `Zbb`, and `Zbs` extensions.
+ 
+-  Bit 1 of the `misa` register encodes the presence of the B standard extension. When `misa.B` is 1,
+-  the implementation supports the instructions provided by the `Zba`, `Zbb`, and `Zbs` extensions.
+-  When `misa.B` is 0, it indicates that the implementation may not support one or more of the
+-  `Zba`, `Zbb`, or `Zbs` extensions.
++synposis: |
++  The B (bitmanip) standard extension is an umbrella extension that
++
++  . implies the `Zba`, `Zbb`, and `Zbs` extensions, and
++  . defines the `misa.B` field, which provides an optional way to detect the presence of `Zba`,
++    `Zbb`, and `Zbs` and/or dynamically disable the instructions from those implied extensions.
++
++prose:
++  - section_name: Overview
++    paragraphs:
++      - type: motivational
++        text: |
++          The B extension is intended to provide some combination of code size reduction, performance
++          improvement, and energy reduction compared to the standard base RISC-V instructions alone.
++
++      - type: informative
++        text: Bit 1 of the `misa` register encodes the presence of the B standard extension.
++
++      - type: intentional
++        text: |
++          Most of the instructions are expected to be forward compatible with RV128.
++          While the shift-immediate instructions are defined to have at most a 6-bit immediate field,
++          a 7th bit is available in the encoding space should this be needed for RV128.
++
++  - section_name: Word Instructions
++    paragraphs:
++      - type: informative
++        text: |
++          The bitmanip extension follows the convention in RV64 that _w_-suffixed instructions
++          (without a dot before the _w_) ignore the upper 32 bits of their inputs, operate on the
++          least-significant 32-bits as signed values and produce a 32-bit signed result that is
++          sign-extended to XLEN.
++
++      - type: informative
++        text: |
++          Bitmanip instructions with the suffix _.uw_ have one operand that is an unsigned 32-bit
++          value that is extracted from the least significant 32 bits of the specified register.
++          Other than that, these perform full XLEN operations.
++
++      - type: informative
++        text: |
++          Bitmanip instructions with the suffix _.b_, _.h_ and _.w_ only look at the least
++          significant 8-bits, 16-bits and 32-bits of the input (respectively) and produce an XLEN-wide
++          result that is sign-extended or zero-extended, based on the specific instruction.
++
++rules:
++  - type: must
++    id: ext-b-implemented
++    text: |
++      When all of `Zba`, `Zbb`, and `Zbs` are implemented, the B extension must be also be
++      implemented.
++
++  - type: must
++    id: ext-b-not-implemented
++    text: |
++      When at least one of `Zba`, `Zbb`, or `Zbs` is not implemented, the B extension cannot be
++      implemented and `misa.B` must be read-only-0.
++
+ params:
+   MUTABLE_MISA_B:
+     description: |
+-      Indicates whether or not the `B` extension can be disabled with the `misa.B` bit.
++      When true, the `misa.B` bit is writable by software.
++      When false, the `misa.B` bit read-only-1.
+     schema:
+       type: boolean
++    when:
++      param(): return MISA_CSR_IMPLEMENTED;
+diff --git a/arch/ext/Zba.yaml b/arch/ext/Zba.yaml
+index de4642e664..6e476b5805 100644
+--- a/arch/ext/Zba.yaml
++++ b/arch/ext/Zba.yaml
+@@ -3,21 +3,34 @@
+ $schema: "ext_schema.json#"
+ kind: extension
+ name: Zba
++base: [32, 64]
+ long_name: Address generation instructions
+-description: |
++
++synopsis: |
+   The Zba instructions can be used to accelerate the generation of addresses that index into
+   arrays of basic types (halfword, word, doubleword) using both unsigned word-sized and
+   XLEN-sized indices: a shifted index is added to a base address.
+ 
+-  The shift and add instructions do a left shift of 1, 2, or 3 because these are commonly found
+-  in real-world code and because they can be implemented with a minimal amount of additional
+-  hardware beyond that of the simple adder. This avoids lengthening the critical path in
+-  implementations.
++prose:
++  Overview:
++    - type: motivational
++      text: |
++        The shift and add instructions do a left shift of 1, 2, or 3 because these are commonly
++        found in real-world code and because they can be implemented with a minimal amount of
++        additional hardware beyond that of the simple adder.
++        This avoids lengthening the critical path in implementations.
++
++    - type: informative
++      text: |
++        While the shift and add instructions are limited to a maximum left shift of 3, the `slli`
++        instruction (from the base ISA) can be used to perform similar shifts for indexing into
++        arrays of wider elements.
++        The `slli.uw` — added in this extension — can be used when the index is to be interpreted
++        as an unsigned word.
++
++# there are no extension-wide rules associated with Zba
++rules: []
+ 
+-  While the shift and add instructions are limited to a maximum left shift of 3, the `slli`
+-  instruction (from the base ISA) can be used to perform similar shifts for indexing into arrays
+-  of wider elements. The `slli.uw` -- added in this extension -- can be used when the index is to
+-  be interpreted as an unsigned word.
+ type: unprivileged
+ company:
+   name: RISC-V International
+diff --git a/arch/inst/Zba/add.uw.yaml b/arch/inst/Zba/add.uw.yaml
+index 94c29bf208..8349bd2e1c 100644
+--- a/arch/inst/Zba/add.uw.yaml
++++ b/arch/inst/Zba/add.uw.yaml
+@@ -5,9 +5,11 @@ kind: instruction
+ name: add.uw
+ long_name: Add unsigned word
+ base: 64
+-description: |
+-  Performs an XLEN-wide addition between rs2 and the
+-  zero-extended least-significant word of rs1.
++rules:
++  - type: must
++    text: |
++      `add.uw` performs an XLEN-wide addition between X register xs2 and the
++      zero-extended least-significant word of X register xs1.
+ definedBy: Zba
+ assembly: xd, xs1, xs2
+ format:
+@@ -30,7 +32,7 @@ pseudoinstructions:
+   - when: rs2 == 0
+     to: zext.w xd, xs1
+ operation(): |
+-  if (implemented?(ExtensionName::B) && (CSR[misa].B == 1'b0)) {
++  if (MISA_CSR_IMPLEMENTED && implemented?(ExtensionName::B) && (CSR[misa].B == 1'b0)) {
+     raise (ExceptionCode::IllegalInstruction, mode(), $encoding);
+   }
+ 

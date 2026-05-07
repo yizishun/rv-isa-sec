@@ -1,0 +1,2 @@
+- Replace `pseudoinstructions` inline in `ori.yaml` with hint references
+- Fix IDL implementation for prefetch instructions to use the offset+reg value

@@ -1,0 +1,141 @@
+{
+  "pr_number": 2570,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2570,
+    "violation_condition": "FreeBSD reads stval directly into the trapframe (sys/riscv/riscv/exception.S:110-111) and page_fault_handler consumes tf_stval as the raw faulting effective address (sys/riscv/riscv/trap.c:228) for VIRT_IS_VALID checks, pmap_fault, vm_fault_trap, and signal si_addr delivery. Per norm:pm_csr_hw_apply, if Ssnpm is enabled for U-mode (or Smnpm for S-mode), the hardware has already applied the ignore transformation—sign-extending or zero-extending the upper PMLEN bits—before writing stval. The kernel's page-fault path, signal delivery, and fatal-panic messages all operate on the canonicalized address, breaking the invariant that stval equals the instruction's original effective address. The kernel has no CSR_SENVCFG definition and no PM-awareness whatsoever.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "csrr\\s+\\w+,\\s*stval|tf_stval|frame->tf_stval|VIRT_IS_VALID\\s*\\(\\s*stval|call_trapsignal\\s*\\([^,]+,[^,]+,[^,]+,\\s*\\(void\\s*\\*\\)\\s*stval|page_fault_handler",
+    "affected_entities": [
+      "stval",
+      "senvcfg",
+      "menvcfg",
+      "henvcfg",
+      "mseccfg"
+    ],
+    "summary": "FreeBSD trap handler reads hardware-transformed stval without ZPM awareness; if Ssnpm is enabled by firmware, the kernel operates on canonicalized addresses in page-fault VM lookups and delivers wrong si_addr to user signal handlers, silently losing the original tag bits"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers (macro)",
+        "line_start": 110,
+        "line_end": 111,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "csrr t0, stval / sd t0, (TF_STVAL)(sp) reads stval directly into the trapframe. Per norm:pm_csr_hw_apply, if Ssnpm is enabled for U-mode, the hardware has already applied the ignore transformation (sign-extending or zero-extending the upper PMLEN bits) before writing stval. The trapframe now holds a canonicalized address rather than the instruction's original effective address. The kernel has no CSR_SENVCFG definition and no code to reverse the transformation.",
+      "snippet": "110: csrr t0, stval\n111: sd t0, (TF_STVAL)(sp)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 228,
+        "line_end": 228,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "stval = frame->tf_stval loads the hardware-canonicalized stval value as the effective faulting address. All downstream consumers (VIRT_IS_VALID check, pmap_fault, vm_fault_trap, signal delivery, panic messages) operate on the canonicalized address, not the original effective address from the faulting instruction.",
+      "snippet": "228: stval = frame->tf_stval;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 231,
+        "line_end": 233,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "VIRT_IS_VALID(stval) check and call_trapsignal(td, SIGSEGV, SEGV_MAPERR, (void *)stval, ...) both consume the canonicalized stval. If Ssnpm is enabled, a user instruction faulting on a non-canonical address will have stval canonicalized by hardware (upper bits sign/zero-extended), potentially turning an invalid-mapping fault into a valid-but-wrong-address condition. The si_addr delivered to userspace via ksi_addr will be the canonicalized address — an info_leak of the kernel's hardware-transformed view of the address.",
+      "snippet": "231: if (!VIRT_IS_VALID(stval)) {\n232:     call_trapsignal(td, SIGSEGV, SEGV_MAPERR, (void *)stval,\n233:         frame->tf_scause & SCAUSE_CODE);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 264,
+        "line_end": 264,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "pmap_fault(map->pmap, va, ftype) where va = trunc_page(stval) uses the canonicalized stval for page-table lookups. An instruction accessing an originally non-canonical user address will be redirected to a canonicalized address by hardware, and the kernel will look up and potentially fault on that transformed address instead of the original.",
+      "snippet": "264: if (VIRT_IS_VALID(va) && pmap_fault(map->pmap, va, ftype))"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 274,
+        "line_end": 276,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Second call_trapsignal site for vm_fault_trap failures also delivers canonicalized stval as si_addr to userspace. This is a second info_leak path: userspace signal handler receives the hardware-transformed address rather than the faulting instruction's original effective address.",
+      "snippet": "275: call_trapsignal(td, sig, ucode, (void *)stval,\n276:     frame->tf_scause & SCAUSE_CODE);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 303,
+        "line_end": 303,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "panic(\"Fatal page fault at %#lx: %#lx\", frame->tf_sepc, stval) logs the canonicalized stval. In a PM-enabled kernel, the panic message would show the hardware-transformed address, not the original faulting effective address, complicating debugging.",
+      "snippet": "303: panic(\"Fatal page fault at %#lx: %#lx\", frame->tf_sepc, stval);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 337,
+        "line_end": 339,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "do_trap_supervisor panic path for access faults reads frame->tf_stval directly. Same canonicalization concern as page_fault_handler: the logged stval is hardware-transformed.",
+      "snippet": "338: panic(\"Memory access exception at %#lx: %#lx\",\n339:     frame->tf_sepc, frame->tf_stval);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "(none — global header)",
+        "line_start": 175,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "riscvreg.h defines HENVCFG_* bit macros for the hypervisor extension (STCE, PBMTE, CBZE, CBCFE, CBIE, FIOM) but has zero definitions for SENVCFG or any Ssnpm/Smnpm/Smpnm-related CSR bits. The kernel has no CSR definitions for the Pointer Masking Extension at all. The only senvcfg mention in the entire sys/riscv tree is the struct field in vmm/riscv.h:67 (hypcsr::senvcfg), which is declared but never read/written by vmm code.",
+      "snippet": "176: #define HENVCFG_STCE   (1UL << 63)\n177: #define HENVCFG_PBMTE  (1UL << 62)\n...no SENVCFG, Ssnpm, Smnpm, Smpmnm definitions..."
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "cpu_switch saves/restores callee-saved registers and FPE state but has no code to save/restore senvcfg. If user processes were to have per-process PM configurations (Ssnpm enable, PMLEN values), these would not be context-switched. However, this is latent risk rather than a live bug since no code currently enables PM.",
+      "snippet": "269: sd ra, (PCB_RA)(x13)\n270: sd sp, (PCB_SP)(x13)\n...no senvcfg save/restore..."
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/pmap.c",
+        "function_name": "pmap_activate_sw",
+        "line_start": 5178,
+        "line_end": 5200,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "pmap_activate_sw only writes satp and performs sfence_vma when switching address spaces. There is no senvcfg write to configure per-process pointer masking. If PM were enabled, this would be required for correct virtualization of CSR-based masking features.",
+      "snippet": "5187: csr_write(satp, pmap->pm_satp);\n...\n5199: sfence_vma();"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

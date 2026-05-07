@@ -1,0 +1,118 @@
+{
+  "pr_number": 668,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 668,
+    "violation_condition": "Kernel reads xtopei.IPRIO and assumes it equals the raw interrupt source priority iprio[i], then uses it for software-based priority arbitration or exposes it to a guest VM without accounting for: (1) saturation to 255 for iprio[i] > 255, and (2) priority=0 mapping to either 0 or 255 depending on whether the default priority is higher or lower than a machine external interrupt",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "csr_read.*xtopei|xTOPEI|topi.*prio|IPRIO.*xithreshold|sxtopei.*prio|mtopei.*prio",
+    "affected_entities": [
+      "xtopei",
+      "xithreshold",
+      "mnxti",
+      "snxti",
+      "mtopei",
+      "stopei"
+    ],
+    "summary": "If KVM or kernel interrupt handling reads xtopei.IPRIO and uses it as a raw priority value rather than a threshold-mapped value, major interrupts with iprio[i] > 255 all collapse to IPRIO=255, causing incorrect priority arbitration and potential guest VM privilege escalation through interrupt-priority injection"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "imsic_mrif_topei",
+        "line_start": 248,
+        "line_end": 281,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SW-file TOPEI emulation uses interrupt identity (i) as the PRIO field value (return (i << TOPEI_ID_SHIFT) | i), instead of deriving PRIO from per-interrupt priority registers (eiprio/iprio[i]). Real hardware returns a PRIO value that reflects programmed per-interrupt priority with spec-mandated clamping (iprio>255 → 255) and platform-defined priority-zero mapping. The SW-file does not model per-interrupt priority at all — the MRIF structure has no eiprio fields — so the PRIO value exposed to guests via VSTOPEI is the raw interrupt ID, not the actual configured priority.",
+      "snippet": "for (i = (!imin) ? 1 : imin; i < imax; i++) {\n\tif (test_bit(i - imin, eipend))\n\t\treturn (i << TOPEI_ID_SHIFT) | i;\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "kvm_riscv_vcpu_aia_imsic_rmw",
+        "line_start": 902,
+        "line_end": 944,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VSTOPEI read path delegates to imsic_mrif_topei() when the VCPU uses the SW-file, returning a TOPEI value where the PRIO field equals the interrupt identity rather than the true per-interrupt iprio[i]. A guest VM that reads VSTOPEI and uses PRIO for software priority arbitration (e.g. nested virtualization, custom interrupt dispatch) receives incorrect priority values. The HW-accelerated VS-file path correctly reflects hardware priority semantics — this asymmetry creates a guest-observable side channel and reliability gap between SW-emulated and HW-accelerated modes.",
+      "snippet": "if (isel == KVM_RISCV_AIA_IMSIC_TOPEI) {\n\ttopei = imsic_mrif_topei(imsic->swfile, imsic->nr_eix,\n\t\t\t\t imsic->nr_msis);\n\tif (val)\n\t\t*val = topei;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "imsic_swfile_extirq_update",
+        "line_start": 614,
+        "line_end": 635,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "extirq_update uses imsic_mrif_topei() as a pending-interrupt predicate but the threshold is used only as an ID-range bound (max_msi = eithreshold ? eithreshold : nr_msis), not as a priority threshold. If a guest configures per-interrupt priorities where lower-numbered IDs have lower priority than higher-numbered IDs, the SW-file will incorrectly report the lower-numbered ID as the highest-priority pending interrupt — violating AIA priority-ordering guarantees. No eiprio registers exist in the SW-file to track true per-interrupt priorities.",
+      "snippet": "if (imsic_mrif_atomic_read(mrif, &mrif->eidelivery) &&\n    imsic_mrif_topei(mrif, imsic->nr_eix, imsic->nr_msis))\n\tkvm_riscv_vcpu_set_interrupt(vcpu, IRQ_VS_EXT);\nelse\n\tkvm_riscv_vcpu_unset_interrupt(vcpu, IRQ_VS_EXT);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "imsic_vsfile_local_read",
+        "line_start": 372,
+        "line_end": 420,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When reading state from HW VS-file into SW-file (clear=true during VCPU migration/release), only eip (pending) and eie (enable) bits are preserved. Per-interrupt priority values (eiprio) from the hardware are discarded — the SW-file has no fields to store them. This means that after a VCPU migration from one physical CPU to another, the guest loses its per-interrupt priority configuration if it subsequently runs in SW-file mode, silently corrupting the guest's view of interrupt priority ordering.",
+      "snippet": "mrif->eidelivery = imsic_vs_csr_swap(IMSIC_EIDELIVERY, 0);\nmrif->eithreshold = imsic_vs_csr_swap(IMSIC_EITHRESHOLD, 0);\nfor (i = 0; i < idata->nr_eix; i++) {\n\teix = &mrif->eix[i];\n\teix->eip[0] = imsic_eix_swap(IMSIC_EIP0 + i * 2, 0);\n\teix->eie[0] = imsic_eix_swap(IMSIC_EIE0 + i * 2, 0);"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-imsic-early.c",
+        "function_name": "imsic_handle_irq",
+        "line_start": 93,
+        "line_end": 125,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Host interrupt handler reads TOPEI via csr_swap() and extracts only the ID field (local_id >>= TOPEI_ID_SHIFT). The PRIO field is discarded. No guest VM is involved at this level — hardware does the priority-vs-threshold comparison internally. Compliant with spec.",
+      "snippet": "while ((local_id = csr_swap(CSR_TOPEI, 0))) {\n\tlocal_id >>= TOPEI_ID_SHIFT;"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-intc.c",
+        "function_name": "riscv_intc_aia_irq",
+        "line_start": 37,
+        "line_end": 42,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reads TOPI (not TOPEI) CSR and extracts only the IID field via topi >> TOPI_IID_SHIFT. TOPI.IID is invariant with respect to the iprio→IPRIO mapping issue. No priority values are exposed or compared.",
+      "snippet": "while ((topi = csr_read(CSR_TOPI)))\n\tgeneric_handle_domain_irq(intc_domain, topi >> TOPI_IID_SHIFT);"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-direct.c",
+        "function_name": "aplic_direct_handle_irq",
+        "line_start": 138,
+        "line_end": 161,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reads APLIC IDC CLAIMI register and extracts the ID field. The hardware IDC internally compares iprio-derived IPRIO values against the IDC threshold. The kernel does not perform any priority comparison or expose PRIO to guests at this level.",
+      "snippet": "while ((hw_irq = readl(idc->regs + APLIC_IDC_CLAIMI))) {\n\thw_irq = hw_irq >> APLIC_IDC_TOPI_ID_SHIFT;\n\tirq = irq_find_mapping(irqdomain, hw_irq);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia.c",
+        "function_name": "aia_rmw_iprio",
+        "line_start": 351,
+        "line_end": 386,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Guest IPRIO register RMW uses aia_get_iprio8/aia_set_iprio8 with TOPI_IPRIO_MASK (8-bit GENMASK(7,0)), correctly bounded to the 8-bit iprio register width. The IPRIO values stored/retrieved are the raw iprio[i] values as configured by the guest — the saturation/mapping is a hardware concern at the point where TOPEI.PRIO is computed from iprio[i], not at the iprio register level.",
+      "snippet": "prio = aia_get_iprio8(vcpu, first_irq + i);\nold_val |= (unsigned long)prio << (TOPI_IPRIO_BITS * i);"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

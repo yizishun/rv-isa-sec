@@ -1,0 +1,143 @@
+{
+  "pr_number": 609,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 609,
+    "violation_condition": "FreeBSD kernel executing on a hart that implements Smaclic/Ssaclic without Smaiae (IMSIC) reads the CSR-based stopi/sclaimi registers in the trap handler to claim external interrupts; these CSRs do not exist on such a system, so the read returns zero, causing the kernel to silently drop all external interrupts routed through the ACLIC",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csr_read.*[st]opi|csr_read.*[st]claimi|CSR_[ST]OPI|CSR_[ST]CLAIMI|CSR_SIE.*SEIE",
+    "affected_entities": [
+      "stopi",
+      "sclaimi",
+      "stopi",
+      "mtopi",
+      "mclaimi",
+      "mtopi",
+      "mstateen0"
+    ],
+    "summary": "Smaclic/Ssaclic no longer depends on Smaiae, so ACLIC-only harts lack IMSIC CSRs; FreeBSD's intr handler reading stopi/sclaimi gets zero → all external interrupts silently lost"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 307,
+        "line_end": 323,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Trap handler reads scause from the trapframe (saved by exception.S assembly), then delegates to intr_irq_handler(). No CSR-based stopi/sclaimi read is performed. The external interrupt is dispatched through the PIC framework, which uses memory-mapped I/O for claiming.",
+      "snippet": "exception = frame->tf_scause & SCAUSE_CODE;\nif ((frame->tf_scause & SCAUSE_INTR) != 0) {\n  /* Interrupt */\n  intr_irq_handler(frame, INTR_ROOT_IRQ);\n  return;\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 380,
+        "line_end": 404,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Same pattern as do_trap_supervisor: reads scause from trapframe, no CSR-based stopi/sclaimi reads. Delegates to intr_irq_handler() for external interrupts.",
+      "snippet": "exception = frame->tf_scause & SCAUSE_CODE;\nif ((frame->tf_scause & SCAUSE_INTR) != 0) {\n  /* Interrupt */\n  intr_irq_handler(frame, INTR_ROOT_IRQ);\n  return;\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_intr",
+        "line_start": 263,
+        "line_end": 289,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The local interrupt controller handler extracts the interrupt code from scause (saved in the trapframe), not from stopi/sclaimi CSRs. The sepc-saved scause is the standard privileged-spec CSR, always present. SIE_SEIE manipulation via intc_enable_intr/intc_disable_intr uses standard sie CSR bits (not AIA-specific bits), which work correctly in both legacy CLINT and ACLIC-direct modes.",
+      "snippet": "active_irq = frame->tf_scause & SCAUSE_CODE;\nif (active_irq >= INTC_NIRQS)\n  return (FILTER_HANDLED);\nsrc = &sc->isrcs[active_irq];\nif (intr_isrc_dispatch(&src->isrc, frame) != 0) {"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/aplic.c",
+        "function_name": "aplic_intr",
+        "line_start": 223,
+        "line_end": 246,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The APLIC interrupt handler claims interrupts by reading the memory-mapped APLIC_IDC_CLAIMI register via bus_read_4() (aplic_read macro expands to bus_read_4 on sc->mem_res). This is a memory-mapped I/O register at offset 0x1C within the APLIC IDC structure, NOT a CSR read. It works correctly regardless of whether Smaiae (IMSIC) is present. The CLAIMI read returns zero when no interrupt is pending, correctly terminating the claim loop.",
+      "snippet": "while ((claimi = aplic_read(sc, APLIC_IDC_CLAIMI(sc, cpu))) != 0) {\n  prio = APLIC_IDC_CLAIMI_PRIO(claimi);\n  irq = APLIC_IDC_CLAIMI_IRQ(claimi);\n  tf = curthread->td_intr_frame;\n  aplic_irq_dispatch(sc, irq, prio, tf);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/aplic.c",
+        "function_name": "aplic_attach",
+        "line_start": 451,
+        "line_end": 463,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The APLIC driver explicitly rejects IMSIC configurations (Smaiae) via the 'msi-parent' property check, falling back to direct mode only. This is the correct behavior for the scenario described in the spec: APLIC in direct mode without IMSIC. The driver never attempts to use CSR-based stopi/sclaimi because it only supports direct mode.",
+      "snippet": "if (ofw_bus_has_prop(dev, \"msi-parent\")) {\n  device_printf(dev, \"APLIC with IMSIC is unsupported\\n\");\n  return (ENXIO);\n}\nrc = aplic_setup_direct_mode(dev);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/sbi_ipi.c",
+        "function_name": "sbi_ipi_intr",
+        "line_start": 97,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sbi_ipi_intr() clears SIP_SSIP via csr_clear(sip, SIP_SSIP) at line 106. This register is cleared via the SBI IPI mechanism, not via ACLIC. In an ACLIC-direct system, software interrupts (SSI) still arrive through scause=1 because S-mode SSI is a local interrupt, not routed through the external interrupt controller. The SIP_SSIP clearing is the standard RISC-V mechanism and is correct for any system regardless of AIA extensions: SSI is a per-hart local interrupt, not platform-level.",
+      "snippet": "csr_clear(sip, SIP_SSIP);\ncpu = PCPU_GET(cpuid);\nmb();\nipi_bitmap = atomic_readandclear_32(&sc->pending_ipis[cpu]);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/sbi_ipi.c",
+        "function_name": "sbi_ipi_pic_ipi_send",
+        "line_start": 55,
+        "line_end": 78,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "IPI sending uses sbi_send_ipi() which calls into OpenSBI. OpenSBI's IPI path is separate from the external interrupt controller and uses the CLINT/ACLINT MSWI mechanism or SBI IPI extension. This is independent of whether the platform uses PLIC or APLIC for device interrupts.",
+      "snippet": "sbi_send_ipi(&mask);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "(global definitions)",
+        "line_start": 154,
+        "line_end": 163,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SIE_SEIE (1 << 9) is defined as the standard supervisor external interrupt enable bit. This is part of the base privileged spec (always present) and is distinct from any AIA-specific sie bits. No stopi/sclaimi CSR definitions exist in this header.",
+      "snippet": "#define SIE_SEIE (1 << 9)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/plic.c",
+        "function_name": "plic_intr",
+        "line_start": 171,
+        "line_end": 188,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The PLIC driver claims interrupts via memory-mapped PLIC_CONTEXT_CLAIM register (bus_read_4). No CSR reads at all. This works on any system regardless of AIA extensions.",
+      "snippet": "while ((pending = RD4(sc, PLIC_CLAIM(sc, cpu))) != 0) {\n  tf = curthread->td_intr_frame;\n  plic_irq_dispatch(sc, pending, tf);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_aplic.c",
+        "function_name": "aplic_check_pending",
+        "line_start": 450,
+        "line_end": 480,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The VMM APLIC emulation checks pending interrupts by scanning the virtual APLIC software state (aplic_irq structures), not by reading CSRs. The VMM never reads stopi/sclaimi CSRs for its guest interrupt injection logic.",
+      "snippet": "mtx_lock_spin(&aplic->mtx);\nif ((aplic->domaincfg & DOMAINCFG_IE) == 0) {\n  mtx_unlock_spin(&aplic->mtx);\n  return (0);\n}\nfor (i = 0; i < aplic->nirqs; i++) {"
+    }
+  ],
+  "overall_severity": "compliant"
+}

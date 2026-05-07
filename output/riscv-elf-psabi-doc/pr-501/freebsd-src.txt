@@ -1,0 +1,55 @@
+PR #501  target=freebsd-src  overall=potential_risk
+Spec: FreeBSD's unwind.c already uses sizeof(uintptr_t) (=PTRSZ) for frame-record offsets, making it spec-compliant, but riscvreg.h's XLEN_BYTES macro (XLEN/8) is a latent hazard: any future kernel code or ILP32 ABI support that uses XLEN_BYTES instead of sizeof(void*) for user-stack frame records would produce wrong offsets, enabling controlled stack-walk hijack and potential privilege escalation via crafted ILP32 binaries.
+Violation: FreeBSD kernel code (unwinder, signal delivery, kdb) computes frame-record offsets using XLEN_BYTES instead of sizeof(uintptr_t) when FreeBSD gains ILP32 or mixed-XLEN ABI support — on RV64ILP32, XLEN=64 but PTRSZ=32, causing the kernel to read return addresses and saved frame pointers at wrong offsets (fp-16/-8 instead of fp-8/-4), dereferencing garbage as control-flow targets.
+Consequence: privilege_escape
+Pattern: XLEN_BYTES|XLEN\b.*\bframe|\bfp\b.*\bXLEN in riscv/ tree combined with stack frame access
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/unwind.c:42-57  unwind_frame
+  Uses sizeof(uintptr_t) via sizeof(fp) and uintptr_t* array indexing for frame-record offsets. No XLEN_BYTES in frame computation. Forward-compatible with ILP32.
+  | fp = frame->fp;
+  | if (!__is_aligned(fp, sizeof(fp)) ||
+  |     !kstack_contains(td, fp - sizeof(fp) * 2, sizeof(fp) * 2))
+  |   return (false);
+  | frame->fp = ((uintptr_t *)fp)[-2];
+  | frame->pc = ((uintptr_t *)fp)[-1] - 4;
+
+[potential_risk] sys/cddl/dev/dtrace/riscv/dtrace_isa.c:160-161  dtrace_getustack_common
+  User-space frame-record offsets hardcoded as sizeof(uint64_t) instead of sizeof(uintptr_t). On RV64ILP32, sizeof(uint64_t)=8 but sizeof(uintptr_t)=4, causing reads at fp-8/-16 instead of fp-4/-8, dereferencing garbage as control-flow targets. Currently benign on LP64-only FreeBSD.
+  | pc = dtrace_fuword64((void *)(fp - 1 * sizeof(uint64_t)));
+  | fp = dtrace_fuword64((void *)(fp - 2 * sizeof(uint64_t)));
+
+[compliant] sys/riscv/riscv/db_trace.c:59-118  db_stack_trace_cmd
+  Delegates frame-record walking entirely to unwind_frame(). Trapframe access uses struct fields (tf->tf_s[0], tf->tf_sepc), not XLEN-based offset computation.
+  | if (!unwind_frame(td, frame))
+  |   break;
+  | ...
+  | frame->fp = tf->tf_s[0];
+  | frame->pc = tf->tf_sepc;
+
+[compliant] sys/riscv/riscv/stack_machdep.c:46-59  stack_capture
+  Delegates all frame-record walking to unwind_frame(). No manual offset computation. Forward-compatible.
+  | while (1) {
+  |   if (!unwind_frame(td, frame))
+  |     break;
+  |   ...
+  | }
+
+[compliant] sys/riscv/riscv/copyinout.S:60-108  copycommon
+  Uses XLEN_BYTES for ld/sd instruction width in data-copy loops. This is correct usage — XLEN controls register/memory-access width (ld needs 8-byte alignment on RV64). Not frame-related; not in scope.
+  | li t2, XLEN_BYTES
+  | blt a2, t2, 4f  /* Byte-copy if len < XLEN_BYTES */
+  | ...
+  | ld a4, 0(a0)   /* Load word from src */
+  | sd a4, 0(a1)   /* Store word in dest */
+
+[compliant] sys/riscv/riscv/exec_machdep.c:337-413  sendsig
+  Signal delivery uses stack-aligned pointer arithmetic on struct sigframe*, not XLEN-based frame-record offset computation. No frame-record walking.
+  | fp = (struct sigframe *)td->td_frame->tf_sp;
+  | fp--;
+  | fp = STACKALIGN(fp);
+
+[compliant] sys/riscv/include/riscvreg.h:197-198  XLEN_BYTES
+  Definition: XLEN_BYTES = XLEN/8 = __riscv_xlen/8. Correct definition. Only risky if used for frame-record offset arithmetic (which it is not in the kernel unwinder; only in DTrace as noted above).
+  | #define XLEN   __riscv_xlen
+  | #define XLEN_BYTES (XLEN / 8)
+

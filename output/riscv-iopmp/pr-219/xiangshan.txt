@@ -1,0 +1,53 @@
+PR #219  target=xiangshan  overall=compliant
+Spec: New rridscp_unselectable[] HW config gate on RRIDSCP writes: if RTL omits or incorrectly implements this check, software can stall/unstall RRIDs that hardware intends to protect from cherry-pick stall control, bypassing IOPMP stall enforcement
+Violation: When software writes RRIDSCP with op=1 (stall) or op=2 (unstall) and an RRID that is hardware-configured as unselectable (rridscp_unselectable[rrid]=1), but the XiangShan RTL fails to check the unselectable array and permits the stall/unstall operation to proceed on that RRID's transactions
+Consequence: privilege_escape
+Pattern: RRIDSCP write CSR logic that does not index into an rridscp_unselectable bit-array before committing rrid_stall state changes; or rridscp_unselectable tied to constant false instead of hardware configuration
+------------------------------------------------------------
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:565-616  RegRridscp (Bundle definition)
+  The RegRridscp Bundle is defined only inside a /* not implemented begin ... not implemented end */ block comment (lines 565-616), making it dead code that never compiles. The Bundle is defined twice (duplicate at 581-586 and 588-593) with fields stat[1:0], op[1:0], rsv[13:0], rrid[15:0]. Bit layout: op at bits [17:16], rrid at bits [15:0] — these bit positions match the IOPMP spec if the Bundle were ever instantiated. The duplicate definition is a code hygiene issue but has no security impact since neither is instantiated.
+  | /* not implemented begin
+  | class RegRridscp extends Bundle {
+  |   val stat = UInt(2.W)  // [R   ] --
+  |   val op   = UInt(2.W)  // [W   ] --
+  |   val rrid = UInt(16.W) // [WARL] RRID to select
+  | }
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:759-882  RegMap (CSR register bank)
+  RegMap has no reg_rridscp register instance (lines 766-776 declare 10 registers but not rridscp). No addrhit_rridscp write-enable signal is generated for offset 0x0038 (contrast addrhit_hwcfg0 at line 784, addrhit_hwcfg2 at line 786, addrhit_errcfg at line 788). The write-logic block (lines 794-851) has no when() branch for rridscp. The read-path MuxLookup (lines 855-867) has no entry for reg_rridscp_addr_offset (0x0038), so APB reads return 0 (default case). APB writes to 0x0038 are NOPs — no write handler fires, no rridscp_unselectable[] is checked, no rrid_stall state is committed. However, this means the specific violation pattern (stall/unstall proceeding on an unselectable RRID) cannot occur because no stall state is ever recorded. The feature is simply absent.
+  | val regcfg_dout := MuxLookup(addr_offset, 0.U)(Seq(
+  |   // ... no case for reg_rridscp_addr_offset=0x0038
+  | ))
+  | io.regcfg.dout := regcfg_dout
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:737-757  RegMapIO (register-facing signal Bundle)
+  RegMapIO carries hwcfg0/hwcfg1/hwcfg2/errcfg/errinfo signals between RegMap and Ctrl, but has no signals for rridscp semantics: no rridscp_unselectable[] (32-bit bit-array indexed by RRID), no per-RRID rrid_stall[] state feedback, and no rridscp op/rrid fields. The interface was never extended to provision RRIDSCP data, confirming the feature was deferred entirely. Since no RRIDSCP data can cross this interface, the specific violation (unselectable RRID being stalled) cannot occur.
+  | class RegMapIO extends Bundle {
+  |   val i_errinfo_v = Input(UInt(1.W))
+  |   // ... no rridscp_unselectable[], no rrid_stall[]
+  |   val o_reg_errinfo_ttype = Output(UInt(2.W))
+  | }
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1003-1100  Ctrl (access-check FSM)
+  The Ctrl FSM performs a valid RRID bounds check at line 1080 (io.req.bits.rrid < io.reg.o_reg_hwcfg1_rrid_num) and rejects unknown RRIDs with etype=0x6. However, the FSM has no awareness of per-RRID stall state: no rrid_stall[] array exists in Ctrl, no logic to gate transaction processing based on whether the request's RRID is stalled. The only stall mechanism is the global 'stall' signal (line 1093: io.stall === 0.U) which pauses the FSM in sSrcmd during any APB register write — this is unrelated to RRIDSCP per-RRID stall semantics. Since the Ctrl FSM never receives or acts on per-RRID stall state, the violation pattern (stall proceeding on an unselectable RRID) cannot manifest here.
+  | is(State.sSrcmd) {
+  |   when(io.stall === 0.U) {  // global stall, not per-RRID
+  |     state := State.sMdcfg
+  |   }
+  | }
+
+[potential_risk] ChiselIOPMP/src/main/scala/IopmpChecker.scala:41-41  IopmpParams.stall_en
+  stall_en is hardwired to 0 with comment '// [R] stall feature is not imp'. This feeds into reg_hwcfg0.stall_en (a read-only hardware configuration bit), correctly informing software that stall is unsupported. However, the RRIDSCP register address 0x0038 is still within the valid info-region address range (info_base_addr to info_base_addr+0x80) and is routed to RegMap, where writes are silently dropped and reads return 0. A spec-compliant implementation should either: (a) implement the feature, or (b) report an access fault/trap on RRIDSCP writes when stall_en=0, rather than silently ignoring them. The silent-drop creates a hardware/software contract ambiguity where software could assume a stall took effect when it did not.
+  | val stall_en = 0    // [R] stall feature is not imp
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:226-258  RegCfgMux (address routing)
+  RegCfgMux correctly routes addresses in the info region (info_base_addr to info_base_addr+0x80) to reg_map.io.regcfg. Since 0x0038 falls within [0, 0x80), the address routing is correct — rridscp writes do reach RegMap. The mux generates correct hit signals for its four destinations (regmap, mdcfg, srcmd, entry) and returns the selected destination's dout. The routing layer is not the source of the feature gap; the RegMap module is.
+  | val addrhit_info = (io.regcfg.addr >= IopmpParams.info_base_addr.U) &&
+  |                    (io.regcfg.addr < IopmpParams.info_max_addr.U)
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1347-1375  IopmpChecker (top-level module)
+  The IopmpChecker top-level module instantiates five submodules (regcfg_mux, srcmd_table, mdcfg_table, entry_table, reg_map, ctrl) and wires them with no rridscp-related connections. There is no rridscp_unselectable[] input port, no rrid_stall[] wires between RegMap and Ctrl, and no logic to special-case RRIDSCP writes. The feature gap is consistent across all module boundaries — no partial implementation exists that could be exploited.
+  | val reg_map = Module(new RegMap)
+  | val ctrl = Module(new Ctrl)
+  | ctrl.io.reg <> reg_map.io.bits  // no rridscp signals in RegMapIO
+

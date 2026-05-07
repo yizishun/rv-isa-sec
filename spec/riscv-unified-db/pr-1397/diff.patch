@@ -1,0 +1,208 @@
+diff --git a/backends/instructions_appendix/all_instructions.golden.adoc b/backends/instructions_appendix/all_instructions.golden.adoc
+index 81f1fd44bd..5fc7a6804c 100644
+--- a/backends/instructions_appendix/all_instructions.golden.adoc
++++ b/backends/instructions_appendix/all_instructions.golden.adoc
+@@ -54915,7 +54915,7 @@ Included in::
+ == vmv.v.i
+ 
+ Synopsis::
+-No synopsis available
++Vector move immediate to vector register
+ 
+ Base::
+ 
+@@ -54937,7 +54937,13 @@ Encoding::
+ ....
+ 
+ Description::
+-No description available.
++Copies a sign-extended 5-bit immediate value to all body elements of the destination
++vector register group. This is an unmasked instruction (vm=1).
++
++The 5-bit immediate (simm[4:0]) is sign-extended to SEW bits and written to each
++body element of the destination vector register group (elements from vstart to vl-1).
++Prestart elements (indices less than vstart) are unchanged.
++Tail elements (indices >= vl) are handled according to the tail agnostic/undisturbed policy.
+ 
+ 
+ Decode Variables::
+diff --git a/spec/std/isa/inst/V/vmv.v.i.yaml b/spec/std/isa/inst/V/vmv.v.i.yaml
+index f154142bfa..2148413874 100644
+--- a/spec/std/isa/inst/V/vmv.v.i.yaml
++++ b/spec/std/isa/inst/V/vmv.v.i.yaml
+@@ -6,9 +6,15 @@
+ $schema: "inst_schema.json#"
+ kind: instruction
+ name: vmv.v.i
+-long_name: No synopsis available
++long_name: Vector move immediate to vector register
+ description: |
+-  No description available.
++  Copies a sign-extended 5-bit immediate value to all body elements of the destination
++  vector register group. This is an unmasked instruction (vm=1).
++
++  The 5-bit immediate (simm[4:0]) is sign-extended to SEW bits and written to each
++  body element of the destination vector register group (elements from vstart to vl-1).
++  Prestart elements (indices less than vstart) are unchanged.
++  Tail elements (indices >= vl) are handled according to the tail agnostic/undisturbed policy.
+ definedBy:
+   extension:
+     name: Zvl32b
+@@ -27,6 +33,36 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  # Get current vector state
++  VectorState state = vector_state();
++  VectorLmulType lmul_type = state.lmul_type;
++
++  XReg vlen = VLEN;
++  XReg vlmax;
++  if (lmul_type == VectorLmulType::Multiply) {
++    vlmax = (vlen << state.log2_lmul) >> state.log2_sew;
++  } else {
++    # (lmul_type == VectorLmulType::Divide)
++    vlmax = (vlen >> state.log2_lmul) >> state.log2_sew;
++  }
++
++  # Sign-extend the 5-bit immediate to XLEN bits for use in loop
++  XReg sext_imm = $signed(imm);
++
++  # Iterate through elements from vstart to vl
++  for (U32 i = CSR[vstart].VALUE; i < CSR[vl].VALUE; i++) {
++    U32 start_bit_pos = i * state.sew;
++    U32 end_bit_pos = start_bit_pos + state.sew - 1;
++
++    # Write the sign-extended immediate (truncated to SEW bits) to the element
++    v[vd] = {
++      v[vd][VLEN-1:end_bit_pos + 1],
++      sext_imm[state.sew-1:0],
++      v[vd][start_bit_pos-1:0]
++    };
++  }
++
++  CSR[vstart].VALUE = 0;
+ 
+ # SPDX-SnippetBegin
+ # SPDX-FileCopyrightText: 2017-2025 Contributors to the RISCV Sail Model <https://github.com/riscv/sail-riscv/blob/master/LICENCE>
+diff --git a/tests/isa/rv32uv/Makefrag b/tests/isa/rv32uv/Makefrag
+index 5d70f75fd1..c5b2f51355 100644
+--- a/tests/isa/rv32uv/Makefrag
++++ b/tests/isa/rv32uv/Makefrag
+@@ -6,7 +6,8 @@ rv32uv_sc_tests = \
+     vsetivli \
+     vsetvl \
+     vsetvli_vl_lt_vlmax \
+-    vsetvli_rs1_eq_zero
++    vsetvli_rs1_eq_zero \
++    vmv_v_i
+ 
+ rv32uv_p_tests = $(addprefix rv32uv-p-, $(rv32uv_sc_tests))
+ rv32uv_v_tests = $(addprefix rv32uv-v-, $(rv32uv_sc_tests))
+diff --git a/tests/isa/rv32uv/vmv_v_i.S b/tests/isa/rv32uv/vmv_v_i.S
+new file mode 100644
+index 0000000000..fc759e6775
+--- /dev/null
++++ b/tests/isa/rv32uv/vmv_v_i.S
+@@ -0,0 +1,9 @@
++# Copyright (c) Ishaan Arora
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++# See LICENSE for license details
++
++#include "riscv_test.h"
++#undef RVTEST_RV64U
++#define RVTEST_RV64U RVTEST_RV32U
++
++#include "../rv64uv/vmv_v_i.S"
+diff --git a/tests/isa/rv64uv/Makefrag b/tests/isa/rv64uv/Makefrag
+index 70cadd2bdb..0f8aa6bcec 100644
+--- a/tests/isa/rv64uv/Makefrag
++++ b/tests/isa/rv64uv/Makefrag
+@@ -6,7 +6,8 @@ rv64uv_sc_tests = \
+     vsetivli \
+     vsetvl \
+     vsetvli_vl_lt_vlmax \
+-    vsetvli_rs1_eq_zero
++    vsetvli_rs1_eq_zero \
++    vmv_v_i
+ 
+ rv64uv_p_tests = $(addprefix rv64uv-p-, $(rv64uv_sc_tests))
+ rv64uv_v_tests = $(addprefix rv64uv-v-, $(rv64uv_sc_tests))
+diff --git a/tests/isa/rv64uv/vmv_v_i.S b/tests/isa/rv64uv/vmv_v_i.S
+new file mode 100644
+index 0000000000..1274d55563
+--- /dev/null
++++ b/tests/isa/rv64uv/vmv_v_i.S
+@@ -0,0 +1,72 @@
++# Copyright (c) Ishaan Arora
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++# See LICENSE for license details
++
++#*****************************************************************************
++# vmv_v_i.S
++#-----------------------------------------------------------------------------
++#
++# Test vmv.v.i instruction.
++#
++# vmv.v.i vd, imm
++# Copies sign-extended 5-bit immediate to all elements of vd
++
++#include "riscv_test.h"
++#include "test_macros.h"
++
++RVTEST_RV64UV
++RVTEST_CODE_BEGIN
++
++# Test 1: vmv.v.i with positive immediate (imm = 5)
++# VLEN=128, SEW=64, LMUL=1 -> VLMAX=2
++# Expected: all elements = 5
++  TEST_CASE(1, x5, 5, \
++    vsetivli x0, 2, 0x1b; \
++    vmv.v.i v1, 5; \
++    vmv.x.s x5, v1; \
++  )
++
++# Test 2: vmv.v.i with negative immediate (imm = -1 = 0x1f in 5-bit)
++# VLEN=128, SEW=64, LMUL=1 -> VLMAX=2
++# Expected: all elements = -1 (0xFFFFFFFFFFFFFFFF)
++  TEST_CASE(2, x5, -1, \
++    vsetivli x0, 2, 0x1b; \
++    vmv.v.i v2, -1; \
++    vmv.x.s x5, v2; \
++  )
++
++# Test 3: vmv.v.i with zero immediate
++# VLEN=128, SEW=32, LMUL=1 -> VLMAX=4
++# Expected: all elements = 0
++  TEST_CASE(3, x5, 0, \
++    vsetivli x0, 4, 0x13; \
++    vmv.v.i v3, 0; \
++    vmv.x.s x5, v3; \
++  )
++
++# Test 4: vmv.v.i with max positive 5-bit immediate (imm = 15)
++# VLEN=128, SEW=8, LMUL=1 -> VLMAX=16
++# Expected: all elements = 15
++  TEST_CASE(4, x5, 15, \
++    vsetivli x0, 16, 0x03; \
++    vmv.v.i v4, 15; \
++    vmv.x.s x5, v4; \
++  )
++
++# Test 5: vmv.v.i with min negative 5-bit immediate (imm = -16)
++# VLEN=128, SEW=16, LMUL=1 -> VLMAX=8
++# Expected: all elements = -16 (sign-extended)
++  TEST_CASE(5, x5, -16, \
++    vsetivli x0, 8, 0x0b; \
++    vmv.v.i v5, -16; \
++    vmv.x.s x5, v5; \
++  )
++
++  TEST_PASSFAIL
++
++RVTEST_CODE_END
++
++  .data
++RVTEST_DATA_BEGIN
++
++RVTEST_DATA_END

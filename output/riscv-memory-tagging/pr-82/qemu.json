@@ -1,0 +1,147 @@
+{
+  "pr_number": 82,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 82,
+    "violation_condition": "QEMU TCG does not deposit the MTAG bit from the trapping instruction's code-page PTE into mstatus.MTAG_I (on M-mode trap with mtinst written nonzero) or hstatus.MTAG_I (on HS-mode trap with htinst written nonzero), AND QEMU fails to consult mstatus.MTAG_I / hstatus.MTAG_I to suppress tag checks during MPRV-influenced loads/stores or HLV/HSV hypervisor accesses — causing tag checks to be applied when the spec mandates unchecked access (MTAG_I=1), or skipped when the spec mandates checked access (MTAG_I=0).",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "helper_hyp_hlv|helper_hyp_hsv|check_access_hlsv|mstatus.*MTAG|hstatus.*MTAG|mte_tag|mtag_i|MPRV.*load|MPRV.*store|tcg_gen_qemu_ld|tcg_gen_qemu_st|riscv_cpu_do_interrupt|get_physical_address.*MTAG|pte_mtag|PTE_MTAG",
+    "affected_entities": [
+      "mstatus.MTAG_I",
+      "hstatus.MTAG_I",
+      "HLV*.W",
+      "HLV*.D",
+      "HSV*.W",
+      "HSV*.D",
+      "HLVX*.HU",
+      "HLVX*.WU",
+      "mstatus.MPRV",
+      "mtinst",
+      "htinst"
+    ],
+    "summary": "mstatus/hstatus MTAG_I bits control opt-out of tag checks on HLV/HSV/MPRV memory accesses based on code-page PTE.MTAG; QEMU must correctly deposit these bits on trap entry and evaluate them during emulated memory access translation, or guest memory-tagging isolation is silently broken."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "check_access_hlsv",
+        "line_start": 620,
+        "line_end": 635,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "HLV/HSV access check does not consult mstatus.MTAG_I or hstatus.MTAG_I to suppress memory tag checks. If MTE were implemented, HLV/HSV loads/stores could incorrectly enforce tag checks against hypervisor accesses when the spec mandates unchecked access (MTAG_I=1 from trapping instruction's code-page PTE). Currently benign because no MTE implementation exists.",
+      "snippet": "static int check_access_hlsv(CPURISCVState *env, bool x, uintptr_t ra)\n{\n    if (env->priv == PRV_M) {\n        /* always allowed */\n    } else if (env->virt_enabled) {\n        riscv_raise_exception(env, RISCV_EXCP_VIRT_INSTRUCTION_FAULT, ra);\n    } else if (env->priv == PRV_U && !get_field(env->hstatus, HSTATUS_HU)) {\n        riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, ra);\n    }\n\n    int mode = get_field(env->hstatus, HSTATUS_SPVP);\n    if (!x && mode == PRV_S && get_field(env->vsstatus, MSTATUS_SUM)) {\n        mode = MMUIdx_S_SUM;\n    }\n    return mode | MMU_2STAGE_BIT;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "helper_hyp_hlv_bu through helper_hyp_hsv_d",
+        "line_start": 637,
+        "line_end": 707,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "All HLV/HSV helpers (hlv_bu, hlv_hu, hlv_wu, hlv_d, hsv_b, hsv_h, hsv_w, hsv_d) call cpu_ld*/st*_mmu() without checking whether MTAG_I is set in mstatus or hstatus. If MTE tag checks were implemented at the TCG ld/st layer, these helpers would apply tag checks on hypervisor-initiated accesses even when MTAG_I=1 mandates unchecked access.",
+      "snippet": "target_ulong helper_hyp_hlv_bu(CPURISCVState *env, target_ulong addr)\n{\n    uintptr_t ra = GETPC();\n    int mmu_idx = check_access_hlsv(env, false, ra);\n    MemOpIdx oi = make_memop_idx(MO_UB, mmu_idx);\n\n    return cpu_ldb_mmu(env, adjust_addr_virt(env, addr), oi, ra);\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2426,
+        "line_end": 2511,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "M-mode trap entry writes mstatus fields (MPIE, MPP, MIE, MDT, MPV, GVA) and mtinst but never deposits the executing instruction's code-page PTE.MTAG bit into mstatus.MTAG_I. A future MTE implementation requires propagating this bit here so that MPRV-influenced loads/stores during the trap handler can correctly suppress or enforce tag checks.",
+      "snippet": "    } else {\n        /* handle the trap in M-mode */\n        ...\n        s = env->mstatus;\n        s = set_field(s, MSTATUS_MPIE, get_field(s, MSTATUS_MIE));\n        s = set_field(s, MSTATUS_MPP, env->priv);\n        s = set_field(s, MSTATUS_MIE, 0);\n        ...\n        env->mstatus = s;\n        env->mcause = cause | ((target_ulong)async << (mxlen - 1));\n        ...\n        env->mtinst = tinst;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2370,
+        "line_end": 2425,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "S/HS-mode trap entry writes hstatus fields (SPVP, SPV, GVA) and htinst but never deposits the executing instruction's code-page PTE.MTAG bit into hstatus.MTAG_I. A future MTE implementation requires this bit to be set here so that HLV/HSV accesses during the HS-mode trap handler correctly suppress tag checks.",
+      "snippet": "    if (mode == PRV_S) {\n        /* handle the trap in S-mode */\n        ...\n            } else if (env->virt_enabled) {\n                /* Trap into HS mode, from virt */\n                riscv_cpu_swap_hypervisor_regs(env);\n                env->hstatus = set_field(env->hstatus, HSTATUS_SPVP, env->priv);\n                env->hstatus = set_field(env->hstatus, HSTATUS_SPV, true);\n                ...\n        env->htinst = tinst;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "cpu_address_mode",
+        "line_start": 725,
+        "line_end": 733,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "cpu_address_mode() applies MPRV to switch effective privilege mode but does not check whether mstatus.MTAG_I is set. If MTE tag checks were implemented, this function would need to signal the tag-check-suppression state back to callers so that MPRV-influenced loads/stores can skip tag checks when MTAG_I=1.",
+      "snippet": "static inline int cpu_address_mode(CPURISCVState *env)\n{\n    int mode = env->priv;\n\n    if (mode == PRV_M && get_field(env->mstatus, MSTATUS_MPRV)) {\n        mode = get_field(env->mstatus, MSTATUS_MPP);\n    }\n    return mode;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvi.c.inc",
+        "function_name": "gen_load_tl / gen_store_tl",
+        "line_start": 363,
+        "line_end": 531,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "TCG translation of regular integer loads/stores uses ctx->mem_idx with tcg_gen_qemu_ld_tl/st_tl without any MTAG_I state being factored into the memory operation flags (MemOp). A future MTE implementation would need to inspect mstatus.MTAG_I (for MPRV accesses) and adjust MemOp to suppress tag checks when mandated.",
+      "snippet": "static bool gen_load_tl(DisasContext *ctx, arg_lb *a, MemOp memop)\n{\n    TCGv dest = dest_gpr(ctx, a->rd);\n    TCGv addr = get_address(ctx, a->rs1, a->imm);\n\n    tcg_gen_qemu_ld_tl(dest, addr, ctx->mem_idx, memop);\n    gen_set_gpr(ctx, a->rd, dest);\n    return true;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address",
+        "line_start": 1237,
+        "line_end": 1242,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "get_physical_address() does not extract or carry an MTAG bit from the leaf PTE. The function signature has no parameter for returning PTE metadata (like PTE.MTAG) to callers. If MTE were implemented, the page-table walk would need to extract this bit and propagate it for use during tag-check decisions.",
+      "snippet": "static int get_physical_address(CPURISCVState *env, hwaddr *physical,\n                                int *ret_prot, vaddr addr,\n                                target_ulong *fault_pte_addr,\n                                int access_type, int mmu_idx,\n                                bool first_stage, bool two_stage,\n                                bool is_debug, bool is_probe)"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "mstatus/hstatus bit definitions",
+        "line_start": 610,
+        "line_end": 686,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "No MSTATUS_MTAG, MSTATUS_MTAG_I, HSTATUS_MTAG, or HSTATUS_MTAG_I bit definitions exist. These fields are required by the RISC-V MTE spec to (a) record the MTAG bit from the trapping instruction's code-page PTE on trap entry, and (b) suppress memory tag checks on MPRV/HLV/HSV accesses. Missing definitions mean no code can reference these control bits.",
+      "snippet": "#define MSTATUS_MPRV        0x00020000\n...\n/* No MSTATUS_MTAG or MSTATUS_MTAG_I defined */\n...\n#define HSTATUS_VTSR         0x00400000\n...\n/* No HSTATUS_MTAG or HSTATUS_MTAG_I defined */"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_riscv_cpu",
+        "line_start": 426,
+        "line_end": 504,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The CPU VMState does not include any MTE-related fields (mstatus.MTAG_I, hstatus.MTAG_I, or tag-check metadata). If MTE were implemented and these fields were omitted from vmstate, live-migration would silently corrupt the tag-check-suppression state, causing tag checks to be incorrectly applied or skipped post-migration on the destination host.",
+      "snippet": "const VMStateDescription vmstate_riscv_cpu = {\n    .name = \"cpu\",\n    .version_id = 11,\n    .minimum_version_id = 11,\n    .post_load = riscv_cpu_post_load,\n    .fields = (const VMStateField[]) {\n        VMSTATE_UINTTL_ARRAY(env.gpr, RISCVCPU, 32),\n        ...\n        VMSTATE_UINT64(env.mstatus, RISCVCPU),"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_mstatus",
+        "line_start": 1995,
+        "line_end": 2075,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "write_mstatus() applies WARL masks for mstatus CSR writes but has no logic for MTAG_I field. If MTAG_I were defined as a WLRL field (legal values constrained by spec), the current write path would allow arbitrary values to be written, potentially letting malicious guest code set MTAG_I=1 to suppress tag checks when the spec does not permit it (e.g., not on a trap entry path).",
+      "snippet": "static RISCVException write_mstatus(CPURISCVState *env, int csrno,\n                                     target_ulong val)\n{\n    ...\n    /* No MTAG_I WARL/WLRL validation */\n    ...\n}"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

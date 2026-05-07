@@ -1,0 +1,69 @@
+PR #2818  target=qemu  overall=bug_confirmed
+Spec: Vector extension dependency validation must accept Zfinx/Zdinx/Zhinxmin as alternatives to F/D/Zfhmin, and TCG must route vector FP scalar moves through x registers (not f registers) when Zfinx is active — stale f-register reads constitute guest info leak.
+Violation: QEMU validates the V/Zve32f/Zve64f/Zve64d extension dependency strictly against misa.F/misa.D flags without accepting Zfinx/Zdinx/Zhinxmin as valid alternatives, causing either (a) incorrect rejection of valid V+Zfinx guest configurations, or (b) silent emulation of vector floating-point scalar move instructions (vfmv.s.f, vfmv.f.s, vfmv.s.h, etc.) using non-existent f registers when Zfinx is active, because the TCG translator reads/writes f-register state that does not exist under Zfinx — guest x-register state is used instead at the architectural level.
+Consequence: info_leak
+Pattern: misa_ext_mask.*V.*F|misa.*D.*V.*dep|has_ext.*F.*V|vext_check_dependencies.*F|(vfmv\.s\.f|vfmv\.f\.s).*freg|Zve32f.*dep.*F[^Z]|!has_ext.*Zfinx.*V
+------------------------------------------------------------
+[bug_confirmed] target/riscv/cpu.c:2430-2437  ZVE32F_IMPLIED
+  ZVE32F_IMPLIED unconditionally sets implied_misa_exts = RVF, forcibly enabling misa.F when any Vector/Zve32f guest is configured. This blocks Zfinx as an alternative to F, making V+Zfinx (and Zve32f+Zfinx, Zve64f+Zfinx) guest configurations impossible. Per the RISC-V spec, Zfinx is a valid alternative to the F extension — the implied rule should skip enabling RVF when ext_zfinx is already enabled.
+  | static RISCVCPUImpliedExtsRule ZVE32F_IMPLIED = {
+  |     .ext = CPU_CFG_OFFSET(ext_zve32f),
+  |     .implied_misa_exts = RVF,
+  |     .implied_multi_exts = {
+  |         CPU_CFG_OFFSET(ext_zve32x),
+
+[bug_confirmed] target/riscv/cpu.c:2459-2467  ZVE64F_IMPLIED
+  ZVE64F_IMPLIED also unconditionally forces implied_misa_exts = RVF. Combined with ZVE32F_IMPLIED, this creates two independent code paths that block V+Zfinx. Since Zfinx and RVF are mutually exclusive (enforced at tcg-cpu.c:746-750), setting both causes contradictory configuration.
+  | static RISCVCPUImpliedExtsRule ZVE64F_IMPLIED = {
+  |     .ext = CPU_CFG_OFFSET(ext_zve64f),
+  |     .implied_misa_exts = RVF,
+  |     .implied_multi_exts = {
+  |         CPU_CFG_OFFSET(ext_zve32f), CPU_CFG_OFFSET(ext_zve64x),
+
+[bug_confirmed] target/riscv/cpu.c:2449-2457  ZVE64D_IMPLIED
+  ZVE64D_IMPLIED unconditionally sets implied_misa_exts = RVD, blocking V+Zdinx guest configurations. Zdinx is a valid alternative to the D extension in the same way Zfinx is to F.
+  | static RISCVCPUImpliedExtsRule ZVE64D_IMPLIED = {
+  |     .ext = CPU_CFG_OFFSET(ext_zve64d),
+  |     .implied_misa_exts = RVD,
+  |     .implied_multi_exts = {
+  |         CPU_CFG_OFFSET(ext_zve64f),
+
+[bug_confirmed] target/riscv/tcg/tcg-cpu.c:692-706  riscv_tcg_cpu_realize (validation section)
+  Validation code at line 694 requires riscv_has_ext(env, RVD) when ext_zve64d is set, and line 702 requires riscv_has_ext(env, RVF) when ext_zve32f is set. Neither check accepts Zfinx/Zdinx/Zhinxmin as valid alternatives. Even if the implied-exts rules in cpu.c were fixed, this validation would still reject V+Zfinx configurations.
+  | if (cpu->cfg.ext_zve64d) {
+  |     if (!riscv_has_ext(env, RVD)) {
+  |         error_setg(errp, "Zve64d/V extensions require D extension");
+  | ...
+  | if (cpu->cfg.ext_zve32f) {
+  |     if (!riscv_has_ext(env, RVF)) {
+  |         error_setg(errp, "Zve32f/Zve64f extensions require F extension");
+
+[bug_confirmed] target/riscv/insn_trans/trans_rvv.c.inc:35-54  require_rvf
+  require_rvf() checks mstatus_fs == EXT_STATUS_DISABLED at the top (line 37-39), then falls through to check ext_zve32f/ext_zve64d for MO_32/MO_64 SEW. Under Zfinx, mstatus.FS is architecturally hardwired to zero, so this first check rejects ALL vector floating-point instructions when Zfinx is active — including pure vector-register-only operations (vfadd.vv, vfsub.vv, etc.) that don't touch f-registers at all. The mstatus_fs check should be skipped when Zfinx is enabled, or replaced with a check that accepts Zfinx as satisfying the scalar-FP precondition.
+  | static bool require_rvf(DisasContext *s)
+  | {
+  |     if (s->mstatus_fs == EXT_STATUS_DISABLED) {
+  |         return false;
+  |     }
+  | ...
+  |     case MO_32:
+  |         return s->cfg_ptr->ext_zve32f;
+
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:3696-3721  trans_vfmv_f_s
+  vfmv.f.s writes to cpu_fpr[a->rd] (line 3707) and calls mark_fs_dirty(s) (line 3715). Under Zfinx, the architectural scalar destination is an x-register, not an f-register. If Zfinx were active with V (once other blockers are fixed), this would write vector FP data into uninitialized/dangling f-register state and mark FS dirty — a potential info_leak if that f-register value is later read by a different hart or context. The instruction should write to x-registers (cpu_gpr) under Zfinx.
+  | vec_element_loadi(s, cpu_fpr[a->rd], a->rs2, 0, false);
+  | /* NaN-box f[rd] as necessary for SEW */
+  | ...
+  | mark_fs_dirty(s);
+
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:3724-3751  trans_vfmv_s_f
+  vfmv.s.f reads from cpu_fpr[a->rs1] (line 3741) via do_nanbox. Under Zfinx, the scalar source is an x-register. This would read stale/uninitialized f-register values (since no FP instructions write f-registers under Zfinx), causing incorrect data to be written into the destination vector register element. This is an info_leak vector: guest f-register state (potentially from another security domain) could leak into vector registers.
+  | do_nanbox(s, t1, cpu_fpr[a->rs1]);
+  | vec_element_storei(s, a->rd, 0, t1);
+
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:2907-2949  trans_vfmv_v_f / opfvf_trans
+  vfmv.v.f and opfvf_trans read cpu_fpr[rs1] (lines 2462, 2921, 2939). Under Zfinx, the scalar source should be an x-register. This reads f-register state that is architecturally empty under Zfinx, potentially leaking stale data into all elements of a vector register.
+  | do_nanbox(s, t1, cpu_fpr[a->rs1]);
+  | ...
+  | tcg_gen_gvec_dup_i64(s->sew, vreg_ofs(s, a->rd), MAXSZ(s), MAXSZ(s), t1);
+

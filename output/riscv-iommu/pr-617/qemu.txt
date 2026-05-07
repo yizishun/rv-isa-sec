@@ -1,0 +1,78 @@
+PR #617  target=qemu  overall=compliant
+Spec: Unchecked msiptp.MODE when iohgatp.MODE is Bare allows guest VM to trigger MSI translation through undefined GSCID, enabling inter-VM MSI injection or arbitrary physical DMA via misrouted interrupt writes
+Violation: QEMU IOMMU emulation does not enforce that msiptp.MODE is Off when iohgatp.MODE is Bare. When iohgatp.MODE is Bare, second-stage address translation is disabled, no valid GSCID exists to associate MSI page table translations with a VM address space, yet a guest may configure a non-Off msiptp.MODE. The IOMMU would then perform MSI address translation through an undefined GSCID context, routing MSI writes to arbitrary physical addresses.
+Consequence: privilege_escape
+Pattern: DC.iohgatp.MODE set to Bare while DC.msiptp.MODE != Off, with no cause=259 (DDT entry misconfigured) fault reported — look for missing cross-field validation between iohgatp mode and msiptp mode in DDT entry processing, specifically where cause=259 is checked
+------------------------------------------------------------
+[bug_confirmed] hw/riscv/riscv-iommu.c:747-757  riscv_iommu_validate_device_ctx
+  BEFORE this PR: No cross-field validation between iohgatp.MODE and msiptp.MODE. A guest could set DC.iohgatp.MODE=Bare (disabling G-stage translation, no valid GSCID) while keeping DC.msiptp.MODE!=Off. The IOMMU would then perform MSI page table walks through riscv_iommu_msi_write() using msiptp.PPN without any GSCID-scoped address space context, allowing MSI writes to be routed to arbitrary physical addresses outside the VM's allocation.
+  | gatp = get_field(ctx->gatp, RISCV_IOMMU_ATP_MODE_FIELD);
+  |     if (ctx->tc & RISCV_IOMMU_DC_TC_T2GPA &&
+  |         gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE) {
+  |         return false;
+  |     }
+  | 
+  |     if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |         get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |         RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |         return false;
+  |     }
+
+[compliant] hw/riscv/riscv-iommu.c:753-757  riscv_iommu_validate_device_ctx
+  AFTER this PR: The new cross-field validation correctly enforces that msiptp.MODE must be Off when iohgatp.MODE is Bare. When violated, validate_device_ctx returns false, and the caller (line 1141) returns RISCV_IOMMU_FQ_CAUSE_DDT_MISCONFIGURED (cause=259) exactly as the spec requires. Validation happens at context-fetch time, before any translation, so the invalid configuration never reaches the MSI write path.
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |         get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |         RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |         return false;
+  |     }
+
+[compliant] hw/riscv/riscv-iommu.c:289-295  riscv_iommu_spa_fetch
+  The early MSI check path at line 289 already requires (!en_s) — i.e., satp.MODE=Bare — before consulting msiptp. The riscv_iommu_msi_check at line 228 further validates msiptp.MODE==FLAT before proceeding. However, this defense-in-depth existed ONLY for the early-check codepath, not for the post-G-stage-translation MSI check at line 476, and crucially did not prevent the riscv_iommu_msi_write path from accessing msiptp.PPN without GSCID context. The new validation at DDT-fetch time closes this gap at the entry point.
+  | if (!en_s && (iotlb->perm & IOMMU_WO) &&
+  |         riscv_iommu_msi_check(s, ctx, iotlb->iova)) {
+  |         iotlb->target_as = &s->trap_as;
+  |         iotlb->translated_addr = iotlb->iova;
+  |         iotlb->addr_mask = ~TARGET_PAGE_MASK;
+  |         return 0;
+  |     }
+
+[potential_risk] hw/riscv/riscv-iommu.c:573-575  riscv_iommu_msi_write
+  riscv_iommu_msi_write() at line 574 directly dereferences ctx->msiptp PPN for MSI PTE fetch without checking iohgatp mode. Before this PR, this was the vulnerable codepath for the described attack — when iohgatp.MODE=Bare but msiptp.MODE!=Off, the MSI PTE table base address is looked up without any GSCID scoping. After this PR, the DDT validation at fetch time prevents reaching this point with the illegal configuration, making this defense-in-depth consideration rather than an active bug. No further change needed here.
+  | /* fetch MSI PTE */
+  |     addr = PPN_PHYS(get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_PPN));
+  |     if (addr & offset) {
+
+[compliant] hw/riscv/riscv-iommu.c:1140-1142  riscv_iommu_dd_fetch (unnamed, context at line 1140)
+  The caller of validate_device_ctx correctly maps a false return to RISCV_IOMMU_FQ_CAUSE_DDT_MISCONFIGURED (cause=259). This fault code is what the spec requires for a misconfigured DDT entry. The fault is reported via riscv_iommu_report_fault (line 516), and additionally, cause=259 bypasses the DTF (Disable Transaction Fault) filter at line 529, so it is always reported even when DTF is set — correct behavior per spec.
+  | if (!riscv_iommu_validate_device_ctx(s, ctx)) {
+  |         return RISCV_IOMMU_FQ_CAUSE_DDT_MISCONFIGURED;
+  |     }
+
+[compliant] hw/riscv/riscv-iommu.c:1042-1056  riscv_iommu_dd_fetch (DDTP BARE pass-through path)
+  The DDTP_MODE_BARE pass-through bypass path at line 1042 correctly initializes ctx->msiptp=0 (MODE=Off), so a device in DDTP BARE mode can never trigger the new validation failure. The pass-through context correctly mocks up gatp as BARE and msiptp as Off consistently.
+  | case RISCV_IOMMU_DDTP_MODE_BARE:
+  |         /* mock up pass-through translation context */
+  |         ctx->gatp = set_field(0, RISCV_IOMMU_ATP_MODE_FIELD,
+  |             RISCV_IOMMU_DC_IOHGATP_MODE_BARE);
+  |         ctx->satp = set_field(0, RISCV_IOMMU_ATP_MODE_FIELD,
+  |             RISCV_IOMMU_DC_FSC_MODE_BARE);
+  | 
+  |         ctx->tc = RISCV_IOMMU_DC_TC_V;
+  |         if (s->enable_ats) {
+  |             ctx->tc |= RISCV_IOMMU_DC_TC_EN_ATS;
+  |         }
+  | 
+  |         ctx->ta = 0;
+  |         ctx->msiptp = 0;
+  |         return 0;
+
+[potential_risk] hw/riscv/riscv-iommu.c:1507-1518  riscv_iommu_iot_lookup
+  RISCVIOMMUEntry GSCID is extracted from ctx->gatp IOHGATP_GSCID field (line 1513). When iohgatp.MODE is Bare and GSCID bits happen to be non-zero (e.g., stale bits from a previous non-Bare mode), the IOTLB cache key would contain a spurious GSCID value. After this PR, the DDT validation prevents this scenario at entry, but if any other code path independently sets ctx->gatp with MODE Bare and non-zero GSCID bits, the cache lookup/update would use an undefined GSCID. Recommend adding a mask: when MODE is Bare, use 0 for GSCID in iot_lookup and iot_update.
+  | RISCVIOMMUEntry key = {
+  |         .tag   = transtag,
+  |         .gscid = get_field(ctx->gatp, RISCV_IOMMU_DC_IOHGATP_GSCID),
+  |         .pscid = get_field(ctx->ta, RISCV_IOMMU_DC_TA_PSCID),
+  |         .iova  = PPN_DOWN(iova),
+  |     };
+  |     return g_hash_table_lookup(iot_cache, &key);
+

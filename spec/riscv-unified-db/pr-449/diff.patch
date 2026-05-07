@@ -1,0 +1,2499 @@
+diff --git a/.github/workflows/regress.yml b/.github/workflows/regress.yml
+index 83f06dc2f8..e9ee24869f 100644
+--- a/.github/workflows/regress.yml
++++ b/.github/workflows/regress.yml
+@@ -185,3 +185,42 @@ jobs:
+         run: ./bin/build_container
+       - name: Generate extension PDF
+         run: ./do gen:profile[MockProfileRelease]
++  regress-gen-opcode:
++      runs-on: ubuntu-latest
++      env:
++        SINGULARITY: 1
++      steps:
++        - name: Clone Github Repo Action
++          uses: actions/checkout@v4
++        - name: Cache riscv-opcodes submodule
++          id: cache-opcodes
++          uses: actions/cache@v4
++          with:
++            path: ext/riscv-opcodes
++            key: ${{ runner.os }}-submodule-riscv-opcodes-${{ hashFiles('.gitmodules') }}
++        - if: steps.cache-opcodes.outputs.cache-hit != 'true'
++          name: Checkout riscv-opcodes submodule
++          run: |
++            git submodule init ext/riscv-opcodes
++            git submodule update ext/riscv-opcodes
++        - name: Setup apptainer
++          uses: eWaterCycle/setup-apptainer@v2.0.0
++        - name: Get container from cache
++          id: cache-sif
++          uses: actions/cache@v4
++          with:
++            path: .singularity/image.sif
++            key: ${{ hashFiles('container.def', 'bin/.container-tag') }}
++        - name: Get gems and node files from cache
++          id: cache-bundle-npm
++          uses: actions/cache@v4
++          with:
++            path: |
++              .home/.gems
++              node_modules
++            key: ${{ hashFiles('Gemfile.lock') }}-${{ hashFiles('package-lock.json') }}
++        - if: ${{ steps.cache-sif.outputs.cache-hit != 'true' }}
++          name: Build container
++          run: ./bin/build_container
++        - name: Generate opcode outputs
++          run: ./do gen:opcode_outputs
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+old mode 100644
+new mode 100755
+diff --git a/Rakefile b/Rakefile
+index 40b2c220e9..831899dea5 100644
+--- a/Rakefile
++++ b/Rakefile
+@@ -10,6 +10,7 @@ require "yard"
+ require "minitest/test_task"
+ 
+ require_relative $root / "lib" / "architecture"
++$opcode_outputs = $root / "gen" / "opcodes_outputs"
+ 
+ directory "#{$root}/.stamps"
+ 
+@@ -39,6 +40,28 @@ file "#{$root}/.stamps/dev_gems" => ["#{$root}/.stamps"] do |t|
+   FileUtils.touch t.name
+ end
+ 
++namespace :gen do
++  desc "Generate opcode outputs, optionally specify YAML_DIR=path/to/yaml"
++  task :opcode_outputs do
++    yaml_dir = ENV['YAML_DIR'] || "#{$root}/arch/inst"
++    mkdir_p $opcode_outputs
++    sh "#{$root}/.home/.venv/bin/python3 #{$root}/backends/opcodes_maker/yaml_to_json.py #{yaml_dir} #{$opcode_outputs}"
++    sh "#{$root}/.home/.venv/bin/python3 #{$root}/backends/opcodes_maker/generator.py #{$opcode_outputs}/instr_dict.json -c -chisel -spinalhdl -sverilog -rust -go -latex"
++
++    # Move generated files to output dir
++    Dir.chdir("#{$root}") do
++      mv "encoding.out.h", "#{$opcode_outputs}/", force: true
++      mv "inst.chisel", "#{$opcode_outputs}/", force: true
++      mv "inst.spinalhdl", "#{$opcode_outputs}/", force: true
++      mv "inst.sverilog", "#{$opcode_outputs}/", force: true
++      mv "inst.rs", "#{$opcode_outputs}/", force: true
++      mv "inst.go", "#{$opcode_outputs}/", force: true
++      mv "instr-table.tex", "#{$opcode_outputs}/", force: true
++      mv "priv-instr-table.tex", "#{$opcode_outputs}/", force: true
++    end
++  end
++ end
++
+ namespace :gen do
+   desc "Generate documentation for the ruby tooling"
+   task tool_doc: "#{$root}/.stamps/dev_gems" do
+@@ -319,6 +342,8 @@ namespace :test do
+ 
+     Rake::Task["gen:html"].invoke("generic_rv64")
+ 
++    Rake::Task["gen:opcode_outputs"].invoke
++
+     Rake::Task["#{$root}/gen/certificate_doc/pdf/MockCertificateModel.pdf"].invoke
+     Rake::Task["#{$root}/gen/profile_doc/pdf/MockProfileRelease.pdf"].invoke
+ 
+diff --git a/arch/inst/C/c.add.yaml b/arch/inst/C/c.add.yaml
+index c2249358b8..1c0729a879 100644
+--- a/arch/inst/C/c.add.yaml
++++ b/arch/inst/C/c.add.yaml
+@@ -17,8 +17,9 @@ encoding:
+   variables:
+     - name: rs2
+       location: 6-2
+-    - name: rd
++    - name: rd/rs1
+       location: 11-7
++      not: 0
+ access:
+   s: always
+   u: always
+diff --git a/arch/inst/C/c.addi.yaml b/arch/inst/C/c.addi.yaml
+index 6263e0c8f0..e4245ea0f1 100644
+--- a/arch/inst/C/c.addi.yaml
++++ b/arch/inst/C/c.addi.yaml
+@@ -20,7 +20,7 @@ encoding:
+     - name: imm
+       location: 12|6-2
+       not: 0
+-    - name: rd
++    - name: rd/rs1
+       location: 11-7
+       not: 0
+ access:
+diff --git a/arch/inst/C/c.addiw.yaml b/arch/inst/C/c.addiw.yaml
+index d1c409584b..13c3587400 100644
+--- a/arch/inst/C/c.addiw.yaml
++++ b/arch/inst/C/c.addiw.yaml
+@@ -20,7 +20,7 @@ encoding:
+   variables:
+     - name: imm
+       location: 12|6-2
+-    - name: rd
++    - name: rd/rs1
+       location: 11-7
+       not: 0
+ access:
+diff --git a/arch/inst/C/c.addw.yaml b/arch/inst/C/c.addw.yaml
+index a78674a86a..12aee8ecc0 100644
+--- a/arch/inst/C/c.addw.yaml
++++ b/arch/inst/C/c.addw.yaml
+@@ -19,7 +19,7 @@ encoding:
+   variables:
+     - name: rs2
+       location: 4-2
+-    - name: rd
++    - name: rd/rs1
+       location: 9-7
+ access:
+   s: always
+diff --git a/arch/inst/C/c.and.yaml b/arch/inst/C/c.and.yaml
+index ba2648f0b8..addc3db3d7 100644
+--- a/arch/inst/C/c.and.yaml
++++ b/arch/inst/C/c.and.yaml
+@@ -18,7 +18,7 @@ encoding:
+   variables:
+     - name: rs2
+       location: 4-2
+-    - name: rd
++    - name: rd/rs1
+       location: 9-7
+ access:
+   s: always
+diff --git a/arch/inst/C/c.andi.yaml b/arch/inst/C/c.andi.yaml
+index 3ef3ac838b..358a37088d 100644
+--- a/arch/inst/C/c.andi.yaml
++++ b/arch/inst/C/c.andi.yaml
+@@ -18,7 +18,7 @@ encoding:
+   variables:
+     - name: imm
+       location: 12|6-2
+-    - name: rd
++    - name: rd/rs1
+       location: 9-7
+ access:
+   s: always
+diff --git a/arch/inst/C/c.or.yaml b/arch/inst/C/c.or.yaml
+index b14f348c1a..1a98f13f10 100644
+--- a/arch/inst/C/c.or.yaml
++++ b/arch/inst/C/c.or.yaml
+@@ -18,7 +18,7 @@ encoding:
+   variables:
+     - name: rs2
+       location: 4-2
+-    - name: rd
++    - name: rd/rs1
+       location: 9-7
+ access:
+   s: always
+diff --git a/arch/inst/C/c.slli.yaml b/arch/inst/C/c.slli.yaml
+index 01dad72a7c..4c356a00f5 100644
+--- a/arch/inst/C/c.slli.yaml
++++ b/arch/inst/C/c.slli.yaml
+@@ -18,7 +18,7 @@ encoding:
+   variables:
+     - name: shamt
+       location: 12|6-2
+-    - name: rd
++    - name: rd/rs1
+       location: 11-7
+       not: 0
+ access:
+diff --git a/arch/inst/C/c.srai.yaml b/arch/inst/C/c.srai.yaml
+index 0aa7341844..cbbc5f4fc9 100644
+--- a/arch/inst/C/c.srai.yaml
++++ b/arch/inst/C/c.srai.yaml
+@@ -19,7 +19,7 @@ encoding:
+   variables:
+     - name: shamt
+       location: 12|6-2
+-    - name: rd
++    - name: rd/rs1
+       location: 9-7
+ access:
+   s: always
+diff --git a/arch/inst/C/c.srli.yaml b/arch/inst/C/c.srli.yaml
+index 86112f61c0..b60054a8c2 100644
+--- a/arch/inst/C/c.srli.yaml
++++ b/arch/inst/C/c.srli.yaml
+@@ -19,7 +19,7 @@ encoding:
+   variables:
+     - name: shamt
+       location: 12|6-2
+-    - name: rd
++    - name: rd/rs1
+       location: 9-7
+ access:
+   s: always
+diff --git a/arch/inst/C/c.sub.yaml b/arch/inst/C/c.sub.yaml
+index 32757173a0..5e6f97e4da 100644
+--- a/arch/inst/C/c.sub.yaml
++++ b/arch/inst/C/c.sub.yaml
+@@ -18,7 +18,7 @@ encoding:
+   variables:
+     - name: rs2
+       location: 4-2
+-    - name: rd
++    - name: rd/rs1
+       location: 9-7
+ access:
+   s: always
+diff --git a/arch/inst/C/c.subw.yaml b/arch/inst/C/c.subw.yaml
+index 36ecadfe50..82c7810768 100644
+--- a/arch/inst/C/c.subw.yaml
++++ b/arch/inst/C/c.subw.yaml
+@@ -19,7 +19,7 @@ encoding:
+   variables:
+     - name: rs2
+       location: 4-2
+-    - name: rd
++    - name: rd/rs1
+       location: 9-7
+ access:
+   s: always
+diff --git a/arch/inst/C/c.xor.yaml b/arch/inst/C/c.xor.yaml
+index 5700c7b631..3139a5e03c 100644
+--- a/arch/inst/C/c.xor.yaml
++++ b/arch/inst/C/c.xor.yaml
+@@ -18,7 +18,7 @@ encoding:
+   variables:
+     - name: rs2
+       location: 4-2
+-    - name: rd
++    - name: rd/rs1
+       location: 9-7
+ access:
+   s: always
+diff --git a/arch/inst/V/vsetivli.yaml b/arch/inst/V/vsetivli.yaml
+index e45be1043c..7701b93b71 100644
+--- a/arch/inst/V/vsetivli.yaml
++++ b/arch/inst/V/vsetivli.yaml
+@@ -11,9 +11,9 @@ assembly: xd, imm
+ encoding:
+   match: 11---------------111-----1010111
+   variables:
+-    - name: zimm10
++    - name: imm
+       location: 29-20
+-    - name: uimm
++    - name: imm
+       location: 19-15
+     - name: rd
+       location: 11-7
+diff --git a/arch/inst/V/vsetvli.yaml b/arch/inst/V/vsetvli.yaml
+index aeb3569bb7..b85fb18d38 100644
+--- a/arch/inst/V/vsetvli.yaml
++++ b/arch/inst/V/vsetvli.yaml
+@@ -11,7 +11,7 @@ assembly: xs1, xd, imm
+ encoding:
+   match: 0----------------111-----1010111
+   variables:
+-    - name: zimm11
++    - name: imm
+       location: 30-20
+     - name: rs1
+       location: 19-15
+diff --git a/arch/inst/Zicsr/csrrwi.yaml b/arch/inst/Zicsr/csrrwi.yaml
+index 473236a8bc..188dcd4ec8 100644
+--- a/arch/inst/Zicsr/csrrwi.yaml
++++ b/arch/inst/Zicsr/csrrwi.yaml
+@@ -13,7 +13,7 @@ description: |
+   If `rd=x0`, then the instruction shall not read the CSR and shall not
+   cause any of the side effects that might occur on a CSR read.
+ definedBy: Zicsr
+-assembly: xd, zimm, csr
++assembly: xd, imm, csr
+ encoding:
+   match: -----------------101-----1110011
+   variables:
+diff --git a/arch/inst/Zvbb/vwsll.vi.yaml b/arch/inst/Zvbb/vwsll.vi.yaml
+index ae3468bc75..27c7799b44 100644
+--- a/arch/inst/Zvbb/vwsll.vi.yaml
++++ b/arch/inst/Zvbb/vwsll.vi.yaml
+@@ -16,7 +16,7 @@ encoding:
+       location: 25-25
+     - name: vs2
+       location: 24-20
+-    - name: zimm5
++    - name: imm
+       location: 19-15
+     - name: vd
+       location: 11-7
+diff --git a/arch/inst/Zvkn/vaeskf1.vi.yaml b/arch/inst/Zvkn/vaeskf1.vi.yaml
+index 89ca6562de..b296fe28ad 100644
+--- a/arch/inst/Zvkn/vaeskf1.vi.yaml
++++ b/arch/inst/Zvkn/vaeskf1.vi.yaml
+@@ -14,7 +14,7 @@ encoding:
+   variables:
+     - name: vs2
+       location: 24-20
+-    - name: zimm5
++    - name: imm
+       location: 19-15
+     - name: vd
+       location: 11-7
+diff --git a/arch/inst/Zvkn/vaeskf2.vi.yaml b/arch/inst/Zvkn/vaeskf2.vi.yaml
+index ac12aef4f1..d66f446123 100644
+--- a/arch/inst/Zvkn/vaeskf2.vi.yaml
++++ b/arch/inst/Zvkn/vaeskf2.vi.yaml
+@@ -14,7 +14,7 @@ encoding:
+   variables:
+     - name: vs2
+       location: 24-20
+-    - name: zimm5
++    - name: imm
+       location: 19-15
+     - name: vd
+       location: 11-7
+diff --git a/arch/inst/Zvks/vsm3c.vi.yaml b/arch/inst/Zvks/vsm3c.vi.yaml
+index 98ed236f78..c93c133f39 100644
+--- a/arch/inst/Zvks/vsm3c.vi.yaml
++++ b/arch/inst/Zvks/vsm3c.vi.yaml
+@@ -14,7 +14,7 @@ encoding:
+   variables:
+     - name: vs2
+       location: 24-20
+-    - name: zimm5
++    - name: imm
+       location: 19-15
+     - name: vd
+       location: 11-7
+diff --git a/arch/inst/Zvks/vsm4k.vi.yaml b/arch/inst/Zvks/vsm4k.vi.yaml
+index b1b897326d..01cd22dcc7 100644
+--- a/arch/inst/Zvks/vsm4k.vi.yaml
++++ b/arch/inst/Zvks/vsm4k.vi.yaml
+@@ -14,7 +14,7 @@ encoding:
+   variables:
+     - name: vs2
+       location: 24-20
+-    - name: zimm5
++    - name: imm
+       location: 19-15
+     - name: vd
+       location: 11-7
+diff --git a/backends/instr_isa_manual/tasks.rake b/backends/instr_isa_manual/tasks.rake
+new file mode 100644
+index 0000000000..d5579d00b5
+--- /dev/null
++++ b/backends/instr_isa_manual/tasks.rake
+@@ -0,0 +1,35 @@
++# tasks.rake
++
++# Define the manual generation directory constant
++ISA_INDEX_GEN_DIR = $root / "gen" / "instr_isa_manual/index"
++
++# Rule to create the instructions index page (all instructions with details)
++rule %r{#{ISA_INDEX_GEN_DIR}/.*/antora/modules/insts/pages/instructions_index\.adoc} => [
++  __FILE__,
++  ($root / "backends" / "instr_isa_manual" / "templates" / "instr_index.adoc.erb").to_s
++] do |t|
++  cfg_arch = cfg_arch_for("_")
++  # Collect all instructions sorted by name
++  instructions = cfg_arch.instructions.sort_by(&:name)
++  template_path = $root / "backends" / "instr_isa_manual" / "templates" / "instr_index.adoc.erb"
++  erb = ERB.new(template_path.read, trim_mode: "-")
++  erb.filename = template_path.to_s
++
++  FileUtils.mkdir_p(File.dirname(t.name))
++  File.write(t.name, AsciidocUtils.resolve_links(cfg_arch.find_replace_links(erb.result(binding))))
++end
++
++# Rake task to generate the instructions index page.
++namespace :gen do
++  desc "Generate the instructions index page (with index and full instruction details)"
++  task :instructions_index do
++    # Use provided version or default to "latest"
++    version = ENV["VERSION"] || "latest"
++    target = ISA_INDEX_GEN_DIR / version / "antora/modules/insts/pages/instructions_index.adoc"
++
++    # Invoke the rule to generate the file
++    Rake::Task[target.to_s].invoke
++
++    puts "SUCCESS: Instructions index generated at '#{target}'"
++  end
++end
+diff --git a/backends/instr_isa_manual/templates/instr_index.adoc.erb b/backends/instr_isa_manual/templates/instr_index.adoc.erb
+new file mode 100644
+index 0000000000..73f53c3779
+--- /dev/null
++++ b/backends/instr_isa_manual/templates/instr_index.adoc.erb
+@@ -0,0 +1,94 @@
++<% require_relative '../instruction_index' %>
++<% instruction_index ||= InstructionIndex.new %>
++<% instructions = instruction_index.instructions %>
++
++= Instruction Index
++:toc:
++:toclevels: 1
++
++== Instruction Index
++
++<% instructions.each do |inst| %>
++* <<%= anchor_for_inst(inst.name) %>, <%= inst.name %>>
++<% end %>
++
++== Instructions Details
++
++<% instructions.each do |inst| %>
++
++<%= anchor_for_inst(inst.name) %>
++= <%= inst.name %>
++
++Mnemonic::
++----
++<%= inst.assembly.gsub('x', 'r') %>
++----
++
++Encoding::
++<%- if inst.multi_encoding? -%>
++[NOTE]
++This instruction has different encodings in RV32 and RV64
++
++RV32::
++[wavedrom, ,svg,subs='attributes',width="100%"]
++....
++<%= JSON.dump inst.wavedrom_desc(32) %>
++....
++
++RV64::
++[wavedrom, ,svg,subs='attributes',width="100%"]
++....
++<%= JSON.dump inst.wavedrom_desc(64) %>
++....
++<%- else -%>
++[wavedrom, ,svg,subs='attributes',width="100%"]
++....
++<%= JSON.dump inst.wavedrom_desc(inst.base.nil? ? 64 : inst.base) %>
++....
++<%- end -%>
++
++Description::
++<%= inst.description %>
++
++<%- if inst.latency -%>
++Latency::
++<%= inst.latency %>
++<%- end -%>
++
++<%- if inst.throughput -%>
++Throughput::
++<%= inst.throughput %>
++<%- end -%>
++
++Decode Variables::
++<%- if inst.multi_encoding? ? (inst.decode_variables(32).empty? && inst.decode_variables(64).empty?) : inst.decode_variables(inst.base.nil? ? 64 : inst.base).empty? -%>
++<%= inst.name %> has no decode variables.
++<%- else -%>
++<%- if inst.multi_encoding? -%>
++RV32::
+++
++[source,idl]
++----
++<% inst.decode_variables(32).each do |d| %>
++<%= d.sext? ? 'signed ' : '' %>Bits<<%= d.size %>> <%= d.name %> = <%= d.extract %>;
++<% end %>
++----
++
++RV64::
+++
++[source,idl]
++----
++<% inst.decode_variables(64).each do |d| %>
++<%= d.sext? ? 'signed ' : '' %>Bits<<%= d.size %>> <%= d.name %> = <%= d.extract %>;
++<% end %>
++----
++<%- else -%>
++[source,idl,subs="specialchars,macros"]
++----
++<% inst.decode_variables(inst.base.nil? ? 64 : inst.base).each do |d| %>
++<%= d.sext? ? 'signed ' : '' %>Bits<<%= d.size %>> <%= d.name %> = <%= d.extract %>;
++<% end %>
++----
++<%- end -%>
++<%- end -%>
++<% end %>
+diff --git a/backends/opcodes_maker/Makefile b/backends/opcodes_maker/Makefile
+new file mode 100755
+index 0000000000..11d2d0eccc
+--- /dev/null
++++ b/backends/opcodes_maker/Makefile
+@@ -0,0 +1,50 @@
++# Directories
++YAML_DIR ?= ../../arch/inst
++OUTPUT_DIR := output
++
++# Python scripts
++YAML_TO_JSON := yaml_to_json.py
++GENERATOR := generator.py
++
++# Generated files
++INSTR_DICT := $(OUTPUT_DIR)/instr_dict.json
++C_OUT := $(OUTPUT_DIR)/encoding.out.h
++CHISEL_OUT := $(OUTPUT_DIR)/inst.chisel
++SPINALHDL_OUT := $(OUTPUT_DIR)/inst.spinalhdl
++SVERILOG_OUT := $(OUTPUT_DIR)/inst.sverilog
++RUST_OUT := $(OUTPUT_DIR)/inst.rs
++GO_OUT := $(OUTPUT_DIR)/inst.go
++LATEX_OUT := $(OUTPUT_DIR)/instr-table.tex
++LATEX_PRIV_OUT := $(OUTPUT_DIR)/priv-instr-table.tex
++
++# Check for required files
++REQUIRED_FILES := $(YAML_TO_JSON) $(GENERATOR)
++$(foreach file,$(REQUIRED_FILES),\
++    $(if $(wildcard $(file)),,$(error Required file $(file) not found)))
++
++# Default target
++all: generate
++
++# Create output directory
++$(OUTPUT_DIR):
++	mkdir -p $(OUTPUT_DIR)
++
++# Convert YAML to JSON
++$(INSTR_DICT): $(YAML_TO_JSON) | $(OUTPUT_DIR)
++	python3 $(YAML_TO_JSON) $(YAML_DIR) $(OUTPUT_DIR)
++
++# Generate all outputs
++generate: $(INSTR_DICT)
++	python3 $(GENERATOR) $(INSTR_DICT) -c -chisel -spinalhdl -sverilog -rust -go -latex || \
++		{ echo "Error generating riscv-opcodes outputs. Likely, you don't have updated riscv-opcodes submodules. Please do:"; \
++		  echo "git submodule update --init --recursive"; \
++		  echo "git submodule update --remote ext/riscv-opcodes"; \
++		  exit 1; }
++	mv encoding.out.h inst.chisel inst.spinalhdl inst.sverilog inst.rs inst.go \
++	   instr-table.tex priv-instr-table.tex $(OUTPUT_DIR)/ 2>/dev/null || true
++	python3 sorter.py
++# Clean generated files
++clean:
++	rm -rf $(OUTPUT_DIR)
++
++.PHONY: all generate clean
+diff --git a/backends/opcodes_maker/README.md b/backends/opcodes_maker/README.md
+new file mode 100644
+index 0000000000..84d5735ae3
+--- /dev/null
++++ b/backends/opcodes_maker/README.md
+@@ -0,0 +1,89 @@
++# RISC-V Instruction Format Generator
++
++This tool converts RISC-V instruction YAML definitions into various output formats including C headers, Chisel, Rust, Go, and LaTeX documentation.
++
++## Prerequisites
++
++- Python 3
++- YAML Python package (`pip install pyyaml`)
++- Make
++
++## Directory Structure
++
++```
++.
++├── yaml_to_json.py    # Converts YAML instruction definitions to JSON
++├── generator.py       # Generates various output formats from JSON
++├── output/           # Generated files directory
++└── Makefile         # Build system configuration
++```
++
++## Input/Output Format
++
++### Input
++- YAML files containing RISC-V instruction definitions
++- Default input directory: `../../arch/inst`
++- Can be customized using `YAML_DIR` variable
++
++### Output
++All outputs are generated in the `output` directory:
++- `encoding.out.h` - C header definitions
++- `inst.chisel` - Chisel implementation
++- `inst.spinalhdl` - SpinalHDL implementation
++- `inst.sverilog` - SystemVerilog implementation
++- `inst.rs` - Rust implementation
++- `inst.go` - Go implementation
++- `instr-table.tex` - LaTeX instruction table
++- `priv-instr-table.tex` - LaTeX privileged instruction table
++- `instr_dict.json` - Intermediate JSON representation
++- `processed_instr_dict.json` - Final processed JSON
++
++## Usage
++
++### Basic Usage
++```bash
++make                        # Use default YAML directory
++make YAML_DIR=/custom/path  # Use custom YAML directory
++make clean                  # Remove all generated files
++make help                   # Show help message
++```
++
++### Pipeline Steps
++1. YAML to JSON conversion (`yaml_to_json.py`)
++   - Reads YAML instruction definitions
++   - Creates intermediate JSON representation
++
++2. Output Generation (`generator.py`)
++   - Takes JSON input
++   - Generates all output formats
++   - Places results in output directory
++
++### Customization
++- Input directory can be changed:
++  ```bash
++  make YAML_DIR=/path/to/yaml/files
++  ```
++- Default paths in Makefile:
++  ```makefile
++  YAML_DIR ?= ../../arch/inst
++  OPCODES_DIR := ../riscv-opcodes
++  OUTPUT_DIR := output
++  ```
++
++## Error Handling
++- Checks for required Python scripts before execution
++- Verifies input directory exists
++- Creates output directory if missing
++- Shows helpful error messages for missing files/directories
++
++## Cleaning Up
++```bash
++make clean  # Removes all generated files and output directory
++```
++
++## Dependencies
++- Requires access to RISC-V opcodes repository (expected at `../riscv-opcodes`)
++- Python scripts use standard libraries plus PyYAML
++
++## Note
++Make sure your input YAML files follow the expected RISC-V instruction definition format. For format details, refer to the RISC-V specification or example YAML files in the arch/inst directory.
+diff --git a/backends/opcodes_maker/__pycache__/compareOpcodes.cpython-312-pytest-8.3.4.pyc b/backends/opcodes_maker/__pycache__/compareOpcodes.cpython-312-pytest-8.3.4.pyc
+new file mode 100644
+index 0000000000..1a0dd2f60d
+Binary files /dev/null and b/backends/opcodes_maker/__pycache__/compareOpcodes.cpython-312-pytest-8.3.4.pyc differ
+diff --git a/backends/opcodes_maker/__pycache__/compareOpcods.cpython-312-pytest-8.3.4.pyc b/backends/opcodes_maker/__pycache__/compareOpcods.cpython-312-pytest-8.3.4.pyc
+new file mode 100644
+index 0000000000..97e1045e6a
+Binary files /dev/null and b/backends/opcodes_maker/__pycache__/compareOpcods.cpython-312-pytest-8.3.4.pyc differ
+diff --git a/backends/opcodes_maker/compareOpcodes.py b/backends/opcodes_maker/compareOpcodes.py
+new file mode 100644
+index 0000000000..99eb4f69f7
+--- /dev/null
++++ b/backends/opcodes_maker/compareOpcodes.py
+@@ -0,0 +1,97 @@
++import json
++import pytest
++import warnings
++
++
++def load_json_file(filename):
++    with open(filename) as f:
++        return json.load(f)
++
++
++# Pre-load the JSON data from the two files.
++JSON1 = load_json_file("sorted_instr_dict.json")
++JSON2 = load_json_file("../../ext/riscv-opcodes/instr_dict.json")
++
++# Create lowercase versions of the keys for comparison
++JSON1_LOWER = {k.lower(): v for k, v in JSON1.items()}
++JSON2_LOWER = {k.lower(): v for k, v in JSON2.items()}
++
++# Compute the common instructions for parametrization.
++COMMON_INSTRUCTIONS = sorted(list(set(JSON1_LOWER.keys()) & set(JSON2_LOWER.keys())))
++
++
++@pytest.fixture
++def json1():
++    return JSON1
++
++
++@pytest.fixture
++def json2():
++    return JSON2
++
++
++@pytest.fixture
++def json1_lower():
++    return JSON1_LOWER
++
++
++@pytest.fixture
++def json2_lower():
++    return JSON2_LOWER
++
++
++def test_instructions_missing_in_riscv_opcodes(json1_lower, json2_lower):
++    """
++    Check for instructions in sorted_instr_dict.json but missing in riscv-opcodes.
++    This will issue a warning instead of failing.
++    """
++    instructions1 = set(json1_lower.keys())
++    instructions2 = set(json2_lower.keys())
++
++    missing_in_file2 = instructions1 - instructions2
++
++    if missing_in_file2:
++        warnings.warn(f"Instructions missing in riscv-opcodes: {missing_in_file2}")
++
++
++def test_instructions_missing_in_sorted_dict(json1_lower, json2_lower):
++    """
++    Check for instructions in riscv-opcodes but missing in sorted_instr_dict.json.
++    This will fail the test if any are found.
++    """
++    instructions1 = set(json1_lower.keys())
++    instructions2 = set(json2_lower.keys())
++
++    missing_in_file1 = instructions2 - instructions1
++
++    assert (
++        missing_in_file1 == set()
++    ), f"Instructions missing in 'sorted_instr_dict.json': {missing_in_file1}"
++
++
++@pytest.mark.parametrize("instr", COMMON_INSTRUCTIONS)
++def test_variable_fields_exact(instr, json1_lower, json2_lower):
++    """
++    For each common instruction, verify that both JSON files:
++      - Have the key 'variable_fields'
++      - Contain an identical set of variable_fields (order does not matter)
++    """
++    entry1 = json1_lower[instr]
++    entry2 = json2_lower[instr]
++
++    assert (
++        "variable_fields" in entry1
++    ), f"Instruction '{instr}' is missing 'variable_fields' in 'sorted_instr_dict.json'"
++    assert (
++        "variable_fields" in entry2
++    ), f"Instruction '{instr}' is missing 'variable_fields' in '../../ext/riscv-opcodes/instr_dict.json'"
++
++    vf1 = entry1["variable_fields"]
++    vf2 = entry2["variable_fields"]
++
++    # Compare after sorting the lists so that order is ignored.
++    assert sorted(vf1) == sorted(vf2), (
++        f"Instruction '{instr}' variable_fields differ:\n"
++        f"  sorted_instr_dict.json: {vf1}\n"
++        f"  ../../ext/riscv-opcodes/instr_dict.json: {vf2}"
++    )
+diff --git a/backends/opcodes_maker/fieldo.json b/backends/opcodes_maker/fieldo.json
+new file mode 100644
+index 0000000000..31562ff21d
+--- /dev/null
++++ b/backends/opcodes_maker/fieldo.json
+@@ -0,0 +1,660 @@
++{
++  "fd": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "fr",
++    "prio": 10,
++    "dst": true,
++    "count": 0
++  },
++  "fs1": {
++    "msb": 19,
++    "lsb": 15,
++    "kind": "fr",
++    "prio": 20,
++    "src": true,
++    "count": 0
++  },
++  "fs2": {
++    "msb": 24,
++    "lsb": 20,
++    "kind": "fr",
++    "prio": 30,
++    "src": true,
++    "count": 0
++  },
++  "fs3": {
++    "msb": 31,
++    "lsb": 27,
++    "kind": "fr",
++    "prio": 40,
++    "src": true,
++    "count": 0
++  },
++  "rd": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "xr",
++    "prio": 10,
++    "dst": true,
++    "count": 753
++  },
++  "rs1": {
++    "msb": 19,
++    "lsb": 15,
++    "kind": "xr",
++    "prio": 20,
++    "src": true,
++    "count": 1007
++  },
++  "rs2": {
++    "msb": 24,
++    "lsb": 20,
++    "kind": "xr",
++    "prio": 30,
++    "src": true,
++    "count": 501
++  },
++  "rs3": {
++    "msb": 31,
++    "lsb": 27,
++    "kind": "xr",
++    "prio": 40,
++    "src": true,
++    "count": 26
++  },
++  "rm": {
++    "msb": 14,
++    "lsb": 12,
++    "kind": "rm",
++    "count": 80
++  },
++  "shamtq": {
++    "msb": 26,
++    "lsb": 20,
++    "bits": [6, 5, 4, 3, 2, 1, 0],
++    "count": 6
++  },
++  "shamtd": {
++    "msb": 25,
++    "lsb": 20,
++    "bits": [5, 4, 3, 2, 1, 0],
++    "count": 17
++  },
++  "shamtw": {
++    "msb": 24,
++    "lsb": 20,
++    "bits": [4, 3, 2, 1, 0],
++    "count": 29
++  },
++  "shamtw4": {
++    "msb": 23,
++    "lsb": 20,
++    "bits": [3, 2, 1, 0],
++    "count": 2
++  },
++  "imm12": {
++    "msb": 31,
++    "lsb": 20,
++    "bits": [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
++    "kind": "sext",
++    "count": 23
++  },
++  "imm12lo": {
++    "msb": 11,
++    "lsb": 7,
++    "bits": [4, 3, 2, 1, 0],
++    "count": 9
++  },
++  "imm12hi": {
++    "msb": 31,
++    "lsb": 25,
++    "bits": [11, 10, 9, 8, 7, 6, 5],
++    "count": 12
++  },
++  "imm20": {
++    "msb": 31,
++    "lsb": 12,
++    "bits": [
++      31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14,
++      13, 12
++    ],
++    "count": 2
++  },
++  "jimm20": {
++    "msb": 31,
++    "lsb": 12,
++    "bits": [
++      20, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 11, 19, 18, 17, 16, 15, 14, 13, 12
++    ],
++    "count": 1
++  },
++  "vd": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "vr",
++    "prio": 10,
++    "dst": true,
++    "count": 412
++  },
++  "vs1": {
++    "msb": 19,
++    "lsb": 15,
++    "kind": "vr",
++    "prio": 40,
++    "src": true,
++    "count": 128
++  },
++  "vs2": {
++    "msb": 24,
++    "lsb": 20,
++    "kind": "vr",
++    "prio": 30,
++    "src": true,
++    "count": 380
++  },
++  "vs3": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "vr",
++    "prio": 20,
++    "src": true,
++    "dst": true,
++    "count": 38
++  },
++  "vm": {
++    "msb": 25,
++    "lsb": 25,
++    "count": 395
++  },
++  "nf": {
++    "msb": 31,
++    "lsb": 29,
++    "count": 72
++  },
++  "wd": {
++    "msb": 26,
++    "lsb": 26,
++    "count": 36
++  },
++  "simm5": {
++    "msb": 19,
++    "lsb": 15,
++    "bits": [4, 3, 2, 1, 0],
++    "kind": "sext",
++    "count": 30
++  },
++  "zimm5": {
++    "msb": 19,
++    "lsb": 15
++  },
++  "fd_p": {
++    "msb": 4,
++    "lsb": 2,
++    "kind": "frc",
++    "prio": 10,
++    "dst": true,
++    "count": 10
++  },
++  "fs2_p": {
++    "msb": 4,
++    "lsb": 2,
++    "kind": "frc",
++    "prio": 30,
++    "src": true,
++    "count": 15
++  },
++  "c_fs2": {
++    "msb": 6,
++    "lsb": 2,
++    "kind": "fr",
++    "prio": 30,
++    "src": true,
++    "count": 6
++  },
++  "rs1_p": {
++    "msb": 9,
++    "lsb": 7,
++    "kind": "xrc",
++    "prio": 20,
++    "src": true,
++    "count": 19
++  },
++  "rs2_p": {
++    "msb": 4,
++    "lsb": 2,
++    "kind": "xrc",
++    "prio": 30,
++    "src": true,
++    "count": 15
++  },
++  "rd_p": {
++    "msb": 4,
++    "lsb": 2,
++    "kind": "xrc",
++    "prio": 10,
++    "dst": true,
++    "count": 10
++  },
++  "rd_rs1_n0": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "xr",
++    "prio": 10,
++    "dst": true,
++    "src": true,
++    "count": 3
++  },
++  "rd_rs1_p": {
++    "msb": 9,
++    "lsb": 7,
++    "kind": "xrc",
++    "prio": 10,
++    "dst": true,
++    "src": true,
++    "count": 18
++  },
++  "rd_rs1": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "xr",
++    "prio": 10,
++    "dst": true,
++    "count": 3
++  },
++  "rd_n2": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "xr",
++    "prio": 10,
++    "dst": true,
++    "count": 1
++  },
++  "rd_n0": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "xr",
++    "prio": 10,
++    "dst": true,
++    "count": 3
++  },
++  "rs1_n0": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "xr",
++    "prio": 20,
++    "src": true,
++    "count": 1
++  },
++  "c_rs2_n0": {
++    "msb": 6,
++    "lsb": 2,
++    "kind": "xr",
++    "prio": 30,
++    "src": true,
++    "count": 2
++  },
++  "c_rs1_n0": {
++    "msb": 11,
++    "lsb": 7,
++    "kind": "xr",
++    "prio": 20,
++    "src": true,
++    "count": 1
++  },
++  "c_rs2": {
++    "msb": 6,
++    "lsb": 2,
++    "kind": "xr",
++    "prio": 30,
++    "src": true,
++    "count": 6
++  },
++  "c_sreg1": {
++    "msb": 9,
++    "lsb": 7,
++    "kind": "xrc",
++    "prio": 20,
++    "src": true,
++    "count": 2
++  },
++  "c_sreg2": {
++    "msb": 4,
++    "lsb": 2,
++    "kind": "xrc",
++    "prio": 30,
++    "src": true,
++    "count": 2
++  },
++  "aq": {
++    "msb": 26,
++    "lsb": 26,
++    "count": 22
++  },
++  "rl": {
++    "msb": 25,
++    "lsb": 25,
++    "count": 22
++  },
++  "c_nzuimm10": {
++    "msb": 12,
++    "lsb": 5,
++    "bits": [5, 4, 9, 8, 7, 6, 2, 3],
++    "count": 1
++  },
++  "c_uimm7lo": {
++    "msb": 6,
++    "lsb": 5,
++    "bits": [2, 6],
++    "count": 4
++  },
++  "c_uimm7hi": {
++    "msb": 12,
++    "lsb": 10,
++    "bits": [5, 4, 3],
++    "count": 4
++  },
++  "c_nzimm6lo": {
++    "msb": 6,
++    "lsb": 2,
++    "bits": [4, 3, 2, 1, 0],
++    "count": 2
++  },
++  "c_nzimm6hi": {
++    "msb": 12,
++    "lsb": 12,
++    "bits": [5],
++    "count": 2
++  },
++  "c_imm6lo": {
++    "msb": 6,
++    "lsb": 2,
++    "bits": [4, 3, 2, 1, 0],
++    "count": 4
++  },
++  "c_imm6hi": {
++    "msb": 12,
++    "lsb": 12,
++    "bits": [5],
++    "kind": "sext",
++    "count": 4
++  },
++  "c_nzimm10lo": {
++    "msb": 6,
++    "lsb": 2,
++    "bits": [4, 6, 8, 7, 5],
++    "count": 1
++  },
++  "c_nzimm10hi": {
++    "msb": 12,
++    "lsb": 12,
++    "bits": [9],
++    "count": 1
++  },
++  "c_nzimm18lo": {
++    "msb": 6,
++    "lsb": 2,
++    "bits": [16, 15, 14, 13, 12],
++    "count": 1
++  },
++  "c_nzimm18hi": {
++    "msb": 12,
++    "lsb": 12,
++    "bits": [17],
++    "count": 1
++  },
++  "c_imm12": {
++    "msb": 12,
++    "lsb": 2,
++    "bits": [11, 4, 9, 8, 10, 6, 7, 3, 2, 1, 5],
++    "count": 2
++  },
++  "c_bimm9lo": {
++    "msb": 6,
++    "lsb": 2,
++    "bits": [7, 6, 2, 1, 5],
++    "count": 2
++  },
++  "c_bimm9hi": {
++    "msb": 12,
++    "lsb": 10,
++    "bits": [8, 4, 3],
++    "count": 2
++  },
++  "c_uimm8splo": {
++    "msb": 6,
++    "lsb": 2,
++    "bits": [4, 3, 2, 7, 6],
++    "count": 2
++  },
++  "c_uimm8sphi": {
++    "msb": 12,
++    "lsb": 12,
++    "bits": [5],
++    "count": 2
++  },
++  "c_uimm8sp_s": {
++    "msb": 12,
++    "lsb": 7,
++    "bits": [5, 4, 3, 2, 7, 6],
++    "count": 2
++  },
++  "c_nzuimm5": {
++    "msb": 6,
++    "lsb": 2,
++    "bits": [4, 3, 2, 1, 0],
++    "count": 2
++  },
++  "c_nzuimm6lo": {
++    "msb": 6,
++    "lsb": 2,
++    "bits": [4, 3, 2, 1, 0],
++    "count": 4
++  },
++  "c_nzuimm6hi": {
++    "msb": 12,
++    "lsb": 12,
++    "bits": [5],
++    "count": 3
++  },
++  "c_uimm8lo": {
++    "msb": 6,
++    "lsb": 5,
++    "bits": [7, 6],
++    "count": 6
++  },
++  "c_uimm8hi": {
++    "msb": 12,
++    "lsb": 10,
++    "bits": [5, 4, 3],
++    "count": 6
++  },
++  "c_uimm9splo": {
++    "msb": 6,
++    "lsb": 2,
++    "bits": [4, 5, 8, 7, 6],
++    "count": 3
++  },
++  "c_uimm9sphi": {
++    "msb": 12,
++    "lsb": 12,
++    "bits": [5],
++    "count": 3
++  },
++  "c_uimm9sp_s": {
++    "msb": 12,
++    "lsb": 7,
++    "bits": [5, 4, 3, 8, 7, 6],
++    "count": 3
++  },
++  "c_uimm2": {
++    "msb": 6,
++    "lsb": 5,
++    "count": 2
++  },
++  "c_uimm1": {
++    "msb": 5,
++    "lsb": 5,
++    "count": 3
++  },
++  "c_spimm": {
++    "msb": 3,
++    "lsb": 2,
++    "count": 4
++  },
++  "c_uimm9lo": {
++    "msb": 6,
++    "lsb": 5,
++    "count": 2
++  },
++  "c_uimm9hi": {
++    "msb": 12,
++    "lsb": 10,
++    "count": 2
++  },
++  "c_uimm10splo": {
++    "msb": 6,
++    "lsb": 2,
++    "count": 1
++  },
++  "c_uimm10sphi": {
++    "msb": 12,
++    "lsb": 12,
++    "count": 1
++  },
++  "c_uimm10sp_s": {
++    "msb": 12,
++    "lsb": 7,
++    "count": 1
++  },
++  "c_index": {
++    "msb": 9,
++    "lsb": 2,
++    "count": 1
++  },
++  "c_rlist": {
++    "msb": 7,
++    "lsb": 4,
++    "count": 4
++  },
++  "bs": {
++    "msb": 31,
++    "lsb": 30,
++    "count": 6
++  },
++  "rnum": {
++    "msb": 23,
++    "lsb": 20,
++    "count": 1
++  },
++  "bimm12hi": {
++    "msb": 31,
++    "lsb": 25,
++    "bits": [12, 10, 9, 8, 7, 6, 5],
++    "count": 6
++  },
++  "bimm12lo": {
++    "msb": 11,
++    "lsb": 7,
++    "bits": [4, 3, 2, 1, 11],
++    "count": 6
++  },
++  "fm": {
++    "msb": 31,
++    "lsb": 28,
++    "kind": "fm",
++    "count": 1
++  },
++  "pred": {
++    "msb": 27,
++    "lsb": 24,
++    "kind": "pred",
++    "count": 1
++  },
++  "succ": {
++    "msb": 23,
++    "lsb": 20,
++    "kind": "succ",
++    "count": 1
++  },
++  "csr": {
++    "msb": 31,
++    "lsb": 20,
++    "kind": "csr",
++    "count": 6
++  },
++  "zimm": {
++    "msb": 19,
++    "lsb": 15,
++    "count": 6
++  },
++  "zimm10": {
++    "msb": 29,
++    "lsb": 20,
++    "kind": "vtypei",
++    "count": 1
++  },
++  "zimm11": {
++    "msb": 30,
++    "lsb": 20,
++    "kind": "vtypei",
++    "count": 1
++  },
++  "zimm6hi": {
++    "msb": 26,
++    "lsb": 26
++  },
++  "zimm6lo": {
++    "msb": 19,
++    "lsb": 15
++  },
++  "imm2": {
++    "msb": 21,
++    "lsb": 20,
++    "count": 1
++  },
++  "imm3": {
++    "msb": 22,
++    "lsb": 20,
++    "count": 9
++  },
++  "imm4": {
++    "msb": 23,
++    "lsb": 20,
++    "count": 8
++  },
++  "imm5": {
++    "msb": 24,
++    "lsb": 20,
++    "count": 11
++  },
++  "imm6": {
++    "msb": 25,
++    "lsb": 20,
++    "count": 1
++  },
++  "mop_r_t_30": {
++    "msb": 30,
++    "lsb": 30
++  },
++  "mop_r_t_27_26": {
++    "msb": 27,
++    "lsb": 26
++  },
++  "mop_r_t_21_20": {
++    "msb": 21,
++    "lsb": 20
++  },
++  "mop_rr_t_30": {
++    "msb": 30,
++    "lsb": 30
++  },
++  "mop_rr_t_27_26": {
++    "msb": 27,
++    "lsb": 26
++  },
++  "c_mop_t": {
++    "msb": 10,
++    "lsb": 8
++  }
++}
+diff --git a/backends/opcodes_maker/generator.py b/backends/opcodes_maker/generator.py
+new file mode 100755
+index 0000000000..e61c516385
+--- /dev/null
++++ b/backends/opcodes_maker/generator.py
+@@ -0,0 +1,186 @@
++#!/usr/bin/env python3
++
++import argparse
++import json
++import logging
++import pprint
++import os
++import sys
++import shutil
++from contextlib import contextmanager
++from pathlib import Path
++from typing import Dict, List, Any
++
++# Add riscv-opcodes directory to Python path
++SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
++RISCV_OPCODES_DIR = os.path.join(SCRIPT_DIR, "..", "..", "ext", "riscv-opcodes")
++sys.path.insert(0, RISCV_OPCODES_DIR)
++
++
++@contextmanager
++def working_directory(path):
++    """Context manager for changing the current working directory"""
++    prev_cwd = os.getcwd()
++    os.chdir(path)
++    try:
++        yield prev_cwd
++    finally:
++        os.chdir(prev_cwd)
++
++
++# Change to riscv-opcodes directory when importing to ensure relative paths work
++with working_directory(RISCV_OPCODES_DIR):
++    from c_utils import make_c
++    from chisel_utils import make_chisel
++    from constants import emitted_pseudo_ops
++    from go_utils import make_go
++    from latex_utils import make_latex_table, make_priv_latex_table
++    from rust_utils import make_rust
++    from sverilog_utils import make_sverilog
++
++LOG_FORMAT = "%(levelname)s:: %(message)s"
++LOG_LEVEL = logging.INFO
++
++pretty_printer = pprint.PrettyPrinter(indent=2)
++logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
++
++
++def load_instruction_dict(json_path: str) -> Dict[str, Any]:
++    """
++    Load instruction dictionary from a JSON file.
++    """
++    try:
++        with open(json_path, encoding="utf-8") as f:
++            return json.load(f)
++    except FileNotFoundError:
++        logging.error(f"Input JSON file not found: {json_path}")
++        raise
++    except json.JSONDecodeError:
++        logging.error(f"Invalid JSON format in file: {json_path}")
++        raise
++
++
++def move_file(src: str, dest_dir: str):
++    """
++    Move a file to the destination directory if it exists.
++    """
++    if os.path.exists(src):
++        dest = os.path.join(dest_dir, os.path.basename(src))
++        shutil.move(src, dest)
++
++
++def generate_outputs(
++    instr_dict: Dict[str, Any],
++    include_pseudo: bool,
++    c: bool,
++    chisel: bool,
++    spinalhdl: bool,
++    sverilog: bool,
++    rust: bool,
++    go: bool,
++    latex: bool,
++):
++    """
++    Generate output files based on the instruction dictionary.
++    """
++    # Sort the dictionary for consistent output
++    instr_dict = dict(sorted(instr_dict.items()))
++
++    # Save the processed dictionary in current directory
++    with open("processed_instr_dict.json", "w", encoding="utf-8") as outfile:
++        json.dump(instr_dict, outfile, indent=2)
++
++    # Generate files in riscv-opcodes directory and move them to current directory
++    with working_directory(RISCV_OPCODES_DIR) as orig_dir:
++        if c:
++            # For C output, filter pseudo-ops if needed
++            if not include_pseudo:
++                c_dict = {
++                    k: v for k, v in instr_dict.items() if k not in emitted_pseudo_ops
++                }
++            else:
++                c_dict = instr_dict
++            make_c(c_dict)
++            move_file("encoding.out.h", orig_dir)
++            logging.info("encoding.out.h generated successfully")
++
++        if chisel:
++            make_chisel(instr_dict)
++            move_file("inst.chisel", orig_dir)
++            logging.info("inst.chisel generated successfully")
++
++        if spinalhdl:
++            make_chisel(instr_dict, True)
++            move_file("inst.spinalhdl", orig_dir)
++            logging.info("inst.spinalhdl generated successfully")
++
++        if sverilog:
++            make_sverilog(instr_dict)
++            move_file("inst.sverilog", orig_dir)
++            logging.info("inst.sverilog generated successfully")
++
++        if rust:
++            make_rust(instr_dict)
++            move_file("inst.rs", orig_dir)
++            logging.info("inst.rs generated successfully")
++
++        if go:
++            make_go(instr_dict)
++            move_file("inst.go", orig_dir)
++            logging.info("inst.go generated successfully")
++
++        if latex:
++            make_latex_table()
++            make_priv_latex_table()
++            move_file("instr-table.tex", orig_dir)
++            move_file("priv-instr-table.tex", orig_dir)
++            logging.info("LaTeX files generated successfully")
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Generate RISC-V constants from JSON input"
++    )
++    parser.add_argument(
++        "input_json", help="Path to JSON file containing instruction definitions"
++    )
++    parser.add_argument(
++        "-pseudo", action="store_true", help="Include pseudo-instructions"
++    )
++    parser.add_argument("-c", action="store_true", help="Generate output for C")
++    parser.add_argument(
++        "-chisel", action="store_true", help="Generate output for Chisel"
++    )
++    parser.add_argument(
++        "-spinalhdl", action="store_true", help="Generate output for SpinalHDL"
++    )
++    parser.add_argument(
++        "-sverilog", action="store_true", help="Generate output for SystemVerilog"
++    )
++    parser.add_argument("-rust", action="store_true", help="Generate output for Rust")
++    parser.add_argument("-go", action="store_true", help="Generate output for Go")
++    parser.add_argument("-latex", action="store_true", help="Generate output for Latex")
++
++    args = parser.parse_args()
++
++    # Load instruction dictionary from JSON
++    instr_dict = load_instruction_dict(args.input_json)
++
++    print(f"Loaded instruction dictionary from: {args.input_json}")
++
++    # Generate outputs based on the loaded dictionary
++    generate_outputs(
++        instr_dict,
++        args.pseudo,
++        args.c,
++        args.chisel,
++        args.spinalhdl,
++        args.sverilog,
++        args.rust,
++        args.go,
++        args.latex,
++    )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/backends/opcodes_maker/sorter.py b/backends/opcodes_maker/sorter.py
+new file mode 100644
+index 0000000000..bde4f78a1d
+--- /dev/null
++++ b/backends/opcodes_maker/sorter.py
+@@ -0,0 +1,32 @@
++import json
++
++
++def sort_instr_json(dir_name, outname):
++    with open(dir_name) as file:
++        data = json.load(file)
++
++    sorted_data = {}
++    for key in sorted(data):
++        entry = data[key]
++        if "variable_fields" in entry:
++            entry["variable_fields"] = sorted(entry["variable_fields"])
++        if "extension" in entry:
++            entry["extension"] = sorted(entry["extension"])
++
++        # Add the processed entry to the sorted data
++        sorted_data[key] = entry
++
++    # Write the sorted data with an indentation of 2 spaces
++    with open(outname, "w") as file:
++        json.dump(sorted_data, file, indent=2)
++
++    print(json.dumps(sorted_data, indent=2))
++
++
++def main():
++    # Uncomment and adjust file names as needed
++    # sort_instr_json("instr_dict.json", "udb_sorted_data.json")
++    sort_instr_json("processed_instr_dict.json", "sorted_instr_dict.json")
++
++
++main()
+diff --git a/backends/opcodes_maker/yaml_to_json.py b/backends/opcodes_maker/yaml_to_json.py
+new file mode 100755
+index 0000000000..d2754e3f3a
+--- /dev/null
++++ b/backends/opcodes_maker/yaml_to_json.py
+@@ -0,0 +1,809 @@
++import re
++from typing import List, Dict, Union, Any
++import argparse
++import os
++import sys
++import yaml
++import json
++from re import findall
++
++# Mapping of instructions to their canonical fields
++#  needed for compressed instructions since their immediates have a syntax impossible (to the best of my knowledge) to replicate
++HARDCODED_FIELDS = {
++    # Compressed instructions
++    "c_addi": ["rd_rs1_n0", "c_nzimm6lo", "c_nzimm6hi"],
++    "c_addi16sp": ["c_nzimm10hi", "c_nzimm10lo"],
++    "c_addi4spn": ["rd_p", "c_nzuimm10"],
++    "c_addiw": ["rd_rs1_n0", "c_imm6lo", "c_imm6hi"],
++    "c_andi": ["rd_rs1_p", "c_imm6hi", "c_imm6lo"],
++    "c_beqz": ["rs1_p", "c_bimm9lo", "c_bimm9hi"],
++    "c_bnez": ["rs1_p", "c_bimm9lo", "c_bimm9hi"],
++    "c_fld": ["rd_p", "rs1_p", "c_uimm8lo", "c_uimm8hi"],
++    "c_fldsp": ["rd", "c_uimm9sphi", "c_uimm9splo"],
++    "c_flw": ["rd_p", "rs1_p", "c_uimm7lo", "c_uimm7hi"],
++    "c_flwsp": ["rd", "c_uimm8sphi", "c_uimm8splo"],
++    "c_fsd": ["rs1_p", "rs2_p", "c_uimm8lo", "c_uimm8hi"],
++    "c_fsdsp": ["c_rs2", "c_uimm9sp_s"],
++    "c_fsw": ["rs1_p", "rs2_p", "c_uimm7lo", "c_uimm7hi"],
++    "c_fswsp": ["c_rs2", "c_uimm8sp_s"],
++    "c_j": ["c_imm12"],
++    "c_jal": ["c_imm12"],
++    "c_jr": ["rs1_n0"],
++    "c_lbu": ["rd_p", "rs1_p", "c_uimm2"],
++    "c_ld": ["rd_p", "rs1_p", "c_uimm8lo", "c_uimm8hi"],
++    "c_ldsp": ["rd_n0", "c_uimm9sphi", "c_uimm9splo"],
++    "c_lh": ["rd_p", "rs1_p", "c_uimm1"],
++    "c_lhu": ["rd_p", "rs1_p", "c_uimm1"],
++    "c_li": ["rd_n0", "c_imm6lo", "c_imm6hi"],
++    "c_lui": ["rd_n2", "c_nzimm18hi", "c_nzimm18lo"],
++    "c_lw": ["rd_p", "rs1_p", "c_uimm7lo", "c_uimm7hi"],
++    "c_lwsp": ["rd_n0", "c_uimm8sphi", "c_uimm8splo"],
++    "c_mv": ["rd_n0", "c_rs2_n0"],
++    "c_nop": ["c_nzimm6hi", "c_nzimm6lo"],
++    "c_sb": ["rs2_p", "rs1_p", "c_uimm2"],
++    "c_sd": ["rs1_p", "rs2_p", "c_uimm8hi", "c_uimm8lo"],
++    "c_sdsp": ["c_rs2", "c_uimm9sp_s"],
++    "c_sh": ["rs2_p", "rs1_p", "c_uimm1"],
++    "c_slli": ["rd_rs1_n0", "c_nzuimm6hi", "c_nzuimm6lo"],
++    "c_srai": ["rd_rs1_p", "c_nzuimm6lo", "c_nzuimm6hi"],
++    "c_srli": ["rd_rs1_p", "c_nzuimm6lo", "c_nzuimm6hi"],
++    "c_sw": ["rs1_p", "rs2_p", "c_uimm7lo", "c_uimm7hi"],
++    "c_swsp": ["c_rs2", "c_uimm8sp_s"],
++    # CM instructions
++    "cm_mva01s": ["c_sreg1", "c_sreg2"],
++    "cm_mvsa01": ["c_sreg1", "c_sreg2"],
++}
++
++
++def load_fieldo() -> dict:
++    """Load the fieldo.json file from the current directory."""
++    this_dir = os.path.dirname(os.path.abspath(__file__))
++    json_path = os.path.join(this_dir, "fieldo.json")
++    try:
++        with open(json_path) as f:
++            return json.load(f)
++    except FileNotFoundError:
++        raise FileNotFoundError(f"Could not find fieldo.json in {this_dir}")
++    except json.JSONDecodeError:
++        raise ValueError(f"Invalid JSON format in fieldo.json")
++
++
++# Register names that need special handling
++reg_names = {"qs1", "qs2", "qd", "fs1", "fs2", "fd", "hs1", "dd", "hd"}
++fieldo = load_fieldo()
++
++
++def range_size(range_str: str) -> int:
++    """Calculate the width of a bit range like '31-20'. Returns 0 if invalid."""
++    try:
++        end, start = map(int, range_str.split("-"))
++        return abs(end - start) + 1
++    except Exception:
++        return 0
++
++
++def lookup_immediate_by_range(
++    var_base: str,
++    high: int,
++    low: int,
++    instr_name: str,
++    left_shift: bool = False,
++    hi: int = 0,
++    lo: int = 0,
++) -> Union[str, None]:
++    """
++    Find a canonical field name in fieldo that matches the bit range.
++
++    Args:
++        var_base: Base variable name (e.g., 'imm', 'bimm')
++        high: Most significant bit position
++        low: Least significant bit position
++        instr_name: Name of the instruction for context
++        left_shift: Flag for left-shift operations
++        hi: Set to 1 when looking for high portion of a field
++        lo: Set to 1 when looking for low portion of a field
++
++    Returns:
++        Canonical field name or None if not found
++    """
++    # Search for fields that match the bit range
++    candidates = []
++    for key, field in fieldo.items():
++        if field.get("msb") == high and field.get("lsb") == low:
++            # Handle standard immediates
++            if var_base == "imm" or var_base == "uimm":
++                if "imm" in key and not key.startswith("c_") and key != "csr":
++                    candidates.append(key)
++            # Handle compressed immediates
++            elif var_base.startswith("c_") or var_base.startswith("c_imm"):
++                if key.startswith("c_"):
++                    candidates.append(key)
++            # Handle other field types
++            else:
++                if key.startswith(var_base):
++                    candidates.append(key)
++
++    # Filter by hi/lo flags if requested
++    if hi == 1:
++        candidates = [c for c in candidates if "hi" in c.lower()]
++    if lo == 1:
++        candidates = [c for c in candidates if "lo" in c.lower()]
++
++    print(
++        f"DEBUG: lookup_immediate_by_range: var_base='{var_base}', high={high}, low={low}, hi_flag={hi}, lo_flag={lo}, candidates={candidates}"
++    )
++
++    # Pick the best candidate
++    if candidates:
++        if len(candidates) == 1:
++            return candidates[0]
++        else:
++            # Apply heuristics for multiple candidates
++            if left_shift:
++                for cand in candidates:
++                    if cand.startswith("bimm"):
++                        return cand
++
++            # Prefer "zimm" for imm fields
++            if var_base == "imm" and "zimm" in candidates:
++                return "zimm5"
++
++            # Instruction-specific preferences
++            lower_instr = instr_name.lower()
++            for cand in candidates:
++                if lower_instr.startswith("j") and cand.startswith("jimm"):
++                    return cand
++                if lower_instr.startswith("b") and cand.startswith("bimm"):
++                    return cand
++
++            # Default to first candidate
++            return candidates[0]
++
++    return None
++
++
++def canonical_immediate_names(
++    var_name: str,
++    location: str,
++    instr_name: str,
++    left_shift: bool = False,
++    not_val: Union[str, None] = None,
++) -> List[str]:
++    """
++    Map YAML immediate variables to canonical field names.
++
++    This function handles various immediate encoding formats:
++    - 4-part branch immediates
++    - 4-part jump immediates
++    - 3-part compressed store/load immediates
++    - 2-part immediates
++    - Standard composite formats
++    - Single range immediates
++
++    Returns list of canonical field names or empty list if not found.
++    """
++    print(
++        f"DEBUG: canonical_immediate_names: var_name='{var_name}', location='{location}', instr_name='{instr_name}', not_val='{not_val}'"
++    )
++    parts = location.split("|")
++
++    # Handle 4-part branch immediates (format: 31|7|30-25|11-8)
++    if len(parts) == 4 and var_name == "imm" and instr_name.lower().startswith("b"):
++        try:
++            high_msb = int(parts[0])
++            high_lsb = int(parts[2].split("-")[-1])
++            low_msb = int(parts[3].split("-")[0])
++            low_lsb = int(parts[1])
++        except Exception as e:
++            print(f"DEBUG: Error parsing 4-part branch composite immediate: {e}")
++            return []
++
++        hi_candidate = lookup_immediate_by_range(
++            "bimm", high_msb, high_lsb, instr_name, left_shift=left_shift
++        )
++        lo_candidate = lookup_immediate_by_range(
++            "bimm", low_msb, low_lsb, instr_name, left_shift=left_shift
++        )
++
++        print(
++            f"DEBUG: 4-part branch composite: hi_candidate='{hi_candidate}', lo_candidate='{lo_candidate}'"
++        )
++        if hi_candidate is None or lo_candidate is None:
++            print(
++                f"DEBUG: 4-part branch composite immediate candidate not found for location '{location}'"
++            )
++            return []
++        return [hi_candidate, lo_candidate]
++
++    # Handle 4-part jump immediates (jal instruction)
++    elif len(parts) == 4 and var_name == "imm" and instr_name.lower().startswith("j"):
++        try:
++            high = int(parts[0])
++            low = int(parts[1].split("-")[1])
++        except Exception as e:
++            print(f"DEBUG: Error parsing 4-part jump composite immediate: {e}")
++            return []
++
++        candidate = lookup_immediate_by_range(
++            "jimm", high, low, instr_name, left_shift=left_shift
++        )
++        print(f"DEBUG: 4-part jump composite: candidate='{candidate}'")
++        if candidate is None:
++            return []
++        return [candidate]
++
++    # Handle 3-part compressed store/load immediates (e.g., c.sw format: 5|12-10|6)
++    elif "|" in location and len(parts) == 3:
++        try:
++            # The three parts need special adjustments based on encoding format
++            low_msb = int(parts[0].strip()) - 1  # e.g., 5 becomes 4
++            low_lsb = int(parts[2].strip()) - 4  # e.g., 6 becomes 2
++            high_range = parts[1].strip()  # e.g., "12-10"
++            high_msb, high_lsb = map(int, high_range.split("-"))
++        except Exception as e:
++            print(f"DEBUG: Error parsing 3-part composite immediate: {e}")
++            return []
++
++        print(
++            f"DEBUG: 3-part composite immediate: computed high=({high_msb},{high_lsb}), computed low=({low_msb},{low_lsb})"
++        )
++
++        # Use c_uimm prefix for c_sw/c_sd/c_ld instructions
++        if (
++            instr_name.lower().startswith("c_sw")
++            or instr_name.lower().startswith("c_sd")
++            or instr_name.lower().startswith("c_ld")
++        ):
++            prefix = "c_uimm"
++            print(
++                "DEBUG: Instruction starts with 'c_sw/c_sd/c_ld', using prefix 'c_uimm'"
++            )
++        else:
++            prefix = var_name
++            print(
++                f"DEBUG: Using default prefix '{prefix}' for 3-part composite immediate"
++            )
++
++        hi_candidate = lookup_immediate_by_range(
++            prefix, high_msb, high_lsb, instr_name, left_shift=left_shift, hi=1
++        )
++        lo_candidate = lookup_immediate_by_range(
++            prefix, low_msb, low_lsb, instr_name, left_shift=left_shift, lo=1
++        )
++
++        print(
++            f"DEBUG: 3-part composite immediate: hi_candidate='{hi_candidate}', lo_candidate='{lo_candidate}'"
++        )
++
++        # Try to find matching high/low pairs
++        if hi_candidate and hi_candidate.endswith("hi"):
++            desired_lo = hi_candidate.replace("hi", "lo")
++            print(f"DEBUG: Attempting to use paired lower candidate: '{desired_lo}'")
++            try:
++                if (
++                    desired_lo in fieldo
++                    and fieldo[desired_lo].get("msb") == low_msb
++                    and fieldo[desired_lo].get("lsb") == low_lsb
++                ):
++                    lo_candidate = desired_lo
++                    print(f"DEBUG: Paired lower candidate found: '{lo_candidate}'")
++            except Exception:
++                pass
++
++        if hi_candidate is None or lo_candidate is None:
++            print(
++                f"DEBUG: 3-part composite immediate candidate not found for location '{location}'"
++            )
++            return []
++
++        # Return low part first (important for store instructions)
++        return [lo_candidate, hi_candidate]
++
++    # Handle 2-part composite immediates (format: X|Y or X|Y-Z)
++    elif "|" in location and len(parts) == 2:
++        high_part = parts[0].strip()
++        low_part = parts[1].strip()
++
++        # Convert single-bit locations to range format
++        if "-" not in high_part:
++            high_range = f"{high_part}-{high_part}"
++        else:
++            high_range = high_part
++
++        if "-" not in low_part:
++            low_range = f"{low_part}-{low_part}"
++        else:
++            low_range = low_part
++
++        try:
++            high_msb, high_lsb = map(int, high_range.split("-"))
++            low_msb, low_lsb = map(int, low_range.split("-"))
++        except Exception as e:
++            print(f"DEBUG: Error parsing 2-part composite immediate ranges: {e}")
++            return []
++
++        print(
++            f"DEBUG: 2-part composite immediate parts: high=({high_msb},{high_lsb}), low=({low_msb},{low_lsb})"
++        )
++
++        # Use bimm prefix for branch instructions
++        if var_name == "imm" and instr_name.lower().startswith("b"):
++            prefix = "bimm"
++            print("DEBUG: Branch immediate, using prefix 'bimm'")
++        else:
++            prefix = var_name
++            print(f"DEBUG: Using default prefix '{prefix}'")
++
++        hi_candidate = lookup_immediate_by_range(
++            prefix, high_msb, high_lsb, instr_name, left_shift=left_shift
++        )
++        lo_candidate = lookup_immediate_by_range(
++            prefix, low_msb, low_lsb, instr_name, left_shift=left_shift
++        )
++
++        print(
++            f"DEBUG: 2-part composite immediate: hi_candidate='{hi_candidate}', lo_candidate='{lo_candidate}'"
++        )
++
++        # Look for paired hi/lo fields
++        if hi_candidate and hi_candidate.endswith("hi"):
++            desired_lo = hi_candidate.replace("hi", "lo")
++            print(f"DEBUG: Attempting to use paired lower candidate: '{desired_lo}'")
++            try:
++                if (
++                    desired_lo in fieldo
++                    and fieldo[desired_lo].get("msb") == low_msb
++                    and fieldo[desired_lo].get("lsb") == low_lsb
++                ):
++                    lo_candidate = desired_lo
++                    print(f"DEBUG: Paired lower candidate found: '{lo_candidate}'")
++            except Exception:
++                pass
++
++        if hi_candidate is None or lo_candidate is None:
++            print(
++                f"DEBUG: 2-part composite immediate candidate not found for location '{location}'"
++            )
++            return []
++
++        return [hi_candidate, lo_candidate]
++
++    # Handle standard format X-Y|Z-W with regex
++    elif "|" in location:
++        match = re.match(r"(\d+-\d+)\|(\d+-\d+)", location)
++        if match:
++            high_range = match.group(1)
++            low_range = match.group(2)
++            try:
++                high_msb, high_lsb = map(int, high_range.split("-"))
++                low_msb, low_lsb = map(int, low_range.split("-"))
++            except Exception as e:
++                print(f"DEBUG: Error parsing standard composite ranges: {e}")
++                return []
++
++            prefix = (
++                "bimm"
++                if var_name == "imm" and instr_name.lower().startswith("b")
++                else var_name
++            )
++            hi_candidate = lookup_immediate_by_range(
++                prefix, high_msb, high_lsb, instr_name, left_shift=left_shift
++            )
++            lo_candidate = lookup_immediate_by_range(
++                prefix, low_msb, low_lsb, instr_name, left_shift=left_shift
++            )
++
++            print(
++                f"DEBUG: standard composite: hi_candidate='{hi_candidate}', lo_candidate='{lo_candidate}'"
++            )
++            if hi_candidate is None or lo_candidate is None:
++                return []
++            return [hi_candidate, lo_candidate]
++
++        else:
++            # Fall back to number extraction
++            nums = list(map(int, findall(r"\d+", location)))
++            if len(nums) >= 2:
++                high, low = nums[0], nums[1]
++                candidate = lookup_immediate_by_range(
++                    var_name, high, low, instr_name, left_shift=left_shift
++                )
++                print(f"DEBUG: fallback composite: candidate='{candidate}'")
++                if candidate:
++                    return [candidate]
++            print(
++                f"DEBUG: Fallback composite immediate candidate not found for location '{location}'"
++            )
++            return []
++
++    # Handle simple range format X-Y or single bit X
++    else:
++        try:
++            # Handle single bit cases (e.g., "26" instead of "26-26")
++            if isinstance(location, int) or (
++                isinstance(location, str) and location.isdigit()
++            ):
++                high = low = int(location)
++            else:
++                high, low = map(int, location.split("-"))
++        except Exception:
++            print(
++                f"DEBUG: Invalid immediate location '{location}' for variable '{var_name}'"
++            )
++            return []
++
++        candidate = lookup_immediate_by_range(
++            var_name, high, low, instr_name, left_shift=left_shift
++        )
++        print(f"DEBUG: non-composite: candidate='{candidate}'")
++
++        if candidate:
++            # For "hi" fields, try to find the corresponding "lo" field
++            if candidate.endswith("hi"):
++                lo_candidate = lookup_immediate_by_range(
++                    var_name, 11, 7, instr_name, left_shift=left_shift
++                )
++                if lo_candidate:
++                    return [candidate, lo_candidate]
++            return [candidate]
++        else:
++            print(
++                f"DEBUG: No fieldo canonical name for {var_name} with range {location}"
++            )
++            return []
++
++
++def GetVariables(vars: List[Dict[str, str]], instr_name: str = "") -> List[str]:
++    """
++    Extract field names from YAML variables.
++
++    This processes variables from YAML and maps them to canonical field names
++    using various heuristics for different field types.
++    """
++    # Use hardcoded fields for certain instructions
++    if instr_name in HARDCODED_FIELDS:
++        print(
++            f"Using hardcoded fields for {instr_name}: {HARDCODED_FIELDS[instr_name]}"
++        )
++        return HARDCODED_FIELDS[instr_name]
++
++    result = []
++    for var in reversed(vars):
++        var_name = str(var["name"]).lower().strip()
++
++        # Get location and handle integer values
++        location_val = var.get("location", "")
++        if isinstance(location_val, int):
++            # Convert single integer to range format
++            location = f"{location_val}-{location_val}"
++        else:
++            location = str(location_val).strip()
++
++        # SPECIAL CASE: Always preserve original "fm" field name
++        # This prevents it from being replaced with "rm" due to bit position overlap
++        if var_name == "fm":
++            result.append("fm")
++            continue
++
++        # Handle register pair naming with slash
++        if "/" in var_name:
++            if var_name == "rd/rs1":
++                not_val = var.get("not", None)
++                if not_val is not None and str(not_val).strip() == "0":
++                    result.append("rd_rs1_n0")
++                else:
++                    result.append("rd_rs1_p")
++            else:
++                result.append(var_name)
++            continue
++
++        # Handle shift amount fields
++        if var_name == "shamt":
++            size = range_size(location)
++            if size == 5:
++                result.append("shamtw")
++            elif size == 6:
++                result.append("shamtd")
++            else:
++                result.append("shamt")
++            continue
++
++        # Handle immediate fields
++        if var_name in ("imm", "simm", "zimm", "jimm", "uimm") or var_name.startswith(
++            "c_"
++        ):
++            left_shift_flag = var.get("left_shift", 0) == 1
++            not_val = var.get("not", None)
++            canon_names = canonical_immediate_names(
++                var_name,
++                location,
++                instr_name,
++                left_shift=left_shift_flag,
++                not_val=not_val,
++            )
++            if canon_names:
++                result.extend(canon_names)
++            else:
++                print(
++                    f"Warning: Skipping immediate field {var_name} with location {location} since no fieldo mapping was found."
++                )
++                result.append(var_name)  # Add the original name as fallback
++            continue
++
++        # Handle special register names
++        if (
++            var_name in reg_names
++            or var_name.startswith("q")
++            or var_name.startswith("f")
++        ):
++            result.append("r" + var_name[1:])
++            continue
++
++        # Handle general variables with bit positions
++        if location:
++            try:
++                msb, lsb = map(int, location.split("-"))
++                candidate = None
++
++                # Try exact match first
++                if var_name in fieldo:
++                    field = fieldo[var_name]
++                    if field.get("msb") == msb and field.get("lsb") == lsb:
++                        candidate = var_name
++
++                # Try compressed variants
++                if candidate is None:
++                    prefix = "c_" + var_name
++                    comp_candidates = [
++                        key
++                        for key, field in fieldo.items()
++                        if key.startswith(prefix)
++                        and field.get("msb") == msb
++                        and field.get("lsb") == lsb
++                    ]
++                    if comp_candidates:
++                        candidate = comp_candidates[0]
++
++                # Try name-based matches
++                if candidate is None:
++                    all_candidates = [
++                        key
++                        for key, field in fieldo.items()
++                        if var_name in key
++                        and field.get("msb") == msb
++                        and field.get("lsb") == lsb
++                    ]
++                    if all_candidates:
++                        # Prefer exact match, then _p variants, then first match
++                        for cand in all_candidates:
++                            if cand == var_name:
++                                candidate = cand
++                                break
++                        if candidate is None:
++                            for cand in all_candidates:
++                                if "_p" in cand:
++                                    candidate = cand
++                                    break
++                        if candidate is None:
++                            candidate = all_candidates[0]
++
++                if candidate:
++                    result.append(candidate)
++                elif var_name in fieldo:
++                    result.append(var_name)
++                else:
++                    # Add original name as fallback
++                    result.append(var_name)
++                    print(
++                        f"Warning: Variable field '{var_name}' not found in fieldo mapping with location {location}; using original name"
++                    )
++            except Exception as e:
++                # Add original name when parsing fails
++                result.append(var_name)
++                print(
++                    f"Warning: Could not parse location '{location}' for variable '{var_name}': {e}"
++                )
++        else:
++            # Handle variables without location
++            if var_name in fieldo:
++                result.append(var_name)
++            else:
++                # Add original name as fallback
++                result.append(var_name)
++                print(
++                    f"Warning: Variable field '{var_name}' not found in fieldo mapping; using original name"
++                )
++
++    return result
++
++
++def GetMatchMask(bit_str: str) -> str:
++    """Convert a bit string with dashes to hex, replacing dashes with zeros."""
++    new_bit_str = ""
++    for bit in bit_str:
++        if bit == "-":
++            new_bit_str += "0"
++        else:
++            new_bit_str += bit
++    return hex(int(new_bit_str, 2))
++
++
++def GetMask(bit_str: str) -> str:
++    """Create a mask from a bit string, with 1's for bits and 0's for dashes."""
++    mask_str = ""
++    for bit in bit_str:
++        if bit == "-":
++            mask_str += "0"
++        else:
++            mask_str += "1"
++    return hex(int(mask_str, 2))
++
++
++def process_extension(ext: Union[str, dict]) -> List[str]:
++    """Extract extension names from YAML definedBy field."""
++    if isinstance(ext, str):
++        return [ext.lower()]
++    elif isinstance(ext, dict):
++        result = []
++        for item in ext.values():
++            if isinstance(item, list):
++                result.extend(
++                    [
++                        x.lower() if isinstance(x, str) else x["name"].lower()
++                        for x in item
++                    ]
++                )
++            elif isinstance(item, (str, dict)):
++                if isinstance(item, str):
++                    result.append(item.lower())
++                else:
++                    result.append(item["name"].lower())
++        return result
++    return []
++
++
++def GetExtensions(ext: Union[str, dict, list], base: str) -> List[str]:
++    """Get a list of extensions with RV prefix and remove duplicates."""
++    prefix = f"rv{base}_"
++    final_extensions = []
++
++    if isinstance(ext, (str, dict)):
++        extensions = process_extension(ext)
++        final_extensions.extend(prefix + x for x in extensions)
++    elif isinstance(ext, list):
++        for item in ext:
++            extensions = process_extension(item)
++            final_extensions.extend(prefix + x for x in extensions)
++
++    # Remove duplicates while preserving order
++    seen = set()
++    return [x for x in final_extensions if not (x in seen or seen.add(x))]
++
++
++def GetEncodings(enc: str) -> str:
++    """Pad encoding to 32 bits if needed."""
++    n = len(enc)
++    if n < 32:
++        return "-" * (32 - n) + enc
++    return enc
++
++
++def convert(file_dir: str, json_out: Dict[str, Any]) -> None:
++    """Process a single YAML file into JSON format."""
++    try:
++        with open(file_dir) as file:
++            data = yaml.safe_load(file)
++
++            # Skip non-instruction files
++            if data["kind"] != "instruction":
++                print(
++                    f"Error: File {file_dir} has kind '{data['kind']}', expected 'instruction'. Skipping."
++                )
++                return
++
++            instr_name = data["name"].replace(".", "_")
++            print(instr_name)
++            encodings = data["encoding"]
++
++            # Handle RV64 variant if present
++            rv64_flag = False
++            if "RV64" in encodings:
++                encodings = encodings["RV64"]
++                rv64_flag = True
++            enc_match = GetEncodings(encodings["match"])
++
++            # Extract variable fields
++            var_names = []
++            if "variables" in encodings:
++                var_names = GetVariables(encodings["variables"], instr_name)
++
++            # Extract extension information
++            extensions = []
++            prefix = ""
++            if rv64_flag:
++                prefix = "64"
++            try:
++                if "base" in data:
++                    extensions = GetExtensions(data["definedBy"], data["base"])
++                else:
++                    extensions = GetExtensions(data["definedBy"], prefix)
++            except Exception as e:
++                print(
++                    f"Warning: Error processing extensions for {instr_name}: {str(e)}"
++                )
++                extensions = []
++
++            # Calculate match and mask values
++            match_hex = GetMatchMask(enc_match)
++            match_mask = GetMask(enc_match)
++
++            # Store instruction data
++            json_out[instr_name] = {
++                "encoding": enc_match,
++                "variable_fields": var_names,
++                "extension": extensions,
++                "match": match_hex,
++                "mask": match_mask,
++            }
++    except Exception as e:
++        print(f"Error processing file {file_dir}: {str(e)}")
++        raise
++
++
++def find_yaml_files(path: str) -> List[str]:
++    """Find all YAML files in a directory tree."""
++    yaml_files = []
++    for root, _, files in os.walk(path):
++        for file in files:
++            if file.endswith(".yaml") or file.endswith(".yml"):
++                yaml_files.append(os.path.join(root, file))
++    return yaml_files
++
++
++def main():
++    """Main entry point for the script."""
++    parser = argparse.ArgumentParser(
++        description="Convert YAML instruction files to JSON"
++    )
++    parser.add_argument("input_dir", help="Directory containing YAML instruction files")
++    parser.add_argument("output_dir", help="Output directory for generated files")
++
++    args = parser.parse_args()
++
++    # Validate input directory
++    if not os.path.isdir(args.input_dir):
++        parser.error(f"Input directory does not exist: {args.input_dir}")
++
++    # Find YAML files
++    yaml_files = find_yaml_files(args.input_dir)
++    if not yaml_files:
++        parser.error(f"No YAML files found in {args.input_dir}")
++
++    # Process files
++    inst_dict = {}
++    output_file = os.path.join(args.output_dir, "instr_dict.json")
++
++    try:
++        for yaml_file in yaml_files:
++            try:
++                convert(yaml_file, inst_dict)
++            except Exception as e:
++                print(f"Warning: Failed to process {yaml_file}: {str(e)}")
++                continue
++
++        # Sort alphabetically
++        insts_sorted = {inst: inst_dict[inst] for inst in sorted(inst_dict)}
++
++        # Write output
++        with open(output_file, "w") as outfile:
++            json.dump(insts_sorted, outfile, indent=4)
++
++        print(f"Successfully processed {len(yaml_files)} YAML files")
++        print(f"Output written to: {output_file}")
++    except Exception as e:
++        print(f"Error: Failed to process YAML files: {str(e)}")
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/ext/riscv-opcodes b/ext/riscv-opcodes
+index 5ce8977a59..9bd0acd771 160000
+--- a/ext/riscv-opcodes
++++ b/ext/riscv-opcodes
+@@ -1 +1 @@
+-Subproject commit 5ce8977a5961a6bbfc1638e6676e60489665d882
++Subproject commit 9bd0acd77198aa70186ed3e8cc2931bceff97899

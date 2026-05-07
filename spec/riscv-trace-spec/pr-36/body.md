@@ -1,0 +1,5 @@
+…turn with coroutine swap in itype encoding
+
+The list of jump classifications in section 3.1.1 included both inferable and uninferable calls, but only uninferable tail calls.  Added the missing tail calls (jal x0 and c.j).  
+
+Following on from this, the itype codes for jump classification in Table 3-1 included both inferable and uninferable cases for all 4 types (call, tail call, return and other jump).  Whilst this is clearly symmetrical, it overlooks the fact that there is no such thing as an inferable return.  Returns are always with respect to either x1 or x5 and so are always uninferrable (notwithstanding implict return mode).  And arguably, if they did exist, they would be indistinguishable from inferable tail calls as they both use x0 as the link register.  So I've removed the inferable return itype code, and taken advantage of this to move coroutine swap from code 7 to code 13 (the former inferable return code).  This consolidates all the jump classification codes in the range 8 - 15, which is somewhat cleaner.  Code 7 is now reserved.

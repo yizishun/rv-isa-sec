@@ -1,0 +1,1 @@
+If rs1 fails its integrity check, then its tag is set to zero by construction (assuming the absence of faulty IP cores or memory corruption). Furthermore, we will later only adjust the M-bit if rs1 passes the integrity checks, so the previous check for them failing is unnecessary.

@@ -1,0 +1,81 @@
+PR #702  target=qemu  overall=potential_risk
+Spec: sipopret bundles implicit sret into interrupt-return; missing TCG privilege check (>=S-mode) lets U-mode guest craft stack frames for controlled S-mode privilege escalation
+Violation: QEMU TCG translates sipopret (opcode 0x73, funct3=0x0, rd=x0, funct7=0x08) without first checking current privilege >= S-mode. sipopret is a compound operation: (1) scspspop — conditionally swaps x2(sp) with ssp CSR based on ssp.PPUSH, (2) restores x10-x15 from guest stack memory at OFFSET(sp), (3) addi sp,sp,FRAMESIZE, (4) executes sret to return to lower privilege with sepc as target PC. If TCG permits U-mode execution (missing privilege gate, or incorrectly inheriting the old Smip-only decode tables where this encoding was invalid), a guest U-mode attacker can: craft a fake interrupt stack frame at an arbitrary VA with attacker-chosen x10-x15, sepc, and sstatus values in the corresponding CSRs; point sp at this frame; execute sipopret which silently transitions to S-mode at attacker-controlled sepc.
+Consequence: privilege_escape
+Pattern: sipopret|mipopret|scspspush|scspspop|mcspspush|mcspspop|has_ssip|has_smip|gen_helper_ipop|decode_xipop|trans_ipop|opcode_0x73.*funct7_0x08
+------------------------------------------------------------
+[potential_risk] target/riscv/csr.c:861-866  write_ssp
+  write_ssp() stores the raw guest value into env->ssp with no WARL masking. Per Zicfiss spec, SSP is a WARL CSR subject to alignment constraints (SSP must be aligned to the shadow stack access width, 4 or 8 bytes) and potential architectural-address-range constraints. Writing an unaligned value sets up subsequent sspush/sspopchk/ssamoswap instructions to trigger access faults or corrupt guest memory at unexpected addresses. A guest that writes a misaligned SSP via csrw ssp, value then executes sspush may cause a fault at a non-obvious PC, or worse, write the return address to a shifted location leaking RA to an attacker-observable address.
+  | static RISCVException write_ssp(CPURISCVState *env, int csrno,
+  |                                 target_ulong val, uintptr_t ra)
+  | {
+  |     env->ssp = val;
+  |     return RISCV_EXCP_NONE;
+  | }
+
+[potential_risk] target/riscv/csr.c:861-866  write_ssp
+  No TLB flush or icount update triggered on SSP write. While the Zicfiss spec does not require a TLB flush for SSP writes (SSP is a data pointer, not a page-table-affecting CSR), the act of changing SSP may affect the shadow stack page table walk behavior (SS-MMU-index-based access to PTE.W-only pages). If a guest writes a new SSP value pointing to a region whose PTEs have not yet been walked, the cached TLB entries may not reflect the shadow-stack interpretation of PTE.W-only pages, potentially allowing an sspush to succeed on a non-shadow-stack page. This is a latent correctness issue in the PTW/tlb interaction.
+  | static RISCVException write_ssp(CPURISCVState *env, int csrno,
+  |                                 target_ulong val, uintptr_t ra)
+  | {
+  |     env->ssp = val;
+  |     return RISCV_EXCP_NONE;
+  | }
+
+[compliant] target/riscv/insn32.decode:119-119  decode (sret entry)
+  The sipopret encoding space (SYSTEM opcode 0x73, funct3=0x0, rd=x0, funct7=0x08 = 0001000 binary, rs2=00110) does NOT match any decode table entry. The existing sret entry (line 119) explicitly requires rs2=00010. Unassigned SYSTEM encodings fall through to gen_exception_illegal() at translate.c:273. A U-mode guest attempting to execute sipopret gets RISCV_EXCP_ILLEGAL_INST — correct behavior. The privilege-escalation scenario described in the security spec would only materialize IF sipopret decode were added without the corresponding privilege gate, which has not occurred.
+  | sret        0001000    00010 00000 000 00000 1110011
+
+[compliant] target/riscv/op_helper.c:293-295  helper_sret
+  helper_sret() checks env->priv >= PRV_S at line 293, raising RISCV_EXCP_ILLEGAL_INST if violated. This is the correct defense-in-depth pattern that sipopret would need to replicate. Even though trans_sret() at trans_privileged.c.inc:97 checks has_ext(ctx, RVS) (which gates U-mode execution since RVS implies S-mode presence), the runtime check in the helper provides the hard privilege gate. This is the model to follow when implementing sipopret.
+  | if (!(env->priv >= PRV_S)) {
+  |     riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, GETPC());
+  | }
+
+[compliant] target/riscv/csr.c:189-213  cfi_ss
+  The SSP CSR access predicate cfi_ss() correctly enforces: (a) ext_zicfiss must be set, (b) M-mode always has access, (c) cpu_get_bcfien() must return true for other modes, (d) virtualized modes get RISCV_EXCP_VIRT_INSTRUCTION_FAULT, (e) U-mode with disabled S-mode SSE gets RISCV_EXCP_ILLEGAL_INST. Debugger access is always permitted. This is a complete and correct implementation of the Zicfiss CSR access policy.
+  | if (!env_archcpu(env)->cfg.ext_zicfiss) {
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+  | if (env->priv == PRV_M) {
+  |     return RISCV_EXCP_NONE;
+  | }
+  | if (!cpu_get_bcfien(env)) {
+
+[compliant] target/riscv/cpu_helper.c:92-119  cpu_get_bcfien
+  cpu_get_bcfien() correctly determines shadow stack enable status per privilege level: U-mode depends on SENVCFG_SSE, HS-mode on MENVCFG_SSE, VS-mode on HENVCFG_SSE, M-mode shadow stack is always off. The cascade (higher-priv must enable SSE for lower-priv) is enforced in write_senvcfg (lines 3295-3298) and write_henvcfg. This matches the Zicfiss v1.0 spec.
+  | case PRV_U:
+  |     return env->senvcfg & SENVCFG_SSE;
+  | case PRV_S:
+  |     if (env->virt_enabled) {
+  |         return env->henvcfg & HENVCFG_SSE;
+  |     }
+  |     return env->menvcfg & MENVCFG_SSE;
+
+[compliant] target/riscv/insn_trans/trans_rvzicfiss.c.inc:25-51  trans_sspopchk
+  trans_sspopchk correctly gates on ctx->bcfi_enabled (returns false = NOP if disabled, matching Zimop fallback semantics), loads from the shadow stack using SS_MMU_INDEX, compares against rs1, and raises RISCV_EXCP_SW_CHECK with tval=RISCV_EXCP_SW_CHECK_BCFI_TVAL (3) on mismatch. SSP is incremented by XLEN/8 on success. The privilege-isolation aspect is enforced indirectly: if bcfi is not enabled for the current priv, the instruction is a NOP, so a U-mode guest with SENVCFG_SSE=0 cannot use sspopchk to probe shadow stack contents.
+  | if (!ctx->bcfi_enabled) {
+  |     return false;
+  | }
+  | TCGv addr = tcg_temp_new();
+  | TCGLabel *skip = gen_new_label();
+  | uint32_t tmp = (get_xl(ctx) == MXL_RV64) ? 8 : 4;
+
+[compliant] target/riscv/machine.c:384-400  vmstate_ssp
+  SSP is included in migration state via vmstate_ssp subsection, conditioned on ext_zicfiss. The subsection pattern (needed = ssp_needed) correctly includes SSP only when Zicfiss is enabled on the source, preventing migration compatibility issues with QEMU instances that lack Zicfiss. No missing fields.
+  | static const VMStateDescription vmstate_ssp = {
+  |     .name = "cpu/ssp",
+  |     .version_id = 1,
+  |     .minimum_version_id = 1,
+  |     .needed = ssp_needed,
+  |     .fields = (const VMStateField[]) {
+  |         VMSTATE_UINTTL(env.ssp, RISCVCPU),
+  |         VMSTATE_END_OF_LIST()
+  |     }
+
+[compliant] target/riscv/cpu.c:773-776  riscv_cpu_reset_hold
+  SSP is reset to 0 on cpu_reset, which is the architecturally correct initial value per Zicfiss spec (shadow stack pointer starts at 0, grows downward). Combined with elp reset to false, the reset state is correct.
+  | env->elp = false;
+  | /* on reset ssp is set to 0 */
+  | env->ssp = 0;
+

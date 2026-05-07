@@ -1,0 +1,3 @@
+- Fix https://github.com/riscv-non-isa/riscv-external-debug-security/issues/146
+- Fix https://github.com/riscv-non-isa/riscv-external-debug-security/issues/144
+- Address https://github.com/riscv-non-isa/riscv-external-debug-security/issues/142 . Introduce new CSR msdcfg 

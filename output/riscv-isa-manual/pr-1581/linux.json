@@ -1,0 +1,129 @@
+{
+  "pr_number": 1581,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 1581,
+    "violation_condition": "In the Linux kernel, KVM emulation of CSRRS/CSRRC (vcpu_insn.c:162-168) or any kernel code using csr_read_set/csr_read_clear macros (csr.h:575-598) on a CSR containing bits whose architectural read value differs from the underlying stored value (e.g., pmpaddr[n][G-1] reads as 0 but stores 1 due to grain matching): the read-modify-write cycle reads the 'read-as' value, applies rs1's set/clear mask, then writes back — silently overwriting the underlying value of the 'reads-as' bits even though rs1 did not target them.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "csr_read_set|csr_read_clear on CSRs with WRITE-synthesized or grain-masked bits that differ from underlying storage; KVM CSRRS/CSRRC emulation doing read-then-write on CSRs with 'reads as' semantics",
+    "affected_entities": [
+      "pmpaddr",
+      "CSRRS",
+      "CSRRC",
+      "CSRRSI",
+      "CSRRCI"
+    ],
+    "summary": "CSRRS/CSRRC read-modify-write can corrupt underlying state of 'reads-as' bits (e.g., pmpaddr grain bits) when kernel modifies unrelated bits in the same CSR — KVM emulation and csr_read_set/clear macros are the primary exposure surface"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_insn.c",
+        "function_name": "csr_insn",
+        "line_start": 147,
+        "line_end": 227,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM CSRRS/CSRRC decode passes wr_mask and new_val to in-kernel handlers and user-space without any guard against CSRs that have 'reads as' semantics (e.g., pmpaddr[n][G-1] where grain-masked bits read as 0 but store 1). The CSRRS decode sets new_val=-1UL (line 164) and CSRRC sets new_val=0 (line 168). For CSRs not in the in-kernel csr_funcs[] table (which includes pmpaddr, pmpcfg, and most non-AIA/non-PMU CSRs), the kernel exits to user-space with KVM_EXIT_RISCV_CSR, delegating the actual read-modify-write to the VMM. If the VMM (e.g., QEMU) reads the 'read-as' architectural value and performs the RMW on that, the underlying storage bits will be silently corrupted. The in-kernel AIA handlers (aia_rmw_iprio, imsic_rmw) are safe because they operate on kernel-maintained swfile state, not actual hardware CSRs. The PMU handler rejects writes (wr_mask != 0 → illegal trap). No in-kernel safeguard exists to prevent or warn about CSRRS/CSRRC on CSRs known to have divergent read-vs-stored semantics.",
+      "snippet": "case GET_FUNCT3(INSN_MATCH_CSRRS):\n    wr_mask = rs1_val;\n    new_val = -1UL;\n    break;\ncase GET_FUNCT3(INSN_MATCH_CSRRC):\n    wr_mask = rs1_val;\n    new_val = 0;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "",
+        "line_start": 575,
+        "line_end": 599,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "csr_read_set/csr_read_clear macros expand to CSRRS/CSRRC hardware instructions, which perform an atomic read-modify-write cycle. When used on a CSR with 'reads as' semantics (e.g., pmpaddr[n][G-1] where grain-masked bits read as 0 but underlying storage is 1), the hardware reads the architectural 'read-as' value (0), applies the set/clear mask, and writes back — overwriting the underlying stored value of the 'reads-as' bits to 0 even when rs1 did not target those bits. For CSRRS with bit_i=0 in rs1: CSR[bit_i] = read_as(0) | 0 = 0, corrupting the underlying 1. All five current call sites (irqflags.h:33 STATUS.SR_IE, process.c:402 ENVCFG.PMM, vcpu_sbi_fwft.c:135 HENVCFG.PMM, vector.h:154,184 STATUS.SR_FS_DIRTY) are safe because STATUS/ENVCFG/HENVCFG do not have 'reads as' semantics. However, the macros carry no documentation warning and no compile-time or runtime guard against misuse on CSRs with 'reads as' bits, making them a latent footgun for future kernel code.",
+      "snippet": "#define csr_read_set(csr, val) ({ \\\n    unsigned long __v = (unsigned long)(val); \\\n    __asm__ __volatile__ (\"csrrs %0, \" __ASM_STR(csr) \", %1\" \\\n        : \"=r\" (__v) : \"rK\" (__v) : \"memory\"); \\\n    __v; })"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia.c",
+        "function_name": "aia_rmw_iprio",
+        "line_start": 351,
+        "line_end": 386,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "aia_rmw_iprio() implements RMW for AIA iprio indirect CSRs (CSR_SIREG with selected iprio registers). It reads old_val from kernel-maintained software state (aia_get_iprio8 calls into kvm_vcpu_aia_csr guest_csr fields, not actual hardware CSRs), then computes new_val = (old_val & ~wr_mask) | (new_val & wr_mask). Since old_val reflects the true stored value (not a 'reads-as' transformed value), the RMW is correct and does not suffer from the 'reads as' corruption issue. This is the proper pattern for in-kernel CSR emulation that the other handlers should follow.",
+      "snippet": "old_val = 0;\nfor (i = 0; i < nirqs; i++) {\n    prio = aia_get_iprio8(vcpu, first_irq + i);\n    old_val |= (unsigned long)prio << (TOPI_IPRIO_BITS * i);\n}\nif (wr_mask) {\n    new_val = (old_val & ~wr_mask) | (new_val & wr_mask);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_pmu.c",
+        "function_name": "kvm_riscv_vcpu_pmu_read_hpm",
+        "line_start": 364,
+        "line_end": 394,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HPMCOUNTER CSRs are correctly handled as read-only: any write attempt (wr_mask != 0) is rejected with KVM_INSN_ILLEGAL_TRAP (line 388-389). Since no RMW write-back occurs, there is no risk of corrupting underlying storage via 'reads as' semantics. The read path uses pmu_ctr_read() which reads from the kernel-maintained perf_event counter values, not from hardware CSRs with potential read-vs-store divergence.",
+      "snippet": "/* The counter CSR are read only. Thus, any write should result in illegal traps */\nif (wr_mask)\n    return KVM_INSN_ILLEGAL_TRAP;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "kvm_riscv_vcpu_aia_imsic_rmw",
+        "line_start": 902,
+        "line_end": 930,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "IMSIC RMW emulation operates on kernel-maintained swfile (imsic->swfile) state, not on hardware CSRs. The topei read returns the computed pending+enabled interrupt with highest priority from the swfile data structure. When wr_mask is set (write), the handler clears (acknowledges) the top pending interrupt by manipulating the swfile bitmask. No 'reads as' semantic mismatch exists because reads and writes both target the same software-maintained representation.",
+      "snippet": "topei = imsic_mrif_topei(imsic->swfile, imsic->nr_eix, imsic->nr_msis);\nif (val)\n    *val = topei;\n/* Writes ignore value and clear top pending interrupt */\nif (topei && wr_mask) {\n    topei >>= TOPEI_ID_SHIFT;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/irqflags.h",
+        "function_name": "arch_local_irq_save",
+        "line_start": 31,
+        "line_end": 34,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "csr_read_clear(CSR_STATUS, SR_IE) is a safe usage: it atomically reads sstatus and clears the IE (interrupt enable) bit. sstatus does not contain 'reads as' bits — all fields read back their written values (subject to WARL constraints, which for IE is straightforward: 0 or 1). No grain-masking or synthesized read values apply to this CSR. The atomic CSRRC instruction is the architecturally correct way to implement irq_save, and the underlying storage cannot be corrupted because the read value equals the stored value for all bits.",
+      "snippet": "static inline unsigned long arch_local_irq_save(void)\n{\n    return csr_read_clear(CSR_STATUS, SR_IE);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__vstate_csr_save",
+        "line_start": 150,
+        "line_end": 156,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "csr_read_set(CSR_STATUS, SR_FS_DIRTY) in __vstate_csr_save()/__vstate_csr_restore() atomically sets the FS (Floating-point/Vector Status) field to Dirty. sstatus.FS is a standard WARL field without 'reads as' semantics — the value read back reflects the actual FS state. Setting FS to Dirty via CSRRS is the canonical approach used across RISC-V kernel code to mark FPU/vector state as modified. No risk of silent bit corruption.",
+      "snippet": "status = csr_read_set(CSR_STATUS, SR_FS_DIRTY);\ndest->vcsr = csr_read(CSR_VXSAT) | csr_read(CSR_VXRM) << CSR_VXRM_SHIFT;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "try_to_set_pmm",
+        "line_start": 399,
+        "line_end": 403,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "csr_read_clear(CSR_ENVCFG, ENVCFG_PMM) in try_to_set_pmm() atomically reads ENVCFG and clears the PMM (Pointer Masking Mode) enable bit. ENVCFG does not have 'reads as' semantics — all defined fields read back their written values. The pattern (csr_set followed by csr_read_clear to test) is a correct verification that the PMM bit was successfully enabled. No bit corruption risk exists for ENVCFG.",
+      "snippet": "csr_set(CSR_ENVCFG, value);\nreturn (csr_read_clear(CSR_ENVCFG, ENVCFG_PMM) & ENVCFG_PMM) == value;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_sbi_fwft.c",
+        "function_name": "",
+        "line_start": 133,
+        "line_end": 136,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "csr_read_clear(CSR_HENVCFG, ENVCFG_PMM) in the SBI FWFT (Firmware Feature) handler atomically reads HENVCFG and clears its PMM bit to test if pointer masking is enabled in HS-mode. HENVCFG, like ENVCFG, does not have 'reads as' semantics. The read-then-clear is correct for this CSR and the result is used to compare against the requested value. No security concern.",
+      "snippet": "return (csr_read_clear(CSR_HENVCFG, ENVCFG_PMM) & ENVCFG_PMM) == value;"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

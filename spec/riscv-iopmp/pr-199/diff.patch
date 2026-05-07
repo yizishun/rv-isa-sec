@@ -1,0 +1,562 @@
+diff --git a/iopmp_ref_model/include/iopmp.h b/iopmp_ref_model/include/iopmp.h
+index e78ac99..4417d8d 100644
+--- a/iopmp_ref_model/include/iopmp.h
++++ b/iopmp_ref_model/include/iopmp.h
+@@ -60,8 +60,6 @@ typedef struct iopmp_dev_t {
+     iopmp_regs_t reg_file;              // Register file for IOPMP
+     iopmp_entries_t iopmp_entries;      // IOPMP entry table
+     err_mfrs_t err_svs;                 // Error status vector
+-    int intrpt_suppress;                // Set when interrupt is suppressed
+-    int error_suppress;                 // Set when error is suppressed
+     int rrid_stall[IOPMP_MAX_RRID_NUM]; // Stall status array for requester IDs
+     int stall_cntr;                     // Counts stalled transactions
+     bool imp_mdlck;                     // IOPMP implements the Memory Domain Lock (MDLCK) feature
+@@ -145,6 +143,12 @@ typedef struct iopmp_rule_analyzer_input_t {
+ typedef struct iopmp_rule_analyzer_output_t {
+     iopmpMatchStatus_t match_status;
+     bool grant_perm;
++    bool sie;           // When per-entry interrupt suppression is supported,
++                        // this signal indicates the matched entry suppresses
++                        // the interrupt for requested permission.
++    bool see;           // When per-entry bus error suppression is supported,
++                        // this signal indicates the matched entry suppresses
++                        // the bus error for requested permission.
+ } iopmp_rule_analyzer_output_t;
+ 
+ uint8_t write_memory(uint64_t *data, uint64_t addr, uint32_t size);
+@@ -152,7 +156,9 @@ uint8_t write_memory(uint64_t *data, uint64_t addr, uint32_t size);
+ // Function Declarations: Core IOPMP operations
+ void iopmpRuleAnalyzer(iopmp_dev_t *iopmp, iopmp_rule_analyzer_input_t *input,
+                        iopmp_rule_analyzer_output_t *output);
+-void errorCapture(iopmp_dev_t *iopmp, perm_type_e trans_type, uint8_t error_type, uint16_t rrid, uint16_t entry_id, uint64_t err_addr, uint8_t *intrpt);
+-void generate_interrupt(iopmp_dev_t *iopmp, uint8_t *intrpt);
++void errorCapture(iopmp_dev_t *iopmp, perm_type_e trans_type, uint8_t error_type,
++                  uint16_t rrid, uint16_t entry_id, uint64_t err_addr,
++                  bool gen_intrpt, bool gen_buserr, uint8_t *intrpt);
++void generate_interrupt(iopmp_dev_t *iopmp, bool gen_intrpt, uint8_t *intrpt);
+ 
+ #endif // IOPMP_H
+diff --git a/iopmp_ref_model/src/iopmp_error_capture.c b/iopmp_ref_model/src/iopmp_error_capture.c
+index 8677c77..02782c9 100644
+--- a/iopmp_ref_model/src/iopmp_error_capture.c
++++ b/iopmp_ref_model/src/iopmp_error_capture.c
+@@ -38,6 +38,8 @@ static void setRridSv(iopmp_dev_t *iopmp, uint16_t rrid) {
+   * @param rrid Requester ID associated with the transaction.
+   * @param entry_id IOPMP entry ID where the error was encountered.
+   * @param err_addr Address at which the error occurred.
++  * @param gen_intrpt Generate interrupt or not.
++  * @param gen_buserr Generate bus error or not.
+   * @param intrpt Pointer to the variable to store wired interrupt flag.
+   *               This flag is set to 1 if the following conditions are true:
+   *                 - the transaction fails
+@@ -50,7 +52,9 @@ static void setRridSv(iopmp_dev_t *iopmp, uint16_t rrid) {
+   *                 - the interrupts are suppressed, or IOPMP implements MSI extension
+   *                   and triggers MSI instead of wired interrupt
+  **/
+-void errorCapture(iopmp_dev_t *iopmp, perm_type_e trans_type, uint8_t error_type, uint16_t rrid, uint16_t entry_id, uint64_t err_addr, uint8_t *intrpt) {
++void errorCapture(iopmp_dev_t *iopmp, perm_type_e trans_type, uint8_t error_type,
++                  uint16_t rrid, uint16_t entry_id, uint64_t err_addr,
++                  bool gen_intrpt, bool gen_buserr, uint8_t *intrpt) {
+ 
+     // Current value of ERR_INFO.v
+     int err_reqinfo_v = iopmp->reg_file.err_info.v;
+@@ -58,7 +62,7 @@ void errorCapture(iopmp_dev_t *iopmp, perm_type_e trans_type, uint8_t error_type
+     // First error capture occurs when the following conditions are true:
+     //   - An interrupt is triggered, or a bus error is returned
+     //   - There is no pending error capture, that is, current ERR_INFO.v = '0'
+-    bool first_record = (!iopmp->error_suppress || !iopmp->intrpt_suppress) && !err_reqinfo_v;
++    bool first_record = (gen_intrpt || gen_buserr) && !err_reqinfo_v;
+ 
+     if (first_record) {
+         iopmp->reg_file.err_info.v = 1;               // Mark error as captured
+@@ -79,7 +83,7 @@ void errorCapture(iopmp_dev_t *iopmp, perm_type_e trans_type, uint8_t error_type
+             iopmp->reg_file.err_reqid.eid = entry_id;
+         }
+ 
+-        generate_interrupt(iopmp, intrpt);
++        generate_interrupt(iopmp, gen_intrpt, intrpt);
+     }
+ 
+     // If IOPMP implements Multi-Faults Record extension, IOPMP has ability to
+@@ -89,7 +93,7 @@ void errorCapture(iopmp_dev_t *iopmp, perm_type_e trans_type, uint8_t error_type
+         // Subsequent error capture occurs when the following conditions are true:
+         //   - An interrupt is triggered or a bus error is returned
+         //   - There is a pending error capture, that is, current ERR_INFO.v = '1'
+-        bool subsq_record = (!iopmp->error_suppress || !iopmp->intrpt_suppress) && err_reqinfo_v;
++        bool subsq_record = (gen_intrpt || gen_buserr) && err_reqinfo_v;
+ 
+         if (subsq_record) {
+             // Update violation window
+diff --git a/iopmp_ref_model/src/iopmp_interrupt.c b/iopmp_ref_model/src/iopmp_interrupt.c
+index 7d45d75..d52d699 100644
+--- a/iopmp_ref_model/src/iopmp_interrupt.c
++++ b/iopmp_ref_model/src/iopmp_interrupt.c
+@@ -23,6 +23,7 @@
+  * and data, writes them to memory, and handles any potential bus errors during the write operation.
+  *
+  * @param iopmp The IOPMP instance.
++ * @param gen_intrpt Generate interrupt or not.
+  * @param intrpt Pointer to the variable to store wired interrupt flag.
+  *               This flag is set to 1 if the following conditions are true:
+  *                 - the interrupts are not suppressed
+@@ -31,7 +32,7 @@
+  *                 - the interrupts are suppressed, or IOPMP implements MSI extension
+  *                   and triggers MSI instead of wired interrupt
+  */
+-void generate_interrupt(iopmp_dev_t *iopmp, uint8_t *intrpt) {
++void generate_interrupt(iopmp_dev_t *iopmp, bool gen_intrpt, uint8_t *intrpt) {
+ 
+     if (!iopmp->imp_msi) {
+         // If IOPMP doesn't implement Message-Signaled Interrupts (MSI)
+@@ -39,7 +40,7 @@ void generate_interrupt(iopmp_dev_t *iopmp, uint8_t *intrpt) {
+         // IOPMP triggers wired interrupt if the following conditions are true:
+         //   - IOPMP interrupts are enabled
+         //   - The interrupts are not suppressed
+-        *intrpt = iopmp->reg_file.err_cfg.ie && !iopmp->intrpt_suppress;
++        *intrpt = gen_intrpt;
+         return;
+     }
+ 
+@@ -48,8 +49,7 @@ void generate_interrupt(iopmp_dev_t *iopmp, uint8_t *intrpt) {
+     //   - IOPMP interrupts are enabled
+     //   - The interrupts are not suppressed
+     //   - IOPMP doesn't enable MSI
+-    *intrpt = iopmp->reg_file.err_cfg.ie && !iopmp->intrpt_suppress &&
+-              !iopmp->reg_file.err_cfg.msi_en;
++    *intrpt = gen_intrpt && !iopmp->reg_file.err_cfg.msi_en;
+ 
+     // IOPMP implements Message-Signaled Interrupts (MSI) extension.
+     // IOPMP triggers MSI if the following conditions are true:
+@@ -57,8 +57,7 @@ void generate_interrupt(iopmp_dev_t *iopmp, uint8_t *intrpt) {
+     //   - The interrupts are not suppressed
+     //   - MSI is enabled
+     //   - (implementation-specific) There are no pending MSI write error
+-    bool msi = iopmp->reg_file.err_cfg.ie && !iopmp->intrpt_suppress &&
+-               iopmp->reg_file.err_cfg.msi_en &&
++    bool msi = gen_intrpt && iopmp->reg_file.err_cfg.msi_en &&
+                !iopmp->reg_file.err_info.msi_werr;
+     if (msi) {
+         // Construct MSI address and data for enabled MSI.
+diff --git a/iopmp_ref_model/src/iopmp_rule_analyzer.c b/iopmp_ref_model/src/iopmp_rule_analyzer.c
+index 51f0318..4797688 100644
+--- a/iopmp_ref_model/src/iopmp_rule_analyzer.c
++++ b/iopmp_ref_model/src/iopmp_rule_analyzer.c
+@@ -103,10 +103,14 @@ static iopmpMatchStatus_t iopmpMatchAddr(uint64_t trans_start,
+   * @param iopmpcfg IOPMP configuration for the entry
+   * @param md Respective Memory Domain
+   * @param is_amo Indicates the AMO Access
++  * @param sie Output 0 if matched entry doesn't suppress the interrupt, otherwise output 1
++  * @param see Output 0 if matched entry doesn't suppress the bus error, otherwise output 1
+   * @return - true if entry grants transation permission
+   *         - false if entry doesn't grant transation permission
+  **/
+-static bool iopmpCheckPerms(iopmp_dev_t *iopmp, uint16_t rrid, perm_type_e req_perm, entry_cfg_t iopmpcfg, uint8_t md, bool is_amo) {
++static bool iopmpCheckPerms(iopmp_dev_t *iopmp, uint16_t rrid, perm_type_e req_perm,
++                            entry_cfg_t iopmpcfg, uint8_t md, bool is_amo,
++                            bool *sie, bool *see) {
+     // Common permission checks
+     bool read_allowed    = false;
+     bool write_allowed   = false;
+@@ -152,23 +156,23 @@ static bool iopmpCheckPerms(iopmp_dev_t *iopmp, uint16_t rrid, perm_type_e req_p
+     switch (req_perm) {
+     case READ_ACCESS:
+         if (!read_allowed) {
+-            iopmp->intrpt_suppress = iopmpcfg.sire;
+-            iopmp->error_suppress  = iopmpcfg.sere | iopmp->reg_file.err_cfg.rs;
++            *sie = iopmp->reg_file.hwcfg2.peis ? iopmpcfg.sire : false;
++            *see = iopmp->reg_file.hwcfg2.pees ? iopmpcfg.sere : false;
+         }
+         return read_allowed;
+ 
+     case WRITE_ACCESS:
+         if (!write_allowed) {
+-            iopmp->intrpt_suppress = iopmpcfg.siwe;
+-            iopmp->error_suppress  = iopmpcfg.sewe | iopmp->reg_file.err_cfg.rs;
++            *sie = iopmp->reg_file.hwcfg2.peis ? iopmpcfg.siwe : false;
++            *see = iopmp->reg_file.hwcfg2.pees ? iopmpcfg.sewe : false;
+         }
+         return write_allowed;
+ 
+     case INSTR_FETCH:
+         if (iopmp->reg_file.hwcfg2.chk_x) {
+             if (!execute_allowed) {
+-                iopmp->intrpt_suppress = iopmpcfg.sixe;
+-                iopmp->error_suppress  = iopmpcfg.sexe | iopmp->reg_file.err_cfg.rs;
++                *sie = iopmp->reg_file.hwcfg2.peis ? iopmpcfg.sixe : false;
++                *see = iopmp->reg_file.hwcfg2.pees ? iopmpcfg.sexe : false;
+             }
+             return execute_allowed;
+         }
+@@ -212,5 +216,6 @@ void iopmpRuleAnalyzer(iopmp_dev_t *iopmp,
+     // iopmpMatchAddr() returns ENTRY_MATCH. Further checks entry permissions
+     output->grant_perm = iopmpCheckPerms(iopmp, input->rrid, input->perm,
+                                          input->iopmpcfg, input->md,
+-                                         input->is_amo);
++                                         input->is_amo,
++                                         &output->sie, &output->see);
+ }
+diff --git a/iopmp_ref_model/src/iopmp_validate.c b/iopmp_ref_model/src/iopmp_validate.c
+index 427a8aa..2117a39 100644
+--- a/iopmp_ref_model/src/iopmp_validate.c
++++ b/iopmp_ref_model/src/iopmp_validate.c
+@@ -70,16 +70,16 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+     perm_type_e trans_perm = trans_req->perm;
+     iopmpErrorType_t error_type = NO_ERROR;
+     uint16_t error_eid = 0;
++    bool gen_intrpt = iopmp->reg_file.err_cfg.ie;
++    bool gen_buserr = !iopmp->reg_file.err_cfg.rs;
+ 
+-    iopmp->intrpt_suppress = 0;
+-    iopmp->error_suppress  = 0;
+     int lwr_entry, upr_entry;
+ 
+     srcmd_en_t  srcmd_en;
+     srcmd_enh_t srcmd_enh;
+ 
+-    int nonPrioErrorSup    = 0;
+-    int nonPrioIntrSup     = 0;
++    bool gen_intrpt_nonPrio = false;
++    bool gen_buserr_nonPrio = false;
+     int firstIllegalAccess = 1;
+     iopmpErrorType_t nonPrioRuleStatus = NOT_HIT_ANY_RULE;
+     int nonPrioRuleNum = 0;
+@@ -97,8 +97,6 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+ 
+     // Check for valid RRID; if invalid, capture error and return
+     if (rrid >= iopmp->reg_file.hwcfg1.rrid_num) {
+-        // Initially, check for global error suppression
+-        iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+         error_type = UNKNOWN_RRID;
+         goto stop_and_report_fault;
+     }
+@@ -121,7 +119,6 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+         // IOPMP can fault the stalled transactions in this case and record the
+         // error due to the stalled transactions.
+         if (iopmp->reg_file.err_cfg.stall_violation_en) {
+-            iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+             error_type = STALLED_TRANSACTION;
+             goto stop_and_report_fault;
+         }
+@@ -137,7 +134,6 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+     // of entry rule configurations, reporting them with error type
+     // "not hit any rule" (0x05).
+     if (trans_perm == WRITE_ACCESS && iopmp->reg_file.hwcfg3.no_w) {
+-        iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+         error_type = NOT_HIT_ANY_RULE;
+         goto stop_and_report_fault;
+     }
+@@ -147,7 +143,6 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+         // fetch transactions regardless of entry rule configurations, reporting
+         // them with error type "not hit any rule" (0x05).
+         if (iopmp->reg_file.hwcfg2.chk_x && iopmp->reg_file.hwcfg3.no_x) {
+-            iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+             error_type = NOT_HIT_ANY_RULE;
+             goto stop_and_report_fault;
+         }
+@@ -215,6 +210,8 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+             /* Reset output information */
+             rule_analyzer_o.match_status = ENTRY_NOTMATCH;
+             rule_analyzer_o.grant_perm   = false;
++            rule_analyzer_o.sie          = false;
++            rule_analyzer_o.see          = false;
+ 
+             // Analyze entry for matching and permission granting
+             iopmpRuleAnalyzer(iopmp, &rule_analyzer_i, &rule_analyzer_o);
+@@ -232,7 +229,6 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+                 // The priority entry must match all bytes of a transaction, or
+                 // transaction is illegal with error type =
+                 // "partial hit on a priority rule" (0x04).
+-                iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+                 error_type = PARTIAL_HIT_ON_PRIORITY;
+                 error_eid  = cur_entry;
+                 goto stop_and_report_fault;
+@@ -244,8 +240,19 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+                 // checks. If no matching entry permits, the transaction is
+                 // illegal.
+                 if (iopmp->reg_file.hwcfg2.non_prio_en && cur_entry >= iopmp->reg_file.hwcfg2.prio_entry) {
+-                    nonPrioErrorSup |= iopmp->error_suppress;
+-                    nonPrioIntrSup  |= iopmp->intrpt_suppress;
++                    // The logic to generate interrupt when matching non-priority entries is:
++                    // "ERR_CFG.ie && (!ENTRY_CFG(i0).{sire|siwe|sixe} || !ENTRY_CFG(i1).{sire|siwe|sixe} ... )"
++                    // Here we perform (!ENTRY_CFG(i0).{sire|siwe|sixe} || !ENTRY_CFG(i1).{sire|siwe|sixe} ... ).
++                    if (iopmp->reg_file.hwcfg2.peis) {
++                        gen_intrpt_nonPrio = (gen_intrpt_nonPrio || !rule_analyzer_o.sie);
++                    }
++                    // The logic to generate bus error when matching non-priority entries is:
++                    // "!ERR_CFG.rs && (!ENTRY_CFG(i0).{sere|sewe|sexe} || !ENTRY_CFG(i1).{sere|sewe|sexe} ... )"
++                    // Here we perform (!ENTRY_CFG(i0).{sere|sewe|sexe} || !ENTRY_CFG(i1).{sere|sewe|sexe} ... ).
++                    if (iopmp->reg_file.hwcfg2.pees) {
++                        gen_buserr_nonPrio = (gen_buserr_nonPrio || !rule_analyzer_o.see);
++                    }
++
+                     if (firstIllegalAccess) {
+                         nonPrioRuleStatus = perm_to_etype(trans_perm);
+                         nonPrioRuleNum    = cur_entry;
+@@ -254,6 +261,21 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+                     continue;
+                 }
+ 
++                // If IOPMP supports per-entry interrupt suppression, IOPMP
++                // checks the suppression bit in ENTRY_CFG of the matched entry.
++                // The logic to generate interrupt when matching any priority entry is:
++                // "ERR_CFG.ie && !ENTRY_CFG(i).{sire|siwe|sixe}"
++                if (iopmp->reg_file.hwcfg2.peis) {
++                    gen_intrpt = gen_intrpt && !rule_analyzer_o.sie;
++                }
++                // If IOPMP supports per-entry bus error suppression, IOPMP
++                // checks the suppression bit in ENTRY_CFG of the matched entry.
++                // The logic to generate bus error when matching any priority entry is:
++                // "!ERR_CFG.rs && !ENTRY_CFG(i).{sere|sewe|sexe}"
++                if (iopmp->reg_file.hwcfg2.pees) {
++                    gen_buserr = gen_buserr && !rule_analyzer_o.see;
++                }
++
+                 // If the matching entry is priority entry but doesn't grant
+                 // transaction permission to operate, the transaction is illegal
+                 // with error type = "illegal read access" (0x01) for read
+@@ -272,7 +294,6 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+     if (iopmp->reg_file.hwcfg2.non_prio_en) {
+         if (nonPrioRuleStatus == NOT_HIT_ANY_RULE) {
+             // None of the non-priority entries fully matches the transaction
+-            iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+             error_type = NOT_HIT_ANY_RULE;
+         } else {
+             // At least one non-priority entry fully matches the transaction but
+@@ -282,13 +303,21 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+             // error type = "illegal read access" (0x01) for read access
+             // transaction or "illegal write access/AMO" (0x02) for write
+             // access/AMO transaction.
+-            iopmp->error_suppress = nonPrioErrorSup;
+-            iopmp->intrpt_suppress = nonPrioIntrSup;
+             error_type = nonPrioRuleStatus;
+             error_eid  = nonPrioRuleNum;
++
++            // The logic to generate interrupt when matching non-priority entries is:
++            // "ERR_CFG.ie && (!ENTRY_CFG(i0).{sire|siwe|sixe} || !ENTRY_CFG(i1).{sire|siwe|sixe} ... )"
++            if (iopmp->reg_file.hwcfg2.peis) {
++                gen_intrpt = gen_intrpt && gen_intrpt_nonPrio;
++            }
++            // The logic to generate bus error when matching non-priority entries is:
++            // "!ERR_CFG.rs && (!ENTRY_CFG(i0).{sere|sewe|sexe} || !ENTRY_CFG(i1).{sere|sewe|sexe} ... )"
++            if (iopmp->reg_file.hwcfg2.pees) {
++                gen_buserr = gen_buserr && gen_buserr_nonPrio;
++            }
+         }
+     } else {
+-        iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+         error_type = NOT_HIT_ANY_RULE;
+     }
+     goto stop_and_report_fault;
+@@ -301,12 +330,12 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+     // If IOPMP implements error capture feature, IOPMP triggers error capture
+     // to log the error information into the registers.
+     if (iopmp->imp_error_capture) {
+-        errorCapture(iopmp, trans_perm, error_type, rrid, error_eid, trans_req->addr, intrpt);
++        errorCapture(iopmp, trans_perm, error_type, rrid, error_eid, trans_req->addr, gen_intrpt, gen_buserr, intrpt);
+     }
+     // Return response with default status if no match/error occurs
+     // In case of error suppression, success response is returned, with user defined value on initiator port
+     // NOTE: You can change the `user` value
+-    if (iopmp->error_suppress) {
++    if (!gen_buserr) {
+         iopmp_trans_rsp->status = IOPMP_SUCCESS;
+         iopmp_trans_rsp->user = USER;
+     }
+diff --git a/iopmp_ref_model/verif/tests/compactmodel.c b/iopmp_ref_model/verif/tests/compactmodel.c
+index 0f63a50..65a7f57 100644
+--- a/iopmp_ref_model/verif/tests/compactmodel.c
++++ b/iopmp_ref_model/verif/tests/compactmodel.c
+@@ -524,7 +524,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+@@ -541,7 +541,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+diff --git a/iopmp_ref_model/verif/tests/dynamicmodel.c b/iopmp_ref_model/verif/tests/dynamicmodel.c
+index a25e9fd..bdfe571 100644
+--- a/iopmp_ref_model/verif/tests/dynamicmodel.c
++++ b/iopmp_ref_model/verif/tests/dynamicmodel.c
+@@ -761,7 +761,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+@@ -780,7 +780,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+diff --git a/iopmp_ref_model/verif/tests/fullmodel.c b/iopmp_ref_model/verif/tests/fullmodel.c
+index 091873e..0432efd 100644
+--- a/iopmp_ref_model/verif/tests/fullmodel.c
++++ b/iopmp_ref_model/verif/tests/fullmodel.c
+@@ -855,7 +855,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+@@ -875,7 +875,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+diff --git a/iopmp_ref_model/verif/tests/isolationmodel.c b/iopmp_ref_model/verif/tests/isolationmodel.c
+index 555eed8..1fd5ef5 100644
+--- a/iopmp_ref_model/verif/tests/isolationmodel.c
++++ b/iopmp_ref_model/verif/tests/isolationmodel.c
+@@ -561,7 +561,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+@@ -579,7 +579,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+diff --git a/iopmp_ref_model/verif/tests/rapidmodel.c b/iopmp_ref_model/verif/tests/rapidmodel.c
+index 86a707a..e028abc 100644
+--- a/iopmp_ref_model/verif/tests/rapidmodel.c
++++ b/iopmp_ref_model/verif/tests/rapidmodel.c
+@@ -763,7 +763,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+@@ -782,7 +782,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+diff --git a/iopmp_ref_model/verif/tests/unnamed_model_1.c b/iopmp_ref_model/verif/tests/unnamed_model_1.c
+index 848fa32..8175597 100644
+--- a/iopmp_ref_model/verif/tests/unnamed_model_1.c
++++ b/iopmp_ref_model/verif/tests/unnamed_model_1.c
+@@ -511,7 +511,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+@@ -528,7 +528,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+diff --git a/iopmp_ref_model/verif/tests/unnamed_model_2.c b/iopmp_ref_model/verif/tests/unnamed_model_2.c
+index d9daf14..de09cb7 100644
+--- a/iopmp_ref_model/verif/tests/unnamed_model_2.c
++++ b/iopmp_ref_model/verif/tests/unnamed_model_2.c
+@@ -598,7 +598,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+@@ -617,7 +617,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+diff --git a/iopmp_ref_model/verif/tests/unnamed_model_3.c b/iopmp_ref_model/verif/tests/unnamed_model_3.c
+index 3aecd09..711e4d7 100644
+--- a/iopmp_ref_model/verif/tests/unnamed_model_3.c
++++ b/iopmp_ref_model/verif/tests/unnamed_model_3.c
+@@ -501,7 +501,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+@@ -519,7 +519,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+diff --git a/iopmp_ref_model/verif/tests/unnamed_model_4.c b/iopmp_ref_model/verif/tests/unnamed_model_4.c
+index b37589a..2b323cb 100644
+--- a/iopmp_ref_model/verif/tests/unnamed_model_4.c
++++ b/iopmp_ref_model/verif/tests/unnamed_model_4.c
+@@ -483,7 +483,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 
+@@ -501,7 +501,7 @@ int main()
+     FAIL_IF((iopmp_trans_rsp.status != IOPMP_SUCCESS));
+     FAIL_IF((iopmp_trans_rsp.rrid != 2));
+     FAIL_IF((iopmp_trans_rsp.user != USER));
+-    error_record_chk(&iopmp, ILLEGAL_INSTR_FETCH, INSTR_FETCH, 360, 1);
++    error_record_chk(&iopmp, NO_ERROR, INSTR_FETCH, 360, 0);
+     write_register(&iopmp, ERR_INFO_OFFSET, 0, 4);
+     END_TEST();)
+ 

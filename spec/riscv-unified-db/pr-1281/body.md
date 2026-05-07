@@ -1,0 +1,3 @@
+- Updated model according to spec for the cases of `rs1==0` and for a `Reserved` value of VSEW
+- Added 64 bit vector config with "F" extension to enable the UV TVM of `riscv-tests` 
+- Filed Sail-RISC-V [Issue #1434 ](https://github.com/riscv/sail-riscv/issues/1434)

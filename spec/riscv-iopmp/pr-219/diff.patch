@@ -1,0 +1,146 @@
+diff --git a/iopmp_ref_model/README.md b/iopmp_ref_model/README.md
+index 3257ad2..5897302 100644
+--- a/iopmp_ref_model/README.md
++++ b/iopmp_ref_model/README.md
+@@ -46,17 +46,19 @@ The **IOPMP Reference Model** incorporates all IOPMP Models and each model can b
+ | mdcfg_fmt          | 0 - 2                     | Indicate the MDCFG format:<br />**0**: Format 0. MDCFG Table is implemented. <br />**1**: Format 1. No MDCFG Table. HWCFG3.md_entry_num is fixed. <br />**2**: Format 2. No MDCFG Table. HWCFG3.md_entry_num is programmable.                                                                          |
+ | srcmd_fmt          | 0 - 2                     | Indicate the SRCMD Table format:<br />**0**: Format 0 (baseline). SRCMD_EN(s) and SRCMD_ENH(s) are available. <br />**1**: Exclusive Format. No SRCMD Table. RRID i associates exclusively with memory domain i, i = 0 … HWCFG0.md_num-1. <br />**2**: MD-indexed Format. SRCMD_PERM(m) and SRCMD_PERMH(m) are available.                                                                             |
+ | md_entry_num       | 0 - IMP                   | Indicates the number of entries associated with each Memory Domain (MD) when `mdcfg_fmt` is not 0.<br />Implementation defined value                                                                                                   |
+-| xinr               | 0/1                       | Indicates whether the IOPMP treats the instruction fetch
+-accesses as data read accesses.<br />**0**: Fields of instruction fetches are not ignored<br />**1**: Fields of instruction fetches are ignored |
++| xinr               | 0/1                       | Indicates whether the IOPMP treats the instruction fetch accesses as data read accesses.<br />**0**: Fields of instruction fetches are not ignored<br />**1**: Fields of instruction fetches are ignored |
+ | no_x               | 0/1                       | Valid only if `xinr` = 0. <br />**0**: Instruction fetch checks are permissive. <br />**1**: Instruction fetches are always denied.                                                                                       |
+ | no_w               | 0/1                       | Indicates if write accesses are always denied.<br />**0**: Write accesses are allowed based on permissions. <br />**1**: Write accesses are always denied.                                                                   |
+ | rrid_transl_en     | 0/1                       | Indicates if tagging a new Requestor ID (RRID) on the initiator port is supported.<br />**0**: Tagging not supported. <br />**1**: New RRID tagging is supported.                                                            |
+ | rrid_transl_prog   | 0/1                       | Indicates if the `rrid_transl` field is programmable. <br />**0**: Field is fixed. <br />**1**: Field is programmable                                                                                                      |
+ | rrid_transl        | IMP                       | The RRID tagged to outgoing transactions. Supported only for `rrid_transl_en`=1. It is writable only when `rrid_transl_prog`=1.                                                                                                      |
+ | entryoffset        | IMP                       | The offset address of the IOPMP array from the base of an IOPMP instance.                                                                                                      |
++| granularity        | IMP                       | The granularity (bytes) of protected regions by entry.                                                                                                      |
+ | imp_mdlck          | 0/1                       | Indicates if the Memory Domain Lock (MDLCK) feature is implemented.<br />**0**: Feature is not implemented<br />**1**: Memory domains can be locked.                                                                         |
+ | imp_err_reqid_eid  | 0/1                       | Indicates if `ERR_REQID.eid` is implemented. <br />**0**: Feature not supported. <br />**1**: Errored RRID and Entry num is recorded.                                                                                          |
+ | imp_rridscp        | 0/1                       | Indicates if RRIDSCP register is implemented.<br />**0:** RRIDSCP register is not implemented.<br />**1:** RRIDSCP register is implemented.                                                                                                 |
++| imp_stall_buffer   | 0/1                       | Indicates if IOPMP implements buffer to record and store stalled transactions.<br />**0:** Stall buffer is not implemented.<br />**1:** Stall buffer is implemented.                                                                                                 |
++| rridscp_unselectable | IMP                     | Unselectable RRID in RRID Cherry Pick Stall Control feature.<br />If `rridscp_unselectable[rrid]`=0, the RRID is selectable when writing RRIDSCP.<br />If `rridscp_unselectable[rrid]`=1, the RRID is unselectable when writing RRIDSCP.<br /><br />This configuration is optional. Implementation can make all RRIDs be selectable by default.                                                                                                 |
+ 
+ ### Key feature configuration parameters in `config.h` include:
+ | **Feature**  | **Possible Values** | **Description**                                                                                                                                                                                                                    |
+diff --git a/iopmp_ref_model/include/iopmp.h b/iopmp_ref_model/include/iopmp.h
+index 4e3c4f4..75fa48c 100644
+--- a/iopmp_ref_model/include/iopmp.h
++++ b/iopmp_ref_model/include/iopmp.h
+@@ -64,6 +64,7 @@ typedef struct iopmp_dev_t {
+     err_mfrs_t err_svs;                 // Error status vector
+     int rrid_stall[IOPMP_MAX_RRID_NUM]; // Stall status array for requester IDs
+     int stall_cntr;                     // Counts stalled transactions
++    bool rridscp_unselectable[IOPMP_MAX_RRID_NUM];  // Unselectable RRID in RRID Cherry Pick Stall Control feature
+     uint64_t granularity;               // The granularity (bytes) of protected regions by entry
+     bool imp_mdlck;                     // IOPMP implements the Memory Domain Lock (MDLCK) feature
+     bool imp_err_reqid_eid;             // IOPMP implements ERR_REQID.eid
+@@ -107,6 +108,7 @@ typedef struct iopmp_cfg_t {
+     bool imp_err_reqid_eid;             // IOPMP implements ERR_REQID.eid
+     bool imp_rridscp;                   // IOPMP implements RRIDSCP-related features
+     bool imp_stall_buffer;              // IOPMP implements buffer to record and store stalled transactions
++    bool rridscp_unselectable[IOPMP_MAX_RRID_NUM];  // Unselectable RRID in RRID Cherry Pick Stall Control feature
+ } iopmp_cfg_t;
+ 
+ // Enumerates specific match statuses for transactions
+diff --git a/iopmp_ref_model/src/iopmp_reg.c b/iopmp_ref_model/src/iopmp_reg.c
+index 0891fc1..29a7f1b 100644
+--- a/iopmp_ref_model/src/iopmp_reg.c
++++ b/iopmp_ref_model/src/iopmp_reg.c
+@@ -172,6 +172,10 @@ int reset_iopmp(iopmp_dev_t *iopmp, iopmp_cfg_t *cfg)
+     iopmp->imp_mdlck                        = cfg->imp_mdlck;
+     iopmp->imp_err_reqid_eid                = cfg->imp_err_reqid_eid;
+     iopmp->imp_rridscp                      = cfg->imp_rridscp;
++    if (cfg->imp_rridscp) {
++        memcpy(iopmp->rridscp_unselectable, cfg->rridscp_unselectable,
++               sizeof(cfg->rridscp_unselectable));
++    }
+     iopmp->imp_stall_buffer                 = cfg->imp_stall_buffer;
+ 
+     return 0;
+@@ -623,20 +627,35 @@ void write_register(iopmp_dev_t *iopmp, uint64_t offset, reg_intf_dw data, uint8
+ 
+     case RRIDSCP_OFFSET:
+         if (iopmp->imp_rridscp) {
+-            iopmp->reg_file.rridscp.rsv  = 0;
+-            iopmp->reg_file.rridscp.op   = rridscp_temp.op;
++            iopmp->reg_file.rridscp.rsv = 0;
++            iopmp->reg_file.rridscp.op  = rridscp_temp.op;
++
+             if (rridscp_temp.rrid < iopmp->reg_file.hwcfg1.rrid_num) {
+                 iopmp->reg_file.rridscp.rrid = rridscp_temp.rrid;
+-            } else if (iopmp->reg_file.rridscp.op == 0) {
+-                iopmp->reg_file.rridscp.stat = 3;
+-                break;
+-            }
++                if (iopmp->rridscp_unselectable[rridscp_temp.rrid]) {
++                    iopmp->reg_file.rridscp.stat = 3;   // Unselectable RRID
++                    break;
++                }
+ 
+-            if (iopmp->reg_file.rridscp.op == 0) {
+-                iopmp->reg_file.rridscp.stat = 2 - iopmp->rrid_stall[iopmp->reg_file.rridscp.rrid];
++                switch (rridscp_temp.op) {
++                case 0: // Query
++                    // Query stalled state from rrid_stall
++                    iopmp->reg_file.rridscp.stat = 2 - iopmp->rrid_stall[rridscp_temp.rrid];
++                    break;
++                case 1: // Stall transactions associated with selected RRID
++                    iopmp->rrid_stall[rridscp_temp.rrid] = 1;
++                    iopmp->reg_file.rridscp.stat = 1;   // Set stat as stalled
++                    break;
++                case 2: // Don't stall transactions associated with selected RRID
++                    iopmp->rrid_stall[rridscp_temp.rrid] = 0;
++                    iopmp->reg_file.rridscp.stat = 2;   // Set stat as not stalled
++                    break;
++                default:// Write op=3
++                    break;
++                }
++            } else {
++                iopmp->reg_file.rridscp.stat = 3;   // Unimplemented RRID
+             }
+-            else if (iopmp->reg_file.rridscp.op == 1) { iopmp->rrid_stall[rridscp_temp.rrid] = 1; }
+-            else if (iopmp->reg_file.rridscp.op == 2) { iopmp->rrid_stall[rridscp_temp.rrid] = 0; }
+         }
+         break;
+ 
+diff --git a/iopmp_ref_model/verif/tests/compactmodel.c b/iopmp_ref_model/verif/tests/compactmodel.c
+index 9fbd3aa..0ce1d2d 100644
+--- a/iopmp_ref_model/verif/tests/compactmodel.c
++++ b/iopmp_ref_model/verif/tests/compactmodel.c
+@@ -681,7 +681,7 @@ int main()
+ 
+ #if (STALL_BUF_DEPTH != 0)
+     START_TEST_IF(iopmp.reg_file.hwcfg2.stall_en && iopmp.imp_rridscp, "Stall MD Feature",
+-    // reset_iopmp(&iopmp, &cfg);
++    reset_iopmp(&iopmp, &cfg);
+     receiver_port(5, 360, 0, 3, INSTR_FETCH, 0, &iopmp_trans_req);
+     configure_entry_n(&iopmp, ENTRY_ADDR, (iopmp_trans_req.rrid * (iopmp.reg_file.hwcfg3.md_entry_num + 1)), 90, 4); // (364 >> 2) and keeping lsb 0
+     configure_entry_n(&iopmp, ENTRY_CFG, (iopmp_trans_req.rrid * (iopmp.reg_file.hwcfg3.md_entry_num + 1)), (NAPOT | X), 4);
+diff --git a/iopmp_ref_model/verif/tests/fullmodel.c b/iopmp_ref_model/verif/tests/fullmodel.c
+index 960f5bb..bcf70c6 100644
+--- a/iopmp_ref_model/verif/tests/fullmodel.c
++++ b/iopmp_ref_model/verif/tests/fullmodel.c
+@@ -990,7 +990,7 @@ int main()
+ 
+ #if (STALL_BUF_DEPTH != 0)
+     START_TEST_IF(iopmp.reg_file.hwcfg2.stall_en && iopmp.imp_rridscp, "Stall MD Feature",
+-    // reset_iopmp(&iopmp, &cfg);
++    reset_iopmp(&iopmp, &cfg);
+     configure_srcmd_n(&iopmp, SRCMD_EN, 5, 0x10, 4);
+     configure_srcmd_n(&iopmp, SRCMD_X, 5, 0x10, 4);
+     configure_mdcfg_n(&iopmp, 3, 2, 4);
+diff --git a/iopmp_ref_model/verif/tests/unnamed_model_1.c b/iopmp_ref_model/verif/tests/unnamed_model_1.c
+index 4638dc8..3af3225 100644
+--- a/iopmp_ref_model/verif/tests/unnamed_model_1.c
++++ b/iopmp_ref_model/verif/tests/unnamed_model_1.c
+@@ -668,7 +668,7 @@ int main()
+ 
+ #if (STALL_BUF_DEPTH != 0)
+     START_TEST_IF(iopmp.reg_file.hwcfg2.stall_en && iopmp.imp_rridscp, "Stall MD Feature",
+-    // reset_iopmp(&iopmp, &cfg);
++    reset_iopmp(&iopmp, &cfg);
+     receiver_port(5, 360, 0, 3, INSTR_FETCH, 0, &iopmp_trans_req);
+     configure_entry_n(&iopmp, ENTRY_ADDR, (iopmp_trans_req.rrid * (iopmp.reg_file.hwcfg3.md_entry_num + 1)), 90, 4); // (364 >> 2) and keeping lsb 0
+     configure_entry_n(&iopmp, ENTRY_CFG, (iopmp_trans_req.rrid * (iopmp.reg_file.hwcfg3.md_entry_num + 1)), (NAPOT | X), 4);

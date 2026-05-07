@@ -1,0 +1,255 @@
+{
+  "pr_number": 2379,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2379,
+    "violation_condition": "",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "",
+    "affected_entities": [],
+    "summary": "Failed to parse agent output as JSON"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/context.c",
+        "function_name": "set_mm_asid",
+        "line_start": 192,
+        "line_end": 197,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR_SATP write in context-switch fast path correctly includes satp_mode (Sv39/Sv48/Sv57 encoding) or'd with the ASID and PPN. ASID-vs-version check via relaxed cmpxchg prevents stale ASID reuse across version rollover, and need_flush_tlb flag from __flush_context() triggers local_flush_tlb_all() only when necessary per the ASID allocation protocol.",
+      "snippet": "csr_write(CSR_SATP, virt_to_pfn(mm->pgd) |\n          (cntx2asid(cntx) << SATP_ASID_SHIFT) |\n          satp_mode);\n\n    if (need_flush_tlb)\n        local_flush_tlb_all();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/context.c",
+        "function_name": "set_mm_noasid",
+        "line_start": 200,
+        "line_end": 205,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "No-ASID fallback path correctly writes CSR_SATP with only the PPN and satp_mode (ASID=0), then issues local_flush_tlb_all_asid(0). The sfence.vma ordering constraint is satisfied: SATP write happens first, then TLB flush invalidates all ASID-0 entries, ensuring new translations are used from that point forward.",
+      "snippet": "csr_write(CSR_SATP, virt_to_pfn(mm->pgd) | satp_mode);\nlocal_flush_tlb_all_asid(0);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/context.c",
+        "function_name": "asids_init",
+        "line_start": 231,
+        "line_end": 244,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ASID bit probing by writing SATP with all ASID bits set, then reading back to count implemented bits. The probe correctly saves/restores the original SATP value and issues local_flush_tlb_all() after restoration to purge TLB entries polluted with the probe ASID. The comment explicitly acknowledges the pollution rationale.",
+      "snippet": "old = csr_read(CSR_SATP);\nasid_bits = old | (SATP_ASID_MASK << SATP_ASID_SHIFT);\ncsr_write(CSR_SATP, asid_bits);\nasid_bits = (csr_read(CSR_SATP) >> SATP_ASID_SHIFT)  & SATP_ASID_MASK;\n// ...\nlocal_flush_tlb_all();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/init.c",
+        "function_name": "set_satp_mode",
+        "line_start": 896,
+        "line_end": 910,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SATP mode detection uses csr_write(CSR_SATP, identity_satp) with a candidate satp_mode followed by csr_swap(CSR_SATP, 0) to read back the accepted mode. If the hardware does not silently ignore an unsupported mode but instead hangs or raises an unrecoverable fault, the csr_swap never executes and fallback is impossible. The kernel mitigates this via cmdline (no4lvl/no5lvl) and device-tree mmu-type restrictions, but the retry-on-Sv57-failure logic at line 903-907 assumes the hart is still alive after the failed mode write.",
+      "snippet": "identity_satp = PFN_DOWN((uintptr_t)&early_pg_dir) | satp_mode;\nlocal_flush_tlb_all();\ncsr_write(CSR_SATP, identity_satp);\nhw_satp = csr_swap(CSR_SATP, 0ULL);\n// ...\nif (hw_satp != identity_satp) {\n    if (pgtable_l5_enabled) {\n        disable_pgtable_l5();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/fault.c",
+        "function_name": "vmalloc_fault",
+        "line_start": 190,
+        "line_end": 246,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vmalloc_fault reads the current PGD base from CSR_SATP (line 191-192) and synchronizes the task's PGD entry from init_mm, then issues local_flush_tlb_page(addr). The comment at lines 240-244 explicitly documents the RISC-V SFENCE.VMA ordering semantics: 'SFENCE.VMA specifies an ordering constraint, not a cache flush; it is necessary even after writing invalid entries.' This demonstrates correct awareness of the normative rule.",
+      "snippet": "pfn = csr_read(CSR_SATP) & SATP_PPN;\npgd = (pgd_t *)pfn_to_virt(pfn) + index;\npgd_k = init_mm.pgd + index;\n// ...\nflush_tlb:\n    local_flush_tlb_page(addr);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/fault.c",
+        "function_name": "show_pte",
+        "line_start": 28,
+        "line_end": 77,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "show_pte() performs a full page table walk (PGD->P4D->PUD->PMD->PTE) respecting runtime folding (p4d_offset/pud_offset handle 3/4/5-level dynamically). Uses pgd_none/pgd_bad/pgd_leaf at each level to detect termination conditions. Compliant with the normative page table walk definition for Sv39/Sv48/Sv57.",
+      "snippet": "pgdp = pgd_offset(mm, addr);\npgd = pgdp_get(pgdp);\nif (pgd_none(pgd) || pgd_bad(pgd) || pgd_leaf(pgd))\n    goto out;\np4dp = p4d_offset(pgdp, addr);\n// ... continues through all levels"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/pgtable-64.h",
+        "function_name": "pud_bad",
+        "line_start": 187,
+        "line_end": 190,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "pud_bad() returns true when _PAGE_LEAF (R|W|X) bits are set, which matches the RISC-V normative rule that non-leaf PTEs must have R=W=X=0. However, this would also return true for a valid 1GB huge page at the PUD level. Correctness depends on callers checking pud_leaf() before pud_bad(), which the generic mm code does (e.g., __handle_mm_fault checks pud_leaf first, then pud_bad). If any code path calls pud_bad() without first checking pud_leaf(), valid PUD huge pages would be misclassified as corrupted.",
+      "snippet": "static inline int pud_bad(pud_t pud)\n{\n    return !pud_present(pud) || (pud_val(pud) & _PAGE_LEAF);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/pgtable-64.h",
+        "function_name": "pfn_pmd",
+        "line_start": 253,
+        "line_end": 260,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "pfn_pmd() constructs a PMD entry from PFN and protection bits. The ALT_THEAD_PMA() macro applies the T-Head memory attribute workaround. PTE bits 0-9 (V,R,W,X,U,G,A,D,RSW) come from pgprot_val, bits 10-53 from the PFN. Svnapot (bit 63) and Svpbmt (bits 61-62) are preserved through the prot_val. Compliant with the normative rv64 PTE format.",
+      "snippet": "static inline pmd_t pfn_pmd(unsigned long pfn, pgprot_t prot)\n{\n    unsigned long prot_val = pgprot_val(prot);\n    ALT_THEAD_PMA(prot_val);\n    return __pmd((pfn << _PAGE_PFN_SHIFT) | prot_val);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/tlbflush.c",
+        "function_name": "flush_tlb_range",
+        "line_start": 170,
+        "line_end": 201,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "flush_tlb_range() resets the TLB invalidation stride to individual PTE granularity for NAPOT huge pages when Svnapot is present (lines 185-196). The comment at lines 180-184 explicitly references the privileged specification requirement that every PTE in a NAPOT region must be invalidated. This correctly implements the normative NAPOT TLB invalidation rule.",
+      "snippet": "/*\n * As stated in the privileged specification, every PTE in a\n * NAPOT region must be invalidated, so reset the stride in that\n * case.\n */\nif (has_svnapot()) {\n    if (stride_size >= PGDIR_SIZE)\n        stride_size = PGDIR_SIZE;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/tlbflush.c",
+        "function_name": "local_flush_tlb_range_threshold_asid",
+        "line_start": 38,
+        "line_end": 65,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Svinval-aware TLB range flush uses the correct SFENCE_W_INVAL + SINVAL_VMA loop + SFENCE_INVAL_IR sequence per the RISC-V Svinval extension spec. Falls back to per-page SFENCE.VMA loop when Svinval is absent. Threshold check at line 46 avoids excessive per-page flushes. Compliant.",
+      "snippet": "if (has_svinval()) {\n    local_sfence_w_inval();\n    for (i = 0; i < nr_ptes_in_range; ++i) {\n        local_sinval_vma(start, asid);\n        start += stride;\n    }\n    local_sfence_inval_ir();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/pgtable.c",
+        "function_name": "pmdp_collapse_flush",
+        "line_start": 139,
+        "line_end": 156,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "When collapsing PTEs into a huge PMD, pmdp_collapse_flush() uses flush_tlb_mm() (global flush) rather than address-specific SFENCE.VMA. The comment at lines 147-153 cites the RISC-V spec rule that sfence.vma with address operands only applies to leaf PTEs, so converting non-leaf to leaf requires a global flush. This correctly obeys the normative SFENCE.VMA address-scope rule.",
+      "snippet": "/*\n * When leaf PTE entries (regular pages) are collapsed into a leaf\n * PMD entry (huge page), a valid non-leaf PTE is converted into a\n * valid leaf PTE at the level 1 page table.  Since the sfence.vma\n * forms that specify an address only apply to leaf PTEs, we need a\n * global flush here.\n */\nflush_tlb_mm(vma->vm_mm);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/pgtable.h",
+        "function_name": "update_mmu_cache_range",
+        "line_start": 572,
+        "line_end": 594,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "update_mmu_cache_range() handles the Svvptc vs non-Svvptc case explicitly. With Svvptc, no SFENCE.VMA is needed because the extension guarantees new valid PTEs become visible within a bounded timeframe. Without Svvptc, eager SFENCE.VMA is issued per page. The comment at lines 585-589 explicitly references the SFENCE.VMA ordering constraint from the RISC-V spec, demonstrating correct normative rule awareness.",
+      "snippet": "/*\n * The kernel assumes that TLBs don't cache invalid entries, but\n * in RISC-V, SFENCE.VMA specifies an ordering constraint, not a\n * cache flush; it is necessary even after writing invalid entries.\n */\nwhile (nr--)\n    local_flush_tlb_page(address + nr * PAGE_SIZE);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/head.S",
+        "function_name": "secondary_start_sbi",
+        "line_start": 96,
+        "line_end": 124,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Head.S correctly issues sfence.vma BEFORE writing CSR_SATP for the trampoline page table (line 106-107), and again AFTER writing CSR_SATP for the kernel page tables (line 123-124). The comments explicitly justify: the first fence ensures newly written PTEs from setup_vm() are visible; the second fence avoids stale trampoline translations. Both sfence.vma uses are unqualified (no operands), providing full address-space invalidation — correct for bootstrap.",
+      "snippet": "sfence.vma\ncsrw CSR_SATP, a0\n// ...\ncsrw CSR_SATP, a2\nsfence.vma"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/tlb.c",
+        "function_name": "kvm_riscv_local_hfence_gvma_vmid_gpa",
+        "line_start": 23,
+        "line_end": 45,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM G-stage HFENCE.GVMA uses the correct Svinval sequence (SFENCE_W_INVAL + HINVAL_GVMA loop + SFENCE_INVAL_IR) when available, falling back to HFENCE.GVMA otherwise. The threshold check at line 29 (PTRS_PER_PTE) avoids excessive per-page operations. The HINVAL.GVMA operand gpa>>2 correctly accounts for the instruction's 4-byte shift requirement. Compliant with the hypervisor extension's normative TLB invalidation rules.",
+      "snippet": "if (has_svinval()) {\n    asm volatile (SFENCE_W_INVAL() ::: \"memory\");\n    for (pos = gpa; pos < (gpa + gpsz); pos += BIT(order))\n        asm volatile (HINVAL_GVMA(%0, %1)\n        : : \"r\" (pos >> 2), \"r\" (vmid) : \"memory\");\n    asm volatile (SFENCE_INVAL_IR() ::: \"memory\");"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/tlb.c",
+        "function_name": "kvm_riscv_local_hfence_vvma_asid_gva",
+        "line_start": 80,
+        "line_end": 108,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM VS-stage HFENCE.VVMA correctly swaps in the VMID via CSR_HGATP (line 93) before issuing HFENCE.VVMA/HINVAL.VVMA, then restores the original HGATP (line 107). The csr_swap ensures atomic read-modify of the HGATP VMID field. This correctly implements the normative requirement that HFENCE.VVMA uses the VMID from HGATP, not a register operand.",
+      "snippet": "hgatp = csr_swap(CSR_HGATP, vmid << HGATP_VMID_SHIFT);\n// ... HFENCE_VVMA or HINVAL_VVMA operations ...\ncsr_write(CSR_HGATP, hgatp);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/tlb.c",
+        "function_name": "kvm_riscv_local_tlb_sanitize",
+        "line_start": 161,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TLB sanitization on VCPU CPU migration correctly flushes G-stage TLB entries by VMID when the host CPU changes (preventing stale entries from other VCPUs of the same guest). For implementations where VS-stage TLB caches GPAs, also flushes VS-stage. Uses READ_ONCE for the VMID read (correct for lockless access). Compliant with the normative requirement to avoid stale translations when reusing VMIDs across host CPUs.",
+      "snippet": "vmid = READ_ONCE(vcpu->kvm->arch.vmid.vmid);\nkvm_riscv_local_hfence_gvma_vmid_all(vmid);\nif (static_branch_unlikely(&kvm_riscv_vsstage_tlb_no_gpa))\n    kvm_riscv_local_hfence_vvma_all(vmid);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/mmu.c",
+        "function_name": "kvm_riscv_mmu_update_hgatp",
+        "line_start": 604,
+        "line_end": 616,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HGATP update correctly constructs the register value from gstage_mode, VMID, and PGD physical address. When hardware VMID bits are 0 (no HW VMID support), it issues a full HFENCE.GVMA to compensate. The ncsr_write (non-conditionally) writes HGATP. Compliant with the normative HGATP register format and ordering requirement.",
+      "snippet": "hgatp |= (READ_ONCE(k->vmid.vmid) << HGATP_VMID_SHIFT) & HGATP_VMID;\nhgatp |= (k->pgd_phys >> PAGE_SHIFT) & HGATP_PPN;\nncsr_write(CSR_HGATP, hgatp);\nif (!kvm_riscv_gstage_vmid_bits())\n    kvm_riscv_local_hfence_gvma_all();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "SATP_MODE constants",
+        "line_start": 68,
+        "line_end": 85,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SATP mode encoding constants match the RISC-V privileged spec: SATP_MODE_32=0x80000000, SATP_MODE_39=0x8000000000000000 (bit 63), SATP_MODE_48=0x9000000000000000 (bits 63+60), SATP_MODE_57=0xa000000000000000 (bits 63+61). ASID bit positions (shift=22 for RV32, shift=44 for RV64) and PPN masks match the spec. HGATP mode encodings SV32X4=1, SV39X4=8, SV48X4=9, SV57X4=10 also match. These are the normative rule definitions referenced by the PR title.",
+      "snippet": "#define SATP_MODE_39    _AC(0x8000000000000000, UL)\n#define SATP_MODE_48    _AC(0x9000000000000000, UL)\n#define SATP_MODE_57    _AC(0xa000000000000000, UL)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/pgtable-bits.h",
+        "function_name": "_PAGE_LEAF",
+        "line_start": 72,
+        "line_end": 76,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "_PAGE_LEAF is correctly defined as _PAGE_READ | _PAGE_WRITE | _PAGE_EXEC, matching the RISC-V normative rule: when R=W=X=0, the PTE is a pointer to the next level; otherwise it is a leaf PTE. This definition is used throughout the kernel to distinguish leaf from non-leaf entries at all page table levels.",
+      "snippet": "/*\n * when all of R/W/X are zero, the PTE is a pointer to the next level\n * of the page table; otherwise, it is a leaf PTE.\n */\n#define _PAGE_LEAF (_PAGE_READ | _PAGE_WRITE | _PAGE_EXEC)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/pgtable-64.h",
+        "function_name": "_PAGE_CHG_MASK",
+        "line_start": 172,
+        "line_end": 175,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "_PAGE_CHG_MASK defines the set of bits PRESERVED across pte_modify() by inverting PRESENT|READ|WRITE|EXEC|USER|GLOBAL|MTMASK. However, reserved PTE bits (54-60 in RV64) are NOT explicitly masked. If a PTE is ever constructed with reserved bits set (e.g., from a hardware bug, corrupted memory, or a kernel error), pte_modify() would preserve them rather than clearing them. In practice, PTEs are built from scratch via pfn_pte()/pfn_pmd() which only set intentional bits, so this is a defense-in-depth gap rather than an active bug.",
+      "snippet": "#define _PAGE_CHG_MASK  (~(unsigned long)(_PAGE_PRESENT | _PAGE_READ | \\\n                      _PAGE_WRITE | _PAGE_EXEC | \\\n                      _PAGE_USER | _PAGE_GLOBAL | \\\n                      _PAGE_MTMASK))"
+    }
+  ],
+  "overall_severity": "compliant"
+}

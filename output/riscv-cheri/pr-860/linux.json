@@ -1,0 +1,197 @@
+{
+  "pr_number": 860,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 860,
+    "violation_condition": "Under CHERI-capable RISC-V, the kernel allows execution (or emulates) vector load/store instructions whose base register is x0, when the spec reserves those encodings as illegal",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "vector.*x0.*base|base.*x0.*vector|cheri.*vector.*reserved|vsetvli|vle|vse|vlse|vsse|lut4o16i4.*cheri",
+    "affected_entities": [
+      "vector load/store instructions with x0 base (vle8.v/vle16.v/vle32.v/vle64.v, vse8.v/vse16.v/vse32.v/vse64.v, vlse.v, vsse.v, vluxei.v, vsuxei.v, vloxei.v, vsoxei.v variants where rs1=x0)"
+    ],
+    "summary": "CHERI v1 ratification now includes V extension with the invariant that vector memory accesses using x0 as base are reserved/illegal, because the nulla capability cannot authoritatively cover all of addressable memory; the kernel must trap these encodings as illegal instructions rather than executing or emulating them, or user space bypasses capability-based memory access control"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/vector.c",
+        "function_name": "insn_is_vector",
+        "line_start": 81,
+        "line_end": 112,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "insn_is_vector() classifies instructions as 'vector' solely by opcode, width field, and CSR number. It does NOT inspect the rs1 (base register) field. Under CHERI-capable RISC-V, vector load/store encodings with rs1=x0 are reserved as illegal (they encode distinct capability-aware operations). This function would return true for CHERI-reserved encodings with rs1=x0 (e.g., 0x02058007 for a width-8 LD opcode with rs1=x0), treating them as valid vector instructions rather than rejecting them.",
+      "snippet": "switch (opcode) {\ncase RVV_OPCODE_VECTOR: return true;\ncase RVV_OPCODE_VL:\ncase RVV_OPCODE_VS:\n  width = RVV_EXTRACT_VL_VS_WIDTH(insn_buf);\n  if (width == RVV_VL_VS_WIDTH_8 || width == RVV_VL_VS_WIDTH_16 ||\n      width == RVV_VL_VS_WIDTH_32 || width == RVV_VL_VS_WIDTH_64)\n    return true;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/vector.c",
+        "function_name": "riscv_v_first_use_handler",
+        "line_start": 185,
+        "line_end": 228,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "riscv_v_first_use_handler() relies on insn_is_vector() to validate the trapped instruction before allocating vector context. Since insn_is_vector() does not reject CHERI-reserved encodings (vle/vse with rs1=x0), this handler would allocate vector context and enable VS for an instruction that the CHERI spec mandates should be illegal. This creates a privilege escape path: in a CHERI system, an unprivileged process could trigger vector context allocation by executing a CHERI-reserved encoding (e.g., capability load via the vle opcode space with x0 base), and the kernel would enable vector unit, potentially allowing subsequent vector instructions to operate on capability registers.",
+      "snippet": "if (!insn_is_vector(insn))\n  return false;\n...\nif (riscv_v_thread_ctx_alloc(riscv_v_user_cachep, &current->thread.vstate)) {\n  force_sig(SIGBUS);\n  return true;\n}\nriscv_v_vstate_on(regs);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps_misaligned.c",
+        "function_name": "handle_misaligned_load",
+        "line_start": 427,
+        "line_end": 444,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "handle_misaligned_load() uses insn_is_vector() to detect vector misaligned loads and then calls handle_vector_misaligned_load() which explicitly does NOT emulate vector instructions (comment at line 209: 'If vector instruction we don't emulate it yet'). While the initial classification via insn_is_vector() doesn't filter CHERI-reserved encodings, the actual handler path is safe by refusal — it resets epc and returns -1, causing a SIGBUS. In a CHERI system this would be the correct behavior (no emulation of reserved encodings). However, the classification function's false-positive on rs1=x0 encodings could lead to incorrect probe results in check_vector_unaligned_access_emulated().",
+      "snippet": "if (IS_ENABLED(CONFIG_RISCV_VECTOR_MISALIGNED)) {\n  if (get_insn(regs, epc, &insn))\n    return -1;\n  if (insn_is_vector(insn))\n    return handle_vector_misaligned_load(regs);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps_misaligned.c",
+        "function_name": "handle_vector_misaligned_load",
+        "line_start": 194,
+        "line_end": 212,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "handle_vector_misaligned_load() refuses to emulate any vector misaligned load. The comment at line 209 explicitly states: 'If vector instruction we don't emulate it yet.' It resets regs->epc to the trap PC and returns -1. This is correct under CHERI — reserved encodings should not be emulated. The probe path (lines 203-207) only modifies the per-CPU misaligned_access flag during hardware capability probing, not instruction emulation.",
+      "snippet": "/* If vector instruction we don't emulate it yet */\nregs->epc = epc;\nreturn -1;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/insn.h",
+        "function_name": "(macro definitions)",
+        "line_start": 156,
+        "line_end": 163,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "RVV_OPCODE_VL and RVV_OPCODE_VS are defined as aliases for the floating-point load/store opcodes (0x07 and 0x27). Under CHERI, the vector load/store opcode space overlaps with capability load/store instructions in certain reserved encoding regions (specifically when rs1=x0 and funct3 encodes capability operations). These aliases, combined with the width-based discrimination in insn_is_vector(), mean the kernel has no architectural mechanism to distinguish capability load/store from vector load/store in the shared opcode space — it relies solely on the width field, which is insufficient for CHERI where the rs1 field disambiguates reserved encodings.",
+      "snippet": "#define RVV_OPCODE_VL    RVFDQ_OPCODE_FL    /* 0x07 */\n#define RVV_OPCODE_VS    RVFDQ_OPCODE_FS    /* 0x27 */\n#define RVV_VL_VS_WIDTH_8  0\n#define RVV_VL_VS_WIDTH_16 5\n#define RVV_VL_VS_WIDTH_32 6\n#define RVV_VL_VS_WIDTH_64 7"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__vstate_csr_restore",
+        "line_start": 167,
+        "line_end": 194,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "__vstate_csr_restore() uses vsetvl with x0 as the destination register: 'vsetvl x0, %2, %1'. This is the canonical encoding for writing vtype/vl without capturing the vl value — x0 as rd means 'discard vl result'. This is a legitimate and specified use of x0 in the vsetvl instruction format (rd field, not base register). Not affected by the CHERI vector load/store rs1=x0 reservation, which applies only to the base register field in load/store encodings, not the rd field in vsetvl.",
+      "snippet": "\"vsetvl  x0, %2, %1\\n\\t\"\n\".option pop\\n\\t\"\n\"csrw \" __stringify(CSR_VSTART) \", %0\\n\\t\""
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__riscv_v_vstate_save",
+        "line_start": 196,
+        "line_end": 231,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "__riscv_v_vstate_save() uses vsetvli with x0 as the element count source: 'vsetvli %0, x0, e8, m8, ta, ma'. Here x0 means 'VLMAX', which is the architecturally defined encoding to set vl to the maximum vector length. This is a kernel-internal context-save path using the standard V encoding — x0 is in the AVL (rs1) field for vsetvli, not a base register in a vector load/store. The subsequent vse8.v/vle8.v instructions use GPR %1 as base, not x0. No CHERI violation.",
+      "snippet": "\"vsetvli %0, x0, e8, m8, ta, ma\\n\\t\"\n\"vse8.v  v0, (%1)\\n\\t\"\n\"add  %1, %1, %0\\n\\t\"\n\"vse8.v  v8, (%1)\\n\\t\""
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/head.S",
+        "function_name": ".Lreset_regs_done_vector",
+        "line_start": 476,
+        "line_end": 497,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Boot-time vector initialization uses 'vsetvli t1, x0, e8, m8, ta, ma' where x0 in the AVL position means VLMAX — the standard encoding. Then 'vmv.v.i' zeroes vector registers. This executes in M-mode during early boot before any CHERI enforcement context exists. The x0 usage is in vsetvli's rs1 (AVL) field, not a vector load/store base register. Compliant.",
+      "snippet": "vsetvli t1, x0, e8, m8, ta, ma\nvmv.v.i v0, 0\nvmv.v.i v8, 0\nvmv.v.i v16, 0\nvmv.v.i v24, 0"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_vector.c",
+        "function_name": "kvm_riscv_vcpu_vector_reset",
+        "line_start": 19,
+        "line_end": 35,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM VCPU vector reset correctly checks riscv_isa_extension_available(isa, v) before setting SR_VS_INITIAL. When V is unavailable, sets SR_VS_OFF. Does not decode or emulate any vector instructions — relies on hardware CSR delegation (hedeleg). The kernel does not intercept vector load/store during guest execution; those are handled by HS-mode hardware delegation or trap-redirection back to the guest. If CHERI-reserved encodings trap as illegal instructions, they are correctly redirected to the guest's illegal instruction handler via vcpu_redirect().",
+      "snippet": "if (riscv_isa_extension_available(isa, v)) {\n  cntx->sstatus |= SR_VS_INITIAL;\n  WARN_ON(!cntx->vector.datap);\n  memset(cntx->vector.datap, 0, riscv_v_vsize);\n} else {\n  cntx->sstatus |= SR_VS_OFF;\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_exit.c",
+        "function_name": "kvm_riscv_vcpu_exit",
+        "line_start": 187,
+        "line_end": 262,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM exit handler redirects EXC_LOAD_MISALIGNED (line 205-208) and EXC_STORE_MISALIGNED (line 210-213) back to the guest via vcpu_redirect(). It does NOT attempt to decode or emulate vector load/store instructions. This pass-through behavior is correct for CHERI: if hardware classifies a CHERI-reserved encoding as an illegal or misaligned trap, it is simply forwarded to the guest OS to handle, without the hypervisor applying any vector-specific interpretation.",
+      "snippet": "case EXC_LOAD_MISALIGNED:\n  kvm_riscv_vcpu_pmu_incr_fw(vcpu, SBI_PMU_FW_MISALIGNED_LOAD);\n  vcpu->stat.load_misaligned_exits++;\n  ret = vcpu_redirect(vcpu, trap);\n  break;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_insn.c",
+        "function_name": "kvm_riscv_vcpu_virtual_insn",
+        "line_start": 328,
+        "line_end": 359,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM virtual instruction handler only dispatches INSN_OPCODE_SYSTEM (0x73 opcode with shift). It defaults to truly_illegal_insn() for all other opcodes, which injects EXC_INST_ILLEGAL into the guest. Vector load/store opcodes (0x07, 0x27, 0x57) never reach a decode path that would treat them as emulatable. This is correct under CHERI: reserved encodings trapped at the hypervisor level are either redirected to the guest as illegal instructions or handled by hardware delegation. The KVM MMIO path (kvm_riscv_vcpu_mmio_load/store at lines 373/497) only decodes scalar loads/stores, not vector, so CHERI-reserved encodings won't be misinterpreted as MMIO.",
+      "snippet": "switch ((insn & INSN_OPCODE_MASK) >> INSN_OPCODE_SHIFT) {\ncase INSN_OPCODE_SYSTEM:\n  return system_opcode_insn(vcpu, run, insn);\ndefault:\n  return truly_illegal_insn(vcpu, run, insn);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 578,
+        "line_end": 641,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "kvm_arch_vcpu_load() correctly calls kvm_riscv_vcpu_host_vector_save() (line 632) followed by kvm_riscv_vcpu_guest_vector_restore() (line 633). The host save is unconditional (doesn't check sstatus since host CSRs may be modified externally — line 65 comment), and guest restore only proceeds if sstatus.VS != OFF. CSR context-switch delegates completely to hardware for the actual V-execution; the kernel only manages the data buffers. No CHERI-specific decoding or emulation attempted. Compliant.",
+      "snippet": "kvm_riscv_vcpu_host_vector_save(&vcpu->arch.host_context);\nkvm_riscv_vcpu_guest_vector_restore(&vcpu->arch.guest_context,\n                                    vcpu->arch.isa);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/kernel_mode_vector.c",
+        "function_name": "kernel_vector_begin",
+        "line_start": 207,
+        "line_end": 226,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "kernel_vector_begin() is a kernel-internal API for kernel-mode vector usage (e.g., crypto accelerators, memcpy). It saves user vector state, claims CPU vector context, and enables V unit. This function uses the standard has_vector()/has_xtheadvector() checks and the vstate save/restore infrastructure. No instruction decoding occurs here — it only manages state transitions. The actual vector instructions emitted by callers (e.g., crypto code using .option arch, +zvk*) are kernel-mode trusted code. No CHERI violation path through this API.",
+      "snippet": "if (WARN_ON(!(has_vector() || has_xtheadvector())))\n  return;\nBUG_ON(!may_use_simd());\nif (riscv_v_start_kernel_context(&nested)) {\n  get_cpu_vector_context();\n  riscv_v_vstate_save(&current->thread.vstate, task_pt_regs(current));\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__switch_to_vector",
+        "line_start": 369,
+        "line_end": 400,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "__switch_to_vector() is the context-switch handler for vector state. It correctly manages preemptive kernel-vector and user-vector state transitions. The underlying save/restore operations (__riscv_v_vstate_save/restore) use properly formed vsetvli/vle8.v/vse8.v instructions with valid GPR base pointers. No instruction decoding or emulation at this level. Compliant.",
+      "snippet": "if (riscv_preempt_v_started(prev)) {\n  if (riscv_v_is_on()) {\n    WARN_ON(prev->thread.riscv_v_flags & RISCV_V_CTX_DEPTH_MASK);\n    riscv_v_disable();\n    prev->thread.riscv_v_flags |= RISCV_PREEMPT_V_IN_SCHEDULE;\n  }\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_onereg.c",
+        "function_name": "kvm_riscv_vcpu_set_reg / kvm_riscv_vcpu_get_reg",
+        "line_start": 1126,
+        "line_end": 1164,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM ONE_REG interface for vector registers (vstart, vl, vtype, vcsr, vlenb, and 32 vector data registers) correctly delegates to kvm_riscv_vcpu_{get,set}_reg_vector(). The set handler (vcpu_vector.c:165-203) validates vlenb immutability (line 189: rejects changes to vlenb after VCPU creation with -EINVAL). No instruction decoding — this is a pure register-state access interface. Compliant.",
+      "snippet": "if (reg_num == KVM_REG_RISCV_VECTOR_CSR_REG(vlenb)) {\n  ...\n  if (reg_val != cntx->vector.vlenb)\n    return -EINVAL;\n  return 0;\n}"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

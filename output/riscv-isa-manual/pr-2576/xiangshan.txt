@@ -1,0 +1,29 @@
+PR #2576  target=xiangshan  overall=compliant
+Spec: Zvdot4a8i instructions are only defined for SEW=32; XiangShan vector decoder must trap on any other SEW value, otherwise sub-element slicing at wrong bit boundaries corrupts accumulator data
+Violation: When the vector decoder dispatches a Zvdot4a8i instruction (vdot4a, vdot4au, vdot4asu, vdot4aus) with vtype.vsew != 32 (i.e., SEW != 32), the XiangShan RTL executes the instruction instead of raising an illegal instruction exception. The spec mandates these instructions are only defined for SEW=32; all other SEW values are reserved. Executing with wrong SEW causes the 4-element sub-element unpacking logic to slice 32-bit element groups at incorrect bit boundaries, producing wrong multiplicands/multipliers and corrupting the accumulator destination register.
+Consequence: data_corruption
+Pattern: vdot4a.*vsew|SEW.*!=.*32|isReservedSEW|vdot4a.*illegal|vtypeCheck.*vdot|dotProduct.*SEW
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/decode/VecDecoder.scala:28-843  VecDecoder
+  Zvdot4a8i instructions (vdot4a, vdot4au, vdot4asu, vdot4aus) are NOT decoded — no entries exist in opivv/opivx/opivi/opmvv/opmvx tables. Any attempt to execute these opcodes hits decodeDefault (DecodeUnit.scala:50-61) which sets selImm=INVALID_INSTR, triggering an illegal instruction exception. Correct behavior for unimplemented reserved opcodes.
+  | // VecDecoder.scala:842-843 — no vdot4a entries in any decode table
+  | override val decodeArray: Array[(BitPat, XSDecodeBase)] = vset ++
+  |   opivv ++ opivx ++ opivi ++ opmvv ++ opmvx ++ opfvv ++ opfvf ++ opfff ++ vls
+  | // DecodeUnit.scala:877-878 — unhandled opcode → illegal instruction
+  | decodedInst.selImm === SelImm.INVALID_INSTR || …
+
+[potential_risk] src/main/scala/xiangshan/backend/decode/VecExceptionGen.scala:185-200  VecExceptionGen
+  No SEW constraint check exists for vdot4a* instructions (expected: SEW must be 32/e32, i.e., SEW===3). While this is benign today because Zvdot4a8i is not decoded, if the extension is added in the future without adding a SEW==32 check (analogous to intExtEewIllegal or wnEewIllegal), the RTL would execute vdot4a* with arbitrary SEW, causing sub-element boundary misalignment and accumulator corruption.
+  | // VecExceptionGen.scala:185-200 — existing SEW check infrastructure
+  | // No entry for vdot4a* — would need: SEW =/= 3.U → illegal
+  | private val intExtEewIllegal = intExt2 && SEW === 0.U ||
+  |                                 intExt4 && SEW <= 1.U ||
+  |                                 intExt8 && SEW <= 2.U
+  | private val wnEewIllegal = (vdWideningInst || narrowingInst || redWideningInst) && SEW === 3.U
+  | private val eewIllegal = fpEewIllegal || intExtEewIllegal || wnEewIllegal
+
+[compliant] src/main/scala/xiangshan/Parameters.scala:299-304  XSCoreParameters
+  Zvdot4a8i is not in the ISA extension list. The extension configuration only includes Zvbb and Zvkt among vector crypto extensions. Correct: unimplemented extensions should not be advertised.
+  | // Parameters.scala — Zvdot4a8i not listed among enabled extensions
+  | // Only zvbb, zvkt present among vector crypto
+

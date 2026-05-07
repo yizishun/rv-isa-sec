@@ -1,0 +1,105 @@
+{
+  "pr_number": 2397,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2397,
+    "violation_condition": "In the Linux kernel, when SBI ecalls pass kernel buffer addresses to M-mode firmware handlers, and those buffers cross PMP entry boundaries or are only partially covered by an unlocked (L=0) PMP entry, M-mode access faults despite the kernel's assumption that M-mode can unconditionally access any unlocked region. The PMP matching rules (partial match → fail) now explicitly apply to M-mode, meaning even a single PMP entry boundary crossing within a kernel buffer handed to M-mode causes an unrecoverable access fault in firmware context.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "sbi_ecall\\(|sbi_call\\(|__sbi_.*buf|sbi_.*range|sbi_remote_sfence_vma|sbi_remote_fence_i|SBI_EXT_RFNC|sbi_send_ipi",
+    "affected_entities": [
+      "pmpcfg",
+      "pmpaddr",
+      "mstatus.MPRV",
+      "mstatus.MPP",
+      "sbi_ecall"
+    ],
+    "summary": "PMP partial-match access failures now explicitly apply to M-mode even for unlocked (L=0) regions, meaning kernel buffers passed to SBI firmware handlers must be fully contained within a single PMP entry or risk M-mode access faults and silent data corruption."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi.c",
+        "function_name": "__sbi_send_ipi_v01",
+        "line_start": 106,
+        "line_end": 112,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Passes stack-local hart_mask address to M-mode via ecall a0 register. If the kernel stack page straddles a PMP entry boundary, M-mode firmware attempting to read this hart_mask will take an unrecoverable PMP access fault. No alignment or boundary check exists.",
+      "snippet": "static void __sbi_send_ipi_v01(unsigned int cpu)\n{\n\tunsigned long hart_mask =\n\t\t__sbi_v01_cpumask_to_hartmask(cpumask_of(cpu));\n\tsbi_ecall(SBI_EXT_0_1_SEND_IPI, 0, (unsigned long)(&hart_mask),\n\t\t  0, 0, 0, 0, 0);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi.c",
+        "function_name": "__sbi_rfence_v01",
+        "line_start": 114,
+        "line_end": 147,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Passes stack-local hart_mask address to M-mode for all v0.1 RFENCE operations (REMOTE_FENCE_I, REMOTE_SFENCE_VMA, REMOTE_SFENCE_VMA_ASID). Same PMP boundary-crossing risk as __sbi_send_ipi_v01. M-mode reads the hart_mask from kernel stack memory; if that stack page crosses an M-mode PMP entry boundary, M-mode access faults with no recovery path.",
+      "snippet": "hart_mask = __sbi_v01_cpumask_to_hartmask(cpu_mask);\nswitch (fid) {\ncase SBI_EXT_RFENCE_REMOTE_FENCE_I:\n\tsbi_ecall(SBI_EXT_0_1_REMOTE_FENCE_I, 0,\n\t\t  (unsigned long)&hart_mask, 0, 0, 0, 0, 0);\ncase SBI_EXT_RFENCE_REMOTE_SFENCE_VMA:\n\tsbi_ecall(SBI_EXT_0_1_REMOTE_SFENCE_VMA, 0,\n\t\t  (unsigned long)&hart_mask, start, size, 0, 0, 0);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi.c",
+        "function_name": "sbi_debug_console_write",
+        "line_start": 591,
+        "line_end": 618,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Has page-boundary truncation (line 604-605) to avoid crossing OS page boundaries, but uses PAGE_SIZE (4KB) rather than PMP entry granularity. RISC-V PMP granularity (G field) ranges from 4 bytes to 4KB. A 4KB-aligned buffer can still cross PMP entry boundaries at smaller granularities (e.g., NAPOT G=1 gives 8-byte granularity). The physical address base_addr is passed directly to M-mode for read access.",
+      "snippet": "if (PAGE_SIZE < (offset_in_page(bytes) + num_bytes))\n\tnum_bytes = PAGE_SIZE - offset_in_page(bytes);\n...\nret = sbi_ecall(SBI_EXT_DBCN, SBI_EXT_DBCN_CONSOLE_WRITE,\n\t\tnum_bytes, base_addr, 0, 0, 0, 0);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi.c",
+        "function_name": "sbi_debug_console_read",
+        "line_start": 620,
+        "line_end": 647,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Identical partial mitigation as sbi_debug_console_write: truncates to PAGE_SIZE boundary (line 633-634) but PMP entry granularity can be much smaller (4 bytes minimum). M-mode writes to the kernel buffer at base_addr; if the buffer crosses a PMP entry boundary, M-mode write access faults.",
+      "snippet": "if (PAGE_SIZE < (offset_in_page(bytes) + num_bytes))\n\tnum_bytes = PAGE_SIZE - offset_in_page(bytes);\n...\nret = sbi_ecall(SBI_EXT_DBCN, SBI_EXT_DBCN_CONSOLE_READ,\n\t\tnum_bytes, base_addr, 0, 0, 0, 0);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/nacl.c",
+        "function_name": "kvm_riscv_nacl_enable",
+        "line_start": 53,
+        "line_end": 70,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Multi-page SBI NACL shared memory buffer (~10KB, spanning 3x 4KB pages). The kernel passes nacl->shmem_phys (base physical address) to M-mode via ecall. M-mode accesses the entire buffer for HFENCE operations. While alloc_pages() provides physically contiguous pages, the boundary between the buffer's first/last page and neighboring non-shared pages may cross a PMP entry boundary. Neither the kernel nor firmware validates PMP entry alignment.",
+      "snippet": "ret = sbi_ecall(SBI_EXT_NACL, SBI_EXT_NACL_SET_SHMEM,\n\t\tnacl->shmem_phys, 0, 0, 0, 0, 0);\nrc = sbi_err_map_linux_errno(ret.error);\nif (rc)\n\treturn rc;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi.c",
+        "function_name": "__sbi_rfence_v02_call",
+        "line_start": 204,
+        "line_end": 255,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SBI v0.2 RFENCE calls pass all data via registers (hmask, hbase, start, size, asid) with no kernel memory pointers. M-mode does not need to dereference any S-mode memory address from these ecalls. Compliant with respect to the PMP buffer boundary concern at the ecall interface.",
+      "snippet": "case SBI_EXT_RFENCE_REMOTE_SFENCE_VMA:\n\tret = sbi_ecall(ext, fid, hmask, hbase, start, size, 0, 0);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi-ipi.c",
+        "function_name": "sbi_ipi_init",
+        "line_start": 80,
+        "line_end": 86,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Enables the riscv_sbi_for_rfence static branch as a one-way gate. Once enabled, all TLB/cache maintenance operations route through SBI ecalls to M-mode without any runtime fallback. If M-mode encounters PMP access faults due to boundary crossings, there is no mechanism to revert to direct S-mode IPI-based shootdown (the on_each_cpu() path).",
+      "snippet": "static_branch_enable(&riscv_sbi_for_rfence);"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

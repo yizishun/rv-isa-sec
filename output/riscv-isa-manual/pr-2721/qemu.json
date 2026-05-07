@@ -1,0 +1,188 @@
+{
+  "pr_number": 2721,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2721,
+    "violation_condition": "QEMU implements vector scalar move (vmv.x.s/vmv.s.x/vfmv.f.s/vfmv.s.f) or vector reduction operations (vred*.vs/vfred*.vs) or whole-register moves (vmv<nr>r.v) using the pre-relaxation semantics where scalar operands always occupy exactly one vector register (EMUL=1, ignoring ceil(EEW/VLEN)), and whole-register moves use EEW=SEW rather than EEW=min(VLEN*EMUL, SEW). When an ELEN > VLEN configuration is emulated, these operations must access vector register groups spanning ceil(EEW/VLEN) registers; using a single register would read/write only a fraction of the element bits, exposing or corrupting data from unrelated guest state.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "Hardcoded EMUL=1 or s->lmul=0 assumption in scalar move, reduction, or whole-register move emulation paths without computing EMUL = ceil(EEW/VLEN); also EEW computed as SEW in whole-register moves instead of min(VLEN*EMUL, SEW). Grep for vmv_x_s, vmv_s_x, vfmv_f_s, vfmv_s_f, vred, vmv[1248]r in target/riscv/ and check that s->emul derives from ceil(EEW/VLEN) rather than defaulting to 1.",
+    "affected_entities": [
+      "vmv.x.s",
+      "vmv.s.x",
+      "vfmv.f.s",
+      "vfmv.s.f",
+      "vredsum.vs",
+      "vredmaxu.vs",
+      "vredmax.vs",
+      "vredminu.vs",
+      "vredmin.vs",
+      "vredand.vs",
+      "vredor.vs",
+      "vredxor.vs",
+      "vfredusum.vs",
+      "vfredosum.vs",
+      "vfredmax.vs",
+      "vfredmin.vs",
+      "vmv1r.v",
+      "vmv2r.v",
+      "vmv4r.v",
+      "vmv8r.v",
+      "vl1r.v",
+      "vl2r.v",
+      "vl4r.v",
+      "vl8r.v",
+      "vs1r.v",
+      "vs2r.v",
+      "vs4r.v",
+      "vs8r.v"
+    ],
+    "summary": "ELEN>VLEN spec relaxation makes scalar/reduction/whole-register vector ops access register groups via EMUL=ceil(EEW/VLEN) rather than a single register; QEMU must compute EMUL dynamically instead of assuming EMUL=1, or else read/write wrong registers on ELEN>VLEN configs."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/tcg/tcg-cpu.c",
+        "function_name": "riscv_tcg_cpu_validate_v",
+        "line_start": 452,
+        "line_end": 456,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "CRITICAL: ELEN > VLEN constraint (vlen >= cfg->elen) is enforced at init time, but NONE of the vector scalar move (vmv.x.s/vmv.s.x/vfmv.f.s/vfmv.s.f), reduction (vred*.vs/vfred*.vs), or whole-register move (vmv<nr>r.v) helpers implement the multi-register element layout required when SEW > VLEN. If this init-time guard is removed (the stated goal of this PR), all these operations would silently read/write only a single vector register for elements wider than VLEN, leaking or corrupting adjacent register state.",
+      "snippet": "if (vlen < cfg->elen) {\n    error_setg(errp, \"Vector extension implementation requires VLEN \"\n                     \"to be greater than or equal to ELEN\");\n    return;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vmv_x_s",
+        "line_start": 3643,
+        "line_end": 3664,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmv.x.s hardcodes element 0 access via vec_element_loadi(s, t1, a->rs2, 0, true), which loads exactly s->sew bytes from register a->rs2. When ELEN > VLEN and SEW = ELEN > VLEN, a single element spans ceil(SEW/VLEN) registers, but only the first register is read. The upper bits of the element are silently dropped (truncation to VLEN bits), causing info_leak through truncation or data corruption. No EMUL = ceil(EEW/VLEN) computation exists in this path.",
+      "snippet": "vec_element_loadi(s, t1, a->rs2, 0, true);\ntcg_gen_trunc_i64_tl(dest, t1);\ngen_set_gpr(s, a->rd, dest);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vmv_s_x",
+        "line_start": 3667,
+        "line_end": 3693,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmv.s.x explicitly states 'This instruction ignores LMUL and vector register groups' (line 3671), implying EMUL=1 is assumed. When ELEN > VLEN and SEW > VLEN, the scalar element occupies ceil(SEW/VLEN) registers, but only vreg[a->rd] is written. The upper bits of the scalar value are lost, and adjacent register state (in rd+1, rd+2, etc.) is left unmodified, causing an info_leak of stale register contents when later read as part of the element group.",
+      "snippet": "/* This instruction ignores LMUL and vector register groups */\n...\nvec_element_storei(s, a->rd, 0, t1);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vfmv_f_s",
+        "line_start": 3696,
+        "line_end": 3721,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vfmv.f.s has the same single-register assumption as vmv.x.s. NaN-boxing at line 3703-3704 uses ofs = (8 << s->sew) which for SEW=64 gives ofs=512 (nonsensical for VLEN=32). The element is loaded from only one register. For ELEN > VLEN with SEW > VLEN, the FP element's upper bits are missed, and NaN-boxing logic would produce incorrect results.",
+      "snippet": "unsigned int ofs = (8 << s->sew);\nunsigned int len = 64 - ofs;\n...\nvec_element_loadi(s, cpu_fpr[a->rd], a->rs2, 0, false);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vfmv_s_f",
+        "line_start": 3724,
+        "line_end": 3751,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vfmv.s.f has the same single-register assumption as vmv.s.x (line 3732: 'ignores LMUL and vector register group'). When ELEN > VLEN with SEW > VLEN, the FP scalar stored across ceil(SEW/VLEN) registers is only partially written to the first register, leaving stale data in subsequent registers of the implicit group.",
+      "snippet": "/* The instructions ignore LMUL and vector register group. */\n...\nvec_element_storei(s, a->rd, 0, t1);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "GEN_VEXT_RED helper implementations (all vred*.vs variants)",
+        "line_start": 5030,
+        "line_end": 5058,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "GEN_VEXT_RED macro reads vs1[0] accumulator as sizeof(TD) bytes from a single-register buffer (vlenb = simd_maxsz(desc)). When ELEN > VLEN and SEW > VLEN, the accumulator element spans ceil(SEW/VLEN) registers but only the first register's bytes are read. For TD=int64_t (8 bytes) at VLEN=32 (4 bytes/register), the read overruns into the next register, potentially reading correct data by accident if element layout is byte-contiguous, but this is implementation-defined rather than spec-compliant. Additionally, tail-element setting via vext_set_elems_1s(vd, vta, esz, vlenb) uses sizeof(TD) as the clear unit, but if elements span multiple registers this would not correctly clear the full element storage.",
+      "snippet": "TD s1 = *((TD *)vs1 + HD(0));\n...\n*((TD *)vd + HD(0)) = s1;\n...\nvext_set_elems_1s(vd, vta, esz, vlenb);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "GEN_VEXT_FRED helper implementations (all vfred*.vs variants)",
+        "line_start": 5120,
+        "line_end": 5148,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "GEN_VEXT_FRED macro has the same single-register accumulator assumption as GEN_VEXT_RED. For floating-point reductions with ELEN > VLEN and SEW > VLEN, the FP accumulator (potentially a 64-bit double stored across two 32-bit VLEN registers) is read/written as sizeof(TD) bytes from a single register, causing either partial data access or memory overread into adjacent register state.",
+      "snippet": "TD s1 = *((TD *)vs1 + HD(0));\n...\n*((TD *)vd + HD(0)) = s1;\n...\nvext_set_elems_1s(vd, vta, esz, vlenb);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "GEN_VMV_WHOLE_TRANS (vmv1r.v/vmv2r.v/vmv4r.v/vmv8r.v)",
+        "line_start": 3989,
+        "line_end": 4008,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "GEN_VMV_WHOLE_TRANS uses tcg_gen_gvec_mov(s->sew, ...) for the fast path (vstart=0), with maxsz = vlenb * LEN. The gvec_mov uses s->sew as the element size for endian-aware byte swapping. For ELEN > VLEN with SEW > VLEN, s->sew exceeds the vlenb granularity, causing gvec_mov to interpret the register data using an incorrect element size. Additionally, the vmvr_v helper uses sewb = 1 << vsew from env->vtype for byte-granularity vstart offset computation (startb = env->vstart * sewb), which could produce startb > maxsz incorrectly when SEW > VLEN, causing early exit and skipping the copy entirely.",
+      "snippet": "uint32_t maxsz = s->cfg_ptr->vlenb * LEN;\nif (s->vstart_eq_zero) {\n    tcg_gen_gvec_mov(s->sew, vreg_ofs(s, a->rd),\n                     vreg_ofs(s, a->rs2), maxsz, maxsz);\n} else {\n    tcg_gen_gvec_2_ptr(..., gen_helper_vmvr_v);\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "HELPER(vmvr_v)",
+        "line_start": 5756,
+        "line_end": 5782,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The vmvr_v helper comment states 'EEW = SEW' (line 5758) but the post-relaxation spec requires EEW = min(VLEN*EMUL, SEW) for whole-register moves. The helper reads sewb directly from env->vtype and multiplies by env->vstart to compute startb. When ELEN > VLEN and SEW > VLEN, the element size sewb exceeds the register width, causing startb to potentially jump past maxsz entirely, silently skipping the copy. This is both a functional bug and a potential info_leak: stale register contents in the destination are preserved when they should have been overwritten.",
+      "snippet": "/* EEW = SEW */\nuint32_t sewb = 1 << FIELD_EX64(env->vtype, VTYPE, VSEW);\nuint32_t startb = env->vstart * sewb;\nif (startb >= maxsz) {\n    env->vstart = 0;\n    return;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "HELPER(vsetvl)",
+        "line_start": 61,
+        "line_end": 106,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vsetvl correctly checks sew > cpu->cfg.elen (not sew > vlen) to validate vtype. With ELEN > VLEN relaxation, SEW values up to ELEN remain legal even when they exceed VLEN. The fractional LMUL check at lines 82-83 correctly uses elen (not vlen) for the ELEN*LMUL >= SEW constraint. This validation path is consistent with the proposed relaxation.",
+      "snippet": "if (vlmul == 4 ||\n    (cpu->cfg.elen >> (8 - vlmul)) < sew) {\n    vill = true;\n}\n...\nif ((sew > cpu->cfg.elen) || vill || ...) {"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "vext_get_emul",
+        "line_start": 684,
+        "line_end": 688,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vext_get_emul() correctly computes EMUL = EEW - SEW + LMUL (in log2 terms), clamping to 0. This is the canonical EMUL formula used by load/store operations. However, it IS NOT USED by the scalar move or reduction paths, which is the root of those vulnerabilities.",
+      "snippet": "static uint8_t vext_get_emul(DisasContext *s, uint8_t eew)\n{\n    int8_t emul = eew - s->sew + s->lmul;\n    return emul < 0 ? 0 : emul;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "vext_check_isa_ill",
+        "line_start": 669,
+        "line_end": 672,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vext_check_isa_ill() simply checks !s->vill, which is set by vsetvl validation. This flag is correctly computed in the vsetvl path and is used consistently across all vector translation functions. No false-negative ill check exists.",
+      "snippet": "static bool vext_check_isa_ill(DisasContext *s)\n{\n    return !s->vill;\n}"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

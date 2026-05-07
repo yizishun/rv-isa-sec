@@ -1,0 +1,312 @@
+diff --git a/backends/generators/Go/go_generator.py b/backends/generators/Go/go_generator.py
+index b02c8337ee..08f67ea899 100644
+--- a/backends/generators/Go/go_generator.py
++++ b/backends/generators/Go/go_generator.py
+@@ -108,6 +108,11 @@ def parse_args():
+         action="store_true",
+         help="Include all instructions, ignoring extension filtering",
+     )
++    parser.add_argument(
++        "--include-mock",
++        action="store_true",
++        help="Include mock/test instructions and CSRs (excluded by default)",
++    )
+     return parser.parse_args()
+ 
+ 
+@@ -143,9 +148,16 @@ def main():
+     if not os.path.isdir(args.csr_dir):
+         logging.warning(f"CSR directory not found: {args.csr_dir}")
+ 
++    # By default, mock items are excluded unless --include-mock is specified
++    exclude_mock = not args.include_mock
++
+     # Load instructions filtered by extensions or all instructions
+     instr_dict = load_instructions(
+-        args.inst_dir, enabled_extensions, include_all, args.arch
++        args.inst_dir,
++        enabled_extensions,
++        include_all,
++        args.arch,
++        exclude_mock=exclude_mock,
+     )
+     if not instr_dict:
+         logging.error("No instructions found or all were filtered out.")
+@@ -156,7 +168,13 @@ def main():
+     logging.info(f"Loaded {len(instr_dict)} instructions")
+ 
+     # Load CSRs filtered by extensions or all CSRs
+-    csrs = load_csrs(args.csr_dir, enabled_extensions, include_all, args.arch)
++    csrs = load_csrs(
++        args.csr_dir,
++        enabled_extensions,
++        include_all,
++        args.arch,
++        exclude_mock=exclude_mock,
++    )
+     if not csrs:
+         logging.warning("No CSRs found or all were filtered out.")
+     else:
+diff --git a/backends/generators/c_header/generate_encoding.py b/backends/generators/c_header/generate_encoding.py
+index 022942d8c6..602940ba80 100644
+--- a/backends/generators/c_header/generate_encoding.py
++++ b/backends/generators/c_header/generate_encoding.py
+@@ -224,6 +224,11 @@ def main():
+         "--resolved-codes",
+         help="JSON file containing pre-resolved exception codes",
+     )
++    parser.add_argument(
++        "--include-mock",
++        action="store_true",
++        help="Include mock/test instructions and CSRs (excluded by default)",
++    )
+ 
+     args = parser.parse_args()
+ 
+@@ -234,14 +239,25 @@ def main():
+     output_file = os.path.join(this_dir, args.output)
+ 
+     # Load instructions and CSRs
++    # By default, mock items are excluded unless --include-mock is specified
++    exclude_mock = not args.include_mock
++
+     logging.info(f"Loading instructions from {args.inst_dir}")
+     instructions = load_instructions(
+-        args.inst_dir, args.extensions, include_all=args.include_all, target_arch="BOTH"
++        args.inst_dir,
++        args.extensions,
++        include_all=args.include_all,
++        target_arch="BOTH",
++        exclude_mock=exclude_mock,
+     )
+ 
+     logging.info(f"Loading CSRs from {args.csr_dir}")
+     csrs = load_csrs(
+-        args.csr_dir, args.extensions, include_all=args.include_all, target_arch="BOTH"
++        args.csr_dir,
++        args.extensions,
++        include_all=args.include_all,
++        target_arch="BOTH",
++        exclude_mock=exclude_mock,
+     )
+ 
+     # Load exception codes
+diff --git a/backends/generators/generator.py b/backends/generators/generator.py
+index 93ac1c894f..84795ae9a2 100755
+--- a/backends/generators/generator.py
++++ b/backends/generators/generator.py
+@@ -9,6 +9,61 @@
+ logging.basicConfig(level=logging.INFO, format="%(levelname)s:: %(message)s")
+ 
+ 
++def is_mock_item(name, defined_by=None):
++    """
++    Check if an item (instruction, CSR, etc.) is a mock/test item that should
++    be excluded from standard artifacts.
++
++    Mock items are identified by:
++    - Name containing 'mock' (case-insensitive)
++    - Being defined by an extension starting with 'Xmock' or 'Mock'
++
++    Args:
++        name: The name of the item
++        defined_by: The definedBy field from the item's YAML (optional)
++
++    Returns:
++        True if this is a mock item, False otherwise
++    """
++    # Check if name contains 'mock'
++    if name and "mock" in name.lower():
++        return True
++
++    # Check if defined by a mock extension
++    if defined_by:
++        ext_name = None
++        if isinstance(defined_by, str):
++            ext_name = defined_by
++        elif isinstance(defined_by, dict):
++            if "name" in defined_by:
++                ext_name = defined_by["name"]
++            elif "extension" in defined_by:
++                ext_spec = defined_by["extension"]
++                if isinstance(ext_spec, dict) and "name" in ext_spec:
++                    ext_name = ext_spec["name"]
++                elif isinstance(ext_spec, str):
++                    ext_name = ext_spec
++            elif "allOf" in defined_by:
++                # Check all requirements
++                for req in defined_by["allOf"]:
++                    if is_mock_item(None, req):
++                        return True
++            elif "anyOf" in defined_by or "oneOf" in defined_by:
++                # Check any of the requirements
++                reqs = defined_by.get("anyOf") or defined_by.get("oneOf")
++                for req in reqs:
++                    if is_mock_item(None, req):
++                        return True
++
++        if ext_name and ("mock" in ext_name.lower() or ext_name.startswith("X")):
++            # Extensions starting with X are custom/vendor extensions
++            # Only filter if they also contain 'mock'
++            if "mock" in ext_name.lower():
++                return True
++
++    return False
++
++
+ def check_requirement(req, exts):
+     if isinstance(req, str):
+         return req in exts
+@@ -205,7 +260,11 @@ def check_alternative(alt, exts):
+ 
+ 
+ def load_instructions(
+-    root_dir, enabled_extensions, include_all=False, target_arch="RV64"
++    root_dir,
++    enabled_extensions,
++    include_all=False,
++    target_arch="RV64",
++    exclude_mock=True,
+ ):
+     """
+     Recursively walk through root_dir, load YAML files that define an instruction,
+@@ -213,12 +272,14 @@ def load_instructions(
+ 
+     If include_all is True, extension filtering is bypassed.
+     target_arch can be "RV32", "RV64", or "BOTH".
++    If exclude_mock is True (default), mock/test instructions are filtered out.
+     """
+     instr_dict = {}
+     found_files = 0
+     found_instructions = 0
+     extension_filtered = 0
+     encoding_filtered = 0
++    mock_filtered = 0
+ 
+     logging.info(
+         f"Searching for instruction files in {root_dir} for target architecture {target_arch}"
+@@ -246,6 +307,14 @@ def load_instructions(
+                 logging.error(f"Missing 'name' field in {path}")
+                 continue
+ 
++            # Filter out mock/test instructions unless explicitly included
++            if exclude_mock:
++                definedBy = data.get("definedBy")
++                if is_mock_item(name, definedBy):
++                    logging.debug(f"Skipping mock instruction: {name}")
++                    mock_filtered += 1
++                    continue
++
+             # If include_all is True, skip extension filtering
+             if not include_all:
+                 # Check if this instruction is defined by an enabled extension
+@@ -385,6 +454,8 @@ def load_instructions(
+         logging.info(
+             f"Found {found_instructions} instruction definitions in {found_files} files"
+         )
++        if mock_filtered > 0:
++            logging.info(f"Filtered out {mock_filtered} mock instructions")
+         if extension_filtered > 0:
+             logging.info(f"Filtered out {extension_filtered} instructions by extension")
+         if encoding_filtered > 0:
+@@ -398,7 +469,13 @@ def load_instructions(
+     return instr_dict
+ 
+ 
+-def load_csrs(csr_root, enabled_extensions, include_all=False, target_arch="RV64"):
++def load_csrs(
++    csr_root,
++    enabled_extensions,
++    include_all=False,
++    target_arch="RV64",
++    exclude_mock=True,
++):
+     """
+     Recursively walk through csr_root, load YAML files that define a CSR,
+     filter by enabled extensions, and collect them into a dictionary mapping
+@@ -406,6 +483,7 @@ def load_csrs(csr_root, enabled_extensions, include_all=False, target_arch="RV64
+ 
+     If include_all is True, extension filtering is bypassed.
+     target_arch can be "RV32", "RV64", or "BOTH".
++    If exclude_mock is True (default), mock/test CSRs are filtered out.
+     """
+     csrs = {}
+     found_files = 0
+@@ -413,6 +491,7 @@ def load_csrs(csr_root, enabled_extensions, include_all=False, target_arch="RV64
+     extension_filtered = 0
+     arch_filtered = 0
+     address_errors = 0
++    mock_filtered = 0
+ 
+     logging.info(
+         f"Searching for CSR files in {csr_root} for target architecture {target_arch}"
+@@ -440,6 +519,14 @@ def load_csrs(csr_root, enabled_extensions, include_all=False, target_arch="RV64
+                 logging.error(f"Missing 'name' field in {path}")
+                 continue
+ 
++            # Filter out mock/test CSRs unless explicitly included
++            if exclude_mock:
++                definedBy = data.get("definedBy")
++                if is_mock_item(name, definedBy):
++                    logging.debug(f"Skipping mock CSR: {name}")
++                    mock_filtered += 1
++                    continue
++
+             address = data.get("address")
+             indirect_address = data.get("indirect_address")
+ 
+@@ -501,6 +588,8 @@ def load_csrs(csr_root, enabled_extensions, include_all=False, target_arch="RV64
+ 
+     if found_csrs > 0:
+         logging.info(f"Found {found_csrs} CSR definitions in {found_files} files")
++        if mock_filtered > 0:
++            logging.info(f"Filtered out {mock_filtered} mock CSRs")
+         if extension_filtered > 0:
+             logging.info(f"Filtered out {extension_filtered} CSRs by extension")
+         if arch_filtered > 0:
+diff --git a/backends/generators/sverilog/sverilog_generator.py b/backends/generators/sverilog/sverilog_generator.py
+index 471ccdd693..933e191e23 100644
+--- a/backends/generators/sverilog/sverilog_generator.py
++++ b/backends/generators/sverilog/sverilog_generator.py
+@@ -61,6 +61,11 @@ def parse_args():
+         "--resolved-codes",
+         help="JSON file containing pre-resolved exception codes",
+     )
++    parser.add_argument(
++        "--include-mock",
++        action="store_true",
++        help="Include mock/test instructions and CSRs (excluded by default)",
++    )
+     return parser.parse_args()
+ 
+ 
+@@ -174,14 +179,27 @@ def main():
+ 
+     logging.info(f"Target architecture: {args.arch}")
+ 
++    # By default, mock items are excluded unless --include-mock is specified
++    exclude_mock = not args.include_mock
++
+     # Load instructions
+     instructions = load_instructions(
+-        args.inst_dir, enabled_extensions, args.include_all, args.arch
++        args.inst_dir,
++        enabled_extensions,
++        args.include_all,
++        args.arch,
++        exclude_mock=exclude_mock,
+     )
+     logging.info(f"Loaded {len(instructions)} instructions")
+ 
+     # Load CSRs
+-    csrs = load_csrs(args.csr_dir, enabled_extensions, args.include_all, args.arch)
++    csrs = load_csrs(
++        args.csr_dir,
++        enabled_extensions,
++        args.include_all,
++        args.arch,
++        exclude_mock=exclude_mock,
++    )
+     logging.info(f"Loaded {len(csrs)} CSRs")
+ 
+     # Load exception codes

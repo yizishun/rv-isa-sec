@@ -1,0 +1,165 @@
+diff --git a/tests/data/golden/Xqci@0.13.0.adoc b/tests/data/golden/Xqci@0.13.0.adoc
+index 878b63d4a2..de24b43e19 100644
+--- a/tests/data/golden/Xqci@0.13.0.adoc
++++ b/tests/data/golden/Xqci@0.13.0.adoc
+@@ -1,6 +1,6 @@
+ [[header]]
+ :description: Qualcomm uC extensions (Xqci)
+-:revdate: 2026-03-22
++:revdate: 2026-03-25
+ :revnumber: 0.13.0
+ :revmark: This document is in the http://riscv.org/spec-state[Frozen state]. + \
+ + \
+diff --git a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.3.rbi b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.3.rbi
+index 778106a88f..91a87a408e 100644
+--- a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.3.rbi
++++ b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.3.rbi
+@@ -209,6 +209,8 @@ module Udb
+     sig { returns(::Pathname) }
+     def gem_path; end
+ 
++    def global_options; end
++
+     sig { returns(::Udb::LogLevel) }
+     def log_level; end
+ 
+@@ -2477,6 +2479,10 @@ class Udb::FullConfig < ::Udb::AbstractConfig
+   def unconfigured?; end
+ end
+ 
++class Udb::GlobalOptions < ::T::Struct
++  prop :parallel_z3, T::Boolean, default: T.unsafe(nil)
++end
++
+ module Udb::HasFields
+   def affected_by?(ext_ver); end
+   def field(field_name); end
+@@ -4988,6 +4994,17 @@ class Udb::Z3Solver
+ 
+   sig { returns(::Z3::IntExpr) }
+   def xlen; end
++
++  class << self
++    sig { params(desired: T::Boolean).void }
++    def configure_parallelization(desired); end
++
++    sig { returns(T.nilable(T::Boolean)) }
++    def parallel_enabled; end
++
++    sig { params(value: T.nilable(T::Boolean)).void }
++    def parallel_enabled=(value); end
++  end
+ end
+ 
+ class Udb::Z3Sovler; end
+diff --git a/tools/ruby-gems/udb/lib/udb/cli.rb b/tools/ruby-gems/udb/lib/udb/cli.rb
+index 93231f09bf..483a4b24dc 100644
+--- a/tools/ruby-gems/udb/lib/udb/cli.rb
++++ b/tools/ruby-gems/udb/lib/udb/cli.rb
+@@ -10,6 +10,7 @@
+ require "thor"
+ require "terminal-table"
+ 
++require_relative "global_opts"
+ require_relative "resolver"
+ 
+ class SubCommandBase < Thor
+@@ -81,9 +82,12 @@ def spec
+       method_option :custom, type: :string, desc: "Path to custom specification directory, if needed", default: Udb.default_custom_isa_path.to_s
+       method_option :config_dir, type: :string, desc: "Path to directory with config files", default: Udb.default_cfgs_path.to_s
+       method_option :gen, type: :string, desc: "Path to folder used for generation", default: Udb.default_gen_path.to_s
++      method_option :z3parallel, type: :boolean, desc: "Use parallel.enable for Z3", default: true
+       def cfg(name_or_path)
+         raise ArgumentError, "Spec directory does not exist: #{options[:std]}" unless File.directory?(options[:std])
+ 
++        Udb.global_options.parallel_z3 = options[:z3parallel]
++
+         cfg_file =
+           if File.file?(name_or_path)
+             Pathname.new(name_or_path)
+diff --git a/tools/ruby-gems/udb/lib/udb/global_opts.rb b/tools/ruby-gems/udb/lib/udb/global_opts.rb
+new file mode 100644
+index 0000000000..92672d45a3
+--- /dev/null
++++ b/tools/ruby-gems/udb/lib/udb/global_opts.rb
+@@ -0,0 +1,18 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# typed: true
++# frozen_string_literal: true
++
++require "sorbet-runtime"
++
++module Udb
++  class GlobalOptions < T::Struct
++    # when true, set Z3's parallel.enable param to true
++    prop :parallel_z3, T::Boolean, default: true
++  end
++
++  def self.global_options
++    @global_options ||= GlobalOptions.new
++  end
++end
+diff --git a/tools/ruby-gems/udb/lib/udb/z3.rb b/tools/ruby-gems/udb/lib/udb/z3.rb
+index 9935369314..190b7c162e 100644
+--- a/tools/ruby-gems/udb/lib/udb/z3.rb
++++ b/tools/ruby-gems/udb/lib/udb/z3.rb
+@@ -14,6 +14,8 @@
+ require "forwardable"
+ require "sorbet-runtime"
+ require "udb/version_spec"
++
++require_relative "global_opts"
+ require_relative "z3_loader"
+ 
+ # Ensure Z3 library is available before requiring the z3 gem
+@@ -1057,9 +1059,48 @@ class Z3Solver
+     sig { returns(Z3::Solver) }
+     attr_reader :solver
+ 
++    @parallel_enabled = T.let(nil, T.nilable(T::Boolean))
++
++    class << self
++      extend T::Sig
++
++      sig { returns(T.nilable(T::Boolean)) }
++      def parallel_enabled
++        @parallel_enabled
++      end
++
++      sig { params(value: T.nilable(T::Boolean)).void }
++      def parallel_enabled=(value)
++        @parallel_enabled = value
++      end
++
++      sig { params(desired: T::Boolean).void }
++      def configure_parallelization(desired)
++        previous = parallel_enabled
++
++        if !previous.nil? && previous != desired
++          if desired
++            Udb.logger.warn "Z3 parallelization was previously disabled, but is now being enabled"
++          else
++            Udb.logger.warn "Z3 parallelization was previously enabled, but is now being disabled"
++          end
++        end
++
++        Z3.set_param("parallel.enable", desired ? "true" : "false")
++        self.parallel_enabled = desired
++      end
++    end
++
+     sig { void }
+     def initialize
++      if Udb.global_options.parallel_z3
++        Z3Solver.configure_parallelization(true)
++      else
++        Z3Solver.configure_parallelization(false)
++      end
++
+       @solver = T.let(Z3::Solver.new, Z3::Solver)
++
+       # Stacks for incremental solving with push/pop
+       @ext_vers = T.let([{}], T::Array[T::Hash[String, Z3ExtensionVersion]])
+       @ext_reqs = T.let([{}], T::Array[T::Hash[String, Z3ExtensionRequirement]])

@@ -1,0 +1,163 @@
+{
+  "pr_number": 703,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 703,
+    "violation_condition": "If the Smip fast-interrupt extension is enabled on a hart running FreeBSD, the kernel writes a bare address (bit 0 = 0, direct mode) to stvec, creating a single entry point (cpu_exception_handler) shared by both interrupts and synchronous exceptions. Smip modifies interrupt trap entry behavior (e.g., selective register stacking, different save/restore semantics) but does not modify synchronous exception trap behavior. Since both trap types vector to the same handler, the Smip-altered interrupt entry state (register file, trap frame layout, or control flow) violates the assumptions in cpu_exception_handler and its save_registers/load_registers macros, which expect unmodified RISC-V trap entry semantics for all traps regardless of cause.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "csrw\\s+stvec,\\s*\\w+ where the written value has bit 0 clear AND Smip is enabled (check menvcfg/senvcfg for Smip enable bits) OR any kernel code setting stvec.mode=0 while the CLIC/Smip hardware is active",
+    "affected_entities": [
+      "stvec",
+      "mtvec",
+      "scause"
+    ],
+    "summary": "FreeBSD's cpu_exception_handler uses direct-mode stvec (mode=0) as a unified trap entry for both interrupts and exceptions in exception.S:208, which the Smip spec explicitly marks as incompatible because Smip modifies interrupt entry behavior without modifying exception entry behavior"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "_alt_start / pagetables (BSP boot)",
+        "line_start": 231,
+        "line_end": 232,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "BSP writes cpu_exception_handler to stvec with bit 0 = 0 (direct mode), creating a single entry point for both interrupts and synchronous exceptions. If the firmware (OpenSBI) or M-mode enables Smip (menvcfg/senvcfg Smip enable bits), Smip applies selective hardware register stacking for interrupts but not for synchronous exceptions. Since both trap types vector to the same handler, save_registers/load_registers in exception.S assume standard unmodified RISC-V trap entry semantics and would either double-save registers (corrupting the trapframe layout) or miss registers (leaving caller-saved state unrestored on sret), depending on which subset Smip stacks. The kernel has no Smip-awareness, no ISA string check for Smsip, and no defensive configuration.",
+      "snippet": "la\tt0, cpu_exception_handler\n\tcsrw\tstvec, t0"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "mpentry (secondary CPU boot)",
+        "line_start": 386,
+        "line_end": 387,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same pattern as BSP: secondary CPUs set stvec = cpu_exception_handler (bit 0 = 0, direct mode). Same vulnerability: if Smip is active, interrupt entry diverges from synchronous exception entry but both go through the same save_registers/load_registers path which assumes standard trap semantics. All AP harts inherit the same silent corruption risk.",
+      "snippet": "la\tt0, cpu_exception_handler\n\tcsrw\tstvec, t0"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "cpu_exception_handler",
+        "line_start": 208,
+        "line_end": 217,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The shared entry point dispatches on sscratch (user vs supervisor) but does NOT inspect scause before dispatching to save_registers. Under Smip with CLIC active, interrupt traps may have already stacked a subset of registers (x1/x5-x7/x10-x17/x28-x31 per the Smip spec) by the time this handler runs. The save_registers macro (lines 41-114) manually saves ALL of ra, tp, gp, t0-t6, s0-s11, a0-a7, which would: (a) overwrite Smip-stacked values with post-trap register contents, or (b) corrupt the trapframe if Smip-stacked registers are in a different order/offset. The load_registers macro (lines 116-182) would then restore the wrong values on sret.",
+      "snippet": "ENTRY(cpu_exception_handler)\n\tcsrrw\tsp, sscratch, sp\n\tbeqz\tsp, 1f\n\t/* User mode detected */\n\tj\tcpu_exception_handler_user\n1:\n\t/* Supervisor mode detected */\n\tcsrrw\tsp, sscratch, sp\n\tj\tcpu_exception_handler_supervisor\nEND(cpu_exception_handler)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers (macro)",
+        "line_start": 41,
+        "line_end": 114,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The save_registers macro manually saves all t0-t6, s0-s11, a0-a7, ra, tp, gp, sepc, sstatus, stval, scause into a struct trapframe at sp - TF_SIZE. This assumes standard RISC-V trap entry semantics where hardware saves ONLY sepc/scause/stval/sstatus (or their virtualized equivalents) and nothing else. Under Smip with selective hardware stacking, a configurable subset of GPRs may already be saved by the hardware to a different location or in a different format. The manual saves here would clobber or duplicate hardware-stacked state, making the trapframe internally inconsistent.",
+      "snippet": "addi\tsp, sp, -(TF_SIZE)\n\tsd\tra, (TF_RA)(sp)\n\tsd\ttp, (TF_TP)(sp)\n\tsd\tgp, (TF_GP)(sp)\n\t...\n\tsd\tt0, (TF_T + 0 * 8)(sp)\n\t..."
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "load_registers (macro)",
+        "line_start": 116,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The load_registers macro restores sstatus, sepc, then all GPRs from the trapframe and deallocates it with addi sp, sp, TF_SIZE. Under Smip, if selective stacking pushed some registers onto the stack before the kernel's manual save, the trapframe layout (offsets within TF_SIZE) would be misaligned with the actual stack state. The addi sp, sp, TF_SIZE at line 181 may not fully unwind the stack if Smip stacked additional state, causing stack corruption on return.",
+      "snippet": "addi\tsp, sp, (TF_SIZE)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 307,
+        "line_end": 323,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "This C-level handler dispatches interrupts vs exceptions by testing frame->tf_scause & SCAUSE_INTR (line 319). Under Smip, the scause register and trapframe scause slot may already have the Smip-modified cause encoding or the handler reaches this point with a register file in an unexpected state. The code has no awareness that Smip could alter the register state at entry, and no defensive check against it (e.g., checking isa_extensions or senvcfg).",
+      "snippet": "exception = frame->tf_scause & SCAUSE_CODE;\n\tif ((frame->tf_scause & SCAUSE_INTR) != 0) {\n\t\t/* Interrupt */\n\t\tintr_irq_handler(frame, INTR_ROOT_IRQ);\n\t\treturn;\n\t}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch (guest entry)",
+        "line_start": 70,
+        "line_end": 77,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vmm_switch sets stvec = .Lswitch_return (bit 0 = 0, direct-mode) during guest execution. This is contextual: the hypervisor's own trap entry is .Lswitch_return, not cpu_exception_handler. The host stvec (cpu_exception_handler) is correctly saved to HYP_H_STVEC at line 84 and restored at line 165 on guest exit. This is a proper save/restore pair and would correctly handle whatever stvec mode was active before guest entry. No Smip-specific issue here beyond the underlying host kernel issue.",
+      "snippet": "la\tt4, .Lswitch_return\n\t...\n\tcsrrw\tt4, stvec, t4\n\t...\n\tsd\tt4, (HYP_H_STVEC)(a0)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "riscv_unpriv_read",
+        "line_start": 278,
+        "line_end": 319,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Temporarily swaps stvec to vmm_unpriv_trap (bit 0 = 0, direct mode) via csr_swap, then restores via csr_write. This is a bounded critical section with interrupts disabled (intr_disable at line 281). vmm_unpriv_trap is a minimal handler that only records sepc/stval/scause/htval/htinst and advances sepc by 4, then srets. No Smip-specific risk here: interrupts are disabled so an interrupt-caused Smip entry can't fire during this window, and the save/restore of stvec is atomic.",
+      "snippet": "intr = intr_disable();\n\told_stvec = csr_swap(stvec, entry);\n\t...\n\tcsr_write(stvec, old_stvec);\n\tintr_restore(intr);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_restore_csrs",
+        "line_start": 162,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Writes csrs->vstvec to the vstvec CSR (virtual stvec for V=1 mode). This is the guest's virtual stvec, not the host's stvec. The hypervisor correctly uses vs-level CSRs for guest context. No direct Smip concern since the guest's own stvec configuration is the guest's responsibility (and is properly virtualized through vstvec/vscause/vsepc).",
+      "snippet": "csr_write(vstvec, csrs->vstvec);\n\tcsr_write(vsscratch, csrs->vsscratch);\n\tcsr_write(vsepc, csrs->vsepc);\n\tcsr_write(vscause, csrs->vscause);\n\tcsr_write(vstval, csrs->vstval);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/machdep.c",
+        "function_name": "initriscv",
+        "line_start": 558,
+        "line_end": 678,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "initriscv() calls identify_cpu() which parses the ISA string but the kernel has no Smip/Smstateen ISA extension check. There is no code anywhere in the RISC-V port that reads or configures menvcfg/senvcfg, checks the Smip enable bit, or validates that stvec.mode is compatible with the active trap-extension configuration. The encoding.h header has no menvcfg/senvcfg CSR definitions. This means the kernel is completely agnostic to whether firmware has enabled Smip, and cannot adapt its trap handling accordingly.",
+      "snippet": "identify_cpu(0);\n\t...\n\t/* no Smip check, no menvcfg/senvcfg access, no stvec.mode validation */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/encoding.h",
+        "function_name": "(CSR definitions)",
+        "line_start": 560,
+        "line_end": 575,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "encoding.h defines CSR_STVEC (0x105) and CSR_MTVEC (0x305), but does NOT define menvcfg (0x30A) or senvcfg (0x10A). Since Smip enable bits are in menvcfg/senvcfg, the kernel lacks even the constants needed to read whether firmware has enabled the extension. This makes it impossible for the kernel to assert or fail gracefully on Smip-incompatible configurations.",
+      "snippet": "#define CSR_STVEC 0x105\n\t...\n\t/* No CSR_MENVCFG (0x30A), CSR_SENVCFG (0x10A) defined */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch (guest exit)",
+        "line_start": 158,
+        "line_end": 165,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Restores host stvec from HYP_H_STVEC. This correctly unwinds whatever stvec was saved during guest entry. Since the host stvec is cpu_exception_handler (bit 0 = 0), it inherits the same potential_risk as locore.S but the save/restore mechanism itself is correct.",
+      "snippet": "ld\tt1, (HYP_H_STVEC)(a0)\n\t...\n\tcsrw\tstvec, t1"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

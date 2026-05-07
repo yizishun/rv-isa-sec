@@ -1,0 +1,106 @@
+{
+  "pr_number": 727,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 727,
+    "violation_condition": "QEMU TCG translates c.mtss/c.mtss_pop/c.stss/c.stss_pop without checking that the source register's lower 4 bits (rs[3:0]) are zero, executing the stack pointer swap with a misaligned pointer instead of raising an illegal-instruction exception.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "trans_c_mtss|trans_c_stss|stack.*swap|smcsps.*translate|decode.*mtss|decode.*stss",
+    "affected_entities": [
+      "c.mtss",
+      "c.mtss_pop",
+      "c.stss",
+      "c.stss_pop",
+      "msp",
+      "ssp"
+    ],
+    "summary": "Missing alignment check on source register in TCG translation of Smcsps/Sscsps conditional-stack-pointer-swap instructions silently executes with misaligned SP, violating the ISA-mandated illegal-instruction trap that gates the stack-swap mechanism on 128b-aligned x2."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/insn16.decode",
+        "function_name": "decode (compressed quadrant 1)",
+        "line_start": 148,
+        "line_end": 150,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Smscps instructions (c.mtss/c.mtss_pop/c.stss/c.stss_pop) are not implemented in this QEMU version. The existing Zicfiss compressed variants (c.sspush/c.sspopchk) use fixed register assignments (rs2=x1, rs1=x0 for sspush; rs1=x5, rd=x0 for sspopchk) carved from c.mop encoding slots, so there are no variable register operands to validate for alignment. The vulnerability pattern 'trans_c_mtss|trans_c_stss|mtss|stss' has zero matches in the codebase.",
+      "snippet": "sspush   011 0  00001  00000 01 &r2_s rs2=1 rs1=0\nsspopchk 011 0  00101  00000 01 &r2 rs1=5 rd=0\nc_mop_n  011 0 0 n:3 1 00000 01"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvzicfiss.c.inc",
+        "function_name": "trans_sspush",
+        "line_start": 53,
+        "line_end": 70,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "trans_sspush computes the shadow stack address from env->ssp with proper aligned offset (-8/-4), uses SS_MMU_INDEX for shadow-stack-protected memory access, and correctly updates env->ssp. No operand passed from the instruction encoding requires alignment validation — the compressed form uses fixed rs2=1.",
+      "snippet": "tcg_gen_ld_tl(addr, tcg_env, offsetof(CPURISCVState, ssp));\ntcg_gen_addi_tl(addr, addr, tmp);\ntcg_gen_qemu_st_tl(data, addr, SS_MMU_INDEX(ctx), mxl_memop(ctx) | MO_ALIGN);\ntcg_gen_st_tl(addr, tcg_env, offsetof(CPURISCVState, ssp));"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvzicfiss.c.inc",
+        "function_name": "trans_sspopchk",
+        "line_start": 25,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "trans_sspopchk properly loads from env->ssp-aligned address with SS_MMU_INDEX protection, compares against rs1 (fixed x5 in compressed form), branches to sw_check exception on mismatch, and advances ssp. No variable alignment-sensitive operand from the encoding.",
+      "snippet": "tcg_gen_ld_tl(addr, tcg_env, offsetof(CPURISCVState, ssp));\ntcg_gen_qemu_ld_tl(data, addr, SS_MMU_INDEX(ctx), mxl_memop(ctx) | MO_ALIGN);\ntcg_gen_brcond_tl(TCG_COND_EQ, data, rs1, skip);\ngen_helper_raise_exception(tcg_env, tcg_constant_i32(RISCV_EXCP_SW_CHECK));"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_ssp",
+        "line_start": 861,
+        "line_end": 866,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "write_ssp performs no WARL validation on the written ssp value — any arbitrary value is accepted. While the spec allows writes to ssp, an unaligned ssp value could cause subsequent sspush/sspopchk to access misaligned shadow-stack locations. The hardware memory access (MO_ALIGN in trans functions) would trap misaligned accesses, but the CSR itself should enforce alignment constraints per the Zicfiss spec.",
+      "snippet": "static RISCVException write_ssp(CPURISCVState *env, int csrno,\n                                target_ulong val, uintptr_t ra)\n{\n    env->ssp = val;\n    return RISCV_EXCP_NONE;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_ssp",
+        "line_start": 391,
+        "line_end": 400,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ssp CSR state is properly registered in the vmstate subsection (gated on ext_zicfiss) via vmstate_ssp. The ssp field is migrated as UINTTL. No other Zicfiss-specific CSRs require migration — menvcfg/senvcfg/henvcfg are handled by the existing envcfg vmstate.",
+      "snippet": "static const VMStateDescription vmstate_ssp = {\n    .name = \"cpu/ssp\",\n    .fields = (const VMStateField[]) {\n        VMSTATE_UINTTL(env.ssp, RISCVCPU),\n        VMSTATE_END_OF_LIST()\n    }\n};"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_reset",
+        "line_start": 775,
+        "line_end": 776,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reset sets env->ssp = 0, which is the spec-mandated reset value per the Zicfiss spec. menvcfg is also reset to 0 (line 770-771), meaning SSE is disabled on reset — shadow stack must be explicitly enabled by firmware before use.",
+      "snippet": "/* on reset ssp is set to 0 */\nenv->ssp = 0;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "helper_ssamoswap_disabled",
+        "line_start": 748,
+        "line_end": 754,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The ssamoswap disabled check uses get_field(env->menvcfg, MENVCFG_SSE) to test M-mode SSE. However, when in VS/VU mode with H-ext enabled, the effective SSE enablement depends on henvcfg, not menvcfg. The code then checks virt_enabled and raises VIRT_INSTRUCTION_FAULT, but this logic path may not correctly handle the case where MENVCFG_SSE=1 but HENVCFG_SSE=0 for a VS-mode guest — the exception should be illegal-instruction, not virtual-instruction.",
+      "snippet": "if (!get_field(env->menvcfg, MENVCFG_SSE)) {\n    exception = RISCV_EXCP_ILLEGAL_INST;\n    goto done;\n}"
+    }
+  ],
+  "overall_severity": "compliant"
+}

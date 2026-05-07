@@ -1,0 +1,52 @@
+PR #2901  target=xiangshan  overall=bug_confirmed
+Spec: Zisb barriers encoded as Zimop MOPs may be decoded as NOPs in XiangShan, rendering all three speculation barriers (TEB/MDB/DPB) completely ineffective and allowing transient execution attacks to leak data through cache-based side channels despite advertised Zisb support
+Violation: In XiangShan RTL, the Zisb barrier instructions (TEB, MDB, DPB) are encoded using Zimop MOP code points (SYSTEM opcode space). If the XiangShan decoder maps these code points to the Zimop default behavior (treating MOPs as NOPs via a single MOP.NOP micro-op or bypassing the pipeline without generating barrier micro-ops), then even when the CPU advertises Zisb=1 in the ISA string or misa register, the hardware provides zero speculation control. Specifically: (1) the IDU (Instruction Decode Unit) in Frontend.scala or Decoder.scala maps the Zimop opcode range to a no-op functional unit with no pipeline fence, (2) no BarrierTag or speculation-control token is injected into the ROB (Reorder Buffer) or dispatch queue, and (3) the branch predictor (FTQ/FTB in Frontend.scala), load-store unit (LSU in LSU.scala), and any data-value prediction logic remain completely unaware of the barrier boundaries.
+Consequence: info_leak
+Pattern: Zimop.*NOP|MOP\.(NOP|noop)|Zisb.*decode|TEB|MDB|DPB|barrier.*bypass|speculation.*barrier|isZimop|MOPR|MOPS|ZimopDecode|Decoder.*SYSTEM.*000|SYSTEM.*101|FUNCT3.*100.*SYSTEM
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/decode/Instructions.scala:24-27  Zimop object
+  Zimop MOP_R and MOP_RR BitPat definitions use FUNCT3=100 in SYSTEM opcode space (opcode 1110011). The proposed Zisb TEB/MDB/DPB barrier instructions would be encoded in this same opcode/FUNCT3 space, differentiated only by FUNCT7/rs2 fields. If Zisb were added without distinguishing FUNCT7 sub-encodings, all Zisb barriers would silently match the MOP_R/MOP_RR patterns and decode as ALU adds with zero speculation control.
+  | object Zimop {
+  |   def MOP_R  = BitPat("b1?00??0111???????100?????1110011")
+  |   def MOP_RR = BitPat("b1?00??1??????????100?????1110011")
+  | }
+
+[bug_confirmed] src/main/scala/xiangshan/backend/decode/DecodeUnit.scala:526-532  ZimopDecode object
+  Zimop MOP_R and MOP_RR decode as FuType.alu with ALUOpType.add — a bare integer ADD — with noSpec=false, blockBack=false, flushPipe=false (all default to false in XSDecode). This means the instruction that would carry Zisb barrier semantics (TEB/MDB/DPB) produces zero speculation-control tokens. The hardware generates no ROB block-backward, no pipeline flush, and no speculative-execution fence. By contrast, FENCE/SFENCE.VMA/FENCE.I correctly set noSpec=T, blockBack=T, flushPipe=T and map to FuType.fence (line 249-252). The comment '// temp use addi to decode MOP_R and MOP_RR' confirms this is a known placeholder, not a deliberate security decision.
+  | object ZimopDecode extends DecodeConstants {
+  |   override val decodeArray: Array[(BitPat, XSDecodeBase)] = Array(
+  |     // temp use addi to decode MOP_R and MOP_RR
+  |     MOP_R  -> XSDecode(..., FuType.alu, ALUOpType.add, ..., xWen = T, canRobCompress = T),
+  |     MOP_RR -> XSDecode(..., FuType.alu, ALUOpType.add, ..., xWen = T, canRobCompress = T),
+  |   )
+  | }
+
+[bug_confirmed] src/main/scala/xiangshan/backend/decode/DecodeUnit.scala:827-832  DecodeUnit (inline decode logic)
+  The isZimop signal (hardcoded duplicate BitPat match at lines 827-828) propagates Zimop instructions as 'isMove' (line 832: 'decodedInst.isMove := isMove || isZimop'). In the rename stage (Rename.scala), isMove instructions skip physical register allocation entirely. The comment '// temp decode zimop as move' explicitly marks this as temporary. If Zisb barrier instructions share these MOP code points, they would bypass the physical register file allocation — making them truly no-op in the data path and completely invisible to any speculation-control mechanism.
+  | val isZimop = (BitPat("b1?00??0111??_?????_100_?????_1110011") === ctrl_flow.instr) ||
+  |               (BitPat("b1?00??1?????_?????_100_?????_1110011") === ctrl_flow.instr)
+  | // ...
+  | // temp decode zimop as move
+  | decodedInst.isMove := (isMove || isZimop) && ctrl_flow.instr(RD_MSB, RD_LSB) =/= 0.U && !io.csrCtrl.singlestep
+
+[potential_risk] src/main/scala/xiangshan/package.scala:254-261  FenceOpType object
+  The FenceOpType enum defines only 6 opcodes: fence, sfence, fencei, hfence_v, hfence_g, nofence. There are no entries for TEB (speculation barrier for transient-execution), MDB (memory-data-dependency barrier), or DPB (data-prediction barrier). Even if the decoder were fixed to route Zisb instructions to FuType.fence, the Fence FU FSM (Fence.scala:37-99) would not recognize the opcode, and the instruction would fall through to an undefined state. This means Zisb barrier implementation requires coordinated changes to decoder, opcode enum, and Fence FU FSM — a single-point fix is insufficient.
+  | object FenceOpType {
+  |   def fence  = "b10000".U
+  |   def sfence = "b10001".U
+  |   def fencei = "b10010".U
+  |   def hfence_v = "b10011".U
+  |   def hfence_g = "b10100".U
+  |   def nofence= "b00000".U
+  | }
+
+[compliant] src/main/scala/xiangshan/Parameters.scala:303-303  ISA string extensions
+  The ISA string advertises 'zimop' but does NOT advertise 'zisb'. This is currently compliant: the hardware correctly implements Zimop (MOPs as NOPs per spec) and does not falsely claim Zisb support. However, this is a latent risk because: (1) adding 'zisb' to this string without the decoder/FenceOpType/Fence-FU changes above would constitute false advertising of an unimplemented security feature, and (2) the Zimop MOP code points that Zisb shares are already 'consumed' by the ZimopDecode table, meaning any naive Zisb decode entries would conflict.
+  | "zicsr", "zifencei", "zihintntl", "zihintpause", "zihpm", "zimop", "zkn", ...
+
+[potential_risk] src/main/scala/xiangshan/frontend/ifu/PreDecode.scala:26-72  PreDecode (full module)
+  The PreDecode module (Frontend/IFU) handles only branch/jump pre-decode via getJalOffset/getBrOffset. It has no SYSTEM opcode inspection, no FUNCT3 checking, and no awareness of Zimop or Zisb instruction boundaries. A correctly implemented Zisb TEB barrier must block speculative branch prediction across the barrier — the frontend's FTQ/FTB (branch predictor) must observe the barrier and suppress predictions until the barrier commits. With the current pre-decode being entirely unaware of barrier boundaries, branch speculation would continue past any TEB instruction, violating the barrier's fundamental guarantee.
+  | val jalOffset = getJalOffset(inst, io.req.bits.isRvc(i))
+  | val brOffset  = getBrOffset(inst, io.req.bits.isRvc(i))
+  | io.resp.pd(i).brAttribute := BranchAttribute.decode(inst, io.req.valid)
+

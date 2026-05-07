@@ -1,0 +1,159 @@
+diff --git a/iommu_ref_model/README.md b/iommu_ref_model/README.md
+index 308db01d..3df52eda 100644
+--- a/iommu_ref_model/README.md
++++ b/iommu_ref_model/README.md
+@@ -201,7 +201,7 @@ The function may invoke the get_gppn function to request pages to build the page
+ maps the obtained gppn into the G-stage page table determined by iohgatp. The function returns the address,
+ in test memory space, where the leaf entry was inserted.
+ 
+-6. **`uint64_t translate_gpa (iohgatp_t iohgatp, uint64_t gpa, uint64_t *spa)`**
++6. **`uint64_t translate_gpa (iommu_t *iommu, iohgatp_t iohgatp, uint64_t gpa, uint64_t *spa)`**
+ 
+ This function is used to translate a gpa to a spa. The function also returns the G-stage pte that provides
+ the translation as an address in test memory space.
+diff --git a/iommu_ref_model/libiommu/include/iommu_data_structures.h b/iommu_ref_model/libiommu/include/iommu_data_structures.h
+index 4af1e9c3..4fa3f5eb 100644
+--- a/iommu_ref_model/libiommu/include/iommu_data_structures.h
++++ b/iommu_ref_model/libiommu/include/iommu_data_structures.h
+@@ -118,7 +118,7 @@ typedef union {
+ // The G-stage page table format and `MODE` encoding follow the format defined by
+ // the privileged specification.
+ #define IOHGATP_Bare         0
+-#define IOHGATP_Sv32x4       1
++#define IOHGATP_Sv32x4       8
+ #define IOHGATP_Sv39x4       8
+ #define IOHGATP_Sv48x4       9
+ #define IOHGATP_Sv57x4       10
+diff --git a/iommu_ref_model/libtables/include/tables_api.h b/iommu_ref_model/libtables/include/tables_api.h
+index 8e5a922c..36151b73 100644
+--- a/iommu_ref_model/libtables/include/tables_api.h
++++ b/iommu_ref_model/libtables/include/tables_api.h
+@@ -10,7 +10,7 @@ uint64_t add_process_context(iommu_t *iommu, device_context_t *DC, process_conte
+ uint64_t add_g_stage_pte(iommu_t *iommu, iohgatp_t iohgatp, uint64_t gpa, gpte_t gpte, uint8_t add_level);
+ uint64_t add_s_stage_pte(iosatp_t satp, uint64_t va, pte_t pte, uint8_t add_level, uint8_t SXL);
+ uint64_t add_vs_stage_pte(iommu_t *iommu, iosatp_t satp, uint64_t va, pte_t pte, uint8_t add_level, iohgatp_t iohgatp, uint8_t SXL);
+-uint64_t translate_gpa (iohgatp_t iohgatp, uint64_t gpa, uint64_t *spa);
++uint64_t translate_gpa (iommu_t *iommu, iohgatp_t iohgatp, uint64_t gpa, uint64_t *spa);
+ 
+ 
+ extern uint64_t get_free_ppn(uint64_t num_ppn);
+diff --git a/iommu_ref_model/libtables/src/build_pdt.c b/iommu_ref_model/libtables/src/build_pdt.c
+index 01808cc4..6467275d 100644
+--- a/iommu_ref_model/libtables/src/build_pdt.c
++++ b/iommu_ref_model/libtables/src/build_pdt.c
+@@ -25,7 +25,7 @@ add_process_context(
+     a = DC->fsc.pdtp.PPN * PAGESIZE;
+     i = LEVELS - 1;
+     while ( i > 0 ) {
+-        if ( translate_gpa(DC->iohgatp, a, &a) == -1 ) return -1;
++        if ( translate_gpa(iommu, DC->iohgatp, a, &a) == -1 ) return -1;
+         pdte.raw = 0;
+         if ( read_memory_test((a + (PDI[i] * 8)), 8, (char *)&pdte.raw) ) return -1;
+         if ( pdte.V == 0 ) {
+@@ -57,7 +57,7 @@ add_process_context(
+         i = i - 1;
+         a = pdte.PPN * PAGESIZE;
+     }
+-    if ( translate_gpa(DC->iohgatp, a, &a) == -1 ) return -1;
++    if ( translate_gpa(iommu, DC->iohgatp, a, &a) == -1 ) return -1;
+     if ( write_memory_test((char *)PC, (a + (PDI[0] * 16)), 16) ) return -1;
+     return (a + (PDI[0] * 16));
+ }
+diff --git a/iommu_ref_model/libtables/src/build_vs_stage_pt.c b/iommu_ref_model/libtables/src/build_vs_stage_pt.c
+index ab029e43..5f8880c8 100644
+--- a/iommu_ref_model/libtables/src/build_vs_stage_pt.c
++++ b/iommu_ref_model/libtables/src/build_vs_stage_pt.c
+@@ -46,7 +46,7 @@ add_vs_stage_pte (
+     i = LEVELS - 1;
+     a = satp.PPN * PAGESIZE;
+     while ( i > add_level ) {
+-        if ( translate_gpa(iohgatp, a, &a) == -1) return -1;
++        if ( translate_gpa(iommu, iohgatp, a, &a) == -1) return -1;
+         nl_pte.raw = 0;
+         if ( read_memory_test((a | (vpn[i] * PTESIZE)), PTESIZE, (char *)&nl_pte.raw))  return -1;
+         if ( nl_pte.V == 0 ) {
+@@ -75,7 +75,7 @@ add_vs_stage_pte (
+         if ( i < 0 ) return 1;
+         a = nl_pte.PPN * PAGESIZE;
+     }
+-    if ( translate_gpa(iohgatp, a, &a) == -1) return -1;
++    if ( translate_gpa(iommu, iohgatp, a, &a) == -1) return -1;
+     if ( write_memory_test((char *)&pte.raw, (a | (vpn[i] * PTESIZE)), PTESIZE) ) return -1;
+     return (a | (vpn[i] * PTESIZE));
+ }
+diff --git a/iommu_ref_model/libtables/src/translate_gpa.c b/iommu_ref_model/libtables/src/translate_gpa.c
+index fe7fcb54..8a348d76 100644
+--- a/iommu_ref_model/libtables/src/translate_gpa.c
++++ b/iommu_ref_model/libtables/src/translate_gpa.c
+@@ -5,27 +5,28 @@
+ #include "iommu.h"
+ uint64_t
+ translate_gpa (
+-    iohgatp_t iohgatp, uint64_t gpa, uint64_t *spa) {
++    iommu_t *iommu, iohgatp_t iohgatp, uint64_t gpa, uint64_t *spa) {
+ 
+     uint16_t vpn[5];
+     uint64_t a;
+     uint8_t i, PTESIZE, LEVELS;
+     gpte_t nl_gpte;
+     uint64_t gst_page_sz;
++    uint8_t gxl = iommu->reg_file.fctl.gxl;
+ 
+     PTESIZE = 8;
+     if ( iohgatp.MODE == IOHGATP_Bare ) {
+         *spa = gpa;
+         return -1;
+     }
+-    if ( iohgatp.MODE == IOHGATP_Sv32x4 ) {
++    if ( iohgatp.MODE == IOHGATP_Sv32x4 && gxl == 1) {
+         vpn[0] = get_bits(21, 12, gpa);
+         vpn[1] = get_bits(34, 22, gpa);
+         LEVELS = 2;
+         PTESIZE = 4;
+         gst_page_sz = 4UL * 1024UL * 1024UL;
+     }
+-    if ( iohgatp.MODE == IOHGATP_Sv39x4 ) {
++    if ( iohgatp.MODE == IOHGATP_Sv39x4 && gxl == 0) {
+         vpn[0] = get_bits(20, 12, gpa);
+         vpn[1] = get_bits(29, 21, gpa);
+         vpn[2] = get_bits(40, 30, gpa);
+diff --git a/iommu_ref_model/test/test_app.c b/iommu_ref_model/test/test_app.c
+index db12d91c..254a646b 100644
+--- a/iommu_ref_model/test/test_app.c
++++ b/iommu_ref_model/test/test_app.c
+@@ -2341,7 +2341,7 @@ main(void) {
+     fail_if( ( check_rsp_and_faults(&iommu, &req, &rsp, UNSUPPORTED_REQUEST, 266, 0) < 0 ) );
+ 
+     // Access viol on non-leaf PDTE
+-    fail_if( (translate_gpa(DC.iohgatp, DC.fsc.pdtp.PPN * PAGESIZE, &temp) == -1) );
++    fail_if( (translate_gpa(&iommu, DC.iohgatp, DC.fsc.pdtp.PPN * PAGESIZE, &temp) == -1) );
+     access_viol_addr = (temp) | (get_bits(19, 17, 0xBABEC) * 8);
+     send_translation_request(&iommu, 0x112233, 1, 0xBABEC, 0,
+              0, 1, 0, ADDR_TYPE_UNTRANSLATED, 0xdeadbeef,
+@@ -2382,7 +2382,7 @@ main(void) {
+     fail_if( (read_memory_test(PC_addr, 16, (char *)&PC) != 0) );
+ 
+     // misconfigured NL PTE
+-    fail_if( (translate_gpa(DC.iohgatp, DC.fsc.pdtp.PPN * PAGESIZE, &temp) == -1) );
++    fail_if( (translate_gpa(&iommu, DC.iohgatp, DC.fsc.pdtp.PPN * PAGESIZE, &temp) == -1) );
+     temp = (temp) | (get_bits(19, 17, 0xBABEC) * 8);
+     read_memory_test(temp, 8, (char *)&pdte);
+     pdte.reserved0 = 1;
+@@ -2472,7 +2472,7 @@ main(void) {
+ 
+     // guest page fault on PC walk
+     gpa = (DC.fsc.pdtp.PPN * PAGESIZE) | (get_bits(19, 17, 0xBABEC) * 8);
+-    temp = translate_gpa(DC.iohgatp, gpa, &temp);
++    temp = translate_gpa(&iommu, DC.iohgatp, gpa, &temp);
+     fail_if( (temp == -1) );
+     read_memory_test(temp, 8, (char *)&gpte);
+     gpte.V = 0;
+@@ -2750,7 +2750,7 @@ main(void) {
+     fail_if( ( rsp.trsp.PPN != (gpte.PPN & ~0x8)) );
+ 
+     // Guest-Page fault on NL S-stage PTE
+-    gpte_addr = translate_gpa(DC.iohgatp, (PC.fsc.iosatp.PPN * PAGESIZE), &temp);
++    gpte_addr = translate_gpa(&iommu, DC.iohgatp, (PC.fsc.iosatp.PPN * PAGESIZE), &temp);
+     fail_if( (gpte_addr == -1) );
+     read_memory_test(gpte_addr, 8, (char *)&gpte);
+     gpte.V = 0;

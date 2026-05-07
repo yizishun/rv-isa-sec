@@ -1,0 +1,76 @@
+{
+  "pr_number": 825,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 825,
+    "violation_condition": "QEMU emulates a CSR write to mipreemptcfg (0x348) that sets mfie=0 or sipreemptcfg (0x148) that sets sfie=0, but does NOT also clear the corresponding xie bit (mie in mstatus/sie in sstatus) as a side-effect. Conversely, QEMU allows the TCG interrupt delivery path to signal interrupts when xie=0 but xfie=1 and IPRIO < FITHRESH, without checking the FITHRESH condition — the xie bit is no longer the sole gate for fast interrupts.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "CSR write to mipreemptcfg/sipreemptcfg where mfie/sfie transitions 1→0 must atomically clear mstatus.MIE/sstatus.SIE; conversely, riscv_cpu_do_interrupt must check xfie+FITHRESH as an alternate interrupt-gating path that bypasses xie",
+    "affected_entities": [
+      "mipreemptcfg",
+      "sipreemptcfg",
+      "mistatus",
+      "sistatus",
+      "mstatus",
+      "sstatus",
+      "mtopi",
+      "stopi",
+      "mithreshold",
+      "sithreshold",
+      "mret",
+      "sret"
+    ],
+    "summary": "Smnip fast-interrupt enable (xfie) creates a new interrupt-gating path that bypasses the traditional xie bit when IPRIO < FITHRESH; writing xfie=0 must side-effect-clear xie, and trap entry must save-then-zero xfie to xpfie — failure in any coupling rule silently breaks guest interrupt masking"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "(CSR definitions)",
+        "line_start": 208,
+        "line_end": 307,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR addresses 0x148 and 0x348 are not defined. The SMNIP ipreemptcfg CSRs do not exist in this QEMU tree, so there is no write path that could violate the mfie/sfie→0 side-effect requirement (clearing MIE/SIE). No privilege-escape vector exists via this mechanism.",
+      "snippet": "/* Gap at 0x148 between CSR_SCOUNTINHIBIT (0x120) and CSR_SISELECT (0x150) */\n/* Gap at 0x348 between CSR_MIP (0x344) and CSR_MISELECT (0x350) */"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_mie / rmw_sie",
+        "line_start": 2259,
+        "line_end": 2291,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Existing MIE/SIE CSR write handlers manipulate only the standard interrupt-enable bits. No mfie/sfie preemption fields exist in the register layout, so no 1→0 transition side-effect (clearing MIE/SIE) is applicable. The handlers are correct for the currently implemented ISA extensions.",
+      "snippet": "static RISCVException rmw_mie64(CPURISCVState *env, int csrno,\n                                  uint64_t *ret_val,\n                                  uint64_t new_val, uint64_t wr_mask)\n{\n    uint64_t mask = env->miprio_aware ? 0 : MIP_SGEIP;\n    *ret_val = env->mie;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2200,
+        "line_end": 2547,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Interrupt delivery path gates on MSTATUS_MIE/MSTATUS_SIE only (lines 2370-2425 for S-mode, lines 2426-2511 for M-mode). There is no alternate xfie+FITHRESH gating path that could bypass the xie check. The TCG interrupt delivery logic is correct for the currently implemented extensions.",
+      "snippet": "/* S-mode entry: */\n/* line 2408: */ s = set_field(s, MSTATUS_SPIE, get_field(s, MSTATUS_SIE));\n/* line 2410: */ s = set_field(s, MSTATUS_SIE, 0);\n/* M-mode entry: */\n/* line 2471: */ s = set_field(s, MSTATUS_MPIE, get_field(s, MSTATUS_MIE));\n/* line 2473: */ s = set_field(s, MSTATUS_MIE, 0);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_local_irq_pending",
+        "line_start": 519,
+        "line_end": 595,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Interrupt arbitration uses only MSTATUS_MIE/MSTATUS_SIE as the enable gate (lines 538-549). No FITHRESH threshold comparison exists. The single-gate model is correct for the base ISA and implemented extensions (AIA), with no bypass possible.",
+      "snippet": "mie = (env->priv < PRV_M) ||\n      (env->priv == PRV_M && get_field(env->mstatus, MSTATUS_MIE));\nhsie = (env->priv < PRV_S) ||\n       (env->priv == PRV_S && get_field(env->mstatus, MSTATUS_SIE));"
+    }
+  ],
+  "overall_severity": "compliant"
+}

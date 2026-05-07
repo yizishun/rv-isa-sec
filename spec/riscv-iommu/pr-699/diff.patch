@@ -1,0 +1,65 @@
+diff --git a/iommu_ref_model/README.md b/iommu_ref_model/README.md
+index 308db01d..38408baa 100644
+--- a/iommu_ref_model/README.md
++++ b/iommu_ref_model/README.md
+@@ -155,6 +155,11 @@ processing is required then the function should be invoked for each command.
+ This function is used to extract the read, write, execute, and privilege
+ attributes from the the request.
+ 
++10. **`void handle_virtual_interrupt_file_overlap( device_context_t *DC, uint64_t gpa, uint64_t *gst_page_sz)`**
++
++If the GPA superpage overlaps a virtual interrupt file region, reduce \*gst_page_sz to the
++largest smaller page size that avoids the overlap.
++
+ # Libtables functions
+ 
+ The following functions are provided by the libtables to build memory resident data structures.
+diff --git a/iommu_ref_model/libiommu/include/iommu_ref_api.h b/iommu_ref_model/libiommu/include/iommu_ref_api.h
+index bd931bee..21655520 100644
+--- a/iommu_ref_model/libiommu/include/iommu_ref_api.h
++++ b/iommu_ref_model/libiommu/include/iommu_ref_api.h
+@@ -38,5 +38,7 @@ extern void iommu_to_hb_do_global_observability_sync(uint8_t PR, uint8_t PW);
+ extern void send_msg_iommu_to_hb(ats_msg_t *prgr);
+ extern void get_attribs_from_req(hb_to_iommu_req_t *req, uint8_t *read,
+                                  uint8_t *write, uint8_t *exec, uint8_t *priv);
++extern void handle_virtual_interrupt_file_overlap(device_context_t *DC, uint64_t gpa,
++                                                  uint64_t *gst_page_sz);
+ 
+ #endif // __IOMMU_REF_API_H__
+diff --git a/iommu_ref_model/libiommu/src/iommu_translate.c b/iommu_ref_model/libiommu/src/iommu_translate.c
+index 391f6890..84cb1617 100644
+--- a/iommu_ref_model/libiommu/src/iommu_translate.c
++++ b/iommu_ref_model/libiommu/src/iommu_translate.c
+@@ -333,6 +333,7 @@ iommu_translate_iova(
+         if ( gst_fault == GST_ACCESS_FAULT ) goto access_fault;
+         goto data_corruption;
+     }
++    handle_virtual_interrupt_file_overlap(&DC, gpa, &gst_page_sz);
+ 
+ skip_gpa_trans:
+     // The page-based memory types (PBMT), if Svpbmt is supported, obtained
+diff --git a/iommu_ref_model/test/tbapi.c b/iommu_ref_model/test/tbapi.c
+index fb9af3c2..b8d138b7 100644
+--- a/iommu_ref_model/test/tbapi.c
++++ b/iommu_ref_model/test/tbapi.c
+@@ -110,3 +110,20 @@ get_attribs_from_req(
+     *priv = ( req->pid_valid && req->priv_req ) ? S_MODE : U_MODE;
+     return;
+ }
++// If the GPA superpage overlaps a virtual interrupt file region, reduce *gst_page_sz to
++// the largest smaller page size that avoids the overlap.
++void
++handle_virtual_interrupt_file_overlap(
++    device_context_t *DC, uint64_t gpa, uint64_t *gst_page_sz) {
++    uint64_t m = DC->msi_addr_mask.mask << 12;
++    uint64_t p = DC->msi_addr_pattern.pattern << 12;
++    // If MSI page table mode is Off or if the initial page sizes is base page
++    // size, there is nothing to do.
++    if (DC->msiptp.MODE == MSIPTP_Off || *gst_page_sz == PAGESIZE)
++        return;
++    for (uint64_t sz = PAGESIZE << 36; sz >= (PAGESIZE << 9); sz >>= 9) {
++        uint64_t mask = m & ~(sz - 1);
++        *gst_page_sz = (*gst_page_sz >= sz && ((gpa & mask) == (p & mask))) ?
++                       (sz >> 9) : *gst_page_sz;
++    }
++}

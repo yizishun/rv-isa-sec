@@ -1,0 +1,1 @@
+The toolchain should set this flag to indicate that the ELF file uses the RVY base ISA and an appropriate pure-capability ABI. Future pull requests will define the pure-capability ABIs for RVY as well as the associated calling conventions.

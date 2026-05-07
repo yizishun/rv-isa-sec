@@ -1,0 +1,59 @@
+PR #2885  target=qemu  overall=bug_confirmed
+Spec: Ziccamoc extension entirely unimplemented: amocas.q executes on any memory region without verifying coherence+cacheability PMAs, violating the normative rule that AMOCASQ support is restricted to main memory regions with both PMAs
+Violation: QEMU TCG emulates amocas.q (AMOCASQ) gated solely on ext_zacas without checking that the target physical address resides in a main memory region possessing both coherence and cacheability PMAs. The Ziccamoc normative rule requires AMOCASQ-level support exclusively on main memory regions with both PMAs; QEMU has no ext_ziccamoc feature flag, no PMA attribute inspection in the amocas.q translation path, and no mechanism to reject amocas.q on non-coherent or non-cacheable regions such as MMIO or device memory.
+Consequence: data_corruption
+Pattern: trans_amocas_q.*MO_ALIGN|gen_cmpxchg.*MO_ALIGN.*MO_UO|ext_zacas.*amocas|ziccamoc missing ext flag|amocas.q PMA coherence cacheability
+------------------------------------------------------------
+[bug_confirmed] target/riscv/insn_trans/trans_rvzacas.c.inc:101-139  trans_amocas_q
+  amocas.q (AMOCASQ) gates solely on REQUIRE_ZACAS(ctx) and REQUIRE_64BIT(ctx) with zero PMA coherence/cacheability inspection of the target physical address. The Ziccamoc normative rule requires AMOCASQ exclusively on main memory regions with both coherent and cacheable PMA attributes. No ext_ziccamoc feature flag exists anywhere in QEMU, and tcg_gen_atomic_cmpxchg_i128() is called unconditionally with MemOp memop = MO_ALIGN | MO_UO (line 122), which encodes no PMA attribute semantics. The translation path cannot distinguish coherent-cacheable main memory from non-coherent or non-cacheable regions.
+  | static bool trans_amocas_q(DisasContext *ctx, arg_amocas_q *a)
+  | {
+  |     REQUIRE_ZACAS(ctx);
+  |     REQUIRE_64BIT(ctx);
+  |     // ...
+  |     MemOp memop = MO_ALIGN | MO_UO;
+  |     tcg_gen_atomic_cmpxchg_i128(dest, src1, dest, src2, ctx->mem_idx, memop);
+
+[bug_confirmed] target/riscv/cpu_cfg_fields.h.inc:68-70  N/A (field declarations)
+  ext_zacas (line 68), ext_zama16b (line 69), and ext_zabha (line 70) are declared, but no BOOL_FIELD(ext_ziccamoc) exists anywhere in the CPU config structure. The Ziccamoc extension — which normatively constrains AMOCASQ to coherent+cacheable main memory — cannot be modeled, toggled, or enforced by QEMU's RISC-V emulation. Without this flag, there is no architectural mechanism for a guest OS or hypervisor to detect or rely on Ziccamoc compliance.
+  | BOOL_FIELD(ext_zacas)
+  | BOOL_FIELD(ext_zama16b)
+  | BOOL_FIELD(ext_zabha)
+
+[bug_confirmed] target/riscv/cpu.c:1254-1256  riscv_cpu_validate_multi_ext_cfg or property registration
+  QEMU property registrations exist for 'zacas' (line 1254), 'zama16b' (line 1255), and 'zabha' (line 1256), but no 'ziccamoc' property is registered. Users cannot enable or query Ziccamoc compliance via -cpu flags. Additionally, the CPU init path (cpu.c:150) maps zacas to PRIV_VERSION_1_12_0 with no Ziccamoc dependency, meaning Zacas enables amocas.q without any Ziccamoc gating even when both should be specified together per the RISC-V spec.
+  | MULTI_EXT_CFG_BOOL("zacas", ext_zacas, false),
+  | MULTI_EXT_CFG_BOOL("zama16b", ext_zama16b, false),
+  | MULTI_EXT_CFG_BOOL("zabha", ext_zabha, false),
+
+[potential_risk] accel/tcg/cputlb.c:1799-1903  atomic_mmu_lookup
+  The runtime atomic_mmu_lookup() function checks only for TLB_MMIO and TLB_DISCARD_WRITE (line 1874), sending those to stop_the_world (cpu_loop_exit_atomic). It does NOT inspect PMA attributes for coherence or cacheability. A memory region mapped as RAM but with non-coherent or non-cacheable PMA attributes would pass through and execute the atomic cmpxchg natively on the host pointer. In practice, QEMU TCG is single-threaded so coherence is moot, but architecturally this is a gap — QEMU cannot model the Ziccamoc constraint that amocas.q must trap on non-coherent or non-cacheable regions.
+  | /* Notice an IO access or a needs-MMU-lookup access */
+  | if (unlikely(tlb_addr & (TLB_MMIO | TLB_DISCARD_WRITE))) {
+  |     /* There's really nothing that can be done to
+  |        support this apart from stop-the-world.  */
+  |     goto stop_the_world;
+  | }
+
+[potential_risk] target/riscv/translate.c:1174-1186  gen_cmpxchg
+  The generic gen_cmpxchg() used by amocas_w and amocas_d (via trans_rvzacas.c.inc trans_amocas_w and trans_amocas_d) also performs no PMA coherence/cacheability inspection. It calls tcg_gen_atomic_cmpxchg_tl() directly (line 1182) with the mop carried from the caller. While the Ziccamoc normative rule specifically targets AMOCASQ (128-bit), Ziccamoc also defines AMOCAS* behavior constraints. The lack of any PMA attribute plumbing in gen_cmpxchg means all AMOCAS variants share the same vulnerability: no enforcement of the coherent-cacheable requirement on the target memory region.
+  | static bool gen_cmpxchg(DisasContext *ctx, arg_atomic *a, MemOp mop)
+  | {
+  |     TCGv dest = get_gpr(ctx, a->rd, EXT_NONE);
+  |     TCGv src1 = get_address(ctx, a->rs1, 0);
+  |     TCGv src2 = get_gpr(ctx, a->rs2, EXT_NONE);
+  |     // ...
+  |     tcg_gen_atomic_cmpxchg_tl(dest, src1, dest, src2, ctx->mem_idx, mop);
+  | }
+
+[potential_risk] target/riscv/tcg/tcg-cpu.c:656-659  riscv_tcg_cpu_validate_profile
+  The TCG validation only checks that ext_zacas requires RVA (line 656-659). There is no validation that ext_ziccamoc (if it were declared) must accompany ext_zacas when amocas.q is enabled. Per the RISC-V spec, Ziccamoc is defined as an additional normative constraint on Zacas operations; without this dependency check, a CPU configuration with zacas=on but ziccamoc=off (once implemented) would silently violate the spec.
+  | if ((cpu->cfg.ext_zacas) && !riscv_has_ext(env, RVA)) {
+  |     error_setg(errp, "Zacas extension requires A extension");
+  |     return;
+  | }
+
+[potential_risk] target/riscv/kvm/kvm-cpu.c:308-308  kvm_riscv_get_ext_cfgs
+  KVM passthrough exists for zacas (line 308) but no KVM_EXT_CFG entry for ziccamoc. On KVM-accelerated guests, the host kernel's Ziccamoc enforcement (if present in the kernel) is invisible to QEMU's configuration and migration state. If the host kernel does not implement Ziccamoc constraints, guest software has no way to detect the missing compliance via QEMU's ISA string or CSR query mechanisms.
+  | KVM_EXT_CFG("zacas", ext_zacas, KVM_RISCV_ISA_EXT_ZACAS),
+

@@ -1,0 +1,47 @@
+PR #417  target=freebsd-src  overall=bug_confirmed
+Spec: FreeBSD RISC-V kernel has no sv_protect/exec_protect implementation to parse .note.gnu.property CFI bits, so Zicfilp landing-pad and Zicfiss shadow-stack enforcement is never activated per-page in pmap despite binaries advertising CFI support, rendering CFI protections inoperable.
+Violation: FreeBSD's RISC-V elf_machdep.c (sys/riscv/riscv/elf_machdep.c) lacks an sv_protect hook implementation, meaning the kernel never parses .note.gnu.property sections for RISC-V ELF images. When a RISC-V binary or shared library with GNU_PROPERTY_RISCV_FEATURE_1_CFI_LP_UNLABELED or GNU_PROPERTY_RISCV_FEATURE_1_CFI_SS bits set is execve'd, the kernel neither validates hardware support for Zicfilp/Zicfiss extensions nor configures per-page landing-pad/shadow-stack enforcement in the pmap layer, executing the binary with CFI properties advertised but CFI hardware protections absent or misconfigured.
+Consequence: function_loss
+Pattern: sv_protect\s*=\s*(NULL|arm64_exec_protect)|GNU_PROPERTY_RISCV_FEATURE_1_AND|elf_machdep\.c.*sv_protect|pmap_bti_set.*riscv|riscv.*exec_protect|NT_GNU_PROPERTY_TYPE_0.*riscv
+------------------------------------------------------------
+[bug_confirmed] sys/riscv/riscv/elf_machdep.c:61-101  elf64_freebsd_sysvec (static initializer)
+  RISC-V sysentvec has no .sv_protect hook. The arm64 counterpart sets .sv_protect = arm64_exec_protect at line 117, which causes imgact_elf.c:870,1386 to call into arm64_exec_protect() to parse NT_GNU_PROPERTY_TYPE_0 notes and configure pmap_bti_set() for BTI enforcement. Since RISC-V never sets sv_protect, the imgact_elf.c guard `if (sv->sv_protect != NULL)` at lines 870 and 1386 always evaluates false for RISC-V executables, so .note.gnu.property sections with GNU_PROPERTY_RISCV_FEATURE_1_CFI_LP_UNLABELED, GNU_PROPERTY_RISCV_FEATURE_1_CFI_LP_FUNC_SIG, or GNU_PROPERTY_RISCV_FEATURE_1_CFI_SS bits are never parsed, hardware Zicfilp/Zicfiss support is never validated, and per-page landing-pad/shadow-stack enforcement is never configured in the pmap layer.
+  | static struct sysentvec elf64_freebsd_sysvec = {
+  |   .sv_size    = SYS_MAXSYSCALL,
+  |   ...
+  |   .sv_hwcap   = &elf_hwcap,
+  |   /* NOTE: no .sv_protect assignment here */
+  |   .sv_onexec_old = exec_onexec_old,
+  | };
+
+[bug_confirmed] sys/riscv/riscv/elf_machdep.c:1-555  (entire file)
+  The file contains no GNU property parsing infrastructure whatsoever: no gnu_property_note definition, no gnu_property_cb() callback, no calls to __elfN(parse_notes), no GNU_PROPERTY_RISCV_FEATURE_1_AND constant. Compare arm64/arm64/elf_machdep.c lines 338-366 which define all of these. Without this infrastructure, even if sv_protect were set, the kernel would have no logic to decode the RISC-V-specific .note.gnu.property feature bits.
+  | /* Entire file: no NT_GNU_PROPERTY_TYPE_0, gnu_property_note,
+  |    gnu_property_cb, or GNU_PROPERTY_RISCV_FEATURE_1_AND present */
+  | /* Arm64 equivalent: arm64/arm64/elf_machdep.c:338-366 */
+
+[bug_confirmed] sys/riscv/riscv/elf_machdep.c:95-95  elf64_freebsd_sysvec
+  Only .sv_hwcap is set (pointing to elf_hwcap). No .sv_hwcap2 field exists in the RISC-V sysentvec. arm64 sets .sv_hwcap2 through .sv_hwcap4 (lines 113-115) and uses the HWCAP2_BTI bit at line 378 to gate BTI enforcement. RISC-V has no hwcap2 mechanism to advertise Zicfilp/Zicfiss ISA extension presence to userspace or to gate kernel-side CFI policy decisions.
+  | .sv_hwcap   = &elf_hwcap,
+  | /* Missing: .sv_hwcap2 = &elf_hwcap2, */
+  | /* Arm64: lines 112-115 set hwcap/hwcap2/hwcap3/hwcap4 */
+
+[potential_risk] sys/sys/elf_common.h:875-886  (global definitions)
+  elf_common.h defines GNU_PROPERTY_AARCH64_FEATURE_1_AND (0xc0000000) and GNU_PROPERTY_X86_FEATURE_1_AND (0xc0000002) but lacks GNU_PROPERTY_RISCV_FEATURE_1_AND (also 0xc0000000 per LLVM's llvm/include/llvm/BinaryFormat/ELF.h:1836). While 0xc0000000 is in the GNU_PROPERTY_LOPROC..HIPROC range and could share the same value as AArch64, the RISC-V-specific feature bit definitions (CFI_LP_UNLABELED=1<<0, CFI_SS=1<<1, CFI_LP_FUNC_SIG=1<<2) are entirely absent, making it impossible to write a RISC-V gnu_property_cb without first adding these constants.
+  | #define GNU_PROPERTY_LOPROC            0xc0000000
+  | #define GNU_PROPERTY_HIPROC            0xdfffffff
+  | #define GNU_PROPERTY_AARCH64_FEATURE_1_AND  0xc0000000
+  | /* Missing: GNU_PROPERTY_RISCV_FEATURE_1_AND and RISC-V CFI feature bits */
+
+[bug_confirmed] sys/riscv/riscv/identcpu.c:1-1  identify_cpu
+  identcpu.c does not probe for Zicfilp or Zicfiss ISA extension strings. Without CPU identification of these extensions, the kernel cannot conditionally enable or reject CFI-marked binaries based on hardware capability, even if an sv_protect hook were written. This is a prerequisite for any correct CFI enforcement.
+  | /* No Zicfilp/Zicfiss detection in identcpu.c */
+
+[potential_risk] sys/riscv/riscv/genassym.c:1-1  (entire file, context-switch register layout)
+  No CFI-related CSRs (e.g., ssp for shadow stack pointer, CSR_SSP) are included in the genassym.c PCB layout offsets. Even if sv_protect and per-page enforcement were implemented, a correct CFI implementation also requires per-thread save/restore of shadow-stack state in cpu_switch() / swtch.S. This becomes relevant once the sv_protect gap is closed.
+  | /* No CFI-related CSR offsets in genassym.c */
+
+[potential_risk] sys/riscv/riscv/swtch.S:1-1  cpu_switch
+  swtch.S does not save/restore any Zicfilp/Zicfiss state (ssp CSR, lpctl-like configuration). If CFI enforcement were enabled via sv_protect but context-switch code didn't handle per-thread CFI CSRs, threads would either share CFI state (breaking isolation) or crash on context switch.
+  | /* No CFI CSR save/restore in swtch.S */
+

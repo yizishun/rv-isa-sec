@@ -1,0 +1,85 @@
+PR #918  target=freebsd-src  overall=compliant
+Spec: YBNDRW incorrectly cleared capability tags when bounds couldn't be exactly encoded (copy-paste from YBNDSW), causing FreeBSD kernel to lose valid capabilities that should remain authorized because rounding-down preserves authority
+Violation: FreeBSD kernel code (e.g., capability-aware copyin/copyout, pmap capability validation, or capability register save/restore in context-switch paths) invokes the YBNDRW (Set Bounds Round Down) instruction and an incorrect microarchitectural implementation clears cd.tag when the requested bounds cannot be encoded exactly, despite the rounded-down bounds being strictly within the original capability's authority
+Consequence: denial_of_service
+Pattern: YBNDRW\b.*\btag\b|scbndr[wd].*tag.*clear|bounds.*round.*down.*tag|setbounds.*round.*down|capability.*bounds.*restrict.*tag
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/swtch.S:258-358  cpu_switch
+  Context-switch path saves/restores only standard GP registers (ra, sp, gp, tp, s0-s11) and FP registers. No CHERI capability registers (PCC, DDC, or capability CSRs) are saved/restored because this FreeBSD kernel tree does not implement RISC-V CHERI capability support. The YBNDRW instruction is never invoked.
+  | ENTRY(cpu_switch)
+  |         sd      a1, PC_CURTHREAD(tp)
+  |         ld      x13, TD_PCB(a1)
+  |         sd      x13, PC_CURPCB(tp)
+  |         ld      x13, TD_PCB(a0)           /* Save the old context */
+
+[compliant] sys/riscv/riscv/exception.S:227-235  cpu_exception_handler_user
+  Trap entry/exit saves/restores only standard CSRs (sstatus, sepc, stval, scause). No CHERI capability CSRs are handled. This is correct for a non-CHERI kernel, but means the YBNDRW vulnerability pattern cannot manifest here.
+  | ENTRY(cpu_exception_handler_user)
+  |         save_registers 0
+  |         mv      a0, sp
+  |         call    _C_LABEL(do_trap_user)
+  |         do_ast
+
+[compliant] sys/riscv/riscv/trap.c:379-460  do_trap_user
+  Trap handler dispatches standard RISC-V exceptions (page faults, illegal instruction, breakpoint, ecall). No CHERI-specific exception handling (e.g., CHERI tag violations, bounds violations). The illegal-instruction handler delegates to FPE lazy enable, with no YBNDRW or capability instruction decoding.
+  | case SCAUSE_ILLEGAL_INSTRUCTION:
+  |         if ((pcb->pcb_fpflags & PCB_FP_STARTED) == 0) {
+  |                 fpe_state_clear();
+  |                 frame->tf_sstatus &= ~SSTATUS_FS_MASK;
+  |                 frame->tf_sstatus |= SSTATUS_FS_CLEAN;
+
+[compliant] sys/riscv/riscv/copyinout.S:133-144  copyin
+  copyin/copyout performs a simple VM_MAXUSER_ADDRESS range check and byte/word copy with fault handling. No capability-aware bounds checking or YBNDRW invocation. The kernel uses standard integer addresses, not capability-based pointers.
+  | ENTRY(copyin)
+  |         beqz    a2, copyin_end
+  |         add     a3, a0, a2
+  |         li      a4, VM_MAXUSER_ADDRESS
+  |         bgeu    a3, a4, copyio_fault_nopcb
+
+[compliant] sys/riscv/riscv/locore.S:142-219  pagetables
+  Boot sequence configures only standard Sv39 page tables and stvec/satp/sstatus. No CHERI CSR initialization (no pcc, ddc, or capability CSRs). No YBNDRW or any CHERI instruction is emitted.
+  | va:
+  |         lla     gp, __global_pointer$
+  |         la      t0, cpu_exception_handler
+  |         csrw    stvec, t0
+  |         li      t0, 0
+  |         csrw    sscratch, t0
+
+[compliant] sys/riscv/riscv/machdep.c:558-654  initriscv
+  initriscv performs standard CPU ISA identification via identify_cpu(), SBI init, EFI/DTB memory parsing, and pmap bootstrap. No CHERI capability initialization. No YBNDRW usage.
+  | initriscv(struct riscv_bootparams *rvbp)
+  | {
+  |         ...
+  |         identify_cpu(0);
+  |         ...
+  |         pmap_bootstrap(rvbp->kern_phys, kernlen);
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:603-724  vmmops_run
+  bhyve VM run loop virtualizes standard CSRs (hgatp, henvcfg, hie, hcounteren, vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, vsatp). No CHERI capability CSR virtualization. Guest world-switch (vmm_switch.S) saves/restores only GP registers and sstatus/hstatus.
+  | csr_write(hgatp, pmap->pm_satp);
+  |         if (has_sstc)
+  |                 csr_write(henvcfg, HENVCFG_STCE);
+  |         csr_write(hie, HIE_VSEIE | HIE_VSSIE | HIE_SGEIE);
+  |         csr_write(hcounteren, HCOUNTEREN_CY | HCOUNTEREN_TM);
+
+[compliant] sys/riscv/vmm/vmm_instruction_emul.c:59-86  vmm_emulate_instruction
+  bhyve instruction emulation decodes only standard RISC-V load/store instructions (LB/LH/LW/LD/LBU/LHU/LWU, SB/SH/SW/SD, C.LW/C.LD/C.SW/C.SD). No CHERI capability instructions (YBNDRW, SCBNDR, etc.) are decoded or emulated.
+  | if (m_op(insn, MATCH_LB, MASK_LB))
+  |         access_size = 1;
+  | else if (m_op(insn, MATCH_LH, MASK_LH))
+  |         access_size = 2;
+  | else if (m_op(insn, MATCH_LW, MASK_LW))
+
+[compliant] sys/riscv/riscv/pmap.c:1-100  (whole module)
+  pmap layer implements standard RISC-V page table management (Sv39/Sv48/Sv57). No CHERI capability tag tracking or capability-based memory protection. No YBNDRW or capability bounds manipulation.
+  | /* Manages physical address maps. */
+
+[compliant] sys/sys/_types.h:70-173  (type definitions)
+  CHERI __intcap_t/__uintcap_t type aliases exist for hybrid-compilation compatibility only. On non-CHERI systems, these are aliased to __intptr_t/__uintptr_t. This is compile-time type infrastructure, not runtime YBNDRW invocation.
+  | #ifdef __CHERI__
+  |         typedef __intcap_t __intptr_t;
+  |         ...
+  | #ifndef __SIZEOF_INTCAP__
+  |         typedef __intptr_t __intcap_t;
+  |         typedef __uintptr_t __uintcap_t;
+

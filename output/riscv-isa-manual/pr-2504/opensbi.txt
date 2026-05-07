@@ -1,0 +1,63 @@
+PR #2504  target=opensbi  overall=potential_risk
+Spec: Sstc makes mip.STIP read-only when stimecmp is active; OpenSBI writes to mip.STIP for timer injection (SBI set_timer, HSM resume) are silently ignored, breaking timer delivery to S-mode
+Violation: OpenSBI M-mode code writes to mip.STIP (via csrw/csrs to mip with STIP bit set) to inject or clear S-mode timer interrupts while menvcfg.STCE=1 and the Sstc extension is implemented — STIP is read-only in mip when stimecmp is implemented, causing the write to be silently ignored (WARL)
+Consequence: function_loss
+Pattern: csr_set(CSR_MIP,\s*MIP_STIP|csr_write(CSR_MIP.*STIP|mip.*SET_BIT.*STIP|set_mip_stip|write.*mip.*STIP
+------------------------------------------------------------
+[compliant] lib/sbi/sbi_timer.c:141-146  sbi_timer_event_start
+  csr_clear(CSR_MIP, MIP_STIP) at line 145 is only executed in the 'else if' branch when SSTC is NOT present. When SSTC IS present, only csr_write64(CSR_STIMECMP, next_event) executes at line 142. No STIP write occurs while menvcfg.STCE=1.
+  | if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
+  |     csr_write64(CSR_STIMECMP, next_event);
+  | } else if (timer_dev && timer_dev->timer_event_start) {
+  |     timer_dev->timer_event_start(next_event);
+  |     csr_clear(CSR_MIP, MIP_STIP);
+  | }
+
+[compliant] lib/sbi/sbi_timer.c:150-160  sbi_timer_process
+  csr_set(CSR_MIP, MIP_STIP) at line 159 is guarded by '!sbi_hart_has_extension(..., SBI_HART_EXT_SSTC)'. When SSTC is present (and thus menvcfg.STCE=1), the hardware delivers STIP directly to S-mode via stimecmp comparison, and this M-mode STIP injection code is never reached.
+  | if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC))
+  |     csr_set(CSR_MIP, MIP_STIP);
+
+[potential_risk] lib/sbi/sbi_timer.c:211-218  sbi_timer_exit
+  csr_clear(CSR_MIP, MIP_STIP) at line 216 is executed unconditionally — no guard for SSTC presence. Called from sbi_exit() (sbi_init.c:656) during HSM hart stop, after menvcfg.STCE has already been set to 1 by mstatus_init(). On SSTC systems, MIP.STIP is read-only when STCE=1, so this write is silently ignored (WARL). The practical impact is negligible because the hart is stopping, but it is technically a write to a read-only CSR bit while STCE=1.
+  | void sbi_timer_exit(struct sbi_scratch *scratch)
+  | {
+  |     if (timer_dev && timer_dev->timer_event_stop)
+  |         timer_dev->timer_event_stop();
+  | 
+  |     csr_clear(CSR_MIP, MIP_STIP);
+  |     csr_clear(CSR_MIE, MIP_MTIP);
+  | }
+
+[potential_risk] lib/sbi/sbi_hsm.c:435-446  __sbi_hsm_suspend_non_ret_restore
+  csr_set(CSR_MIP, (hdata->saved_mip & (MIP_SSIP | MIP_STIP))) at line 445 attempts to restore STIP after non-retentive suspend resume. This runs after warm-boot reinit has already set menvcfg.STCE=1 (via mstatus_init() → __set_menvcfg_ext(SBI_HART_EXT_SSTC, ENVCFG_STCE)). When STCE=1, MIP.STIP is read-only — writes are silently ignored (WARL). If a timer interrupt was pending before suspend, the attempted STIP restore fails silently. In practice, S-mode typically re-arms stimecmp on resume, mitigating the impact, but the save/restore invariant is broken for STIP on SSTC systems.
+  | csr_write64(CSR_MENVCFG, hdata->saved_menvcfg);
+  | csr_write(CSR_MIDELEG, hdata->saved_mideleg);
+  | csr_write(CSR_MEDELEG, hdata->saved_medeleg);
+  | csr_write(CSR_MIE, hdata->saved_mie);
+  | csr_set(CSR_MIP, (hdata->saved_mip & (MIP_SSIP | MIP_STIP)));
+
+[compliant] lib/sbi/sbi_hart.c:137-174  mstatus_init
+  menvcfg.STCE (bit 63) is correctly set at line 159 only when SBI_HART_EXT_SSTC is detected. CSR_MENVCFG is then written atomically at line 174. This properly delegates stimecmp to S-mode on SSTC-capable harts. The configuration happens during cold boot and warm boot reinit, before S-mode is entered.
+  | __set_menvcfg_ext(SBI_HART_EXT_SSTC, ENVCFG_STCE)
+  | ...
+  | csr_write64(CSR_MENVCFG, menvcfg_val);
+
+[compliant] lib/sbi/sbi_hart.c:212-252  delegate_traps
+  MIP_STIP is correctly delegated to S-mode via mideleg at line 222 (interrupts = MIP_SSIP | MIP_STIP | MIP_SEIP). When SSTC is present with STCE=1, STIP becomes hardware-driven (read-only alias of stimecmp comparison), and is still correctly delegated to S-mode. The delegation setup is consistent regardless of SSTC status.
+  | interrupts = MIP_SSIP | MIP_STIP | MIP_SEIP;
+  | ...
+  | csr_write(CSR_MIDELEG, interrupts);
+
+[compliant] lib/sbi/sbi_hart.c:724-759  sbi_hart_init
+  csr_write(CSR_MIP, 0) at line 732 clears ALL MIP bits (including STIP) during cold boot before S-mode is entered. This write happens BEFORE mstatus_init() sets menvcfg.STCE=1 (hart_detect_features and sbi_hart_reinit/mstatus_init are called later at lines 744 and 758). At this point STCE may not yet be set, so writing all-zeroes to MIP is safe and prevents spurious interrupts in S-mode.
+  | csr_write(CSR_MIP, 0);
+  | ...
+  | rc = hart_detect_features(scratch);
+  | ...
+  | return sbi_hart_reinit(scratch);
+
+[compliant] lib/sbi/sbi_hsm.c:408-433  __sbi_hsm_suspend_non_ret_save
+  Saving MIP.STIP at line 428 (READ, not write) before non-retentive suspend is correct. The code correctly identifies that only S-mode bits (SSIP, STIP) need saving. The issue lies only in the restore path at line 445 where writing STIP is silently ignored when STCE=1.
+  | hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+

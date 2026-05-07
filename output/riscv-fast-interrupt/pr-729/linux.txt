@@ -1,0 +1,77 @@
+PR #729  target=linux  overall=compliant
+Spec: Smivt IVT mode now auto-clears interrupt-pending bits on trap entry; kernel/KVM irqs_pending tracking and mip-read-based IRQ dispatch can observe cleared bits and lose or misroute interrupts
+Violation: The kernel's IRQ entry path (do_irq / handle_arch_irq) or KVM's interrupt dispatch reads mip/sip/hvip to determine which external interrupt fired, but in Smivt IVT mode the hardware auto-clears the corresponding interrupt-pending bit on vector-trap entry before the handler executes, so software observes a stale (cleared) pending bit and either misses the interrupt source or incorrectly dispatches.
+Consequence: race_condition
+Pattern: csrr.*mip|csrr.*sip|csrr.*hvip in IRQ entry/dispatch paths that assume interrupt-pending bits remain set across IVT-mode hardware vectoring
+------------------------------------------------------------
+[compliant] drivers/irqchip/irq-riscv-intc.c:29-35  riscv_intc_irq
+  Non-AIA IRQ dispatch reads the interrupt cause from regs->cause (originally derived from CSR_CAUSE in entry.S:187), not from sip/mip. CSR_CAUSE identifies the interrupt type that triggered the trap and is not auto-cleared by the hypothesised Smivt vector-trap entry. No sip/mip CSR read exists in the dispatch path.
+  | static void riscv_intc_irq(struct pt_regs *regs)
+  | {
+  | 	unsigned long cause = regs->cause & ~CAUSE_IRQ_FLAG;
+  | 
+  | 	if (generic_handle_domain_irq(intc_domain, cause))
+
+[compliant] drivers/irqchip/irq-riscv-intc.c:37-43  riscv_intc_aia_irq
+  AIA IRQ dispatch reads CSR_TOPI in a loop to obtain the top pending interrupt IID. CSR_TOPI is an AIA-specific CSR, not part of the sip/mip/hvip pending-bit set that Smivt would auto-clear. Safe irrespective of IVT-mode vectoring.
+  | static void riscv_intc_aia_irq(struct pt_regs *regs)
+  | {
+  | 	while ((topi = csr_read(CSR_TOPI)))
+  | 		generic_handle_domain_irq(intc_domain, topi >> TOPI_IID_SHIFT);
+  | }
+
+[compliant] arch/riscv/kernel/entry.S:185-193  handle_exception
+  The assembly trap entry reads CSR_CAUSE (line 187) and stashes it into pt_regs->cause. CSR_CAUSE encodes why the trap was taken (e.g. IRQ_S_EXT for external interrupt) and is NOT one of the pending-bit CSRs (sip/mip/hvip) that Smivt would auto-clear on vector trap entry.
+  | csrr s2, CSR_EPC
+  | csrr s3, CSR_TVAL
+  | csrr s4, CSR_CAUSE          /* ← reads cause, not sip/mip */
+  | csrr s5, CSR_SCRATCH
+  | ...
+  | REG_S s4, PT_CAUSE(sp)
+
+[compliant] arch/riscv/kernel/traps.c:438-447  handle_riscv_irq
+  The IRQ handler wrapper calls handle_arch_irq(regs) — the function pointer set by the INTC driver. No direct sip/mip/hvip CSR read occurs here. The callee resolves interrupt identity from regs->cause (non-AIA) or CSR_TOPI (AIA), both independent of auto-clearing pending bits.
+  | static void noinstr handle_riscv_irq(struct pt_regs *regs)
+  | {
+  | 	irq_enter_rcu();
+  | 	old_regs = set_irq_regs(regs);
+  | 	handle_arch_irq(regs);
+  | 	set_irq_regs(old_regs);
+  | 	irq_exit_rcu();
+  | }
+
+[compliant] arch/riscv/kernel/sbi-ipi.c:21-31  sbi_ipi_handle
+  This chained IPI handler writes csr_clear(CSR_IP, IE_SIE) to acknowledge the software interrupt, but does NOT read sip/mip to determine which interrupt fired. The dispatch decision was already made upstream by the INTC based on regs->cause. If Smivt auto-cleared SIP.SSIE on vector entry, this csr_clear would become a harmless no-op (writing 0 to an already-zero bit). No mis-dispatch can result.
+  | static void sbi_ipi_handle(struct irq_desc *desc)
+  | {
+  | 	chained_irq_enter(chip, desc);
+  | 	csr_clear(CSR_IP, IE_SIE);   /* ack write, not a read-for-dispatch */
+  | 	ipi_mux_process();
+  | 	chained_irq_exit(chip, desc);
+  | }
+
+[compliant] arch/riscv/kvm/vcpu.c:364-399  kvm_riscv_vcpu_sync_interrupts
+  Reads CSR_VSIE (line 371) and CSR_HVIP (line 374) strictly for post-guest-exit state synchronization — detecting guest-initiated changes to VSSIP and LCOFIP by comparing hardware values against the in-memory shadow (csr->hvip). These reads are not used to decide which interrupt to dispatch. The guest-exit cause comes from CSR_SCAUSE (line 856 in kvm_riscv_vcpu_enter_exit), which is unaffected by Smivt.
+  | csr->vsie = ncsr_read(CSR_VSIE);
+  | ...
+  | hvip = ncsr_read(CSR_HVIP);
+  | if ((csr->hvip ^ hvip) & (1UL << IRQ_VS_SOFT)) { /* detect guest changes */
+
+[compliant] arch/riscv/kvm/vcpu.c:854-857  kvm_riscv_vcpu_enter_exit
+  After guest exit, reads CSR_SCAUSE (line 856) to capture the guest trap cause, plus CSR_HTVAL/CSR_HTINST for hypervisor trap info. CSR_SCAUSE encodes the reason the guest exited (e.g., VS-level external interrupt) — it is a cause register, not a pending-bit register subject to Smivt auto-clearing.
+  | trap->sepc = gcntx->sepc;
+  | trap->scause = csr_read(CSR_SCAUSE);  /* cause, not sip/hvip */
+  | trap->stval = csr_read(CSR_STVAL);
+
+[compliant] drivers/irqchip/irq-sifive-plic.c:382-403  plic_handle_irq
+  PLIC interrupt handler reads the PLIC claim/complete MMIO register in a loop — no sip/mip/hvip CSR read. The PLIC is a memory-mapped peripheral; its claim register directly provides the hwirq. Smivt vector-trap auto-clearing of sip bits is irrelevant here.
+  | chained_irq_enter(chip, desc);
+  | while ((hwirq = readl(claim))) {
+  | 	err = generic_handle_domain_irq(handler->priv->irqdomain, hwirq);
+
+[compliant] arch/riscv/include/asm/csr.h:207-213  N/A (CSR definitions)
+  CSR_HVICTL definition includes IPRIO/IPRIOM fields (GENMASK(7,0) and BIT(8)) used by KVM for interrupt-prio threshold control, but no CSR_SIPTHRESHOLD/CSR_SIPSTATUS SMAIA-style CSRs exist for Smivt. The kernel has no smivt ISA extension detected, isa_bitmap entry, or Smivt feature enable/disable path. The IVT-mode pending-bit auto-clear behavior is entirely absent from this kernel version (Linux 7.0-rc5).
+  | #define HVICTL_IPRIOM		BIT(8)
+  | #define HVICTL_IPRIO		GENMASK(7, 0)
+  | /* No Smivt CSR_SIPSTATUS, CSR_SITHRESHOLD, or Smivt enable bits exist */
+

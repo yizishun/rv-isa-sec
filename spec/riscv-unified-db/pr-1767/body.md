@@ -1,0 +1,1 @@
+Adds CI automation to detect when `./bin/chore gen all` regenerates `.github/workflows/regress.yml` during autofix.ci, and posts an explanatory PR comment when the autofix run fails in that situation.

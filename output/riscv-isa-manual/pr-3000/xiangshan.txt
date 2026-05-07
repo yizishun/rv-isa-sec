@@ -1,0 +1,46 @@
+PR #3000  target=xiangshan  overall=compliant
+Spec: FCVT.D.S must NOT share the integer-range validity check with FCVT.W[U]/L[U].S; misapplying the int_conv table to double-to-single conversion causes spurious NV exceptions and corrupted conversion results
+Violation: In XiangShan RTL, the FPU conversion pipeline incorrectly applies the integer-range validity check from the int_conv table (designed for FCVT.W[U].S and FCVT.L[U].S) to the FCVT.D.S (double-to-single) instruction. Specifically, the fcvtds decoder maps to the same validity-checking micro-op or the FCVT.D.S execution unit shares a common valid-input-range comparator with the integer-conversion FCVT instructions, causing a double-precision floating-point operand to be compared against the 32-bit or 64-bit signed/unsigned integer representable range. When the double-precision value lies outside the integer range (e.g., 1e100, NaN, infinity), the hardware incorrectly asserts the NV (Invalid Operation) flag in fflags and writes the clipped integer-bound value instead of the correctly rounded single-precision result.
+Consequence: data_corruption
+Pattern: FCVT\.D\.S.*valid.*input|fcvt.*int_conv|FCVT.*range_check.*int|fcvtds.*nv_flag|FCVT_D_S.*fp_to_int.*validity
+------------------------------------------------------------
+[compliant] yunsuan/src/main/scala/yunsuan/vector/VectorConvert/CVT64.scala:214-216  FP_INCVT
+  isFpWidenNext (FCVT.D.S lands here) and isFp2IntNext are derived from mutually exclusive conditions: outIsFpNext && isWiden vs. !outIsFpNext. FCVT.D.S uses vfwcvt_ffv='b11_001100' (bit6=1 → outIsFpNext=true, bit4=0,bit3=1 → isWiden=true). Integer FCVTs (e.g., vfcvt_xufv='b10_000000') have bit6=0 → outIsFpNext=false → isFp2IntNext=true. The two paths are structurally exclusive.
+  | val (isFpWidenNext, isFpNarrowNext, isFp2IntNext, isFpCrossHighNext, isFpCrossLowNext) =
+  |   (outIsFpNext && isWiden, outIsFpNext && isNarrow, !outIsFpNext,
+  |     outIsFpNext && isCrossHigh, outIsFpNext && isCrossLow)
+
+[compliant] yunsuan/src/main/scala/yunsuan/vector/VectorConvert/CVT64.scala:459-478  FP_INCVT
+  The fp→fp widen branch (where FCVT.D.S executes) sets NV only for SNaN canonicalization (isSNaNSrc && !s1_fpCanonicalNAN). of, uf, nx are hardwired to false.B. There is no integer-range check (ofExpRounded, toUnv, toInv) in this branch. The rounded result is correctly built from sign/exp/frac via fpWidenResultMapGen — a proper IEEE 754 widen operation.
+  | when(isFpWiden || isFpCrossHigh){
+  |     nv := isSNaNSrc && !s1_fpCanonicalNAN
+  |     dz := false.B
+  |     of := false.B
+  |     uf := false.B
+  |     nx := false.B
+
+[compliant] yunsuan/src/main/scala/yunsuan/vector/VectorConvert/CVT64.scala:617-657  FP_INCVT
+  The .otherwise branch (fp→int) at line 617 is syntactically unreachable when isFpWiden=true. Chisel when/elsewhen/otherwise compiles to a priority MUX tree; the nv/integer-overflow logic (ofExpRounded, toUnv, toInv at lines 625-653) is physically gated off for fp→fp conversions. The verified hardware does NOT share a comparator between FCVT.D.S and integer FCVT instructions.
+  | .otherwise{
+  |     /* out is int, any fp->any int/uint */
+  |     nv := Mux(hasSignInt, toInv, toUnv)
+  |     ...
+  | }
+
+[compliant] rocket-chip/src/main/scala/tile/FPU.scala:601-620  FPToInt
+  In the scalar FPU FPToInt module, fp→fp conversions are handled entirely within the 'when (in.bits.wflags && !in.bits.ren2)' block (line 601). Widening (FCVT.D.S, outTag>inTag) only canonicalizes NaN at line 604. Narrowing (FCVT.S.D, outTag<inTag) delegates to hardfloat.RecFNToRecFN at line 612. Neither path touches the RecFNToIN (fp→int) module at line 491, which is in a completely separate class (FPToInt vs. IntToFP).
+  | when (in.bits.wflags && !in.bits.ren2) { // fcvt
+  |     // widening conversions simply canonicalize NaN operands
+  |     val widened = Mux(maxType.isNaN(in.bits.in1), maxType.qNaN, in.bits.in1)
+  |     fsgnjMux.exc := maxType.isSNaN(in.bits.in1) << 4
+  |     // narrowing conversions require rounding
+  |     for (outType <- floatTypes.init) when (outTag === typeTag(outType).U && ... outTag < inTag)) {
+
+[compliant] yunsuan/src/main/scala/yunsuan/package.scala:536-536  VfcvtType
+  vfwcvt_ffv encoding 'b11_001100' is correct. Bit[6]=1 (output is fp), bits[5:4]=00, bits[3:2]=11 (widen), bits[1:0]=00. The hardware dispatch at CVT64.scala:183 reads bit[6] as outIsFpNext, and bits[4:3] as isWiden/isNarrow. This matches the encoding table exactly.
+  | def vfwcvt_ffv        = "b11_001100".U(8.W)
+
+[compliant] rocket-chip/src/main/scala/tile/FPU.scala:140-140  FPUDecoder
+  Scalar FPU decoder maps FCVT_D_S to typeTagIn=S, typeTagOut=D with cvt=Y, wflags=Y. This correctly dispatches to IntToFP (IntToFP.scala:601), the fp-to-fp conversion pipe. The RecFNToIN (fp→int) path at FPToInt.scala:491 is in a separate Chisel module class and cannot be reached by FCVT.D.S.
+  | FCVT_D_S -> List(N,Y,Y,N,N,N,X, S, D,N,N,Y,N,N,N,Y)
+

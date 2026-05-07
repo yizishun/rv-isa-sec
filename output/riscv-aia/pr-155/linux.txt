@@ -1,0 +1,107 @@
+PR #155  target=linux  overall=potential_risk
+Spec: Ssamb defines interrupt 14 as local asynchronous memory buffer interrupt (LAMBI) — kernel/KVM mask constants and CSR save/restore paths that treat bit 14 as reserved will leak or corrupt LAMBI interrupt state across context switches and VM boundaries
+Violation: Linux kernel (or KVM) context-switch save/restore of interrupt CSRs (mip, mie, sip, sie, mvien, mvip, hvien, hvip) uses a bitmask that omits bit 14, treating the LAMBI interrupt as reserved. This causes the Ssamb interrupt pending/enable/virtual-enable state to silently leak across process or VM boundaries during context switch, or to be spuriously cleared.
+Consequence: info_leak
+Pattern: CSR mask constant or inline bitfield omitting bit 14 in any CSR_{READ,WRITE}(mip|mie|sip|sie|mvien|mvip|hvien|hvip|mideleg|sideleg) path, especially in __switch_to, kvm_riscv_vcpu_switch, or interrupt controller initialization
+------------------------------------------------------------
+[potential_risk] arch/riscv/include/asm/csr.h:91-103  (global defines)
+  IRQ_LOCAL_MASK = GENMASK(13,0) excludes bit 14 entirely. No IRQ_* define exists for bit 14. Any kernel code using IRQ_LOCAL_MASK to mask/clear interrupt CSRs (sip/sie/mip/mie) would silently drop or fail to clear Ssamb/LAMBI interrupt state at bit 14. On hardware supporting Ssamb, this causes pending/enable state to leak across process boundaries or be spuriously preserved after clearing operations.
+  | #define IRQ_PMU_OVF         13
+  | #define IRQ_LOCAL_MAX       (IRQ_PMU_OVF + 1)
+  | #define IRQ_LOCAL_MASK      GENMASK((IRQ_LOCAL_MAX - 1), 0)
+
+[potential_risk] arch/riscv/include/asm/csr.h:186-191  (global defines)
+  VSIP_VALID_MASK covers only bits 1,5,9,13 (IRQ_S_SOFT, IRQ_S_TIMER, IRQ_S_EXT, IRQ_PMU_OVF). Bit 14 is omitted. In KVM, this mask is used when reading/writing guest sip via ONE_REG (vcpu_onereg.c:527,548), when checking for pending interrupts (vcpu.c:449), and when syncing guest interrupt state. A guest VM that uses the Ssamb interrupt at VS-level bit 14 would have its pending/enable state silently dropped during VM save/restore or migration.
+  | #define VSIP_VALID_MASK     ((_AC(1, UL) << IRQ_S_SOFT)   | \
+  |                              (_AC(1, UL) << IRQ_S_TIMER)  | \
+  |                              (_AC(1, UL) << IRQ_S_EXT)    | \
+  |                              (_AC(1, UL) << IRQ_PMU_OVF))
+
+[potential_risk] arch/riscv/include/asm/csr.h:534-545  (global defines)
+  IE_SIE, IE_TIE, IE_EIE macros (used as bitmask flags for MIE/MIP/SIE/SIP) only define standard software/timer/external interrupt bits, with no macro for bit 14. If the kernel manipulates SIE/SIP using only these flags, the Ssamb bit 14 would be left unmanaged, potentially leaking across context switches.
+  | #define RV_IRQ_SOFT        IRQ_S_SOFT
+  | #define RV_IRQ_TIMER        IRQ_S_TIMER
+  | #define RV_IRQ_EXT          IRQ_S_EXT
+  | #define IE_SIE              (_AC(0x1, UL) << RV_IRQ_SOFT)
+  | #define IE_TIE              (_AC(0x1, UL) << RV_IRQ_TIMER)
+  | #define IE_EIE              (_AC(0x1, UL) << RV_IRQ_EXT)
+
+[potential_risk] arch/riscv/kvm/vcpu.c:401-422  kvm_riscv_vcpu_set_interrupt
+  The set_interrupt gate allows irq >= IRQ_LOCAL_MAX (14) but rejects all local interrupts except 2,6,10,13. For irq=14, the condition 'irq < 14' is false, so the -EINVAL guard is bypassed and bit 14 would be set in irqs_pending. However, downstream consumers (flush_interrupts via irqs_pending_mask[0], has_interrupts via VSIP_VALID_MASK) do not properly propagate bit 14 to hvip or consider it for IRQ injection. This creates an inconsistent state where bit 14 can be set but never delivered.
+  | if (irq < IRQ_LOCAL_MAX &&
+  |     irq != IRQ_VS_SOFT &&
+  |     irq != IRQ_VS_TIMER &&
+  |     irq != IRQ_VS_EXT &&
+  |     irq != IRQ_PMU_OVF)
+  |     return -EINVAL;
+
+[potential_risk] arch/riscv/kvm/vcpu.c:364-399  kvm_riscv_vcpu_sync_interrupts
+  vcpu_sync_interrupts only tracks changes to IRQ_VS_SOFT (bit 2) and IRQ_PMU_OVF (bit 13) when synchronizing hardware HVIP state back to software irqs_pending model. Any guest write to bit 14 of VSIP (which would reflect in bit 14 of HVIP) is silently ignored. This means the KVM software model loses the Ssamb interrupt state written by the guest, causing info loss during VM context switch.
+  | if ((csr->hvip ^ hvip) & (1UL << IRQ_VS_SOFT)) {
+  |     ...
+  | }
+  | if ((csr->hvip ^ hvip) & (1UL << IRQ_PMU_OVF)) {
+  |     ...
+  | }
+
+[potential_risk] arch/riscv/kvm/vcpu.c:445-458  kvm_riscv_vcpu_has_interrupts
+  has_interrupts filters vsie through VSIP_VALID_MASK (bits 1,5,9,13), so even if bit 14 were enabled in vsie and pending in irqs_pending, it would not be recognized as a deliverable interrupt. The second clause (vsie & ~IRQ_LOCAL_MASK) only covers bits 14+, but on the irqs_pending side only irqs_pending[0] is checked for bits <64. Bit 14 would survive the ~IRQ_LOCAL_MASK filter but cannot be pending since no code sets it in irqs_pending.
+  | ie = ((vcpu->arch.guest_csr.vsie & VSIP_VALID_MASK)
+  |     << VSIP_TO_HVIP_SHIFT) & (unsigned long)mask;
+  | ie |= vcpu->arch.guest_csr.vsie & ~IRQ_LOCAL_MASK &
+  |     (unsigned long)mask;
+
+[potential_risk] arch/riscv/kvm/vcpu_onereg.c:525-528  kvm_riscv_vcpu_general_get_csr
+  When userspace reads guest sip via ONE_REG, hvip is projected through VSIP_VALID_MASK (excluding bit 14). The second expression '(csr->hvip & ~IRQ_LOCAL_MASK)' where ~IRQ_LOCAL_MASK = ~GENMASK(13,0) would actually include bit 14 in the output. This inconsistency means bit 14 in hvip could alias to an unintended sip bit position, creating a subtle info leak path if Ssamb were active.
+  | kvm_riscv_vcpu_flush_interrupts(vcpu);
+  | *out_val = (csr->hvip >> VSIP_TO_HVIP_SHIFT) & VSIP_VALID_MASK;
+  | *out_val |= csr->hvip & ~IRQ_LOCAL_MASK;
+
+[potential_risk] arch/riscv/kvm/vcpu_onereg.c:547-549  kvm_riscv_vcpu_general_set_csr
+  When userspace writes guest sip via ONE_REG, the value is masked through VSIP_VALID_MASK before shifting to hvip position. Bit 14 in the write value is silently dropped. This means VM migration or live-save/restore would lose the Ssamb interrupt state.
+  | if (reg_num == KVM_REG_RISCV_CSR_REG(sip)) {
+  |     reg_val &= VSIP_VALID_MASK;
+  |     reg_val <<= VSIP_TO_HVIP_SHIFT;
+  | }
+
+[potential_risk] arch/riscv/include/asm/kvm_host.h:58-60  (global defines)
+  KVM_HIDELEG_DEFAULT delegates only IRQ_VS_SOFT, IRQ_VS_TIMER, IRQ_VS_EXT (bits 2,6,10) to VS-mode. Bit 14 is not delegated. This means the Ssamb interrupt at VS-level bit 14 would trap to HS-mode instead of being handled directly by the guest, which is a correctness issue (not necessarily a security leak, but a functional gap that could mask security state).
+  | #define KVM_HIDELEG_DEFAULT    (BIT(IRQ_VS_SOFT)  | \
+  |                                  BIT(IRQ_VS_TIMER) | \
+  |                                  BIT(IRQ_VS_EXT))
+
+[potential_risk] arch/riscv/kvm/aia.c:560-567  kvm_riscv_aia_enable
+  HVIEN (hypervisor virtual interrupt enable) is only configured for IRQ_PMU_OVF (bit 13), conditionally on sscofpmf. Bit 14 is not enabled in HVIEN. This means Ssamb interrupts from the guest would not be filtered through the hypervisor's virtual interrupt enable mask, potentially allowing the guest to inject interrupts at bit 14 without hypervisor oversight.
+  | csr_set(CSR_HIE, BIT(IRQ_S_GEXT));
+  | if (__riscv_isa_extension_available(NULL, RISCV_ISA_EXT_SSCOFPMF))
+  |     csr_set(CSR_HVIEN, BIT(IRQ_PMU_OVF));
+
+[compliant] arch/riscv/kernel/signal.c:206-215  (arch_ext_list)
+  The signal frame extension save/restore table currently handles only Vector (RISCV_V_MAGIC) and Shadow Stack (RISCV_ZICFISS_MAGIC). Interrupt CSR state (sip/sie/mip/mie) is not saved/restored in signal frames, which is expected since these are per-CPU hardware registers, not per-thread state. Ssamb would not normally require signal-frame save/restore of interrupt CSR bits. Compliant.
+  | static struct arch_ext_priv arch_ext_list[] = {
+  |     { .magic = RISCV_V_MAGIC,        .save = &save_v_state },
+  |     { .magic = RISCV_ZICFISS_MAGIC,  .save = &save_cfiss_state },
+  | };
+
+[compliant] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The context-switch macro switch_to() saves/restores FPU, Vector, and ENVCFG state but does not explicitly save/restore sip/sie/mip/mie CSRs. On RISC-V, these CSRs are per-CPU (not per-thread) hardware registers managed by the interrupt controller. The kernel enters interrupt handlers with interrupts disabled (sstatus.SIE cleared), and the interrupt controller tracks pending/enable state per-CPU. No explicit CSR save/restore is expected here for LAMBI or any local interrupt. Compliant for the current architecture.
+  | #define switch_to(prev, next, last)
+  |     ...
+  |     __switch_to_fpu(__prev, __next);
+  |     __switch_to_vector(__prev, __next);
+  |     __switch_to_envcfg(__next);
+  |     ((last) = __switch_to(__prev, __next));
+
+[compliant] drivers/irqchip/irq-riscv-intc.c:135-155  riscv_intc_domain_alloc
+  The INTC driver's domain_alloc validates hwirq against riscv_intc_nr_irqs (64 with AIA, BITS_PER_LONG otherwise). This is a gatekeeper preventing registration of unsupported interrupt numbers. However, if Ssamb were supported by hardware and riscv_intc_nr_irqs were configured to allow bit 14, the mask/unmask functions (riscv_intc_irq_mask/unmask) use BIT(d->hwirq) directly with no whitelist, so they would handle bit 14 correctly at the IRQ chip level.
+  | if (hwirq >= riscv_intc_nr_irqs &&
+  |     (hwirq < riscv_intc_custom_base ||
+  |      hwirq >= riscv_intc_custom_base + riscv_intc_custom_nr_irqs))
+  |     return -EINVAL;
+
+[potential_risk] arch/riscv/kvm/main.c:36-55  kvm_arch_enable_virtualization_cpu
+  On CPU hotplug (virtualization CPU bringup), CSR_HVIP is initialized to 0 and HIDELEG/HEDELEG are set to defaults that exclude bit 14. If a KVM host CPU comes online on hardware that retains stale Ssamb interrupt state at bit 14 in HVIP from firmware or previous guest execution, this stale state is explicitly cleared by 'csr_write(CSR_HVIP, 0)'. This is actually correct behavior (prevents info leak), but the omission of bit 14 from HIDELEG means the guest cannot directly handle Ssamb interrupts even if hardware supports them.
+  | csr_write(CSR_HEDELEG, KVM_HEDELEG_DEFAULT);
+  | csr_write(CSR_HIDELEG, KVM_HIDELEG_DEFAULT);
+  | csr_write(CSR_HVIP, 0);
+

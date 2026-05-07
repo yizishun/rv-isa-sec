@@ -1,0 +1,74 @@
+PR #77  target=linux  overall=compliant
+Spec: hstatus.MTAG_I and mstatus.MTAG_I are new Zimt CSR bits deposited by hardware on trap entry (HS-mode and M-mode respectively); if the kernel's context-switch or register-save paths omit these bits, a guest VM or process can inherit stale MTAG_I state from a prior context, suppressing tag checks on HLV/HSV emulated accesses and defeating the memory-tagging security boundary
+Violation: KVM context-switches hstatus between VCPUs without saving/restoring hstatus.MTAG_I, or the kernel writes a synthesized sstatus/mstatus value (e.g., during signal frame setup, ptrace register set, or user_regs recovery) that corrupts MTAG_I, causing one execution context to inherit another context's code-page tag state
+Consequence: privilege_escape
+Pattern: save/restore of sstatus/mstatus/hstatus without MTAG_I mask; __fswrite sstatus CSR without MTAG_I preservation; KVM vcpu switch omitting hstatus.MTAG_I in the save/restore sequence
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/entry.S:176-190  handle_exception
+  Trap entry uses csrrc (read-modify-write with bit-clear) to clear SR_SUM|SR_FS_VS from sstatus. This preserves all other sstatus fields including any hypothetical MTAG_I. The read-back value s1 (includes MTAG_I) is saved to PT_STATUS(sp) via REG_S at line 190.
+  | li t0, SR_SUM | SR_FS_VS
+  | csrrc s1, CSR_STATUS, t0
+  | // ... s1 saved to stack
+  | REG_S s1, PT_STATUS(sp)
+
+[compliant] arch/riscv/kernel/entry.S:279-301  ret_from_exception
+  ret_from_exception restores sstatus from pt_regs->status with a full csrw. Since pt_regs->status was populated on trap entry from the hardware CSR (which includes MTAG_I), and is preserved through in-memory modifications (signal, kprobes, ptrace all preserve it), MTAG_I survives the save→modify→restore cycle.
+  | REG_L a0, PT_STATUS(sp)
+  | // ... restore_userssp ...
+  | csrw CSR_STATUS, a0
+  | // ... sret
+
+[compliant] arch/riscv/kernel/entry.S:441-451  __switch_to
+  Context switch saves full sstatus (with any MTAG_I) to prev->thread, then loads next->thread and isolates only SR_SUM via AND, applying it with csrs (bit-set). Since csrs with register operand does read-modify-write (OR), MTAG_I is preserved in current hardware sstatus. User-mode MTAG_I is later restored by ret_from_exception csrw when the task resumes userspace.
+  | csrr  s0, CSR_STATUS
+  | REG_S s0, TASK_THREAD_SUM_RA(a3)  // save full sstatus
+  | // ...
+  | REG_L s0,  TASK_THREAD_SUM_RA(a4)
+  | li    s1,  SR_SUM
+  | and   s0,  s0, s1                  // isolate SUM only
+  | csrs  CSR_STATUS, s0             // bit-set SUM, preserve all other bits
+
+[compliant] arch/riscv/kvm/vcpu_switch.S:41-63  SAVE_HOST_AND_RESTORE_GUEST_CSRS / SAVE_GUEST_AND_RESTORE_HOST_CSRS
+  KVM vCPU switch uses csrrw (atomic swap) to cross host/guest sstatus at line 48 and 155. The old host sstatus (with MTAG_I) is captured in t0 and saved to KVM_ARCH_HOST_SSTATUS. On guest exit, host sstatus from memory is swapped back via csrrw, capturing the guest sstatus (with guest MTAG_I) into t2 which is then saved to KVM_ARCH_GUEST_SSTATUS. Both MTAG_I values survive the atomic swap.
+  | REG_L t0, (KVM_ARCH_GUEST_SSTATUS)(a0)
+  | csrrw t0, CSR_SSTATUS, t0    // swap: host→t0, guest→hw
+  | REG_S t0, (KVM_ARCH_HOST_SSTATUS)(a0)
+
+[compliant] arch/riscv/kvm/vcpu.c:805-849  kvm_arch_vcpu_ioctl_run
+  VCPU run loop swaps host/guest hstatus using csr_swap(CSR_HSTATUS, ...) at lines 819/839/845/849. csr_swap (csrrw) is an atomic read-then-write: old hstatus (including MTAG_I) is returned and saved to the host context, while guest hstatus is written. On exit the reverse swap restores host hstatus. MTAG_I in hstatus is preserved through the atomic read-modify-write semantics.
+  | hcntx->hstatus = csr_swap(CSR_HSTATUS, gcntx->hstatus);  // enter guest
+  | // ... switch_to ...
+  | gcntx->hstatus = csr_swap(CSR_HSTATUS, hcntx->hstatus);  // exit guest
+
+[compliant] arch/riscv/kvm/vcpu_exit.c:70-126  kvm_riscv_vcpu_unpriv_read
+  HLV/HSV unpriv read path saves old hstatus via csr_swap (atomic capture of current hstatus including MTAG_I), later restores it via csr_write(CSR_HSTATUS, old_hstatus). The old_hstatus value was directly read from hardware, so MTAG_I is preserved.
+  | old_hstatus = csr_swap(CSR_HSTATUS, vcpu->arch.guest_context.hstatus);
+  | // ... HLV/HSV operation ...
+  | csr_write(CSR_HSTATUS, old_hstatus);
+
+[compliant] arch/riscv/kernel/signal.c:219-227  setup_sigcontext / restore_sigcontext
+  Signal frame save/restore copies the entire struct pt_regs (including status with MTAG_I) via copy_to_user/copy_from_user. sc_regs is architecturally compatible with the prefix of pt_regs, so MTAG_I in regs->status survives signal delivery and sigreturn.
+  | err = __copy_from_user(regs, &sc->sc_regs, sizeof(sc->sc_regs));  // restore
+  | // ...
+  | err = __copy_to_user(&sc->sc_regs, regs, sizeof(sc->sc_regs));    // save
+
+[compliant] arch/riscv/kernel/process.c:144-180  start_thread
+  start_thread() synthesizes regs->status = SR_PIE for execve(2). This deliberately discards the old process's MTAG_I state, which is correct — exec replaces the address space, so stale code-page tags have no meaning. The new process gets a clean sstatus; when the extension is actually supported, this is the correct place to set initial MTAG_I for the new binary.
+  | regs->status = SR_PIE;
+  | if (has_fpu())
+  | 	regs->status |= SR_FS_INITIAL;
+  | // ... UXL bits ...
+
+[compliant] arch/riscv/kernel/process.c:253-279  copy_thread
+  copy_thread for fork/clone copies parent's full pt_regs including status (line 268: *childregs = *(current_pt_regs())), so the child inherits the parent's MTAG_I. For kernel threads, a synthetic status = SR_PP|SR_PIE is used — correct since kernel threads never have user MTAG_I.
+  | *childregs = *(current_pt_regs());              // user fork: inherit parent
+  | childregs->status = SR_PP | SR_PIE;             // kernel thread: fresh
+
+[compliant] arch/riscv/kvm/vcpu_switch.S:274-440  __kvm_riscv_fp_f_save / __kvm_riscv_fp_d_save / __kvm_riscv_fp_f_restore / __kvm_riscv_fp_d_restore
+  KVM FP save/restore functions use a snapshot pattern: read current sstatus (with MTAG_I) into t2, csrs to enable FS, do FP operations, then csrw CSR_SSTATUS, t2 to restore the exact prior sstatus value. Since t2 was read directly from hardware (which carries MTAG_I), the restore preserves it. This is safe assuming interrupt-disabled context during FP save/restore.
+  | csrr t2, CSR_SSTATUS           // snapshot with MTAG_I
+  | li t1, SR_FS
+  | csrs CSR_SSTATUS, t1           // enable FS (bit-set, preserves MTAG_I)
+  | // ... FP operations ...
+  | csrw CSR_SSTATUS, t2           // restore exact snapshot (includes MTAG_I)
+

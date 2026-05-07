@@ -1,0 +1,1 @@
+Trying to pickup on any mentions of "implementation specific" choices that could be made by a designer of the RISC-V Vector Extension. Descriptions are direct quotes from the spec for easy search. Some parameters may be unneeded as they wouldnt affect instruction-level output behavior but I figured including more rather than less could only be benificial. Names are tentative.

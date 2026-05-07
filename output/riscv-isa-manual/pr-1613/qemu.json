@@ -1,0 +1,128 @@
+{
+  "pr_number": 1613,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1613,
+    "violation_condition": "QEMU's vsetvl/vsetvli/vsetivli handler in vector_helper.c uses cpu->cfg.elen for fractional LMUL validation (elen >> (8 - vlmul) >= sew), but the spec now defines the minimum LMUL constraint as LMUL ≥ SEW_MIN/VLEN. When ELEN=32 and VLEN≥64, QEMU incorrectly rejects e8mf8 (vlmul=5, sew=8 → 32>>3=4 < 8 sets vill=1), while the VLEN-based check (64>>3=8 ≥ 8) would permit it. Conversely, if VLEN < ELEN were ever modeled, the elen-based check could accept configurations that violate the VLEN-based floor.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "cpu->cfg.elen >> (8 - vlmul)",
+    "affected_entities": [
+      "vtype",
+      "vsetvl",
+      "vsetvli",
+      "vsetivli"
+    ],
+    "summary": "QEMU validates fractional LMUL against ELEN instead of VLEN per updated spec, incorrectly rejecting e8mf8 when ELEN=32,VLEN≥64"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_set_vl",
+        "line_start": 75,
+        "line_end": 86,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Fractional LMUL validation uses cpu->cfg.elen instead of VLEN. For vlmul=5 (mf8, sew=8), QEMU computes elen>>(8-5)=elen>>3. When ELEN=32 this yields 4 < sew(8), incorrectly setting vill=1 and denying a valid e8mf8 configuration per the updated spec. The fix is to replace cpu->cfg.elen with (cpu->cfg.vlenb << 3) so the constraint LMUL ≥ SEW_MIN/VLEN is correctly enforced.",
+      "snippet": "    if (vlmul & 4) {\n        /*\n         * Fractional LMUL, check:\n         *\n         * ELEN * LMUL >= SEW\n         * ELEN >> (8 - vlmul) >= sew\n         */\n        if (vlmul == 4 ||\n            (cpu->cfg.elen >> (8 - vlmul)) < sew) {\n            vill = true;\n        }"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_set_vl",
+        "line_start": 103,
+        "line_end": 106,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SEW > ELEN check is correct: ELEN defines the maximum supported SEW, and configurations with sew > elen must be rejected. This check is independent of the fractional-LMUL constraint and remains valid regardless.",
+      "snippet": "    if ((sew > cpu->cfg.elen) || vill || (vtype_reserved(env, s2) != 0)) {\n        reset_ill_vtype(env);\n        return 0;\n    }"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_set_vl",
+        "line_start": 108,
+        "line_end": 110,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VLMAX calculation correctly uses vlenb (VLEN). Even after fixing the fractional-LMUL eligibility check to use VLEN, the VLMAX computation already uses the correct register size and LMUL encoding.",
+      "snippet": "    /* lmul encoded as in DisasContext::lmul */\n    lmul = sextract32(FIELD_EX64(s2, VTYPE, VLMUL), 0, 3);\n    vlmax = vext_get_vlmax(cpu->cfg.vlenb, vsew, lmul);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_riscv_cpu",
+        "line_start": 145,
+        "line_end": 150,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All vector CSR state (vl, vstart, vtype, vill) is included in the VMState migration structure. No missing fields that would cause silent corruption on live migration.",
+      "snippet": "        VMSTATE_UINTTL(env.vl, RISCVCPU),\n        VMSTATE_UINTTL(env.vstart, RISCVCPU),\n        VMSTATE_UINTTL(env.vtype, RISCVCPU),\n        VMSTATE_BOOL(env.vill, RISCVCPU),"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_reset_hold",
+        "line_start": 784,
+        "line_end": 784,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "At reset, env->vill is set to true, which is correct: the vector unit starts in the 'illegal' state until the first vsetvl instruction configures it. vtype is implicitly 0 from zero-initialization, which is also correct.",
+      "snippet": "    env->vill = true;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_init",
+        "line_start": 1120,
+        "line_end": 1121,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Default configuration sets elen=64 and vlenb=16 (VLEN=128). With these defaults the ELEN-based fractional-LMUL check (line 83) happens to produce correct results because elen>>3=8, which equals sew=8 for e8mf8. However, if a user explicitly sets -cpu rv64,elen=32,vlen=128 (which is architecturally valid), the ELEN-based check incorrectly rejects e8mf8. The default masks this bug for common configurations.",
+      "snippet": "    cpu->cfg.vlenb = 128 >> 3;\n    cpu->cfg.elen = 64;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "do_vsetvl",
+        "line_start": 194,
+        "line_end": 215,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vsetvl/vsetvli translation correctly passes the vtype value (s2) and rs1 to gen_helper_vsetvl. No issues in TCG translation — the bug is confined to the runtime helper.",
+      "snippet": "    gen_helper_vsetvl(dst, tcg_env, s1, s2, tcg_constant_tl((int) (rd == 0 && rs1 == 0)));\n    gen_set_gpr(s, rd, dst);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/kvm/kvm-cpu.c",
+        "function_name": "kvm_riscv_get/put_regs",
+        "line_start": 863,
+        "line_end": 920,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM path correctly synchronizes vtype between QEMU and the kernel. The validation of vtype values happens through the same vext_set_vl helper, so a KVM guest setting e8mf8 with ELEN=32 would hit the same fractional-LMUL bug, but the synchronization mechanism itself is correct.",
+      "snippet": "    reg = env->vtype;\n    ret = kvm_set_one_reg(cs, RISCV_VECTOR_CSR_REG(vtype), &reg);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vtype_reserved",
+        "line_start": 36,
+        "line_end": 50,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reserved bits in vtype are correctly checked: bits from ALTFMT_SHIFT (or RESERVED_SHIFT when zvfbfa) through bit xlen-2 are treated as reserved and must be zero. Writes to reserved bits are properly rejected (causing vill=1).",
+      "snippet": "    if (riscv_cpu_cfg(env)->ext_zvfbfa) {\n        reserved = vtype & MAKE_64BIT_MASK(R_VTYPE_RESERVED_SHIFT,\n                                           xlen - 1 - R_VTYPE_RESERVED_SHIFT);\n    } else {\n        reserved = vtype & MAKE_64BIT_MASK(R_VTYPE_ALTFMT_SHIFT,\n                                           xlen - 1 - R_VTYPE_ALTFMT_SHIFT);\n    }"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

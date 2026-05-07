@@ -1,0 +1,222 @@
+diff --git a/cfgs/rv64-vector.yaml b/cfgs/rv64-vector.yaml
+index a3b6185bc0..3a64fba4f1 100644
+--- a/cfgs/rv64-vector.yaml
++++ b/cfgs/rv64-vector.yaml
+@@ -21,6 +21,7 @@ implemented_extensions:
+   - [Zifencei, "2.0.0"]
+   - [Sv39, "1.11.0"]
+   - [V, "1.0.0"]
++  - [F, "2.2"]
+ 
+ params:
+   MXLEN: 64
+@@ -33,7 +34,7 @@ params:
+   MISALIGNED_LDST: true
+   MISALIGNED_LDST_EXCEPTION_PRIORITY: low
+   MISALIGNED_MAX_ATOMICITY_GRANULE_SIZE: 4
+-  MISALIGNED_SPLIT_STRATEGY: by_byte
++  MISALIGNED_SPLIT_STRATEGY: sequential_bytes
+   PRECISE_SYNCHRONOUS_EXCEPTIONS: true
+   TRAP_ON_ECALL_FROM_M: true
+   TRAP_ON_EBREAK: true
+@@ -54,7 +55,7 @@ params:
+   PMA_GRANULARITY: 12
+   PHYS_ADDR_WIDTH: 57
+   MISA_CSR_IMPLEMENTED: true
+-  MTVEC_ACCESS: read-write
++  MTVEC_ACCESS: rw
+   MTVEC_MODES: [0, 1]
+   MTVEC_BASE_ALIGNMENT_DIRECT: 4
+   MTVEC_BASE_ALIGNMENT_VECTORED: 4
+@@ -192,10 +193,8 @@ params:
+   TRAP_ON_ECALL_FROM_S: true
+   TRAP_ON_ECALL_FROM_U: true
+   TRAP_ON_SFENCE_VMA_WHEN_SATP_MODE_IS_READ_ONLY: false
+-  MSTATUS_FS_WRITABLE: false
+-  MSTATUS_VS_WRITABLE: false
+-  MSTATUS_VS_LEGAL_VALUES: [0]
+-  MSTATUS_FS_LEGAL_VALUES: [0]
++  MSTATUS_VS_LEGAL_VALUES: [0, 1, 2, 3]
++  MSTATUS_FS_LEGAL_VALUES: [0, 1, 2, 3]
+   MSTATUS_TVM_IMPLEMENTED: false
+   NUM_PMP_ENTRIES: 16
+   PMP_GRANULARITY: 12
+@@ -203,10 +202,11 @@ params:
+   U_MODE_ENDIANNESS: little
+   UXLEN: [64]
+   MSTATEEN_ENVCFG_TYPE: rw
+-  # HSTATEEN_ENVCFG_TYPE: rw
+   MUTABLE_MISA_V: false
+   HW_MSTATUS_VS_DIRTY_UPDATE: never
+   RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX: "VLMAX"
+   FOLLOW_VTYPE_RESET_RECOMMENDATION: true
+   VLEN: 128
+   ELEN: 64
++  HW_MSTATUS_FS_DIRTY_UPDATE: never
++  MUTABLE_MISA_F: false
+diff --git a/spec/std/isa/inst/V/vsetvli.yaml b/spec/std/isa/inst/V/vsetvli.yaml
+index 6953678b05..b2302d9bd5 100644
+--- a/spec/std/isa/inst/V/vsetvli.yaml
++++ b/spec/std/isa/inst/V/vsetvli.yaml
+@@ -33,44 +33,56 @@ operation(): |
+       || ((new_vtype & 8'd0) != 0)    # reserved bits
+       || (new_vtype[5] == 1)          # reserved vsew encoding
+       || (new_vtype[2:0] == 3'b100)   # reserved vlmul encoding
+-      || (xlen() == 32 && new_vtype[2:0] == 3'b101)) # reserved LMUL in RV32
++      # || (xlen() == 32 && new_vtype[2:0] == 3'b101) # reserved LMUL in RV32
++      )
+   {
+     CSR[vtype].VILL = 1;
+     CSR[vtype].VMA = 0;
+     CSR[vtype].VTA = 0;
+     CSR[vtype].VSEW = 0;
+     CSR[vtype].VLMUL = 0;
+-  } else {
+-    # valid, do the write
+-    CSR[vtype].VILL = 0;
+-    CSR[vtype].VMA = new_vtype[7];
+-    CSR[vtype].VTA = new_vtype[6];
+-    CSR[vtype].VSEW = new_vtype[5:3];
+-    CSR[vtype].VLMUL = new_vtype[2:0];
+-  }
++    CSR[vl].VALUE = 0;
++  } else
++    {
++      # valid, do the write
++      CSR[vtype].VILL = 0;
++      CSR[vtype].VMA = new_vtype[7];
++      CSR[vtype].VTA = new_vtype[6];
++      CSR[vtype].VSEW = new_vtype[5:3];
++      CSR[vtype].VLMUL = new_vtype[2:0];
+ 
+-  VectorState state = vector_state();
+-  XReg vlen = VLEN;
+-  XReg vlmax = (vlen << state.log2_lmul) >> state.log2_sew;
+-  XReg avl = X[xs1];
+-  XReg ceil_avl_over_two = (avl + 1) / 2;
++      VectorState state = vector_state();
++      XReg vlen = VLEN;
++      XReg vlmax = (vlen << state.log2_lmul) >> state.log2_sew;
++      XReg avl = X[xs1];
++      XReg ceil_avl_over_two = (avl + 1) / 2;
+ 
+-  if (xs1 == 0) {
+-    CSR[vl].VALUE = vlmax;
+-  } else if (avl < vlmax) {
+-      CSR[vl].VALUE = avl;
+-  } else if (avl < 2*vlmax) {
+-      if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "ceil(AVL/2)") {
+-        CSR[vl].VALUE = ceil_avl_over_two;
+-      } else if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "VLMAX") {
+-          CSR[vl].VALUE = vlmax;
+-      } else {
+-          unpredictable("Implementations may choose a custom value for vl in the case AVL < (2*VLMAX), so long as ceil(AVL/2) <= vl <= VLMAX");
++      if (xs1 == 0)
++      {
++        CSR[vl].VALUE = vlmax;
++      } else
++      {
++        if (avl <= vlmax)
++        {
++          CSR[vl].VALUE = avl;
++        } else if (avl < 2*vlmax)
++            {
++              if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "ceil(AVL/2)")
++              {
++                CSR[vl].VALUE = ceil_avl_over_two;
++              } else if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "VLMAX")
++                {
++                  CSR[vl].VALUE = vlmax;
++                } else
++                  {
++                    unpredictable("Implementations may choose a custom value for vl in the case AVL < (2*VLMAX), so long as ceil(AVL/2) <= vl <= VLMAX");
++                  }
++            } else
++              {
++                CSR[vl].VALUE = vlmax;
++              }
+       }
+-  } else {
+-      CSR[vl].VALUE = vlmax;
+-  }
+-
++    }
+   X[xd] = CSR[vl].VALUE;
+   CSR[vstart].VALUE = 0;
+ 
+diff --git a/tests/isa/rv64uv/vsetivli.S b/tests/isa/rv64uv/vsetivli.S
+index 9437d6a3ab..6a8a8710a4 100644
+--- a/tests/isa/rv64uv/vsetivli.S
++++ b/tests/isa/rv64uv/vsetivli.S
+@@ -15,7 +15,7 @@
+ #include "riscv_test.h"
+ #include "test_macros.h"
+ 
+-RVTEST_RV64U
++RVTEST_RV64UV
+ RVTEST_CODE_BEGIN
+ 
+ # tests for VLEN=128bits, AVL < VLMAX
+diff --git a/tests/isa/rv64uv/vsetvl.S b/tests/isa/rv64uv/vsetvl.S
+index df9e73fc1f..d2c6cf9c57 100644
+--- a/tests/isa/rv64uv/vsetvl.S
++++ b/tests/isa/rv64uv/vsetvl.S
+@@ -15,7 +15,7 @@
+ #include "riscv_test.h"
+ #include "test_macros.h"
+ 
+-RVTEST_RV64U
++RVTEST_RV64UV
+ RVTEST_CODE_BEGIN
+ 
+ # tests for VLEN=128bits, AVL < VLMAX
+diff --git a/tests/isa/rv64uv/vsetvli_rs1_eq_zero.S b/tests/isa/rv64uv/vsetvli_rs1_eq_zero.S
+index d67fa4bc8f..7bdb3b8b77 100644
+--- a/tests/isa/rv64uv/vsetvli_rs1_eq_zero.S
++++ b/tests/isa/rv64uv/vsetvli_rs1_eq_zero.S
+@@ -13,7 +13,7 @@
+ #include "riscv_test.h"
+ #include "test_macros.h"
+ 
+-RVTEST_RV64U
++RVTEST_RV64UV
+ RVTEST_CODE_BEGIN
+ 
+ # tests for VLEN=128bits, AVL = ~0 (rs1 = x0)
+diff --git a/tests/isa/rv64uv/vsetvli_vl_lt_vlmax.S b/tests/isa/rv64uv/vsetvli_vl_lt_vlmax.S
+index 4a87ad09f5..bf84ccfc58 100644
+--- a/tests/isa/rv64uv/vsetvli_vl_lt_vlmax.S
++++ b/tests/isa/rv64uv/vsetvli_vl_lt_vlmax.S
+@@ -13,22 +13,27 @@
+ #include "riscv_test.h"
+ #include "test_macros.h"
+ 
+-RVTEST_RV64U
++RVTEST_RV64UV
+ RVTEST_CODE_BEGIN
+ 
+ # tests for VLEN=128bits, AVL < VLMAX
+-
+-  TEST_CASE(2, x5, 0x2, \
++  # vtypei = 0x03 -> VMA_VTA_VSEW_VLMUL == 0_0_000_011 -> SEW=8, LMUL=8
++  # VLMAX=LMUL*VLEN/SEW = 8*128/8 = 128
++  TEST_CASE(1, x5, 0x2, \
+     li x4, 0x2; \
+     vsetvli x5, x4, 0x3; \
+   )
+ 
+-  TEST_CASE(3, x5, 0x2, \
++  # vtypei = 0x23 -> VMA_VTA_VSEW_VLMUL == 0_0_100_011 -> SEW=RESERVED, LMUL=8
++  # So vl should be zero
++  TEST_CASE(2, x5, 0x0, \
+     li x4, 0x2; \
+     vsetvli x5, x4, 0x23; \
+   )
+ 
+-  TEST_CASE(4, x5, 0x2, \
++  # vtypei = 0xeb-> VMA_VTA_VSEW_VLMUL == 1_1_101_011 -> SEW=RESERVED, LMUL=8
++  # So vl should be zero
++  TEST_CASE(3, x5, 0x0, \
+     li x4, 0x2; \
+     vsetvli x5, x4, 0xeb; \
+   )

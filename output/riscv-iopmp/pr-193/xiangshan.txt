@@ -1,0 +1,57 @@
+PR #193  target=xiangshan  overall=potential_risk
+Spec: Conditional stall buffer flush on MDSTALL clear: if imp_stall_buffer is true but hardware does not flush buffer + zero stall_cntr when mdstall becomes all-zero, stalled DMA transactions are silently dropped causing permanent I/O denial-of-service
+Violation: In XiangShan RTL, when IOPMP implements stall buffer (imp_stall_buffer=1) and MDSTALL register is cleared (both mdstall_exempt and mdstall_md fields become zero), the hardware must flush all queued stalled transactions from the stall buffer and reset the stall counter to zero. If the RTL fails to assert the internal buffer-flush signal on this condition—e.g., the stall_cntr register is not zeroed, or in-flight stalled DMA transactions remain latched in the hardware buffer without being re-issued—then stale transactions are permanently trapped in the buffer, new stalls may incorrectly appear as buffer-full, and the requester receives no response.
+Consequence: denial_of_service
+Pattern: when (imp_stall_buffer && mdstall_raw === 0) stall_buffer_flush || stall_cntr reset; grep for stall_buffer.*flush|stall_buf.*clear|stall_cntr.*:=.*0|mdstall.*flush
+------------------------------------------------------------
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:41-41  IopmpParams
+  stall_en is hardwired to 0, correctly advertising that stall-related features (including stall buffer, MDSTALL registers, and stall-violation detection) are not implemented. The vulnerability prerequisite (imp_stall_buffer=1) can never be satisfied, so the stale-transaction-in-stall-buffer scenario is impossible.
+  | val stall_en           = 0    // [R   ] stall feature is not imp
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:766-776  RegMap (register instantiation)
+  No reg_mdstall or reg_mdstallh registers are instantiated. The RegMdstall/RegMdstallh Bundle types are commented out (lines 565-616). Without MDSTALL registers, there is no mdstall_md masking or mdstall_exempt mode to control, and thus no stall buffer to flush on MDSTALL clear.
+  | val reg_version        = RegVersion()
+  | val reg_implementation = RegImplementation()
+  | val reg_hwcfg0         = RegHwcfg0()
+  | ...
+  | val reg_erreqid        = RegErreqid()
+  | // no reg_mdstall or reg_mdstallh
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:855-867  RegMap MuxLookup read-back
+  MuxLookup read-path has no entries for MDSTALL (0x0030) or MDSTALLH (0x0034). Reads to these offsets return 0 (MuxLookup default), and writes are silently dropped (no addrhit_mdstall signal exists). This is acceptable WARL-conforming behavior for unimplemented registers.
+  | regcfg_dout := MuxLookup(addr_offset, 0.U)(Seq(
+  |   IopmpParams.reg_version_addr_offset -> reg_version.toUInt,
+  |   ...
+  |   IopmpParams.reg_erreqid_addr_offset -> reg_erreqid.toUInt
+  | ))  // no reg_mdstall_addr_offset or reg_mdstallh_addr_offset
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1035-1036  Ctrl FSM states
+  Ctrl FSM has 9 states: sIdle, sSrcmd, sMdcfg, sMdcfgPre, sEntry, sPriority, sMatching, sErr, sDone. No stall-buffer-drain or stall-buffer-flush states exist. The FSM has no mechanism to gate or queue transactions based on MD, so no stale stalled transactions can accumulate.
+  | object State extends ChiselEnum {
+  |   val sIdle, sSrcmd, sMdcfg, sMdcfgPre, sEntry, sPriority, sMatching, sErr, sDone = Value
+  | }
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1320-1321  IopmpChecker flush signal
+  io.flush triggers on the falling edge of APB regcfg write (stall = io.regcfg.v && io.regcfg.rw), not on MDSTALL clear. This is a standard APB-write-completion flush to invalidate any cached lookup results after config changes. It is unrelated to stall-buffer flushing.
+  | // flush
+  | io.flush := EdgeDetect.falling(io.stall)
+
+[potential_risk] ChiselIOPMP/src/main/scala/IopmpChecker.scala:637-637  RegErrcfg stall_violation_en WARL
+  stall_violation_en field in RegErrcfg is declared WARL but unconditionally stores written values (line 830). With stall_en=0, correct WARL behavior would hardwire this field to 0 — since no stall buffer exists, stall-violation detection cannot be enabled. Software writing 1 reads back 1 despite the feature being absent. If stall support is added later and this WARL sanitization is forgotten, it's a pre-existing latent bug.
+  | val stall_violation_en= UInt(1.W)  // [WARL] Indicates whether the IOPMP faults stalled transactions
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1356-1356  IopmpChecker stall signal
+  The stall signal (io.regcfg.v && io.regcfg.rw) gates the checker pipeline during APB register writes. This is unrelated to MD-based transaction stalling — it is standard pipeline protection to prevent inconsistent reads during configuration updates. Reading this signal anywhere expecting MDSTALL semantics would be a misinterpretation.
+  | val stall = io.regcfg.v && io.regcfg.rw
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpBridge.scala:93-98  IopmpBridge AXI queue architecture
+  IopmpBridge uses standard Chisel Queue primitives (depth=axi_outstanding=8) for slave-side AR/AW buffering. There is no separate stall buffer FIFO physically distinct from the normal transaction queue. All transactions share the same FIFOs, so the concept of permanently-stalled DMA transactions in a dedicated stall buffer does not apply.
+  | val s_ar_fifo = Module(new Queue(slaveBundle.ar.bits.cloneType, IopmpParams.axi_outstanding))
+  | val s_aw_fifo = Module(new Queue(slaveBundle.aw.bits.cloneType, IopmpParams.axi_outstanding))
+  | val m_ar_fifo = Module(new Queue(slaveBundle.ar.bits.cloneType, IopmpParams.axi_outstanding))
+  | val m_aw_fifo = Module(new Queue(slaveBundle.aw.bits.cloneType, IopmpParams.axi_outstanding))
+
+[compliant] ChiselIOPMP/src/main/scala/IopmpChecker.scala:495-516  RegHwcfg0 HWCFG0 BitCat encoding
+  HWCFG0 bit layout in toUInt Cat(): enable[31], addrh_en[30], md_num[29:24], md_entry_num[23:17], mfr_en[16], pees[15], peis[14], stall_en[13], no_w[12], no_x[11], chk_x[10], rrid_transl_prog[9], rrid_transl_en[8], prient_prog[7], user_cfg_en[6], sps_en[5], tor_en[4], srcmd_fmt[3:2], mdcfg_fmt[1:0]. stall_en at bit[13] correctly reads 0, matching the unimplemented status.
+  | def toUInt: UInt = Cat(enable, addrh_en, md_num, md_entry_num, mfr_en, pees, peis, stall_en, no_w, no_x, chk_x, rrid_transl_prog, rrid_transl_en, prient_prog, user_cfg_en, sps_en, tor_en, srcmd_fmt, mdcfg_fmt)
+

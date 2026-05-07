@@ -1,0 +1,505 @@
+diff --git a/.github/workflows/python-tests.yml b/.github/workflows/python-tests.yml
+new file mode 100644
+index 0000000000..69fba05b3f
+--- /dev/null
++++ b/.github/workflows/python-tests.yml
+@@ -0,0 +1,59 @@
++name: RISC-V Unified DB CI
++
++on:
++  push:
++    branches: [ main ]
++  pull_request:
++    branches: [ main ]
++
++jobs:
++  schema-validator:
++    name: Run schema validator tests
++    runs-on: ubuntu-latest
++
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v3
++
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.12"
++
++      - name: Install dependencies
++        run: |
++          python -m pip install --upgrade pip
++          pip install pytest pyyaml
++
++      - name: Run schema validator tests
++        run: pytest -q backends/generators/tests
++
++  generators:
++    name: Run backend generators
++    runs-on: ubuntu-latest
++    needs: schema-validator
++
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v3
++
++      - name: Set up Python
++        uses: actions/setup-python@v4
++        with:
++          python-version: "3.12"
++
++      - name: Install dependencies
++        run: |
++          python -m pip install --upgrade pip
++          pip install pyyaml
++
++      - name: Run Go generator
++        run: python3 backends/generators/Go/go_generator.py --verbose
++
++      - name: Run C header generator
++        run: python3 backends/generators/c_header/generate_encoding.py \
++          --inst-dir arch/inst/ \
++          --csr-dir arch/csr/ \
++          --ext-dir arch/ext/ \
++          --output encoding.out.h \
++          --extensions A D F I M Q Zba Zbb Zbs S System V Zicsr Smpmp Sm H U Zicn
+diff --git a/backends/__init__.py b/backends/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/backends/generators/Go/go_generator.py b/backends/generators/Go/go_generator.py
+index b02c8337ee..f0d14777c7 100644
+--- a/backends/generators/Go/go_generator.py
++++ b/backends/generators/Go/go_generator.py
+@@ -4,9 +4,11 @@
+ import argparse
+ import logging
+ 
+-# Add parent directory to path to find generator.py
+-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
++
+ from generator import load_instructions, load_csrs, parse_match, signed
++from ...generators.schema_validator import validate_entry
+ 
+ logging.basicConfig(level=logging.INFO, format="%(levelname)s:: %(message)s")
+ 
+@@ -38,6 +40,8 @@ def make_go(instr_dict, csrs, output_file="inst.go"):
+     instr_str = ""
+     # Process instructions in sorted order (by name)
+     for name, info in sorted(instr_dict.items(), key=lambda x: x[0].upper()):
++        # Validate instruction entry before using it
++        validate_entry(info, required_fields=["match"])
+         match_str = info["match"]
+         enc_match = parse_match(match_str)
+         opcode = (enc_match >> 0) & ((1 << 7) - 1)
+@@ -61,6 +65,8 @@ def make_go(instr_dict, csrs, output_file="inst.go"):
+     # Convert the dictionary to a list of tuples and sort by address
+     csr_items = [(int(addr), name.upper()) for addr, name in csrs.items()]
+     for addr, name in sorted(csr_items, key=lambda x: x[0]):
++        # Validate CSR entry before using it
++        validate_entry({"addr": addr, "name": name}, required_fields=["addr", "name"])
+         csrs_map_str += f'{hex(addr)} : "{name}",\n'
+     csrs_map_str += "}\n"
+ 
+@@ -147,6 +153,10 @@ def main():
+     instr_dict = load_instructions(
+         args.inst_dir, enabled_extensions, include_all, args.arch
+     )
++    # Validate all loaded instructions
++    for name, entry in instr_dict.items():
++        validate_entry(entry, required_fields=["match"])
++
+     if not instr_dict:
+         logging.error("No instructions found or all were filtered out.")
+         logging.error(
+@@ -157,6 +167,10 @@ def main():
+ 
+     # Load CSRs filtered by extensions or all CSRs
+     csrs = load_csrs(args.csr_dir, enabled_extensions, include_all, args.arch)
++    # Validate all loaded CSRs
++    for addr, name in csrs.items():
++        validate_entry({"addr": addr, "name": name}, required_fields=["addr", "name"])
++
+     if not csrs:
+         logging.warning("No CSRs found or all were filtered out.")
+     else:
+diff --git a/backends/generators/__init__.py b/backends/generators/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/backends/generators/c_header/__init__.py b/backends/generators/c_header/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/backends/generators/c_header/generate_encoding.py b/backends/generators/c_header/generate_encoding.py
+index aba6592511..fb237a7157 100644
+--- a/backends/generators/c_header/generate_encoding.py
++++ b/backends/generators/c_header/generate_encoding.py
+@@ -9,6 +9,7 @@
+ import argparse
+ import yaml
+ import json
++from ..schema_validator import validate_entry
+ 
+ # Add parent directory to path to import generator.py
+ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+@@ -22,6 +23,7 @@
+     parse_extension_requirements,
+ )
+ 
++
+ logging.basicConfig(level=logging.INFO, format="%(levelname)s:: %(message)s")
+ 
+ 
+@@ -125,6 +127,11 @@ def load_exception_codes(
+                             .replace("/", "_")
+                             .replace("-", "_")
+                         )
++                        # Validate the cause entry
++                        validate_entry(
++                            {"num": num, "name": sanitized_name},
++                            required_fields=["num", "name"],
++                        )
+                         exception_codes.append((num, sanitized_name))
+ 
+             except Exception as e:
+@@ -214,6 +221,9 @@ def extract_instruction_fields(instructions):
+ 
+     # Then process fields from actual instructions
+     for name, instr_data in instructions.items():
++        # Validate instruction entry
++        validate_entry(instr_data, required_fields=["match"])
++
+         # Get variables from the instruction structure
+         variables = []
+         if "encoding" in instr_data:
+@@ -357,11 +367,15 @@ def main():
+     instructions = load_instructions(
+         args.inst_dir, args.extensions, include_all=args.include_all, target_arch="BOTH"
+     )
++    for name, entry in instructions.items():
++        validate_entry(entry, required_fields=["match"])
+ 
+     logging.info(f"Loading CSRs from {args.csr_dir}")
+     csrs = load_csrs(
+         args.csr_dir, args.extensions, include_all=args.include_all, target_arch="BOTH"
+     )
++    for addr, name in csrs.items():
++        validate_entry({"addr": addr, "name": name}, required_fields=["addr", "name"])
+ 
+     # Load exception codes
+     logging.info(f"Loading exception codes from {args.ext_dir}")
+@@ -371,6 +385,8 @@ def main():
+         include_all=args.include_all,
+         resolved_codes_file=args.resolved_codes,
+     )
++    for num, name in causes:
++        validate_entry({"num": num, "name": name}, required_fields=["num", "name"])
+ 
+     # Process instructions and calculate masks
+     instr_dict = {}
+@@ -412,8 +428,8 @@ def main():
+     csr_names_str = ""
+     declare_csr_str = ""
+     for addr, name in sorted(csrs.items()):
+-        csr_names_str += f"#define CSR_{name.upper().replace(".","_")} 0x{addr:x}\n"
+-        declare_csr_str += f"DECLARE_CSR({name.lower().replace(".","_")}, CSR_{name.upper().replace(".","_")})\n"
++        csr_names_str += f"#define CSR_{name.upper().replace('.','_')} 0x{addr:x}\n"
++        declare_csr_str += f"DECLARE_CSR({name.lower().replace('.','_')}, CSR_{name.upper().replace('.','_')})\n"
+ 
+     causes_str = ""
+     declare_cause_str = ""
+diff --git a/backends/generators/generator.py b/backends/generators/generator.py
+index 13d29ae819..1754330dd5 100755
+--- a/backends/generators/generator.py
++++ b/backends/generators/generator.py
+@@ -3,12 +3,17 @@
+ import yaml
+ import logging
+ import pprint
++import logging
++from .schema_validator import validate_entry
+ 
+ pp = pprint.PrettyPrinter(indent=2)
+ logging.basicConfig(level=logging.INFO, format="%(levelname)s:: %(message)s")
+ 
+ 
+ def check_requirement(req, exts):
++    if isinstance(req, dict) and "name" in req:
++        validate_entry(req, ["name"], context="check_requirement")
++
+     if isinstance(req, str):
+         return req in exts
+     elif isinstance(req, dict) and "name" in req:
+@@ -124,8 +129,17 @@ def parse_extension_requirements(extensions_spec):
+     """
+     if extensions_spec is None:
+         # If definedBy is None, we should never match
+-        logging.error(f"Missing 'definedBy' field")
+-        return lambda exts: False
++        raise AssertionError(
++            "Schema change detected: 'definedBy' field missing in extensions_spec"
++        )
++
++    if isinstance(extensions_spec, dict):
++        allowed_keys = {"name", "version", "allOf", "oneOf", "anyOf"}
++        for key in extensions_spec.keys():
++            if key not in allowed_keys:
++                raise AssertionError(
++                    f"Schema change detected: unexpected key '{key}' in extensions_spec"
++                )
+ 
+     if isinstance(extensions_spec, str):
+         # Simple case: a single extension
+@@ -158,6 +172,11 @@ def parse_extension_requirements(extensions_spec):
+ 
+         # Process each alternative, which could be a string or a dict with name/version
+         def check_alternative_one_of(alt, exts):
++            if isinstance(alt, dict) and "name" in alt:
++                validate_entry(
++                    alt, ["name"], context="parse_extension_requirements:oneOf"
++                )
++
+             if isinstance(alt, str):
+                 return alt in exts
+             elif isinstance(alt, dict) and "name" in alt:
+@@ -176,6 +195,12 @@ def check_alternative_one_of(alt, exts):
+ 
+         # Process each alternative, which could be a string, dict with name/version, or nested allOf
+         def check_alternative(alt, exts):
++            if isinstance(alt, dict):
++                if "name" in alt:
++                    validate_entry(
++                        alt, ["name"], context="parse_extension_requirements:anyOf"
++                    )
++
+             if isinstance(alt, str):
+                 return alt in exts
+             elif isinstance(alt, dict):
+@@ -192,6 +217,11 @@ def check_alternative(alt, exts):
+ 
+     # Handle direct name/version specification
+     if "name" in extensions_spec and "version" in extensions_spec:
++        validate_entry(
++            extensions_spec,
++            ["name", "version"],
++            context="parse_extension_requirements:name_version",
++        )
+         extension = extensions_spec["name"]
+         # We don't actually check the version, just the extension name
+         return lambda exts: extension in exts
+@@ -240,6 +270,14 @@ def load_instructions(
+                 continue
+ 
+             found_instructions += 1
++
++            # Validate required top-level fields
++            validate_entry(
++                data,
++                ["name", "definedBy", "encoding"],
++                context=f"Instruction file: {path}",
++            )
++
+             name = data.get("name")
+             if not name:
+                 logging.error(f"Missing 'name' field in {path}")
+@@ -247,7 +285,6 @@ def load_instructions(
+ 
+             # If include_all is True, skip extension filtering
+             if not include_all:
+-                # Check if this instruction is defined by an enabled extension
+                 definedBy = data.get("definedBy")
+                 if definedBy is None:
+                     logging.error(
+@@ -264,7 +301,6 @@ def load_instructions(
+                     extension_filtered += 1
+                     continue
+ 
+-                # Check if this instruction is excluded by an enabled extension
+                 excludedBy = data.get("excludedBy")
+                 if excludedBy:
+                     exclusion_check = parse_extension_requirements(excludedBy)
+@@ -298,7 +334,17 @@ def load_instructions(
+                 encoding = {"match": match_string, "variables": []}
+                 logging.debug(f"Built encoding from format field for {name}")
+ 
+-            # Check if the instruction specifies a base architecture constraint
++            # Validate RV32/RV64 encodings
++            if isinstance(encoding, dict):
++                if "RV64" in encoding:
++                    validate_entry(
++                        encoding["RV64"], ["match"], context=f"{name} RV64 encoding"
++                    )
++                if "RV32" in encoding:
++                    validate_entry(
++                        encoding["RV32"], ["match"], context=f"{name} RV32 encoding"
++                    )
++
+             base = data.get("base")
+             if base is not None:
+                 if (base == 32 and target_arch not in ["RV32", "BOTH"]) or (
+@@ -309,34 +355,24 @@ def load_instructions(
+                     encoding_filtered += 1
+                     continue
+ 
+-            # Determine which encoding to use based on target architecture
+             if isinstance(encoding, dict):
+                 if "RV64" in encoding and "RV32" in encoding:
+-                    # Instruction has both RV32 and RV64 encodings
+                     if target_arch == "RV64":
+                         encoding_to_use = encoding["RV64"]
+                         instr_key = name
+                     elif target_arch == "RV32":
+                         encoding_to_use = encoding["RV32"]
+                         instr_key = name
+-                    else:  # BOTH
+-                        # For "BOTH", include both encodings with suitable naming
++                    else:
+                         rv64_encoding = encoding["RV64"]
+                         rv32_encoding = encoding["RV32"]
+-
+-                        # Process RV64 encoding
+                         rv64_match = rv64_encoding.get("match")
+                         if rv64_match:
+-                            instr_dict[name] = {
+-                                "match": rv64_match
+-                            }  # RV64 gets the default name
+-
+-                        # Process RV32 encoding with a _rv32 suffix
++                            instr_dict[name] = {"match": rv64_match}
+                         rv32_match = rv32_encoding.get("match")
+                         if rv32_match:
+                             instr_dict[f"{name}_rv32"] = {"match": rv32_match}
+-
+-                        continue  # Skip the rest of the loop as we've already added the encodings
++                        continue
+                 elif "RV64" in encoding:
+                     if target_arch in ["RV64", "BOTH"]:
+                         encoding_to_use = encoding["RV64"]
+@@ -356,7 +392,6 @@ def load_instructions(
+                         encoding_filtered += 1
+                         continue
+                 elif "match" in encoding:
+-                    # Generic encoding, no specific architecture
+                     encoding_to_use = encoding
+                     instr_key = name
+                 else:
+@@ -433,6 +468,14 @@ def load_csrs(csr_root, enabled_extensions, include_all=False, target_arch="RV64
+                 continue
+ 
+             found_csrs += 1
++
++            # Validate required top-level fields
++            validate_entry(
++                data,
++                ["name", "address", "indirect_address", "definedBy"],
++                context=f"CSR file: {path}",
++            )
++
+             name = data.get("name")
+             if not name:
+                 logging.error(f"Missing 'name' field in {path}")
+@@ -448,7 +491,6 @@ def load_csrs(csr_root, enabled_extensions, include_all=False, target_arch="RV64
+                 address_errors += 1
+                 continue
+ 
+-            # Check if the CSR has a base constraint (32 or 64)
+             base = data.get("base")
+             if base:
+                 if base == 32 and target_arch not in ["RV32", "BOTH"]:
+@@ -460,13 +502,8 @@ def load_csrs(csr_root, enabled_extensions, include_all=False, target_arch="RV64
+                     arch_filtered += 1
+                     continue
+ 
+-            # If include_all is True, skip extension filtering
+             if not include_all:
+-                # Check if this CSR is defined by an enabled extension
+                 definedBy = data.get("definedBy")
+-
+-                # If definedBy is missing, log a warning but don't skip
+-                # This is different from instructions where we're more strict
+                 if definedBy is None:
+                     logging.warning(
+                         f"Missing 'definedBy' field in CSR {name} in {path}, including anyway"
+@@ -482,16 +519,13 @@ def load_csrs(csr_root, enabled_extensions, include_all=False, target_arch="RV64
+                         extension_filtered += 1
+                         continue
+ 
+-            # If we're here, we've passed all checks
+             try:
+-                # Use address if available, otherwise use indirect_address
+                 addr_to_use = address if address is not None else indirect_address
+                 if isinstance(addr_to_use, int):
+                     addr_int = addr_to_use
+                 else:
+                     addr_int = int(addr_to_use, 0)
+ 
+-                # For BOTH architecture, add suffix to RV32-specific CSRs
+                 if target_arch == "BOTH" and base == 32:
+                     csrs[addr_int] = f"{name.upper()}.RV32"
+                 else:
+diff --git a/backends/generators/schema_validator.py b/backends/generators/schema_validator.py
+new file mode 100644
+index 0000000000..f3c5474654
+--- /dev/null
++++ b/backends/generators/schema_validator.py
+@@ -0,0 +1,25 @@
++# backends/generators/schema_validator.py
++
++
++def validate_entry(entry: dict, required_fields: list, context: str = ""):
++    """
++    Validate that all required fields exist in a dictionary entry.
++
++    Parameters:
++        entry (dict): The dictionary to validate.
++        required_fields (list): List of field names, supporting nested fields via dot notation.
++        context (str): Optional string describing where this validation is used (for error messages).
++
++    Raises:
++        AssertionError: If any required field is missing or the structure is unexpected.
++    """
++    for field in required_fields:
++        keys = field.split(".")
++        current = entry
++        for key in keys:
++            if not isinstance(current, dict) or key not in current:
++                ctx = f" in {context}" if context else ""
++                raise AssertionError(
++                    f"Schema change detected{ctx}: missing field '{field}'"
++                )
++            current = current[key]
+diff --git a/backends/generators/tests/test_schema_validator.py b/backends/generators/tests/test_schema_validator.py
+new file mode 100644
+index 0000000000..a86032a002
+--- /dev/null
++++ b/backends/generators/tests/test_schema_validator.py
+@@ -0,0 +1,29 @@
++import pytest
++import os, sys
++
++# Make sure Python can find backends/generators/
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from backends.generators.schema_validator import validate_entry
++
++
++def test_success_top_level():
++    entry = {"address": "0x123", "type": "rw"}
++    validate_entry(entry, ["address", "type"])  # should not raise
++
++
++def test_success_nested():
++    entry = {"encoding": {"match": "0x1", "mask": "0x2"}}
++    validate_entry(entry, ["encoding.match", "encoding.mask"])  # should not raise
++
++
++def test_missing_top_level():
++    entry = {"address": "0x123"}
++    with pytest.raises(AssertionError):
++        validate_entry(entry, ["address", "type"])
++
++
++def test_missing_nested():
++    entry = {"encoding": {"match": "0x1"}}
++    with pytest.raises(AssertionError):
++        validate_entry(entry, ["encoding.match", "encoding.mask"])

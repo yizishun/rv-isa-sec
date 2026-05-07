@@ -1,0 +1,178 @@
+{
+  "pr_number": 79,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 79,
+    "violation_condition": "QEMU TCG translates an instruction that straddles a page boundary between a tagcheck-exempt code page (MTAG=1, X=1) and a normal code page (MTAG=0 or no X), but does not apply the spec rule that the instruction is 'assumed to be fetched from normal code page' — causing loads/stores issued by that instruction to incorrectly bypass tag checks when they should be checked, or QEMU's page table walker in get_physical_address() fails to check the execute permission bit alongside the MTAG bit when classifying a page as 'tagged-data page' (requiring MTAG=1 AND X=0), causing code pages with MTAG=1 to be misclassified as tagged-data pages.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "straddl|page_cross|insn_cross|mtag.*execute|xwr|tagged.data.page.*!.*x|tagcheck.exempt|riscv_cpu_tlb_fill.*mtag|get_physical_address.*mtag",
+    "affected_entities": [
+      "MTAG PTE bit",
+      "menvcfg",
+      "senvcfg",
+      "henvcfg",
+      "get_physical_address",
+      "riscv_cpu_tlb_fill"
+    ],
+    "summary": "Cross-page instruction straddling between tagcheck-exempt and normal code pages must force unchecked-access treatment to the safer normal-page path, and tagged-data page classification must require execute=0 — failure in either causes guest memory-tagging bypass or spurious tag faults"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "(none — CSR bit definitions)",
+        "line_start": 671,
+        "line_end": 686,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hstatus CSR bit definitions (HSTATUS_VSBE through HSTATUS_HUPMM) exist and are correct for the implemented feature set. No HSTATUS_MTAG_I is defined because the src/mte_tag extension is not implemented in this QEMU tree. The WPRI masks at lines 685-686 correctly mark all unimplemented bits as read-as-zero/write-ignored, which includes whatever bit position MTAG_I would occupy. No violation of currently-implemented spec rules.",
+      "snippet": "#define HSTATUS_VSBE         0x00000020\n#define HSTATUS_GVA          0x00000040\n...\n#define HSTATUS32_WPRI       0xFF8FF87E\n#define HSTATUS64_WPRI       0xFFFFFFFFFF8FF87EULL"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "(none — PTE bit definitions)",
+        "line_start": 726,
+        "line_end": 746,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PTE bit definitions (PTE_V through PTE_ATTR) are correct for the implemented feature set. No PTE_MTAG is defined because the extension is not implemented. The PTE_RESERVED macro correctly treats bits 62-58 (or 63-58 depending on svrsw60t59b) as reserved, triggering TRANSLATE_FAIL if set. Any bit position that MTAG would use is correctly treated as reserved and causes a page fault. No misclassification of code vs. data pages based on MTAG can occur because MTAG is not read from PTEs.",
+      "snippet": "#define PTE_V               0x001 /* Valid */\n#define PTE_R               0x002 /* Read */\n...\n#define PTE_RESERVED(svrsw60t59b)    \\\n    (svrsw60t59b ? 0x07C0000000000000ULL : 0x1FC0000000000000ULL)"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address",
+        "line_start": 1433,
+        "line_end": 1458,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reserved-bit checking in the page table walker correctly rejects PTEs with reserved bits set via PTE_RESERVED(). Since no PTE_MTAG bit is defined, any PTE with the MTAG bit position set will trigger TRANSLATE_FAIL (page fault), which is the safe default behavior — no page can be incorrectly classified as tagged-data or tagcheck-exempt. PTE leaf classification at line 1466 uses only (PTE_R | PTE_W | PTE_X), which is correct for the implemented spec subset.",
+      "snippet": "if (pte & PTE_RESERVED(svrsw60t59b)) {\n    qemu_log_mask(LOG_GUEST_ERROR, \"%s: reserved bits set in PTE: \"\n                  \"addr: 0x%\" HWADDR_PRIx \" pte: 0x\" TARGET_FMT_lx \"\\n\",\n                  __func__, pte_addr, pte);\n    return TRANSLATE_FAIL;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address (leaf PTE processing)",
+        "line_start": 1484,
+        "line_end": 1565,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Leaf PTE protection-bit computation correctly derives PAGE_READ/PAGE_WRITE/PAGE_EXEC from PTE_R/PTE_W/PTE_X. No MTAG extraction occurs because the extension is unimplemented. The 'tagged-data page' classification (requiring MTAG=1 AND X=0 per the security spec) is not performed, which is correct — without the MTAG feature, all pages are treated uniformly with no tag-check bypass risk. MXR handling for execute-only pages is correctly implemented.",
+      "snippet": "target_ulong rwx = pte & (PTE_R | PTE_W | PTE_X);\nswitch (rwx) {\ncase PTE_W | PTE_X:\n    return TRANSLATE_FAIL;\ncase PTE_W:\n    if (cpu_get_bcfien(env) && first_stage) {\n        sstack_page = true;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_tlb_fill",
+        "line_start": 1838,
+        "line_end": 1922,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TLB fill correctly handles both two-stage (HLV/HSV) and single-stage translation paths. VS-stage translation followed by G-stage followed by PMP is architecturally correct. No tag-check hook exists between stages because the MTAG feature is unimplemented. The prot bitmask correctly flows from VS-stage through G-stage via prot &= prot2 (line 1873), and PMP via prot &= prot_pmp (line 1885). Adding a tag-check gate would be an extension, not a bug fix.",
+      "snippet": "if (two_stage_lookup) {\n    ret = get_physical_address(env, &pa, &prot, address,\n                               &env->guest_phys_fault_addr, access_type,\n                               mmu_idx, true, true, false, probe);\n...\n        ret = get_physical_address(env, &pa, &prot2, im_address, NULL,\n                                   access_type, MMUIdx_U, false, true,\n                                   false, probe);\n        prot &= prot2;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "check_access_hlsv",
+        "line_start": 620,
+        "line_end": 635,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Central HLV/HSV permission check correctly enforces: M-mode bypass, virtual-instruction-fault when V=1, illegal-instruction for U-mode without HU. Returns (SPVP mode | MMU_2STAGE_BIT) with optional SUM promotion for S-mode stores. No MTAG_I check exists because the MTAG extension is not implemented. The function is architecturally correct for the current spec subset — there is no missing MTAG_I suppression because MTAG_I doesn't exist as a defined CSR field.",
+      "snippet": "static int check_access_hlsv(CPURISCVState *env, bool x, uintptr_t ra)\n{\n    if (env->priv == PRV_M) {\n        /* always allowed */\n    } else if (env->virt_enabled) {\n        riscv_raise_exception(env, RISCV_EXCP_VIRT_INSTRUCTION_FAULT, ra);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "helper_hyp_hlvx_hu / helper_hyp_hlvx_wu",
+        "line_start": 709,
+        "line_end": 732,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HLVX (hypervisor execute-load) helpers use cpu_ld*_code_mmu() which enforces execute permission via the MMU access type. The TODO comment at lines 710-714 correctly notes a known limitation (PMP should check read AND execute, currently only checks execute). This is unrelated to MTAG. No VMTAG_FETCH or MTAG_I interaction exists because the extension is not implemented. The current behavior is correct for the implemented spec.",
+      "snippet": "target_ulong helper_hyp_hlvx_hu(CPURISCVState *env, target_ulong addr)\n{\n    uintptr_t ra = GETPC();\n    int mmu_idx = check_access_hlsv(env, true, ra);\n    MemOpIdx oi = make_memop_idx(mo_endian_env(env) | MO_UW, mmu_idx);\n    return cpu_ldw_code_mmu(env, addr, oi, GETPC());"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/translate.c",
+        "function_name": "riscv_tr_translate_insn",
+        "line_start": 1382,
+        "line_end": 1448,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TCG instruction translation dispatcher at line 1382. No page-boundary straddling detection exists for RISC-V (unlike target/arm/ and target/tricore/ which have insn_crosses_page()). Compressed instructions (RVC) can straddle page boundaries, but without MTAG implementation, there is no tagcheck-exempt vs. normal page distinction to violate. The existing page-fault behavior on the second half of a straddling RVC instruction is architecturally correct — it will fault if the second page is not executable, which is the safe default.",
+      "snippet": "static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)\n{\n    ...\n    .translate_insn     = riscv_tr_translate_insn,"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_hstatus",
+        "line_start": 4597,
+        "line_end": 4633,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hstatus write handler correctly masks HUKTE and HUPMM conditionally on extension presence. All other writable bits are handled via the VPRI (WARL) pattern. No MTAG_I field exists to handle, so no masking is missing. The function is correct for the currently implemented CSR fields.",
+      "snippet": "if (riscv_has_ext(env, RVH)) {\n    mask = ...\n    if (!cpu_get_hukte(env)) {\n        mask &= ~HSTATUS_HUKTE;\n    }"
+    },
+    {
+      "location": {
+        "file_path": "hw/riscv/riscv-iommu.c",
+        "function_name": "riscv_iommu_validate_device_ctx",
+        "line_start": 753,
+        "line_end": 757,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "IOMMU device context validation: disallows MSI page tables (MSIPTP mode != OFF) when G-stage translation is BARE. This is a correctness fix for IOMMU configuration validation per the RISC-V IOMMU spec — when there is no second-stage translation, MSI address translation via page tables is invalid. This is unrelated to memory tagging (MTE/MTAG); the IOMMU 'tag' concept refers to translation-mode tags (bypass/single-stage/G-stage/nested), not memory tags.",
+      "snippet": "if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&\n    get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=\n    RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {\n    return false;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_hyper",
+        "line_start": 81,
+        "line_end": 99,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VM live-migration state correctly serializes hstatus via VMSTATE_UINT64. No additional MTAG-related migration fields are needed because the MTAG extension is unimplemented. If MTAG_I were added as a separate architectural state field, a new VMSTATE entry and version bump would be required, but for the current code this is not a bug.",
+      "snippet": "VMSTATE_UINT64(env.hstatus, RISCVCPU)"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvh.c.inc",
+        "function_name": "do_hlv / do_hsv",
+        "line_start": 41,
+        "line_end": 144,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HLV/HSV/HLVX TCG translation correctly loads the source address from rs1, calls gen_helper_hyp_hlv/hsv, and stores the result to rd. No pre-processing (e.g., loading MTAG_I into a TCG temp for tag-suppression gating) is needed because the MTAG extension is unimplemented. The existing straightforward translation pattern is architecturally correct.",
+      "snippet": "static bool do_hlv(DisasContext *s, arg_r2 *a, ...)\n{\n    ...\n    gen_helper_hyp_hlv_...(dest, cpu_env, src);\n    gen_set_gpr(s, a->rd, dest);\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/internals.h",
+        "function_name": "(MMU index constants)",
+        "line_start": 39,
+        "line_end": 63,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MMU index constants and accessor functions are correct for distinguishing U/S/M privilege modes, SUM override, and two-stage (HLV/HSV) lookups. HLV/HSV is disambiguated via MMU_2STAGE_BIT. No additional tag-checked vs. tag-unchecked mmu_idx bit is needed because the MTAG extension is unimplemented. The current bit allocation is sufficient for all implemented features.",
+      "snippet": "#define MMU_2STAGE_BIT  (1 << 2)\n...\nstatic inline bool mmuidx_2stage(int mmu_idx)\n{\n    return mmu_idx & MMU_2STAGE_BIT;\n}"
+    }
+  ],
+  "overall_severity": "compliant"
+}

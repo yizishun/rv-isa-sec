@@ -1,0 +1,27 @@
+PR #1581  target=freebsd-src  overall=compliant
+Spec: Read-modify-write CSR instructions (CSRRS/C) on pmpaddr corrupt underlying bits that read-as a different value, silently shrinking or relocating PMP regions and potentially weakening inter-domain memory isolation enforced by FreeBSD's pmap or bhyve
+Violation: FreeBSD kernel code uses CSRRC/CSRRS (or immediate variants) on a pmpaddr CSR to atomically modify a subset of writable bits, causing bits that read-as a different value than their underlying value (e.g., pmpaddr[G-1] reading as 0 while underlying value is 1) to be silently written back with the read-value, corrupting the PMP region's address bound.
+Consequence: data_corruption
+Pattern: CSRRC|CSRRS|CSRRCI|CSRRSI.*pmpaddr
+------------------------------------------------------------
+[compliant] sys/riscv/include/riscvreg.h:247-259  csr_set, csr_clear (macros)
+  FreeBSD defines csr_set/csr_clear macros that expand to CSRRS/CSRRC (or CSRRSI/CSRRCI) instructions, but no call site in the entire sys/ tree invokes these macros on a pmpaddr CSR. PMP management is fully delegated to OpenSBI in M-mode; the kernel never reads or writes pmpaddr CSRs at all.
+  | #define csr_set(csr, val)  __asm __volatile("csrs " #csr ...)
+  | #define csr_clear(csr, val) __asm __volatile("csrc " #csr ...)
+
+[compliant] sys/riscv/include/encoding.h:589-608  
+  CSR_PMPADDR0-15 and CSR_PMPCFG0-3 constants are defined with DECLARE_CSR() for completeness, but no kernel code references them in csr_set/csr_clear calls. They exist solely as CSR number definitions.
+  | #define CSR_PMPADDR0  0x3b0
+  | ...#define CSR_PMPADDR15 0x3bf
+
+[compliant] sys/riscv/riscv/exception.S:108-197  exception handlers
+  CSRC/CSRCI/CSRS used on sstatus (for SSTATUS_SUM, SSTATUS_SIE), not on any PMP CSR. No pmpaddr corruption risk.
+  | csrc sstatus, t0    # SSTATUS_SUM
+  | csrci sstatus, (SSTATUS_SIE)
+  | csrs sstatus, a4    # SSTATUS_SIE
+
+[compliant] sys/riscv/riscv/swtch.S:47-198  fpe_state_save/load/clear
+  CSRS/CSRC used on sstatus (for SSTATUS_FS) to enable/disable FPU access during context switch. No PMP CSR manipulation.
+  | csrs sstatus, t0    # SSTATUS_FS_INITIAL
+  | csrc sstatus, t0    # SSTATUS_FS_MASK
+

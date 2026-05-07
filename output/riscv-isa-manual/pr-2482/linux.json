@@ -1,0 +1,193 @@
+{
+  "pr_number": 2482,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2482,
+    "violation_condition": "Kernel S-mode code executes CBO management instructions (cbo.clean, cbo.flush, cbo.inval) on a user virtual address without first verifying that the owning user task holds read permission for that page, or executes cbo.zero on a user virtual address without verifying the user holds write permission — relying on the implicit assumption that CBO permission semantics mirror explicit load/store rather than on explicit page-table / PMP checks performed by hardware at the privilege level of execution.",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "cbo\\.(clean|flush|inval|zero)\\b.*(user_addr|uaddr|__user|copy_to|copy_from|get_user|put_user|access_ok)",
+    "affected_entities": [
+      "cbo.clean",
+      "cbo.flush",
+      "cbo.inval",
+      "cbo.zero",
+      "menvcfg.CBIE",
+      "senvcfg.CBIE",
+      "PMP.PMPCFG",
+      "PTE.R",
+      "PTE.W"
+    ],
+    "summary": "CBO management instructions (clean/flush/inval) now explicitly require read permission and cbo.zero requires write permission on the accessed page; kernel S-mode use of these instructions on untrusted user addresses without prior access_ok() or equivalent permission validation can bypass the page-table-enforced security boundary, enabling cache-based side-channel probing via cbo.inval or unauthorized memory zeroing via cbo.zero."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/dma-noncoherent.c",
+        "function_name": "arch_dma_cache_wback",
+        "line_start": 18,
+        "line_end": 29,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CBO clean operates on kernel virtual address via phys_to_virt(paddr). The paddr comes from DMA mapping infrastructure, not from user virtual addresses. These are kernel-owned DMA buffers with proper page table mappings maintained by the DMA API. No violation of user-page permission semantics.",
+      "snippet": "void *vaddr = phys_to_virt(paddr);\nALT_CMO_OP(CLEAN, vaddr, size, riscv_cbom_block_size);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/dma-noncoherent.c",
+        "function_name": "arch_dma_cache_inv",
+        "line_start": 31,
+        "line_end": 43,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CBO inval operates on kernel virtual address from phys_to_virt(paddr). Same as arch_dma_cache_wback: the physical address originates from DMA-mapped kernel buffers, not userspace.",
+      "snippet": "void *vaddr = phys_to_virt(paddr);\nALT_CMO_OP(INVAL, vaddr, size, riscv_cbom_block_size);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/dma-noncoherent.c",
+        "function_name": "arch_dma_cache_wback_inv",
+        "line_start": 45,
+        "line_end": 57,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CBO flush on kernel virtual address from phys_to_virt. DMA coherent-prep path (arch_dma_prep_coherent, line 117-129) also uses page_address(page) which returns kernel linear-map VA. All are kernel-owned memory.",
+      "snippet": "ALT_CMO_OP(FLUSH, vaddr, size, riscv_cbom_block_size);\n// Also arch_dma_prep_coherent line 128:\nALT_CMO_OP(FLUSH, flush_addr, size, riscv_cbom_block_size);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/pmem.c",
+        "function_name": "arch_wb_cache_pmem",
+        "line_start": 12,
+        "line_end": 21,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CBO clean on persistent memory addresses. addr comes from the kernel's direct map (struct page-based PMEM). These are kernel-owned persistent memory regions, not user virtual addresses.",
+      "snippet": "ALT_CMO_OP(CLEAN, addr, size, riscv_cbom_block_size);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/pmem.c",
+        "function_name": "arch_invalidate_pmem",
+        "line_start": 24,
+        "line_end": 33,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CBO inval on persistent memory - same analysis as arch_wb_cache_pmem. Kernel-owned PMEM addresses only.",
+      "snippet": "ALT_CMO_OP(INVAL, addr, size, riscv_cbom_block_size);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/lib/clear_page.S",
+        "function_name": "clear_page",
+        "line_start": 20,
+        "line_end": 73,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CBO zero operates on the kernel linear-map virtual address of page being cleared. The address in a0 is a kernel virtual address, not a user virtual address. On page fault paths, the kernel writes to the page through the linear map where it holds full write permission. The ALTERNATIVE framework correctly: (a) falls back to memset when Zicboz is absent (order=12), (b) selects the proper unrolled loop variant based on riscv_cboz_block_size (orders 6-11=log2(block_size)).",
+      "snippet": "CBO_ZERO(a0)\nadd  a0, a0, a1\nCBOZ_ALT(11, \"bltu a0, a2, .Lzero_loop; ret\", \"nop; nop\")\n// fallback: .Lno_zicboz: li a1, 0; tail __memset"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/processor.h",
+        "function_name": "prefetch / prefetchw",
+        "line_start": 156,
+        "line_end": 168,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Zicbop prefetch instructions (prefetch.r, prefetch.w) are architecturally defined as HINTs by the RISC-V spec. They are always legal, never raise exceptions, and are semantically NOPs when the address is invalid or the hint is unrecognized. They are categorically distinct from CBO management instructions (cbo.clean/flush/inval/zero) and fall outside the scope of the security spec's vulnerability pattern.",
+      "snippet": "ALTERNATIVE(__nops(1), PREFETCH_R(x, 0), 0, RISCV_ISA_EXT_ZICBOP, CONFIG_RISCV_ISA_ZICBOP)\nALTERNATIVE(__nops(1), PREFETCH_W(x, 0), 0, RISCV_ISA_EXT_ZICBOP, CONFIG_RISCV_ISA_ZICBOP)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/switch_to.h",
+        "function_name": "__switch_to_envcfg",
+        "line_start": 84,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "envcfg CSR is properly switched on context switch. switch_to() macro calls __switch_to_envcfg(next) at line 124, which writes next->thread.envcfg to CSR_ENVCFG. The CBZE and CBCFE bits set during riscv_user_isa_enable() (cpufeature.c:1173-1179) in current->thread.envcfg are thus propagated when that task runs again. No CSR leakage across task boundaries.",
+      "snippet": "static inline void __switch_to_envcfg(struct task_struct *next)\n{\n  asm volatile (ALTERNATIVE(\"nop\",\n    \"csrw \" __stringify(CSR_ENVCFG) \", %0\", ...)\n    :: \"r\" (next->thread.envcfg) : \"memory\");\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/suspend.c",
+        "function_name": "suspend_save_csrs / suspend_restore_csrs",
+        "line_start": 15,
+        "line_end": 48,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "envcfg CSR is saved on suspend (line 18) and restored on resume (line 48). This ensures CBO-related envcfg bits (CBZE, CBCFE, CBIE) are preserved across suspend/resume cycles and CPU hotplug.",
+      "snippet": "context->envcfg = csr_read(CSR_ENVCFG);  // save\ncsr_write(CSR_ENVCFG, context->envcfg);   // restore"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_setup_config",
+        "line_start": 543,
+        "line_end": 559,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM correctly configures henvcfg for guest CBO delegation. When guest has Zicbom: sets CBIE (cache block invalidate enable) and CBCFE (cache block clean/flush enable) bits. When guest has Zicboz: sets CBZE (cache block zero enable) bit. These are written to the hardware CSR in kvm_arch_vcpu_load (line 596/615). Guest CBO instructions are either allowed by hardware or trap as illegal instructions redirected back to the guest (truly_illegal_insn in vcpu_insn.c:30-44).",
+      "snippet": "if (riscv_isa_extension_available(isa, ZICBOM))\n  cfg->henvcfg |= (ENVCFG_CBIE | ENVCFG_CBCFE);\nif (riscv_isa_extension_available(isa, ZICBOZ))\n  cfg->henvcfg |= ENVCFG_CBZE;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_swap_in_guest_state",
+        "line_start": 749,
+        "line_end": 761,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "On VCPU enter, host senvcfg is swapped out (saved to vcpu->arch.host_senvcfg) and guest senvcfg is swapped in (csr->senvcfg written to CSR_SENVCFG). On VCPU exit (swap_in_host_state, line 763-775), the reverse happens. This correctly virtualizes the S-mode envcfg for the guest and prevents the guest's CBO configuration from leaking into the host.",
+      "snippet": "vcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);  // guest enter\ncsr->senvcfg = csr_swap(CSR_SENVCFG, vcpu->arch.host_senvcfg);    // guest exit"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "do_trap_insn_illegal",
+        "line_start": 173,
+        "line_end": 196,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "No kernel-mode CBO emulation exists for userspace illegal instruction traps. When userspace executes a CBO instruction without proper envcfg bits, the hardware traps it as illegal. The kernel delivers SIGILL to the process. This is the correct behavior: the kernel does not silently emulate CBO instructions that the hardware deems illegal, preserving the envcfg-based security model.",
+      "snippet": "asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *regs)\n{\n  if (user_mode(regs)) {\n    handled = riscv_v_first_use_handler(regs);  // vector only, not CBO\n    if (!handled)\n      do_trap_error(regs, SIGILL, ILL_ILLOPC, ...);\n  }\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "riscv_user_isa_enable",
+        "line_start": 1171,
+        "line_end": 1181,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Boot-time envcfg initialization correctly sets CBO enable bits on current->thread.envcfg only when all harts have the extension (riscv_has_extension_unlikely). When some harts lack the extension, a warning is emitted and the bits remain clear. This prevents a situation where a task with CBO envcfg bits set gets scheduled onto a hart without CBO support (which would silently execute CBO instructions as illegal).",
+      "snippet": "if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOZ))\n  current->thread.envcfg |= ENVCFG_CBZE;\nelse if (any_cpu_has_zicboz)\n  pr_warn(\"Zicboz disabled as it is unavailable on some harts\\n\");"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/cacheflush.c",
+        "function_name": "riscv_init_cbo_blocksizes",
+        "line_start": 142,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CBO block sizes are initialized from DT/ACPI before any CBO instructions can be executed. The validate callbacks (riscv_ext_zicbom_validate, etc.) check that block sizes are present and power-of-2, disabling the extension otherwise. This prevents misconfigured CBO operations with garbage block sizes.",
+      "snippet": "unsigned int riscv_cbom_block_size;\nunsigned int riscv_cboz_block_size;\nunsigned int riscv_cbop_block_size;\nvoid riscv_init_cbo_blocksizes(void) { ... }"
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,3614 @@
+diff --git a/.github/workflows/pages.yml b/.github/workflows/pages.yml
+index edb0e1c95b..e2fe3df4e3 100644
+--- a/.github/workflows/pages.yml
++++ b/.github/workflows/pages.yml
+@@ -230,6 +230,24 @@ jobs:
+           path: idl.html
+           github-token: ${{ secrets.GITHUB_TOKEN }}
+           run-id: ${{ github.event.workflow_run.id }}
++      - name: Download and publish schema files
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          # Collect all per-schema release tags (schemas/<schema_name>/<version>)
++          SCHEMA_TAGS=$(gh release list --limit 200 --json tagName --jq '.[] | .tagName | select(startswith("schemas/"))' 2>/dev/null || true)
++          for tag in $SCHEMA_TAGS; do
++              # tag format: schemas/<schema_name>/<version>
++              rest="${tag#schemas/}"
++              schema_name="${rest%%/*}"
++              version="${rest#*/}"
++              mkdir -p "_site/schemas/${schema_name}/${version}"
++              gh release download "${tag}" --dir "_site/schemas/${schema_name}/${version}" --pattern "*.json" 2>/dev/null || true
++            done
++          fi
++          # Write a JSON index of all available schema versions and files
++          ruby tools/scripts/gen_schema_index.rb _site/schemas _site/schemas/index.json
++
+       - name: Create index
+         env:
+           PAGES_URL: https://riscv.github.io/riscv-unified-db
+diff --git a/.github/workflows/regress.yml b/.github/workflows/regress.yml
+index ba686af223..b4be69554c 100644
+--- a/.github/workflows/regress.yml
++++ b/.github/workflows/regress.yml
+@@ -583,6 +583,7 @@ jobs:
+         - cfg
+         - mmr
+         - mmr_schema
++        - schema_versioning
+         - instruction
+         - z3
+         - z3_extensions
+@@ -986,6 +987,21 @@ jobs:
+         - rva22
+         - rva23
+         - rvb23
++  regress-schema-versions:
++    runs-on: ubuntu-latest
++    needs: build-container
++    steps:
++    - name: Clone Github Repo Action
++      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++    - name: Download docker image
++      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
++      with:
++        name: docker_image
++        path: "${{ runner.temp }}"
++    - name: Load image
++      run: docker load --input ${{ runner.temp }}/docker_image.tar
++    - name: Check schema versions against published URLs
++      run: "./do gen:schemas && ./bin/ruby tools/scripts/check_schema_versions.rb"
+   build-idl-doc:
+     runs-on: ubuntu-latest
+     needs: build-container
+@@ -1044,6 +1060,7 @@ jobs:
+     - build-html-cfg-isa-manual
+     - build-instruction-appendix
+     - build-profile
++    - regress-schema-versions
+     - build-idl-doc
+     - regress-pre-commit
+     - regress-llvm
+diff --git a/.github/workflows/schema-release.yml b/.github/workflows/schema-release.yml
+new file mode 100644
+index 0000000000..6cb478303f
+--- /dev/null
++++ b/.github/workflows/schema-release.yml
+@@ -0,0 +1,39 @@
++# This workflow creates GitHub releases for schema files that have changed.
++# It runs after the CI/CD workflow completes successfully on the main branch.
++# Each schema version gets its own release tag (e.g., schemas/v0.1).
++# If a schema file has changed relative to the published release, the release
++# assets are updated.
++
++name: Schema Release
++
++on:
++  workflow_run:
++    workflows: [CI/CD]
++    types: [completed]
++    branches: [main]
++  workflow_dispatch:
++
++permissions:
++  contents: write
++
++jobs:
++  release-schemas:
++    runs-on: ubuntu-latest
++    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
++    steps:
++      - name: Clone Github Repo Action
++        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++
++      - name: Set up Ruby
++        uses: ruby/setup-ruby@v1
++        with:
++          ruby-version: '3.2'
++          bundler-cache: true
++
++      - name: Generate resolved schemas
++        run: ./do gen:schemas
++
++      - name: Publish changed schema versions
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: ./bin/ruby tools/scripts/publish_schemas.rb
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 0febf25da7..5ff51f4d1a 100755
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -56,13 +56,25 @@ repos:
+         stages: [pre-commit]
+         alias: check-jsonschema-inst
+         files: ^spec/std/isa/inst/.*\.(yaml|yml)$
+-        args: ["--schemafile", "spec/schemas/inst_schema.json"]
++        args:
++          [
++            "--schemafile",
++            "spec/schemas/inst_schema.json",
++            "--base-uri",
++            "file://spec/schemas/",
++          ]
+       - id: check-jsonschema
+         name: Validate CSR files with jsonschema
+         stages: [pre-commit]
+         alias: check-jsonschema-csr
+         files: ^spec/std/isa/csr/.*\.(yaml|yml)$
+-        args: ["--schemafile", "spec/schemas/csr_schema.json"]
++        args:
++          [
++            "--schemafile",
++            "spec/schemas/csr_schema.json",
++            "--base-uri",
++            "file://spec/schemas/",
++          ]
+       - id: check-jsonschema
+         name: Validate MMR files with jsonschema
+         stages: [pre-commit]
+@@ -74,36 +86,73 @@ repos:
+         stages: [pre-commit]
+         alias: check-jsonschema-ext
+         files: ^spec/std/isa/ext/.*\.(yaml|yml)$
+-        args: ["--schemafile", "spec/schemas/ext_schema.json"]
++        args:
++          [
++            "--schemafile",
++            "spec/schemas/ext_schema.json",
++            "--base-uri",
++            "file://spec/schemas/",
++          ]
+       - id: check-jsonschema
+         name: Validate cert model files with jsonschema
+         stages: [pre-commit]
+         alias: check-jsonschema-cert-model
+         files: ^spec/std/isa/proc_cert_model/.*\.(yaml|yml)$
+-        args: ["--schemafile", "spec/schemas/proc_cert_model_schema.json"]
++        args:
++          [
++            "--schemafile",
++            "spec/schemas/proc_cert_model_schema.json",
++            "--base-uri",
++            "file://spec/schemas/",
++          ]
+       - id: check-jsonschema
+         name: Validate cert class files with jsonschema
+         stages: [pre-commit]
+         alias: check-jsonschema-cert-class
+         files: ^spec/std/isa/proc_cert_class/.*\.(yaml|yml)$
+-        args: ["--schemafile", "spec/schemas/proc_cert_class_schema.json"]
++        args:
++          [
++            "--schemafile",
++            "spec/schemas/proc_cert_class_schema.json",
++            "--base-uri",
++            "file://spec/schemas/",
++          ]
+       - id: check-jsonschema
+         name: Validate profile family files with jsonschema
+         stages: [pre-commit]
+         alias: check-jsonschema-profile-family
+         files: ^spec/std/isa/profile_family/.*\.(yaml|yml)$
+-        args: ["--schemafile", "spec/schemas/profile_family_schema.json"]
++        args:
++          [
++            "--schemafile",
++            "spec/schemas/profile_family_schema.json",
++            "--base-uri",
++            "file://spec/schemas/",
++          ]
+       - id: check-jsonschema
+         name: Validate profile release files with jsonschema
+         stages: [pre-commit]
+         alias: check-jsonschema-profile-release
+         files: ^spec/std/isa/profile_release/.*\.(yaml|yml)$
+-        args: ["--schemafile", "spec/schemas/profile_release_schema.json"]
++        args:
++          [
++            "--schemafile",
++            "spec/schemas/profile_release_schema.json",
++            "--base-uri",
++            "file://spec/schemas/",
++          ]
+       # Commenting because throwing errors and not sure this is complete yet
+       # - id: check-jsonschema
++      #   name: Validate manual version files with jsonschema
+       #   alias: check-jsonschema-manual-version
+       #   files: ^spec/std/isa/manual/.*\.(yaml|yml)$
+-      #   args: ["--schemafile", "spec/schemas/manual_version_schema.json"]
++      #   args:
++      #     [
++      #       "--schemafile",
++      #       "spec/schemas/manual_version_schema.json",
++      #       "--base-uri",
++      #       "file://spec/schemas/",
++      #     ]
+ 
+   - repo: https://github.com/pre-commit/mirrors-clang-format
+     rev: "v20.1.8"
+diff --git a/Rakefile b/Rakefile
+index 4626e8ea94..4b3d59857f 100755
+--- a/Rakefile
++++ b/Rakefile
+@@ -101,6 +101,12 @@ namespace :gen do
+       $resolver.cfg_arch_for(cfg)
+     end
+   end
++
++  desc "Resolve schema files and write them to gen/schemas/VERSION/SCHEMA with full $id URLs"
++  task :schemas do
++    $resolver.resolve_schemas
++    puts "Resolved schema files written to gen/schemas/"
++  end
+ end
+ 
+ namespace :serve do
+diff --git a/backends/proc_ctp/templates/proc_ctp.adoc.erb b/backends/proc_ctp/templates/proc_ctp.adoc.erb
+index f632a4b0a2..8c55536315 100644
+--- a/backends/proc_ctp/templates/proc_ctp.adoc.erb
++++ b/backends/proc_ctp/templates/proc_ctp.adoc.erb
+@@ -56,7 +56,7 @@ Each certificate has a corresponding CRD and CTP:
+ The certification normative rules reference text in any or all of the following:
+ 
+ * RISC-V ISA manuals in parts 2 and 3
+-* Community-generated documentation located in part 1 (https://github.com/riscv-software-src/riscv-unified-db)
++* Community-generated documentation located in part 1 (https://github.com/riscv/riscv-unified-db)
+ * IDL (ISA Description Language) executable psuedo-code descriptions located in part 1
+ 
+ The RISC-V ISA manuals are the preferred reference for certification normative rules since these manuals
+diff --git a/pyproject.toml b/pyproject.toml
+index 263838fa9e..3d83aaf70f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,4 +1,4 @@
+-# SPDX-FileCopyrightText: 2024-2025 Contributors to the RISCV UnifiedDB <https://github.com/riscv-software-src/riscv-unified-db>
++# SPDX-FileCopyrightText: 2024-2025 Contributors to the RISCV UnifiedDB <https://github.com/riscv/riscv-unified-db>
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+ 
+ [project]
+diff --git a/spec/schemas/README.adoc b/spec/schemas/README.adoc
+new file mode 100644
+index 0000000000..2a49153988
+--- /dev/null
++++ b/spec/schemas/README.adoc
+@@ -0,0 +1,87 @@
++= Schema Versioning
++:toc: left
++:toclevels: 2
++:sectnums:
++
++== Overview
++
++This directory contains the JSON schemas used to validate UDB data files.
++Schemas are versioned so that data files can declare which schema version they
++conform to, and so that older versions remain available as the schemas evolve.
++
++== Directory Layout
++
++----
++spec/schemas/
++├── README.adoc                  # this file
++├── json-schema-draft-07.json    # unversioned copy of the JSON Schema Draft-07 meta-schema
++└── <schema>.json                # schema files (current version)
++----
++
++The `.json` files (except `json-schema-draft-07.json`) are the current versions
++of each schema.  Each schema file contains a `$id` field set to the version
++string (e.g. `v0.1`).  When a schema is resolved for publication, the `$id` is
++expanded to the full canonical URL:
++`https://riscv.github.io/riscv-unified-db/schemas/<version>/<schema>.json`.
++
++Resolved schema files are written to `gen/schemas/<schema_name>/<version>/` and
++published as GitHub releases under the tag `schemas/<schema_name>/<version>`.
++
++== Schema Versions
++
++[cols="1,3",options="header"]
++|===
++| Version | Published URL
++
++| 0.1 (current)
++| https://riscv.github.io/riscv-unified-db/schemas/csr_schema.json/v0.1/csr_schema.json (example)
++|===
++
++== Schema Identification (`$id`)
++
++Every schema file contains a top-level `$id` key whose value is the version
++string (e.g. `v0.1`).  Source data files reference schemas using the bare
++filename (e.g. `csr_schema.json#`).  When data files are resolved, the
++`$schema` field is rewritten to include the version prefix
++(e.g. `v0.1/csr_schema.json#`) so that the resolved file records the exact
++schema version used.
++
++[source,json]
++----
++{
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
++  ...
++}
++----
++
++== Special Files
++
++`json-schema-draft-07.json`::
++  A verbatim copy of the
++  https://json-schema.org/draft-07/schema[JSON Schema Draft-07 meta-schema].
++  It is *not* versioned alongside the UDB schemas and is left as a plain file
++  in the top-level directory.  It carries its own `$id` assigned by the JSON
++  Schema specification (`http://json-schema.org/draft-07/schema#`) and should
++  not be modified.
++
++== Releasing a New Schema Version
++
++When breaking or significant changes are made to one or more schemas, a new
++version should be released.  Follow these steps:
++
++. Update the `$id` field in the changed schema file to the new version string
++  (e.g. `v0.2`). Other schemas that did not change keep their current `$id`.
++. Run `./do gen:schemas` to generate the resolved schema files in
++  `gen/schemas/<schema_name>/<version>/`.
++. The CI `schema-release` workflow will automatically publish the new version
++  as a GitHub release under the tag `schemas/<schema_name>/<version>` when the
++  changes are merged to `main`.
++. Previous schema versions remain available via their GitHub release tags and
++  at `https://riscv.github.io/riscv-unified-db/schemas/<schema_name>/<old-version>/<schema_name>`.
++
++== When to make a new release
++
++A new release is required whenever the schema changes. This includes non-breaking additions and breaking changes.
++
++A new release is not required if the only thing changing is metadata like descriptions or examples.
+diff --git a/spec/schemas/config_schema.json b/spec/schemas/config_schema.json
+index bbc9584711..abdc8dbac1 100644
+--- a/spec/schemas/config_schema.json
++++ b/spec/schemas/config_schema.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "$defs": {
+     "full_configuration": {
+       "type": "object",
+@@ -184,10 +184,15 @@
+       "additionalProperties": false
+     }
+   },
+-
+   "oneOf": [
+-    { "$ref": "#/$defs/full_configuration" },
+-    { "$ref": "#/$defs/partial_configuration" },
+-    { "$ref": "#/$defs/unconfiguration" }
++    {
++      "$ref": "#/$defs/full_configuration"
++    },
++    {
++      "$ref": "#/$defs/partial_configuration"
++    },
++    {
++      "$ref": "#/$defs/unconfiguration"
++    }
+   ]
+ }
+diff --git a/spec/schemas/csr_schema.json b/spec/schemas/csr_schema.json
+index 1807a53c29..2095bb5df6 100644
+--- a/spec/schemas/csr_schema.json
++++ b/spec/schemas/csr_schema.json
+@@ -1,15 +1,13 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "title": "CSR description",
+   "description": "A CSR register specification",
+-
+   "$defs": {
+     "csr_field": {
+       "type": "object",
+       "description": "Field in a CSR register",
+       "required": ["description"],
+-
+       "properties": {
+         "name": {
+           "type": "string",
+@@ -126,7 +124,6 @@
+           "$ref": "schema_defs.json#/$defs/cert_normative_rules"
+         }
+       },
+-
+       "allOf": [
+         {
+           "$comment": "Location is required, but it can either be a single XLEN-independent value or a value for each XLEN",
+@@ -140,7 +137,6 @@
+           ]
+         },
+         {
+-          "$comment": "type is required, but it can either be a static value or a function",
+           "oneOf": [
+             {
+               "required": ["type"]
+@@ -151,7 +147,6 @@
+           ]
+         },
+         {
+-          "$comment": "reset_value is required, but it can either be a static value or a function",
+           "oneOf": [
+             {
+               "required": ["reset_value"]
+@@ -165,11 +160,19 @@
+           "if": {
+             "anyOf": [
+               {
+-                "properties": { "type": { "const": "RW-R" } },
++                "properties": {
++                  "type": {
++                    "const": "RW-R"
++                  }
++                },
+                 "required": ["type"]
+               },
+               {
+-                "properties": { "type": { "const": "RW-RH" } },
++                "properties": {
++                  "type": {
++                    "const": "RW-RH"
++                  }
++                },
+                 "required": ["type"]
+               }
+             ]
+@@ -180,141 +183,137 @@
+         }
+       ],
+       "additionalProperties": false
++    }
++  },
++  "type": "object",
++  "required": [
++    "$schema",
++    "kind",
++    "name",
++    "long_name",
++    "length",
++    "description",
++    "writable",
++    "priv_mode",
++    "definedBy"
++  ],
++  "properties": {
++    "$schema": {
++      "type": "string",
++      "format": "uri-reference",
++      "description": "Path to schema, relative to <UDB ROOT>/schemas",
++      "const": "csr_schema.json#"
++    },
++    "kind": {
++      "type": "string",
++      "const": "csr",
++      "description": "Object type"
++    },
++    "name": {
++      "$ref": "schema_defs.json#/$defs/csr_name"
++    },
++    "long_name": {
++      "type": "string",
++      "description": "One line description for the CSR"
++    },
++    "description": {
++      "$ref": "schema_defs.json#/$defs/spec_text",
++      "description": "Function of the field"
++    },
++    "definedBy": {
++      "$ref": "schema_defs.json#/$defs/condition",
++      "description": "Extension(s) that define the CSR"
++    },
++    "address": {
++      "type": "integer",
++      "minimum": 0,
++      "maximum": 4095,
++      "description": "Address of the CSR, as given to the CSR access instructions of the `Zicsr` extension"
+     },
+-    "csr_register": {
++    "indirect_address": {
++      "type": "integer",
++      "description": "Indirect address of the CSR, as given to the indirect CSRs of the `Smcsrind`/`Sscdrind` extensions"
++    },
++    "indirect_slot": {
++      "type": "integer",
++      "minimum": 1,
++      "maximum": 6,
++      "description": "Indirect window slot of the CSR, corresponding to its appearance in *ireg<slot>"
++    },
++    "writable": {
++      "type": "boolean",
++      "description": "Whether or not the CSR can be written by software (i.e., is read-write)"
++    },
++    "virtual_address": true,
++    "priv_mode": {
++      "enum": ["M", "S", "U", "VS", "D"]
++    },
++    "length": {
++      "description": "Length, in bits, of the CSR. Can either be a 32, 64 or MXLEN, SXLEN, VSXLEN to indicate that it is dependent on the effective XLEN for a given mode. XLEN here refers to the effective XLEN in the current execution mode.",
++      "enum": [32, 64, "MXLEN", "SXLEN", "VSXLEN", "XLEN"]
++    },
++    "requires": {
++      "type": "string",
++      "description": "Extension that must be implemented for this CSR to exist"
++    },
++    "fields": {
+       "type": "object",
+-      "required": [
+-        "$schema",
+-        "kind",
+-        "name",
+-        "long_name",
+-        "length",
+-        "description",
+-        "writable",
+-        "priv_mode",
+-        "definedBy"
+-      ],
+-
+-      "properties": {
+-        "$schema": {
+-          "type": "string",
+-          "format": "uri-reference",
+-          "const": "csr_schema.json#",
+-          "description": "Path to schema, relative to <UDB ROOT>/schemas"
+-        },
+-        "kind": {
+-          "type": "string",
+-          "const": "csr",
+-          "description": "Object type"
+-        },
+-        "name": {
+-          "$ref": "schema_defs.json#/$defs/csr_name"
+-        },
+-        "long_name": {
+-          "type": "string",
+-          "description": "One line description for the CSR"
+-        },
+-        "description": {
+-          "$ref": "schema_defs.json#/$defs/spec_text",
+-          "description": "Function of the field"
+-        },
+-        "definedBy": {
+-          "$ref": "schema_defs.json#/$defs/condition",
+-          "description": "Extension(s) that define the CSR"
+-        },
+-        "address": {
+-          "type": "integer",
+-          "minimum": 0,
+-          "maximum": 4095,
+-          "description": "Address of the CSR, as given to the CSR access instructions of the `Zicsr` extension"
+-        },
+-        "indirect_address": {
+-          "type": "integer",
+-          "description": "Indirect address of the CSR, as given to the indirect CSRs of the `Smcsrind`/`Sscdrind` extensions"
+-        },
+-        "indirect_slot": {
+-          "type": "integer",
+-          "minimum": 1,
+-          "maximum": 6,
+-          "description": "Indirect window slot of the CSR, corresponding to its appearance in *ireg<slot>"
+-        },
+-        "writable": {
+-          "type": "boolean",
+-          "description": "Whether or not the CSR can be written by software (i.e., is read-write)"
+-        },
+-        "virtual_address": true,
+-        "$comment": "Conditionally required; see below",
+-        "priv_mode": {
+-          "enum": ["M", "S", "U", "VS", "D"]
+-        },
+-        "length": {
+-          "description": "Length, in bits, of the CSR. Can either be a 32, 64 or MXLEN, SXLEN, VSXLEN to indicate that it is dependent on the effective XLEN for a given mode. XLEN here refers to the effective XLEN in the current execution mode.",
+-          "enum": [32, 64, "MXLEN", "SXLEN", "VSXLEN", "XLEN"]
+-        },
+-        "requires": {
+-          "type": "string",
+-          "description": "Extension that must be implemented for this CSR to exist"
+-        },
+-        "fields": {
+-          "type": "object",
+-          "patternProperties": {
+-            "^[a-zA-Z].*$": {
+-              "$ref": "#/$defs/csr_field"
+-            }
+-          },
+-          "description": "fields of this CSR",
+-          "additionalProperties": false
+-        },
+-        "sw_read()": {
+-          "type": "string",
+-          "description": "Function that returns the value of the CSR when read by software (i.e., a Zicsr instruction). If not specified, the value last written (through hw_write) is returned."
+-        },
+-        "sw_read_ast": {
+-          "type": "object"
+-        },
+-        "$source": {
+-          "description": "Path to the source file this definition came from; used by downstream tooling -- not expected to be in handwritten files",
+-          "type": "string"
+-        },
+-        "cert_normative_rules": {
+-          "$ref": "schema_defs.json#/$defs/cert_normative_rules"
++      "patternProperties": {
++        "^[a-zA-Z].*$": {
++          "$ref": "#/$defs/csr_field"
+         }
+       },
+-      "additionalProperties": false,
+-
+-      "$comment": "If mode is VS, then there must be a virtual_address field",
+-      "allOf": [
+-        {
+-          "if": {
+-            "properties": {
+-              "priv_mode": { "const": "VS" }
+-            }
+-          },
+-          "then": {
+-            "properties": {
+-              "virtual_address": {
+-                "type": "number",
+-                "description": "Address of the CSR viewed from VS-mode"
+-              }
+-            },
+-            "required": ["virtual_address"]
++      "description": "fields of this CSR",
++      "additionalProperties": false
++    },
++    "sw_read()": {
++      "type": "string",
++      "description": "Function that returns the value of the CSR when read by software (i.e., a Zicsr instruction). If not specified, the value last written (through hw_write) is returned."
++    },
++    "sw_read_ast": {
++      "type": "object"
++    },
++    "$source": {
++      "description": "Path to the source file this definition came from; used by downstream tooling -- not expected to be in handwritten files",
++      "type": "string"
++    },
++    "cert_normative_rules": {
++      "$ref": "schema_defs.json#/$defs/cert_normative_rules"
++    }
++  },
++  "additionalProperties": false,
++  "allOf": [
++    {
++      "if": {
++        "properties": {
++          "priv_mode": {
++            "const": "VS"
++          }
++        }
++      },
++      "then": {
++        "properties": {
++          "virtual_address": {
++            "type": "number",
++            "description": "Address of the CSR viewed from VS-mode"
+           }
+         },
+-        {
+-          "if": {
+-            "not": {
+-              "properties": {
+-                "indirect_address": { "const": null }
+-              }
++        "required": ["virtual_address"]
++      }
++    },
++    {
++      "if": {
++        "not": {
++          "properties": {
++            "indirect_address": {
++              "const": null
+             }
+-          },
+-          "then": {
+-            "required": ["indirect_slot"]
+           }
+         }
+-      ]
++      },
++      "then": {
++        "required": ["indirect_slot"]
++      }
+     }
+-  },
+-
+-  "$ref": "#/$defs/csr_register"
++  ]
+ }
+diff --git a/spec/schemas/exception_code_schema.json b/spec/schemas/exception_code_schema.json
+index 643a1f7c07..27847f1085 100644
+--- a/spec/schemas/exception_code_schema.json
++++ b/spec/schemas/exception_code_schema.json
+@@ -1,12 +1,16 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "type": "object",
+   "additionalProperties": false,
+   "required": ["$schema", "kind", "num", "name", "display_name", "definedBy"],
+   "properties": {
+-    "$schema": { "const": "exception_code_schema.json#" },
+-    "kind": { "const": "exception_code" },
++    "$schema": {
++      "const": "exception_code_schema.json#"
++    },
++    "kind": {
++      "const": "exception_code"
++    },
+     "name": {
+       "type": "string",
+       "description": "Name of the exception, as a legal IDL variable name"
+@@ -19,7 +23,9 @@
+       "type": "integer",
+       "description": "Exception number, as reported in the `*cause` CSRs"
+     },
+-    "definedBy": { "$ref": "schema_defs.json#/$defs/condition" },
++    "definedBy": {
++      "$ref": "schema_defs.json#/$defs/condition"
++    },
+     "$source": {
+       "$ref": "schema_defs.json#/$defs/$source"
+     }
+diff --git a/spec/schemas/ext_schema.json b/spec/schemas/ext_schema.json
+index 5d92477eda..a486694f4b 100644
+--- a/spec/schemas/ext_schema.json
++++ b/spec/schemas/ext_schema.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "type": "object",
+   "required": [
+     "$schema",
+@@ -15,15 +15,17 @@
+     "$schema": {
+       "type": "string",
+       "format": "uri-reference",
+-      "const": "ext_schema.json#",
+-      "description": "Path to schema, relative to <UDB ROOT>/schemas"
++      "description": "Path to schema, relative to <UDB ROOT>/schemas",
++      "const": "ext_schema.json#"
+     },
+     "kind": {
+       "type": "string",
+       "const": "extension",
+       "description": "Object type"
+     },
+-    "name": { "$ref": "schema_defs.json#/$defs/extension_name" },
++    "name": {
++      "$ref": "schema_defs.json#/$defs/extension_name"
++    },
+     "long_name": {
+       "type": "string",
+       "description": "One line description for the extension"
+@@ -106,7 +108,10 @@
+                 "pattern": "^unknown$",
+                 "$comment": "When ratification date is unknown"
+               },
+-              { "type": "null", "$comment": "When version isn't ratified" }
++              {
++                "type": "null",
++                "$comment": "When version isn't ratified"
++              }
+             ]
+           },
+           "changes": {
+diff --git a/spec/schemas/inst_opcode_schema.json b/spec/schemas/inst_opcode_schema.json
+index f215899a32..48c1cf5185 100644
+--- a/spec/schemas/inst_opcode_schema.json
++++ b/spec/schemas/inst_opcode_schema.json
+@@ -1,8 +1,8 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "title": "Instruction Opcode Schema",
+   "description": "Schema for instruction opcode definitions",
+-
+   "type": "object",
+   "required": ["$schema", "kind", "data"],
+   "properties": {
+diff --git a/spec/schemas/inst_schema.json b/spec/schemas/inst_schema.json
+index 984358f94c..60712b6b8f 100644
+--- a/spec/schemas/inst_schema.json
++++ b/spec/schemas/inst_schema.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "$defs": {
+     "fully_resolved_opcodes": {
+       "type": "object",
+@@ -121,7 +121,6 @@
+         "opcodes": {
+           "type": "object",
+           "patternProperties": {
+-            "$comment": "opcode names are lowercase with numbers",
+             "^[a-z][a-z0-9]*$": {
+               "$refs": "#/$defs/fully_resolved_opcodes"
+             }
+@@ -291,185 +290,179 @@
+           "additionalProperties": false
+         }
+       ]
++    }
++  },
++  "type": "object",
++  "required": [
++    "$schema",
++    "kind",
++    "name",
++    "long_name",
++    "description",
++    "definedBy",
++    "access",
++    "assembly"
++  ],
++  "additionalProperties": false,
++  "properties": {
++    "$schema": {
++      "type": "string",
++      "format": "uri-reference",
++      "description": "Path to schema, relative to <UDB ROOT>/schemas",
++      "const": "inst_schema.json#"
++    },
++    "kind": {
++      "type": "string",
++      "const": "instruction"
++    },
++    "name": {
++      "type": "string",
++      "pattern": "^[a-z0-9.]+$",
++      "description": "Instruction mnemonic (must be lowercase)"
+     },
+-    "inst_data": {
++    "long_name": {
++      "type": "string",
++      "description": "One line description of the instruction"
++    },
++    "description": {
++      "$ref": "schema_defs.json#/$defs/spec_text",
++      "description": "Detailed description of the instruction"
++    },
++    "definedBy": {
++      "$ref": "schema_defs.json#/$defs/condition",
++      "description": "Extension(s) that defines the instruction"
++    },
++    "hints": {
++      "type": "array",
++      "items": {
++        "type": "object",
++        "properties": {
++          "$ref": {
++            "type": "string",
++            "format": "uri-reference",
++            "pattern": "^inst/.+\\.yaml#.*$",
++            "description": "Ref to an instruction that is using a HINT codepoint(s) of this instruction"
++          }
++        },
++        "required": ["$ref"],
++        "additionalProperties": false
++      },
++      "description": "List of HINTs that use this instruction's codepoints"
++    },
++    "access": {
+       "type": "object",
+-      "required": [
+-        "$schema",
+-        "kind",
+-        "name",
+-        "long_name",
+-        "description",
+-        "definedBy",
+-        "access",
+-        "assembly"
+-      ],
+-      "additionalProperties": false,
++      "required": ["s", "u", "vs", "vu"],
+       "properties": {
+-        "$schema": {
+-          "type": "string",
+-          "format": "uri-reference",
+-          "const": "inst_schema.json#",
+-          "description": "Path to schema, relative to <UDB ROOT>/schemas"
+-        },
+-        "kind": {
+-          "type": "string",
+-          "const": "instruction"
+-        },
+-        "name": {
+-          "type": "string",
+-          "pattern": "^[a-z0-9.]+$",
+-          "description": "Instruction mnemonic (must be lowercase)"
++        "m": {
++          "enum": ["always", "sometimes", "never"],
++          "default": "always"
+         },
+-        "long_name": {
+-          "type": "string",
+-          "description": "One line description of the instruction"
++        "s": {
++          "enum": ["always", "sometimes", "never"],
++          "default": "always"
+         },
+-        "description": {
+-          "$ref": "schema_defs.json#/$defs/spec_text",
+-          "description": "Detailed description of the instruction"
++        "u": {
++          "enum": ["always", "sometimes", "never"],
++          "default": "always"
+         },
+-        "definedBy": {
+-          "$ref": "schema_defs.json#/$defs/condition",
+-          "description": "Extension(s) that defines the instruction"
++        "vs": {
++          "enum": ["always", "sometimes", "never"],
++          "default": "always"
+         },
+-
+-        "hints": {
+-          "type": "array",
+-          "items": {
+-            "type": "object",
+-            "properties": {
+-              "$ref": {
+-                "type": "string",
+-                "format": "uri-reference",
+-                "pattern": "^inst/.+\\.yaml#.*$",
+-                "description": "Ref to an instruction that is using a HINT codepoint(s) of this instruction"
+-              }
+-            },
+-            "required": ["$ref"],
+-            "additionalProperties": false
++        "vu": {
++          "enum": ["always", "sometimes", "never"],
++          "default": "always"
++        }
++      }
++    },
++    "access_detail": {
++      "type": "string",
++      "description": "Extra detail about access when at least one mode is 'sometimes'"
++    },
++    "operation()": {
++      "type": "string",
++      "description": "Functional description of the instruction using IDL language"
++    },
++    "operation_ast": {
++      "type": "object"
++    },
++    "sail()": {
++      "type": "string",
++      "description": "Functional description of the instruction using Sail"
++    },
++    "cert_normative_rules": {
++      "$ref": "schema_defs.json#/$defs/cert_normative_rules"
++    },
++    "assembly": {
++      "type": "string",
++      "description": "Assembly format of the instruction. Can use decode variables"
++    },
++    "data_independent_timing": {
++      "type": "boolean",
++      "description": "Whether or not the instruction must execute with data-independent timing when the Zkt extension is supported",
++      "default": false
++    },
++    "pseudoinstructions": {
++      "description": "Variations of this instruction that form a pseudoinstruction",
++      "type": "array",
++      "items": {
++        "type": "object",
++        "properties": {
++          "when": {
++            "type": "string",
++            "description": "Condition when the instruction has an alias"
+           },
+-          "description": "List of HINTs that use this instruction's codepoints"
+-        },
+-        "access": {
+-          "type": "object",
+-          "required": ["s", "u", "vs", "vu"],
+-          "properties": {
+-            "m": {
+-              "enum": ["always", "sometimes", "never"],
+-              "default": "always"
+-            },
+-            "s": {
+-              "enum": ["always", "sometimes", "never"],
+-              "default": "always"
+-            },
+-            "u": {
+-              "enum": ["always", "sometimes", "never"],
+-              "default": "always"
+-            },
+-            "vs": {
+-              "enum": ["always", "sometimes", "never"],
+-              "default": "always"
+-            },
+-            "vu": {
+-              "enum": ["always", "sometimes", "never"],
+-              "default": "always"
+-            }
+-          }
+-        },
+-        "access_detail": {
+-          "type": "string",
+-          "description": "Extra detail about access when at least one mode is 'sometimes'"
+-        },
+-        "operation()": {
+-          "type": "string",
+-          "description": "Functional description of the instruction using IDL language"
+-        },
+-        "operation_ast": {
+-          "type": "object"
+-        },
+-        "sail()": {
+-          "type": "string",
+-          "description": "Functional description of the instruction using Sail"
+-        },
+-        "cert_normative_rules": {
+-          "$ref": "schema_defs.json#/$defs/cert_normative_rules"
+-        },
+-        "assembly": {
+-          "type": "string",
+-          "description": "Assembly format of the instruction. Can use decode variables"
+-        },
+-        "data_independent_timing": {
+-          "type": "boolean",
+-          "description": "Whether or not the instruction must execute with data-independent timing when the Zkt extension is supported",
+-          "default": false
+-        },
+-        "pseudoinstructions": {
+-          "description": "Variations of this instruction that form a pseudoinstruction",
+-          "type": "array",
+-          "items": {
+-            "type": "object",
+-            "properties": {
+-              "when": {
+-                "type": "string",
+-                "description": "Condition when the instruction has an alias"
+-              },
+-              "to": {
+-                "type": "string",
+-                "description": "pseudoinstruction format"
+-              }
+-            },
+-            "additionalProperties": false
++          "to": {
++            "type": "string",
++            "description": "pseudoinstruction format"
+           }
+         },
+-        "$source": {
+-          "description": "Path to the source file. Used by downstream tooling; not expected to be found in handwritten files",
+-          "type": "string"
++        "additionalProperties": false
++      }
++    },
++    "$source": {
++      "description": "Path to the source file. Used by downstream tooling; not expected to be found in handwritten files",
++      "type": "string"
++    },
++    "format": {
++      "type": "object",
++      "oneOf": [
++        {
++          "$ref": "#/$defs/fully_resolved_format"
+         },
+-        "format": {
+-          "type": "object",
+-          "oneOf": [
+-            {
+-              "$ref": "#/$defs/fully_resolved_format"
+-            },
+-            {
+-              "$comment": "Unresolved version",
+-              "required": ["$inherits", "opcodes"],
+-              "properties": {
+-                "$inherits": {
+-                  "oneOf": [
+-                    {
+-                      "$ref": "schema_defs.json#/$defs/reference"
+-                    },
+-                    {
+-                      "type": "array",
+-                      "items": {
+-                        "$ref": "schema_defs.json#/$defs/reference"
+-                      }
+-                    }
+-                  ]
++        {
++          "$comment": "Unresolved version",
++          "required": ["$inherits", "opcodes"],
++          "properties": {
++            "$inherits": {
++              "oneOf": [
++                {
++                  "$ref": "schema_defs.json#/$defs/reference"
+                 },
+-                "opcodes": {
++                {
++                  "type": "array",
++                  "items": {
++                    "$ref": "schema_defs.json#/$defs/reference"
++                  }
++                }
++              ]
++            },
++            "opcodes": {
++              "type": "object",
++              "patternProperties": {
++                "^[a-z][a-z0-9]*$": {
+                   "type": "object",
+-                  "patternProperties": {
+-                    "$comment": "opcode names are lowercase with numbers",
+-                    "^[a-z][a-z0-9]*$": {
+-                      "type": "object",
+-                      "properties": {
+-                        "$comment": "location must come from inheritance",
+-                        "display_name": {
+-                          "type": "string",
+-                          "description": "field name, displayed in encoding drawings"
+-                        },
+-                        "value": {
+-                          "$ref": "schema_defs.json#/$defs/integer"
+-                        },
+-                        "$inherits": {
+-                          "type": "string",
+-                          "pattern": "inst_opcode/[^/]+\\.yaml#/data"
+-                        }
+-                      },
+-                      "additionalProperties": false
++                  "properties": {
++                    "display_name": {
++                      "type": "string",
++                      "description": "field name, displayed in encoding drawings"
++                    },
++                    "value": {
++                      "$ref": "schema_defs.json#/$defs/integer"
++                    },
++                    "$inherits": {
++                      "type": "string",
++                      "pattern": "inst_opcode/[^/]+\\.yaml#/data"
+                     }
+                   },
+                   "additionalProperties": false
+@@ -477,35 +470,34 @@
+               },
+               "additionalProperties": false
+             }
+-          ]
++          },
++          "additionalProperties": false
++        }
++      ]
++    },
++    "encoding": {
++      "description": "Instruction encoding and decode variables",
++      "oneOf": [
++        {
++          "$ref": "#/$defs/old_encoding"
+         },
+-        "encoding": {
+-          "description": "Instruction encoding and decode variables",
+-          "oneOf": [
+-            {
++        {
++          "type": "object",
++          "properties": {
++            "RV32": {
+               "$ref": "#/$defs/old_encoding"
+             },
+-            {
+-              "type": "object",
+-              "properties": {
+-                "RV32": {
+-                  "$ref": "#/$defs/old_encoding"
+-                },
+-                "RV64": {
+-                  "$ref": "#/$defs/old_encoding"
+-                }
+-              },
+-              "required": ["RV32", "RV64"],
+-              "additionalProperties": false
++            "RV64": {
++              "$ref": "#/$defs/old_encoding"
+             }
+-          ]
++          },
++          "required": ["RV32", "RV64"],
++          "additionalProperties": false
+         }
+-      },
+-      "patternProperties": {
+-        "^custom_[A-Za-z0-9_]+$": {}
+-      }
++      ]
+     }
+   },
+-
+-  "$ref": "#/$defs/inst_data"
++  "patternProperties": {
++    "^custom_[A-Za-z0-9_]+$": {}
++  }
+ }
+diff --git a/spec/schemas/inst_subtype_schema.json b/spec/schemas/inst_subtype_schema.json
+index ba0f47b331..5694bc26b9 100644
+--- a/spec/schemas/inst_subtype_schema.json
++++ b/spec/schemas/inst_subtype_schema.json
+@@ -1,12 +1,11 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "title": "Instruction Subtype Schema",
+   "description": "Schema for instruction subtype definitions",
+-
+   "type": "object",
+   "required": ["$schema", "kind", "name", "data"],
+   "additionalProperties": false,
+-
+   "$defs": {
+     "fully_resolved_data": {
+       "type": "object",
+@@ -159,11 +158,10 @@
+       }
+     }
+   },
+-
+   "properties": {
+     "$schema": {
+-      "const": "inst_subtype_schema.json#",
+-      "description": "Pointer to schema"
++      "description": "Pointer to schema",
++      "const": "inst_subtype_schema.json#"
+     },
+     "kind": {
+       "const": "instruction_subtype",
+diff --git a/spec/schemas/inst_type_schema.json b/spec/schemas/inst_type_schema.json
+index 76649acdeb..61583e9f6d 100644
+--- a/spec/schemas/inst_type_schema.json
++++ b/spec/schemas/inst_type_schema.json
+@@ -1,14 +1,22 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "title": "Instruction Type Schema",
+   "description": "Schema for instruction type definitions",
+-
+   "type": "object",
+   "properties": {
+-    "$schema": { "const": "inst_type_schema.json#" },
+-    "kind": { "const": "instruction_type" },
+-    "name": { "$ref": "schema_defs.json#/$defs/inst_type_name" },
+-    "description": { "type": "string" },
++    "$schema": {
++      "const": "inst_type_schema.json#"
++    },
++    "kind": {
++      "const": "instruction_type"
++    },
++    "name": {
++      "$ref": "schema_defs.json#/$defs/inst_type_name"
++    },
++    "description": {
++      "type": "string"
++    },
+     "length": {
+       "description": "Length, in bits, of the encoding",
+       "enum": [16, 32]
+@@ -25,7 +33,9 @@
+           "required": ["location"],
+           "additionalProperties": false,
+           "properties": {
+-            "location": { "$ref": "schema_defs.json#/$defs/field_location" }
++            "location": {
++              "$ref": "schema_defs.json#/$defs/field_location"
++            }
+           }
+         }
+       }
+diff --git a/spec/schemas/inst_var_schema.json b/spec/schemas/inst_var_schema.json
+index fe3a4cd3c1..07944d39af 100644
+--- a/spec/schemas/inst_var_schema.json
++++ b/spec/schemas/inst_var_schema.json
+@@ -1,8 +1,8 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "title": "Instruction Variable Schema",
+   "description": "Schema for instruction decode variable definitions",
+-
+   "$defs": {
+     "fully_resolved_data": {
+       "type": "object",
+@@ -67,7 +67,6 @@
+       }
+     }
+   },
+-
+   "type": "object",
+   "required": ["$schema", "kind", "name", "data"],
+   "properties": {
+diff --git a/spec/schemas/inst_var_type_schema.json b/spec/schemas/inst_var_type_schema.json
+index 4747679539..9900589621 100644
+--- a/spec/schemas/inst_var_type_schema.json
++++ b/spec/schemas/inst_var_type_schema.json
+@@ -1,8 +1,8 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "title": "Instruction Variable Type Schema",
+   "description": "Schema for instruction variable type definitions",
+-
+   "type": "object",
+   "unevaluatedProperties": false,
+   "required": ["$schema", "kind", "name", "type"],
+diff --git a/spec/schemas/inst_variable_metadatas.json b/spec/schemas/inst_variable_metadatas.json
+index 1546919706..c04322e8e6 100644
+--- a/spec/schemas/inst_variable_metadatas.json
++++ b/spec/schemas/inst_variable_metadatas.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "type": "object",
+   "patternProperties": {
+     "^[a-zA-Z0-9_]+$": {
+diff --git a/spec/schemas/interrupt_code_schema.json b/spec/schemas/interrupt_code_schema.json
+index b74bc70d80..854fcdf1fb 100644
+--- a/spec/schemas/interrupt_code_schema.json
++++ b/spec/schemas/interrupt_code_schema.json
+@@ -1,12 +1,16 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "type": "object",
+   "additionalProperties": false,
+   "required": ["$schema", "kind", "num", "name", "display_name", "definedBy"],
+   "properties": {
+-    "$schema": { "const": "interrupt_code_schema.json#" },
+-    "kind": { "const": "interrupt_code" },
++    "$schema": {
++      "const": "interrupt_code_schema.json#"
++    },
++    "kind": {
++      "const": "interrupt_code"
++    },
+     "name": {
+       "type": "string",
+       "description": "Name of the interrupt, as a legal IDL variable name"
+@@ -19,7 +23,9 @@
+       "type": "integer",
+       "description": "Interrupt number, as reported in the `*cause` CSRs (not including the leading INT bit)"
+     },
+-    "definedBy": { "$ref": "schema_defs.json#/$defs/condition" },
++    "definedBy": {
++      "$ref": "schema_defs.json#/$defs/condition"
++    },
+     "$source": {
+       "$ref": "schema_defs.json#/$defs/$source"
+     }
+diff --git a/spec/schemas/manual_schema.json b/spec/schemas/manual_schema.json
+index 0dae881382..82e4dc9358 100644
+--- a/spec/schemas/manual_schema.json
++++ b/spec/schemas/manual_schema.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "type": "object",
+   "required": ["$schema", "kind", "name", "long_name"],
+   "properties": {
+diff --git a/spec/schemas/manual_version_schema.json b/spec/schemas/manual_version_schema.json
+index 8aa8e50e87..ba2564e448 100644
+--- a/spec/schemas/manual_version_schema.json
++++ b/spec/schemas/manual_version_schema.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "$defs": {
+     "volume": {
+       "type": "object",
+@@ -48,7 +48,6 @@
+       "description": "Relative (to the contents.yaml file) path to the chapter source"
+     }
+   },
+-
+   "type": "object",
+   "required": [
+     "$schema",
+diff --git a/spec/schemas/mmr_schema.json b/spec/schemas/mmr_schema.json
+index 4a4c419df1..45e6e3e363 100644
+--- a/spec/schemas/mmr_schema.json
++++ b/spec/schemas/mmr_schema.json
+@@ -1,9 +1,8 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "title": "MMR description",
+   "description": "A memory-mapped register specification",
+-
+   "type": "object",
+   "required": [
+     "$schema",
+@@ -16,12 +15,11 @@
+     "physical_address",
+     "definedBy"
+   ],
+-
+   "properties": {
+     "$schema": {
+       "format": "uri-reference",
+-      "const": "mmr_schema.json#",
+-      "description": "Path to schema, relative to <UDB ROOT>/schemas"
++      "description": "Path to schema, relative to <UDB ROOT>/schemas",
++      "const": "mmr_schema.json#"
+     },
+     "kind": {
+       "const": "mmr",
+diff --git a/spec/schemas/non_isa_schema.json b/spec/schemas/non_isa_schema.json
+index 4c95031b49..fa9c01a0c8 100644
+--- a/spec/schemas/non_isa_schema.json
++++ b/spec/schemas/non_isa_schema.json
+@@ -1,5 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "title": "Schema for Non-ISA specification definitions",
+   "type": "object",
+   "required": ["$schema", "kind", "name", "description", "sections"],
+diff --git a/spec/schemas/param_schema.json b/spec/schemas/param_schema.json
+index 0cad255341..8ff45be53b 100644
+--- a/spec/schemas/param_schema.json
++++ b/spec/schemas/param_schema.json
+@@ -1,7 +1,7 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "type": "object",
+-
+   "required": [
+     "$schema",
+     "kind",
+diff --git a/spec/schemas/prm_schema.json b/spec/schemas/prm_schema.json
+index 66f9852fe4..e471e6e3d0 100644
+--- a/spec/schemas/prm_schema.json
++++ b/spec/schemas/prm_schema.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "$defs": {
+     "identifier": {
+       "type": "string",
+@@ -132,7 +132,9 @@
+         },
+         "exclude_content": {
+           "type": "array",
+-          "items": { "type": "string" },
++          "items": {
++            "type": "string"
++          },
+           "description": "Content IDs to exclude (excludes entire sections/chapters and their subsections by AsciiDoc ID)"
+         },
+         "level_offset": {
+@@ -147,7 +149,6 @@
+       "additionalProperties": false
+     }
+   },
+-
+   "type": "object",
+   "required": [
+     "$schema",
+diff --git a/spec/schemas/proc_cert_class_schema.json b/spec/schemas/proc_cert_class_schema.json
+index 9dd0bdd3a1..797f79ce83 100644
+--- a/spec/schemas/proc_cert_class_schema.json
++++ b/spec/schemas/proc_cert_class_schema.json
+@@ -1,5 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "type": "object",
+   "required": ["$schema", "kind", "name", "long_name", "introduction"],
+   "additionalProperties": false,
+diff --git a/spec/schemas/proc_cert_model_schema.json b/spec/schemas/proc_cert_model_schema.json
+index fa0744696c..cfee911337 100644
+--- a/spec/schemas/proc_cert_model_schema.json
++++ b/spec/schemas/proc_cert_model_schema.json
+@@ -1,5 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "type": "object",
+   "required": ["$schema", "kind", "name", "long_name", "base"],
+   "additionalProperties": false,
+diff --git a/spec/schemas/profile_family_schema.json b/spec/schemas/profile_family_schema.json
+index 6253f80df5..7ced9e9c67 100644
+--- a/spec/schemas/profile_family_schema.json
++++ b/spec/schemas/profile_family_schema.json
+@@ -1,5 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "type": "object",
+   "required": ["$schema", "kind", "name", "long_name"],
+   "properties": {
+diff --git a/spec/schemas/profile_release_schema.json b/spec/schemas/profile_release_schema.json
+index 8f2f8c4240..612835acbb 100644
+--- a/spec/schemas/profile_release_schema.json
++++ b/spec/schemas/profile_release_schema.json
+@@ -1,5 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "type": "object",
+   "required": ["$schema", "kind", "name", "long_name", "description"],
+   "properties": {
+diff --git a/spec/schemas/profile_schema.json b/spec/schemas/profile_schema.json
+index bfd5a37e4b..e7988aeee6 100644
+--- a/spec/schemas/profile_schema.json
++++ b/spec/schemas/profile_schema.json
+@@ -1,5 +1,6 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
++  "$id": "v0.1",
+   "type": "object",
+   "required": ["$schema", "kind", "name", "long_name", "base"],
+   "properties": {
+diff --git a/spec/schemas/register_file_schema.json b/spec/schemas/register_file_schema.json
+index 4f0630f0be..a7e511d967 100644
+--- a/spec/schemas/register_file_schema.json
++++ b/spec/schemas/register_file_schema.json
+@@ -1,9 +1,8 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "title": "Register File Schema",
+   "description": "Schema for describing a register file",
+-
+   "$defs": {
+     "register_entry": {
+       "type": "object",
+@@ -82,8 +81,8 @@
+       "properties": {
+         "$schema": {
+           "format": "uri-reference",
+-          "const": "register_file_schema.json#",
+-          "description": "Path to schema, relative to <UDB ROOT>/schemas"
++          "description": "Path to schema, relative to <UDB ROOT>/schemas",
++          "const": "register_file_schema.json#"
+         },
+         "kind": {
+           "const": "register_file"
+diff --git a/spec/schemas/schema_defs.json b/spec/schemas/schema_defs.json
+index 48ccc7b5a1..af172ce4b7 100644
+--- a/spec/schemas/schema_defs.json
++++ b/spec/schemas/schema_defs.json
+@@ -1,8 +1,7 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+-
++  "$id": "v0.1",
+   "title": "Common patterns used by all schemas",
+-
+   "$defs": {
+     "$source": {
+       "type": "string",
+@@ -34,7 +33,10 @@
+     },
+     "field_location": {
+       "oneOf": [
+-        { "type": "integer", "description": "Location of a single bit" },
++        {
++          "type": "integer",
++          "description": "Location of a single bit"
++        },
+         {
+           "type": "string",
+           "pattern": "^[0-9]+-[0-9]+$",
+@@ -148,7 +150,9 @@
+           "type": "string",
+           "description": "IDL boolean expression. When true, the text applies"
+         },
+-        "when_ast": { "type": "object" }
++        "when_ast": {
++          "type": "object"
++        }
+       },
+       "additionalProperties": false
+     },
+@@ -275,7 +279,9 @@
+     },
+     "requires_entry": {
+       "oneOf": [
+-        { "$ref": "#/$defs/extension_requirement" },
++        {
++          "$ref": "#/$defs/extension_requirement"
++        },
+         {
+           "type": "object",
+           "properties": {
+@@ -703,12 +709,10 @@
+       },
+       "additionalProperties": false
+     },
+-
+     "idl": {
+       "description": "IDL code",
+       "type": "string"
+     },
+-
+     "idl_condition": {
+       "description": "A condition expressed with IDL",
+       "type": "object",
+@@ -728,7 +732,6 @@
+       },
+       "additionalProperties": false
+     },
+-
+     "yaml_condition": {
+       "oneOf": [
+         {
+@@ -794,7 +797,6 @@
+         }
+       ]
+     },
+-
+     "xlen_condition": {
+       "type": "object",
+       "required": ["xlen"],
+@@ -805,7 +807,6 @@
+       },
+       "additionalProperties": false
+     },
+-
+     "condition": {
+       "oneOf": [
+         {
+@@ -816,7 +817,6 @@
+         }
+       ]
+     },
+-
+     "extension_requirement_list_item": {
+       "description": "A list of extension requirements, possibly with a condition",
+       "oneOf": [
+@@ -863,7 +863,6 @@
+         }
+       ]
+     },
+-
+     "uint32": {
+       "type": "integer",
+       "minimum": 0,
+diff --git a/spec/std/isa/inst/I/add.yaml b/spec/std/isa/inst/I/add.yaml
+index 3c4fd9abe7..f1778d27a4 100644
+--- a/spec/std/isa/inst/I/add.yaml
++++ b/spec/std/isa/inst/I/add.yaml
+@@ -1,7 +1,7 @@
+ # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+ 
+-# yaml-language-server: $schema=../../../../schemas/inst_schema.json
++# yaml-language-server: $schema=../../../../schemas/v0.1/inst_schema.json
+ 
+ $schema: "inst_schema.json#"
+ kind: instruction
+diff --git a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi
+index 882769d240..2a3574cc67 100644
+--- a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi
++++ b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi
+@@ -4045,6 +4045,9 @@ class Udb::Resolver
+   sig { params(config_path: ::Pathname).returns(T::Hash[::String, T.untyped]) }
+   def resolve_config(config_path); end
+ 
++  sig { void }
++  def resolve_schemas; end
++
+   sig { params(cfg_path_or_name: T.any(::Pathname, ::String)).returns(::Pathname) }
+   def resolved_spec_path(cfg_path_or_name); end
+ 
+@@ -4070,6 +4073,8 @@ class Udb::Resolver::ConfigInfo < ::T::Struct
+   const :resolver, ::Udb::Resolver
+ end
+ 
++Udb::Resolver::SCHEMAS_BASE_URL = T.let(T.unsafe(nil), String)
++
+ class Udb::SatisfiedResult < ::T::Enum
+   enums do
+     Maybe = new
+@@ -4506,8 +4511,8 @@ class Udb::Yaml::PreservingEmitter
+ end
+ 
+ class Udb::Yaml::Resolver
+-  sig { params(quiet: T::Boolean, compile_idl: T::Boolean).void }
+-  def initialize(quiet: T.unsafe(nil), compile_idl: T.unsafe(nil)); end
++  sig { params(quiet: T::Boolean, compile_idl: T::Boolean, schemas_path: T.nilable(T.any(::Pathname, ::String))).void }
++  def initialize(quiet: T.unsafe(nil), compile_idl: T.unsafe(nil), schemas_path: T.unsafe(nil)); end
+ 
+   sig { params(parent_obj: T::Hash[::String, T.untyped], child_ref: ::String).void }
+   def add_parent_of_reference(parent_obj, child_ref); end
+@@ -4629,6 +4634,12 @@ class Udb::Yaml::Resolver
+   end
+   def resolve_object(obj, obj_path, obj_file_path, doc_obj, arch_root, no_checks); end
+ 
++  sig { returns(T::Hash[::String, ::String]) }
++  def schema_version_map; end
++
++  sig { returns(::Pathname) }
++  def schemas_path; end
++
+   sig { params(resolved_data: T::Hash[::String, T.untyped], rel_path: ::String).void }
+   def set_parent_of_relationships(resolved_data, rel_path); end
+ 
+@@ -4647,8 +4658,14 @@ class Udb::Yaml::Resolver
+   end
+   def track_source_locations_helper(keys, contents, file, cumulative_offsets, offset_map, node); end
+ 
++  sig { params(resolved_obj: T::Hash[::String, T.untyped], rel_path: ::String).void }
++  def validate_against_schema(resolved_obj, rel_path); end
++
+   def validate_idl_scalars(node, keys, file_path); end
+ 
++  sig { params(uri: ::String).returns(::String) }
++  def versioned_schema_uri(uri); end
++
+   sig do
+     params(
+       obj: T.untyped,
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb b/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb
+index a9360e2b5c..b3cfbacd75 100644
+--- a/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb
++++ b/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb
+@@ -384,12 +384,16 @@ class ValidationError < ::StandardError
+     sig { params(udb_resolver: Resolver).returns(T.proc.params(pattern: Regexp).returns(T.untyped)) }
+     def self.create_json_schemer_resolver(udb_resolver)
+       proc do |pattern|
+-        if pattern.to_s =~ /^http/
++        uri_str = pattern.to_s
++        if uri_str =~ /^http/
+           JSON.parse(T.must(Net::HTTP.get(pattern)))
+-        elsif pattern.to_s =~ /^json-schemer:\/\/schema/
+-          JSON.load_file("#{udb_resolver.schemas_path}#{URI(pattern.to_s).path}")
++        elsif uri_str =~ /^json-schemer:\/\/schema/
++          JSON.load_file("#{udb_resolver.schemas_path}#{URI(uri_str).path}")
+         else
+-          JSON.load_file(udb_resolver.schemas_path / pattern.to_s)
++          # Relative $ref values (e.g. "schema_defs.json") are resolved directly
++          # from the schemas directory.
++          local_path = udb_resolver.schemas_path / File.basename(uri_str)
++          JSON.load_file(local_path)
+         end
+       end
+     end
+@@ -405,19 +409,21 @@ def validate(resolver)
+       if @data.key?("$schema")
+         schema_path = data["$schema"]
+         schema_file, obj_path = schema_path.split("#")
++        # Strip version prefix (e.g. 'v0.1/ext_schema.json' -> 'ext_schema.json')
++        schema_basename = File.basename(schema_file)
+         schema =
+-          if schemas.key?(schema_file)
+-            schemas[schema_file]
++          if schemas.key?(schema_basename)
++            schemas[schema_basename]
+           else
+-            schemas[schema_file] = JSONSchemer.schema(
+-              File.read("#{resolver.schemas_path}/#{schema_file}"),
++            schemas[schema_basename] = JSONSchemer.schema(
++              File.read("#{resolver.schemas_path}/#{schema_basename}"),
+               regexp_resolver: "ecma",
+               ref_resolver:,
+               insert_property_defaults: true
+             )
+-            raise SchemaError, T.must(schemas[schema_file]).validate_schema unless T.must(schemas[schema_file]).valid_schema?
++            raise SchemaError, T.must(schemas[schema_basename]).validate_schema unless T.must(schemas[schema_basename]).valid_schema?
+ 
+-            schemas[schema_file]
++            schemas[schema_basename]
+           end
+ 
+         unless obj_path.nil?
+@@ -434,6 +440,14 @@ def validate(resolver)
+ 
+         raise "Nothing there?" if jsonified_obj.nil?
+ 
++        # Normalize the $schema field to the bare filename before validation so that
++        # the schema enum (which lists bare names like 'ext_schema.json#') matches
++        # even when the resolved file uses a versioned path like 'v0.1/ext_schema.json#'.
++        if jsonified_obj.key?("$schema")
++          bare_schema = File.basename(jsonified_obj["$schema"].split("#").first) + "#"
++          jsonified_obj = jsonified_obj.merge("$schema" => bare_schema)
++        end
++
+         raise SchemaValidationError.new(@data_path, schema.validate(jsonified_obj)) unless schema.valid?(jsonified_obj)
+       else
+         Udb.logger.warn "No $schema for #{@data_path}"
+diff --git a/tools/ruby-gems/udb/lib/udb/resolver.rb b/tools/ruby-gems/udb/lib/udb/resolver.rb
+index 78b45e1899..51fae45df8 100644
+--- a/tools/ruby-gems/udb/lib/udb/resolver.rb
++++ b/tools/ruby-gems/udb/lib/udb/resolver.rb
+@@ -360,5 +360,37 @@ def cfg_arch_for(config_path_or_name)
+         )
+       end
+     end
++
++    SCHEMAS_BASE_URL = "https://riscv.github.io/riscv-unified-db/schemas"
++
++    # Resolve schema files by rewriting their $id to the full published URL and
++    # writing the result to gen/schemas/SCHEMA_NAME/VERSION/SCHEMA_FILENAME.
++    #
++    # Each schema file has its own independent version (the $id field, e.g. "v0.1").
++    # The resolved file is written to gen/schemas/<schema_name>/<version>/<schema_name>
++    # with $id set to
++    # https://riscv.github.io/riscv-unified-db/schemas/<schema_name>/<version>/<schema_name>.
++    sig { void }
++    def resolve_schemas
++      require "json"
++
++      schemas_path.glob("*.json").each do |schema_file|
++        next if schema_file.basename.to_s == "json-schema-draft-07.json"
++
++        schema_data = JSON.parse(schema_file.read)
++        version = schema_data["$id"]
++        next if version.nil?
++
++        schema_name = schema_file.basename.to_s
++        resolved_id = "#{SCHEMAS_BASE_URL}/#{schema_name}/#{version}/#{schema_name}"
++
++        resolved_schema = schema_data.merge("$id" => resolved_id)
++
++        out_dir = gen_path / "schemas" / schema_name / version
++        out_dir.mkpath
++        out_path = out_dir / schema_name
++        out_path.write(JSON.pretty_generate(resolved_schema) + "\n")
++      end
++    end
+   end
+ end
+diff --git a/tools/ruby-gems/udb/lib/udb/yaml/yaml_resolver.rb b/tools/ruby-gems/udb/lib/udb/yaml/yaml_resolver.rb
+index f7b70d140c..4a83b27f71 100644
+--- a/tools/ruby-gems/udb/lib/udb/yaml/yaml_resolver.rb
++++ b/tools/ruby-gems/udb/lib/udb/yaml/yaml_resolver.rb
+@@ -8,6 +8,7 @@
+ require "pathname"
+ require "fileutils"
+ require "json"
++require "json_schemer"
+ require "sorbet-runtime"
+ 
+ require "idlc"
+@@ -22,8 +23,14 @@ module Yaml
+     class Resolver
+       extend T::Sig
+ 
+-      sig { params(quiet: T::Boolean, compile_idl: T::Boolean).void }
+-      def initialize(quiet: false, compile_idl: false)
++      sig {
++        params(
++          quiet: T::Boolean,
++          compile_idl: T::Boolean,
++          schemas_path: T.nilable(T.any(String, Pathname))
++        ).void
++      }
++      def initialize(quiet: false, compile_idl: false, schemas_path: nil)
+         @quiet = T.let(quiet, T::Boolean)
+         @compile_idl = T.let(compile_idl, T::Boolean)
+         @compiler = T.let(nil, T.nilable(Idl::Compiler))
+@@ -32,6 +39,63 @@ def initialize(quiet: false, compile_idl: false)
+         end
+         @resolved_objs = T.let({}, T::Hash[String, T::Hash[Symbol, T.untyped]])
+         @current_comment_map = T.let(nil, T.nilable(CommentMap))
++        @schemas_path = T.let(schemas_path.nil? ? nil : Pathname.new(schemas_path), T.nilable(Pathname))
++        @schema_version_map = T.let(nil, T.nilable(T::Hash[String, String]))
++      end
++
++      # Returns the path to JSON schema files.
++      # Defaults to <repo_root>/spec/schemas but can be overridden via the constructor.
++      sig { returns(Pathname) }
++      def schemas_path
++        if @schemas_path.nil?
++          @schemas_path = Pathname.new(__dir__).parent.parent.parent.parent.parent.parent / "spec" / "schemas"
++        end
++        T.must(@schemas_path)
++      end
++
++      # Lazy map from schema filename -> version string, built by reading the $id
++      # field from each schema file (e.g. 'csr_schema.json' -> 'v0.1').
++      sig { returns(T::Hash[String, String]) }
++      def schema_version_map
++        if @schema_version_map.nil?
++          version_map = T.let({}, T::Hash[String, String])
++          if schemas_path.exist?
++            schemas_path.glob("*.json").each do |schema_file|
++              next if schema_file.basename.to_s == "json-schema-draft-07.json"
++
++              begin
++                schema_data = JSON.parse(schema_file.read)
++                version = schema_data["$id"]
++                version_map[schema_file.basename.to_s] = version if version.is_a?(String) && !version.start_with?("http")
++              rescue StandardError
++                # Silently skip files that can't be parsed
++              end
++            end
++          end
++          @schema_version_map = version_map
++        end
++        T.must(@schema_version_map)
++      end
++
++      # Rewrite a bare schema URI to include the version prefix recorded in $id.
++      # For example, 'csr_schema.json#' becomes 'v0.1/csr_schema.json#'.
++      # URIs that already contain a '/' in the base are returned unchanged.
++      sig { params(uri: String).returns(String) }
++      def versioned_schema_uri(uri)
++        fragment_sep = uri.index("#")
++        if fragment_sep
++          base = T.must(uri[0...fragment_sep])
++          fragment = T.must(uri[fragment_sep..])
++        else
++          base = uri
++          fragment = ""
++        end
++
++        # Already has a version prefix
++        return uri if base.include?("/")
++
++        version = schema_version_map[base]
++        version ? "#{version}/#{base}#{fragment}" : uri
+       end
+ 
+       sig {
+@@ -233,6 +297,19 @@ def write_resolved_file(rel_path, input_dir, output_dir, no_checks)
+ 
+         resolved_obj["$source"] = (input_dir / rel_path).realpath.to_s
+ 
++        # Phase 1: Validate against bare (unversioned) $schema URI before rewriting.
++        # Source files use bare names like 'csr_schema.json#', so the schema enum
++        # only needs to list bare names.
++        if !no_checks && resolved_obj.key?("$schema")
++          validate_against_schema(resolved_obj, rel_path)
++        end
++
++        # Phase 2: Rewrite $schema to include the version prefix so the output
++        # file records the exact schema version used (e.g. 'v0.1/csr_schema.json#').
++        if resolved_obj.key?("$schema")
++          resolved_obj["$schema"] = versioned_schema_uri(resolved_obj["$schema"])
++        end
++
+         FileUtils.mkdir_p(output_path.dirname)
+ 
+         emitter = PreservingEmitter.new(comments)
+@@ -443,7 +520,7 @@ def walk_for_parent_of(obj, path, doc_root, rel_path)
+         if obj.key?("$child_of")
+           child_of = obj["$child_of"]
+           targets = child_of.is_a?(Array) ? child_of : [child_of]
+-          child_ref = path.empty? ? rel_path : "#{rel_path}#/#{path.join("/")}"
++          child_ref = path.empty? ? "#{rel_path}#/" : "#{rel_path}#/#{path.join("/")}"
+ 
+           targets.each do |target|
+             next unless target.is_a?(String)
+@@ -909,6 +986,54 @@ def build_line_file_offsets(idl_string, first_line_file_offset, file_contents)
+ 
+         offsets
+       end
++
++      # Validate +resolved_obj+ against its bare $schema URI.
++      # Uses the unversioned schema name so that schema enums listing bare names
++      # (e.g. 'csr_schema.json#') match even when $schema contains a version prefix.
++      sig {
++        params(
++          resolved_obj: T::Hash[String, T.untyped],
++          rel_path: String
++        ).void
++      }
++      def validate_against_schema(resolved_obj, rel_path)
++        schema_uri = resolved_obj["$schema"]
++        schema_file = schema_uri.split("#").first
++        schema_basename = File.basename(T.must(schema_file))
++        schema_path = schemas_path / schema_basename
++
++        unless schema_path.exist?
++          Udb.logger.warn "Schema file not found: #{schema_path}" unless @quiet
++          return
++        end
++
++        ref_resolver = proc do |uri|
++          local_path = schemas_path / File.basename(uri.to_s)
++          JSON.parse(local_path.read)
++        end
++
++        schema = JSONSchemer.schema(
++          JSON.parse(schema_path.read),
++          regexp_resolver: "ecma",
++          ref_resolver: ref_resolver,
++          insert_property_defaults: false
++        )
++
++        # Convert through JSON to normalize YAML-specific types (e.g. integer keys)
++        jsonified_obj = JSON.parse(JSON.generate(resolved_obj))
++
++        # Normalize $schema to bare name so the schema enum matches bare refs
++        if jsonified_obj.key?("$schema")
++          bare_schema = File.basename(T.must(jsonified_obj["$schema"].split("#").first)) + "#"
++          jsonified_obj["$schema"] = bare_schema
++        end
++
++        unless schema.valid?(jsonified_obj)
++          errors = schema.validate(jsonified_obj).to_a
++          error_msgs = errors.map { |e| "  - #{e["data_pointer"]}: #{e["type"]}" }.join("\n")
++          raise "Schema validation failed for #{rel_path}:\n#{error_msgs}"
++        end
++      end
+     end
+   end
+ end
+diff --git a/tools/ruby-gems/udb/python/yaml_resolver.py b/tools/ruby-gems/udb/python/yaml_resolver.py
+new file mode 100644
+index 0000000000..41fc7a115b
+--- /dev/null
++++ b/tools/ruby-gems/udb/python/yaml_resolver.py
+@@ -0,0 +1,797 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++import argparse
++import glob
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++from copy import deepcopy
++from pathlib import Path
++
++from jsonschema import Draft7Validator, validators
++from jsonschema.exceptions import ValidationError, best_match
++from mergedeep import Strategy, merge
++from referencing import Registry, Resource
++from ruamel.yaml import YAML
++from tqdm.auto import tqdm
++
++# cache of Schema validators
++schemas = {}
++
++
++def udb_root(d):
++    return d if os.path.exists(os.path.join(d, "do")) else udb_root(os.path.dirname(d))
++
++
++UDB_ROOT = (
++    udb_root(os.path.dirname(os.path.realpath(__file__)))
++    if os.getenv("UDB_ROOT") == None
++    else os.getenv("UDB_ROOT")
++)
++
++SCHEMAS_PATH = Path(os.path.join(UDB_ROOT, "spec", "schemas"))
++
++
++# Map from schema filename -> version string, built by reading the $id field from each schema.
++# e.g. 'csr_schema.json' -> 'v0.1'
++_SCHEMA_VERSION_MAP: dict[str, str] = {}
++for _entry in SCHEMAS_PATH.iterdir():
++    if _entry.suffix == ".json" and _entry.name != "json-schema-draft-07.json":
++        try:
++            _schema_data = json.loads(_entry.read_text())
++            _version = _schema_data.get("$id")
++            if _version:
++                _SCHEMA_VERSION_MAP[_entry.name] = _version
++        except Exception:
++            pass
++
++
++def _versioned_schema_uri(uri: str) -> str:
++    """Rewrite a bare schema URI to include the version prefix.
++
++    For example, 'csr_schema.json#' becomes 'v0.1/csr_schema.json#' (where v0.1
++    is the version recorded in the $id field of csr_schema.json).
++    URIs that already contain a version prefix are returned unchanged.
++    """
++    fragment_sep = uri.find("#")
++    if fragment_sep == -1:
++        base, fragment = uri, ""
++    else:
++        base, fragment = uri[:fragment_sep], uri[fragment_sep:]
++    # If the base already contains a '/', it already has a version prefix
++    if "/" in base:
++        return uri
++    version = _SCHEMA_VERSION_MAP.get(base)
++    if version:
++        return f"{version}/{base}{fragment}"
++    return uri
++
++
++def retrieve_from_filesystem(uri: str):
++    # The referencing library resolves relative $ref values against the schema's $id.
++    # Since $id is now just the version string (e.g. "v0.1"), relative refs like
++    # "schema_defs.json" resolve to just "schema_defs.json" (no prefix).
++    # We look up the file directly in SCHEMAS_PATH.
++    path = SCHEMAS_PATH / Path(uri)
++    if not path.exists():
++        # Fall back to just the filename at the root level.
++        path = SCHEMAS_PATH / Path(uri).name
++    contents = json.loads(path.read_text())
++    return Resource.from_contents(contents)
++
++
++registry = Registry(retrieve=retrieve_from_filesystem)
++
++
++# extend the validator to support default values
++# https://python-jsonschema.readthedocs.io/en/stable/faq/#why-doesn-t-my-schema-s-default-property-set-the-default-on-my-instance
++def extend_with_default(validator_class):
++    """Extends the jsonschema validator to support default values.
++
++    Parameters
++    ----------
++    validator_class : jsonschema.Draft7Validator
++        The validator class to extend.
++
++    Returns
++    -------
++    jsonschema.Draft7Validator
++        The extended validator class that will fill in default values
++    """
++
++    validate_properties = validator_class.VALIDATORS["properties"]
++
++    def set_defaults(validator, properties, instance, schema):
++        for prop, subschema in properties.items():
++            if not isinstance(subschema, dict):
++                continue
++            if "default" in subschema:
++                instance.setdefault(prop, subschema["default"])
++
++        yield from validate_properties(
++            validator,
++            properties,
++            instance,
++            schema,
++        )
++
++    return validators.extend(
++        validator_class,
++        {"properties": set_defaults},
++    )
++
++
++DefaultValidatingValidator = extend_with_default(Draft7Validator)
++
++yaml = YAML(typ="rt")
++yaml.default_flow_style = False
++yaml.preserve_quotes = True
++
++
++def _merge_patch(base: dict, patch: dict, path_so_far=None) -> None:
++    """merges patch into base according to JSON Merge Patch (RFC 7386)
++
++    Parameters
++    ----------
++    base : dict
++      The base object, which will be altered by the patch
++    patch : dict
++      The patch object
++    path_so_far : list
++      The current dict key path within patch
++    """
++    if path_so_far is None:
++        path_so_far = []
++
++    patch_obj = patch if len(path_so_far) == 0 else dig(patch, *path_so_far)
++    for key, patch_value in patch_obj.items():
++        if isinstance(patch_value, dict):
++            # continue to dig
++            _merge_patch(base, patch, (path_so_far + [key]))
++        else:
++            base_ptr = dig(base, *path_so_far)
++            base_value = dig(base_ptr, key)
++            if patch_value == None:
++                # remove from base, if it exists
++                if base_value != None:
++                    base_ptr.pop(key)
++            else:
++                if base_ptr == None:
++                    # add or overwrite value in base
++                    base_ptr = base
++                    for k in path_so_far:
++                        if k not in base_ptr:
++                            base_ptr[k] = {}
++                        base_ptr = base_ptr[k]
++                    base_ptr = dig(base, *path_so_far)
++                base_ptr[key] = patch_value
++
++
++def json_merge_patch(base_obj: dict, patch: dict) -> dict:
++    """merges patch into base according to JSON Merge Patch (RFC 7386)
++
++    Parameters
++    ----------
++    base : dict
++      The base object, which will be altered by the patch
++    patch : dict
++      The patch object
++
++    Returns
++    -------
++    dict
++      base_obj, now with the patch applied
++    """
++    _merge_patch(base_obj, patch, [])
++    return base_obj
++
++
++def read_yaml(file_path: str | Path):
++    """Read a YAML file from file_path and return the parsed content
++
++    Parameters
++    ----------
++    file_path : str, Path
++      Filesystem path to the YAML file
++
++    Returns
++    -------
++    dict, list
++      The object represented in the YAML file
++    """
++    with open(file_path) as file:
++        data = yaml.load(file)
++    return data
++
++
++def write_yaml(file_path: str | Path, data):
++    """Write data as YAML to file_path
++
++    Parameters
++    ----------
++    file_path : str, Path
++      Filesystem path to the YAML file
++    data : dict, list
++      The object to write as YAML
++    """
++    with open(file_path, "w") as file:
++        yaml.dump(data, file)
++        file.close()
++
++
++def write_json(file_path: str | Path, data):
++    """Write data as JSON to file_path
++
++    Parameters
++    ----------
++    file_path : str, Path
++      Filesystem path to the JSON file
++    data : dict, list
++      The object to write as JSON
++    """
++    with open(file_path, "w") as file:
++        json.dump(data, file)
++        file.close()
++
++
++def dig(obj: dict, *keys):
++    """Digs data out of dictionary obj
++
++    Parameters
++    ----------
++    obj : dict
++      A dictionary
++    *keys
++      A list of obj keys
++
++    Returns
++    -------
++    Any
++      The value of obj[keys[0]][keys[1]]...[keys[-1]]
++    """
++    if obj == None:
++        return None
++
++    if len(keys) == 0:
++        return obj
++
++    try:
++        next_obj = obj[keys[0]]
++        if len(keys) == 1:
++            return next_obj
++        else:
++            if not isinstance(next_obj, dict):
++                raise ValueError(f"Not a hash: {keys}")
++            return dig(next_obj, *keys[1:])
++    except KeyError:
++        return None
++
++
++resolved_objs = {}
++
++
++def resolve(
++    rel_path: str | Path, arch_root: str | Path, do_checks: bool, compile_idl: bool
++) -> dict:
++    """Resolve the file at arch_root/rel_path by expanding operators and applying defaults
++
++    Parameters
++    ----------
++    rel_path : str, Path
++      The relative path, from arch_root, to the file to resolve
++    arch_root : str, Path
++      The root of the architecture
++
++    Returns
++    -------
++    dict
++      The resolved object
++    """
++    if str(rel_path) in resolved_objs:
++        return resolved_objs[str(rel_path)]
++    else:
++        unresolved_arch_data = read_yaml(os.path.join(arch_root, rel_path))
++        if do_checks and ("name" not in unresolved_arch_data):
++            print(f"ERROR: Missing 'name' key in {arch_root}/{rel_path}", file=sys.stderr)
++            exit(1)
++        fn_name = Path(rel_path).stem
++        if do_checks and (fn_name != unresolved_arch_data["name"]):
++            print(
++                f"ERROR: 'name' key ({unresolved_arch_data['name']}) must match filename ({fn_name}) in {arch_root}/{rel_path}",
++                file=sys.stderr,
++            )
++            exit(1)
++        resolved_objs[str(rel_path)] = _resolve(
++            unresolved_arch_data,
++            [],
++            rel_path,
++            unresolved_arch_data,
++            arch_root,
++            do_checks,
++            compile_idl,
++        )
++        return resolved_objs[str(rel_path)]
++
++
++def _resolve(obj, obj_path, obj_file_path, doc_obj, arch_root, do_checks, compile_idl):
++    if not isinstance(obj, (list, dict)):
++        return obj
++
++    if isinstance(obj, list):
++        obj = list(
++            map(
++                lambda o: _resolve(
++                    o,
++                    obj_path,
++                    obj_file_path,
++                    doc_obj,
++                    arch_root,
++                    do_checks,
++                    compile_idl,
++                ),
++                obj,
++            )
++        )
++        return obj
++
++    if "$inherits" in obj:
++        # handle the inherits key first so that any override will have priority
++        inherits_targets = (
++            [obj["$inherits"]] if isinstance(obj["$inherits"], str) else obj["$inherits"]
++        )
++        obj["$child_of"] = obj["$inherits"]
++        del obj["$inherits"]
++
++        parent_obj = yaml.load("{}")
++
++        for inherits_target in inherits_targets:
++            ref_file_path = inherits_target.split("#")[0]
++            ref_obj_path = inherits_target.split("#")[1].split("/")[1:]
++
++            ref_obj = None
++            if ref_file_path == "":
++                ref_file_path = obj_file_path
++                # this is a reference in the same document
++                ref_obj = dig(doc_obj, *ref_obj_path)
++                if ref_obj == None:
++                    raise ValueError(f"{ref_obj_path} cannot be found in #{doc_obj}")
++                ref_obj = _resolve(
++                    ref_obj,
++                    ref_obj_path,
++                    ref_file_path,
++                    doc_obj,
++                    arch_root,
++                    do_checks,
++                    compile_idl,
++                )
++            else:
++                # this is a reference to another doc
++                if not os.path.exists(os.path.join(arch_root, ref_file_path)):
++                    raise ValueError(f"{ref_file_path} does not exist in {arch_root}/")
++
++                ref_doc_obj = resolve(ref_file_path, arch_root, do_checks, compile_idl)
++                ref_obj = dig(ref_doc_obj, *ref_obj_path)
++
++                ref_obj = _resolve(
++                    ref_obj,
++                    ref_obj_path,
++                    ref_file_path,
++                    ref_doc_obj,
++                    arch_root,
++                    do_checks,
++                    compile_idl,
++                )
++
++            for key in ref_obj:
++                if key == "$parent_of" or key == "$child_of":
++                    continue  # we don't propagate $parent_of / $child_of
++                if isinstance(parent_obj.get(key), dict):
++                    merge(parent_obj[key], ref_obj[key], strategy=Strategy.REPLACE)
++                else:
++                    parent_obj[key] = deepcopy(ref_obj[key])
++
++            if "$parent_of" in ref_obj:
++                if isinstance(ref_obj["$parent_of"], list):
++                    ref_obj["$parent_of"].append(f"{obj_file_path}#/{'/'.join(obj_path)}")
++                else:
++                    ref_obj["$parent_of"] = [
++                        ref_obj["$parent_of"],
++                        f"{obj_file_path}#/{'/'.join(obj_path)}",
++                    ]
++            else:
++                ref_obj["$parent_of"] = f"{obj_file_path}#/{'/'.join(obj_path)}"
++
++        # now parent_obj is the child and obj is the parent
++        # merge them
++        keys = []
++        for key in obj.keys():
++            keys.append(key)
++        for key in parent_obj.keys():
++            if keys.count(key) == 0:
++                keys.append(key)
++
++        final_obj = yaml.load("{}")
++        for key in keys:
++            if key not in obj:
++                final_obj[key] = parent_obj[key]
++            elif key not in parent_obj:
++                final_obj[key] = _resolve(
++                    obj[key],
++                    obj_path + [key],
++                    obj_file_path,
++                    doc_obj,
++                    arch_root,
++                    do_checks,
++                    compile_idl,
++                )
++            else:
++                if isinstance(parent_obj[key], dict):
++                    final_obj[key] = merge(
++                        yaml.load("{}"),
++                        parent_obj[key],
++                        _resolve(
++                            obj[key],
++                            obj_path + [key],
++                            obj_file_path,
++                            doc_obj,
++                            arch_root,
++                            do_checks,
++                            compile_idl,
++                        ),
++                        strategy=Strategy.REPLACE,
++                    )
++                else:
++                    final_obj[key] = _resolve(
++                        obj[key],
++                        obj_path + [key],
++                        obj_file_path,
++                        doc_obj,
++                        arch_root,
++                        do_checks,
++                        compile_idl,
++                    )
++
++        if "$remove" in final_obj:
++            if isinstance(final_obj["$remove"], list):
++                for key in final_obj["$remove"]:
++                    if key in final_obj:
++                        del final_obj[key]
++            else:
++                if final_obj["$remove"] in final_obj:
++                    del final_obj[final_obj["$remove"]]
++            del final_obj["$remove"]
++
++        return final_obj
++    else:
++        for key in obj:
++            obj[key] = _resolve(
++                obj[key],
++                obj_path + [key],
++                obj_file_path,
++                doc_obj,
++                arch_root,
++                do_checks,
++                compile_idl,
++            )
++
++        if "$remove" in obj:
++            if isinstance(obj["$remove"], list):
++                for key in obj["$remove"]:
++                    if key in obj:
++                        del obj[key]
++            else:
++                if obj["$remove"] in obj:
++                    del obj[obj["$remove"]]
++            del obj["$remove"]
++
++        if compile_idl:
++            idl_keys = {key for key in obj.keys() if key.endswith("()")}
++            for key in idl_keys:
++                if key != "sail()" and key.endswith("()") and obj[key]:
++                    r = (
++                        "instruction_operation"
++                        if key == "operation()"
++                        else ("constraint_body" if key == "idl()" else "function_body")
++                    )
++                    with (
++                        tempfile.NamedTemporaryFile(
++                            mode="w+t", delete=True, suffix=".idl"
++                        ) as temp_file,
++                        tempfile.NamedTemporaryFile(mode="w+", delete=True) as ast_tmp_file,
++                    ):
++                        temp_file.write(obj[key] + "\n")
++                        temp_file.flush()
++                        result = subprocess.run(
++                            f"./bin/idlc compile --format yaml --root {r} {temp_file.name} -o {ast_tmp_file.name}",
++                            shell=True,
++                            capture_output=True,
++                            text=True,
++                        )
++                        if result.returncode != 0:
++                            print(
++                                f"ERROR: Failed to compile {obj_file_path}::{obj_path}::{key}: {result.stderr}",
++                                file=sys.stderr,
++                            )
++                            exit(1)
++                        obj[key[:-2] + "_ast"] = read_yaml(ast_tmp_file.name)
++
++        return obj
++
++
++def merge_file(
++    rel_path: str | Path,
++    arch_dir: str | Path,
++    overlay_dir: str | Path | None,
++    merge_dir: str | Path,
++) -> None:
++    """pick the right file(s) to merge, and write the result to merge_dir
++
++    Parameters
++    ----------
++    rel_path : str, Path
++      Relative path, from arch_dir, to base file
++    arch_dir : str, Path
++      Absolute path to arch dir with base files
++    overlay_dir : str, Path, None
++      Absolute path to overlay dir with overlay files
++    merge_dir : str, Path
++      Absolute path to merge dir, where the merged file will be written
++    """
++    arch_path = overlay_path = None
++
++    if arch_dir != None:
++        arch_path = os.path.join(arch_dir, rel_path)
++    if overlay_dir != None:
++        overlay_path = os.path.join(overlay_dir, rel_path)
++    merge_path = os.path.join(merge_dir, rel_path)
++    if not os.path.exists(arch_path) and (overlay_path == None or not os.path.exists(overlay_path)):
++        # neither exist
++        if not os.path.exists(merge_path):
++            raise "Script error: no path exists"
++
++        # remove the merged file
++        os.remove(merge_path)
++    elif overlay_path == None or not os.path.exists(overlay_path):
++        if arch_path == None:
++            raise "Must supply with arch_path or overlay_path"
++
++        # no overlay, just copy arch
++        if not os.path.exists(merge_path) or (
++            os.path.getmtime(arch_path) > os.path.getmtime(merge_path)
++        ):
++            shutil.copyfile(os.path.join(arch_dir, rel_path), merge_path)
++    elif not os.path.exists(arch_path):
++        if overlay_path == None or not os.path.exists(overlay_path):
++            raise "Must supply with arch_path or overlay_path"
++
++        # no arch, just copy overlay
++        if not os.path.exists(merge_path) or (
++            os.path.getmtime(overlay_path) > os.path.getmtime(merge_path)
++        ):
++            shutil.copyfile(os.path.join(overlay_dir, rel_path), merge_path)
++    else:
++        # both exist, merge
++        if (
++            not os.path.exists(merge_path)
++            or (os.path.getmtime(overlay_path) > os.path.getmtime(merge_path))
++            or (os.path.getmtime(arch_path) > os.path.getmtime(merge_path))
++        ):
++            arch_obj = read_yaml(os.path.join(arch_dir, rel_path))
++            overlay_obj = read_yaml(os.path.join(overlay_dir, rel_path))
++
++            write_yaml(
++                os.path.join(merge_dir, rel_path),
++                json_merge_patch(arch_obj, overlay_obj),
++            )
++
++
++class SchemaNotFoundException(Exception):
++    pass
++
++
++def _get_schema(uri):
++    # Strip version prefix (e.g. 'v0.1/csr_schema.json#' -> 'csr_schema.json')
++    rel_path = uri.split("#")[0]
++    if "/" in rel_path:
++        rel_path = rel_path.split("/", 1)[1]
++
++    if rel_path in schemas:
++        return schemas[rel_path]
++
++    abs_path = os.path.join(SCHEMAS_PATH, rel_path)
++    if not os.path.exists(abs_path):
++        raise SchemaNotFoundException(f"Schema not found: {uri}")
++
++    # Open the JSON file
++    with open(abs_path) as f:
++        # Load the JSON data into a Python dictionary
++        schema_obj = json.load(f)
++        f.close()
++
++    schemas[rel_path] = DefaultValidatingValidator(schema_obj, registry=registry)
++    return schemas[rel_path]
++
++
++def resolve_file(
++    rel_path: str | Path,
++    arch_dir: str | Path,
++    resolved_dir: str | Path,
++    do_checks: bool,
++    compile_idl: bool,
++):
++    """Read object at arch_dir/rel_path, resolve it, and write it as YAML to resolved_dir/rel_path
++
++    Parameters
++    ----------
++    rel_path : str | Path
++      Path to file relative to arch_dir
++    arch_dir : str | Path
++      Absolute path to arch directory
++    resolved_dir : str | Path
++      Directory to write the resolved file to
++    """
++    arch_path = os.path.join(arch_dir, rel_path)
++    resolved_path = os.path.join(resolved_dir, rel_path)
++    if not os.path.exists(arch_path):
++        if os.path.exists(resolved_path):
++            os.remove(resolved_path)
++    elif (
++        not os.path.exists(resolved_path)
++        or (os.path.getmtime(arch_path) > os.path.getmtime(resolved_path))
++        or (os.path.getmtime(__file__) > os.path.getmtime(resolved_path))
++    ):
++        if os.path.exists(resolved_path):
++            os.remove(resolved_path)
++        resolved_obj = resolve(rel_path, args.arch_dir, do_checks, compile_idl)
++        resolved_obj["$source"] = os.path.join(args.arch_dir, rel_path)
++
++        # since already-resolved objects may be updated later with inheritance breadcrumbs ($parent_of),
++        # we can't write the file yet.
++
++
++def write_resolved_file_and_validate(
++    rel_path: str | Path, resolved_dir: str | Path, do_checks: bool, compile_idl: bool
++):
++    resolved_path = os.path.join(resolved_dir, rel_path)
++    resolved_obj = resolve(rel_path, args.arch_dir, do_checks, compile_idl)
++    resolved_obj["$source"] = os.path.join(args.arch_dir, rel_path)
++
++    # Validate against the schema using the bare (unversioned) $schema URI, before
++    # rewriting it to the versioned form.  This way the schema enum only needs to
++    # list the bare name (e.g. 'csr_schema.json#') and source data files use that form.
++    if do_checks and ("$schema" in resolved_obj):
++        schema = _get_schema(resolved_obj["$schema"])
++        try:
++            schema.validate(instance=resolved_obj)
++        except ValidationError:
++            print(f"JSON Schema Validation Error for {rel_path}:")
++            print(best_match(schema.iter_errors(resolved_obj)).message)
++            exit(1)
++
++    # Rewrite the $schema field to include the version prefix, so the written file
++    # records the exact schema version that was used (e.g. 'v0.1/csr_schema.json#').
++    if "$schema" in resolved_obj:
++        resolved_obj["$schema"] = _versioned_schema_uri(resolved_obj["$schema"])
++
++    write_yaml(resolved_path, resolved_obj)
++
++    os.chmod(resolved_path, 0o666)
++
++
++if __name__ == "__main__":
++    cmdparser = argparse.ArgumentParser(
++        prog="yaml_resolver.py",
++        description="Resolves/overlays UDB architecture YAML files",
++    )
++    subparsers = cmdparser.add_subparsers(dest="command", help="sub-command help")
++    merge_parser = subparsers.add_parser("merge", help="Merge overlay on top of architecture files")
++    merge_parser.add_argument(
++        "arch_dir", type=str, help="Unresolved architecture (input) directory"
++    )
++    merge_parser.add_argument("overlay_dir", type=str, help="Overlay directory")
++    merge_parser.add_argument("merged_dir", type=str, help="Merged architecture (output) directory")
++    merge_parser.add_argument("--udb_root", type=str, help="Root of the UDB repo", default=UDB_ROOT)
++
++    all_parser = subparsers.add_parser("resolve", help="Resolve all architecture files")
++    all_parser.add_argument("arch_dir", type=str, help="Unresolved architecture (input) directory")
++    all_parser.add_argument(
++        "resolved_dir", type=str, help="Resolved architecture (output) directory"
++    )
++    all_parser.add_argument("--no-progress", action="store_true", help="Don't display progress bar")
++    all_parser.add_argument("--no-checks", action="store_true", help="Don't verify schema")
++    all_parser.add_argument("--udb_root", type=str, help="Root of the UDB repo", default=UDB_ROOT)
++    all_parser.add_argument(
++        "--compile_idl",
++        action="store_true",
++        help="Compile idl code and insert it in the resolved files",
++    )
++
++    args = cmdparser.parse_args()
++
++    if args.command == "merge":
++        arch_paths = glob.glob("**/*.yaml", recursive=True, root_dir=args.arch_dir)
++        if args.overlay_dir != None:
++            overlay_paths = glob.glob("**/*.yaml", recursive=True, root_dir=args.overlay_dir)
++            arch_paths.extend(overlay_paths)
++            arch_paths = list(set(arch_paths))
++        merged_paths = glob.glob("**/*.yaml", recursive=True, root_dir=args.merged_dir)
++        arch_paths.extend(merged_paths)
++        arch_paths = list(set(arch_paths))
++
++        for arch_path in tqdm(
++            arch_paths,
++            ascii=True,
++            desc="Merging arch",
++            file=sys.stderr,
++        ):
++            merged_arch_path = (
++                os.path.join(args.merged_dir, arch_path)
++                if os.path.isabs(args.merged_dir)
++                else os.path.join(args.udb_root, args.merged_dir, arch_path)
++            )
++            os.makedirs(os.path.dirname(merged_arch_path), exist_ok=True)
++            merge_file(arch_path, args.arch_dir, args.overlay_dir, args.merged_dir)
++
++        print(
++            f"[INFO] Merged architecture files written to {args.merged_dir}",
++            file=sys.stderr,
++        )
++
++    elif args.command == "resolve":
++        arch_paths = glob.glob("*/**/*.yaml", recursive=True, root_dir=args.arch_dir)
++        if os.path.exists(args.resolved_dir):
++            resolved_paths = glob.glob("*/**/*.yaml", recursive=True, root_dir=args.resolved_dir)
++            arch_paths.extend(resolved_paths)
++            arch_paths = list(set(arch_paths))
++        path_iter = (
++            arch_paths
++            if args.no_progress
++            else tqdm(
++                arch_paths,
++                ascii=True,
++                desc="Resolving arch",
++                file=sys.stderr,
++            )
++        )
++        abs_resolved_dir = (
++            f"{args.udb_root}/{args.resolved_dir}"
++            if not os.path.isabs(args.resolved_dir)
++            else f"{args.resolved_dir}"
++        )
++        for arch_path in path_iter:
++            resolved_arch_path = f"{abs_resolved_dir}/{arch_path}"
++            os.makedirs(os.path.dirname(resolved_arch_path), exist_ok=True)
++            resolve_file(
++                arch_path,
++                args.arch_dir,
++                args.resolved_dir,
++                not args.no_checks,
++                args.compile_idl,
++            )
++        it = (
++            arch_paths
++            if args.no_progress
++            else tqdm(
++                arch_paths,
++                ascii=True,
++                desc="Validating arch",
++                file=sys.stderr,
++            )
++        )
++        for arch_path in it:
++            write_resolved_file_and_validate(
++                arch_path, args.resolved_dir, not args.no_checks, args.compile_idl
++            )
++
++        # create index
++        write_yaml(f"{abs_resolved_dir}/index.yaml", arch_paths)
++        write_json(f"{abs_resolved_dir}/index.json", arch_paths)
++
++        print(
++            f"[INFO] Resolved architecture files written to {args.resolved_dir}",
++            file=sys.stderr,
++        )
+diff --git a/tools/ruby-gems/udb/test/test_schema_versioning.rb b/tools/ruby-gems/udb/test/test_schema_versioning.rb
+new file mode 100644
+index 0000000000..5cf711e2e2
+--- /dev/null
++++ b/tools/ruby-gems/udb/test/test_schema_versioning.rb
+@@ -0,0 +1,301 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# typed: false
++# frozen_string_literal: true
++
++require_relative "test_helper"
++
++require "fileutils"
++require "json"
++require "tmpdir"
++
++require "udb/resolver"
++require "udb/obj/database_obj"
++
++# Tests for the per-schema versioning changes introduced in the schema_versioning
++# branch.  Coverage targets:
++#
++#   Udb::Resolver#resolve_schemas
++#     - writes gen/schemas/<schema_name>/<version>/<schema_name>
++#     - sets $id to the full canonical URL
++#     - skips json-schema-draft-07.json
++#     - skips schema files with no $id
++#
++#   Udb::TopLevelDatabaseObject.create_json_schemer_resolver
++#     - resolves relative $ref values (e.g. "schema_defs.json") from schemas_path
++#
++#   Udb::TopLevelDatabaseObject#validate
++#     - accepts a bare $schema value ("ext_schema.json#")
++#     - accepts a versioned $schema value ("v0.1/ext_schema.json#")
++#     - raises SchemaValidationError for invalid data
++#     - raises SchemaError for a bad schema file
++
++class TestSchemaVersioning < Minitest::Test
++  include Udb
++
++  UDB_GEM_ROOT = (Pathname.new(__dir__) / "..").realpath
++  SCHEMAS_PATH = UDB_GEM_ROOT / "schemas"
++
++  # ── helpers ──────────────────────────────────────────────────────────────────
++
++  def make_resolver(gen_path)
++    Udb::Resolver.new(
++      schemas_path_override: SCHEMAS_PATH,
++      cfgs_path_override: UDB_GEM_ROOT / "test" / "mock_cfgs",
++      gen_path_override: gen_path,
++      std_path_override: UDB_GEM_ROOT / "test" / "mock_spec" / "isa",
++      quiet: true
++    )
++  end
++
++  # Minimal valid extension data (matches ext_schema.json)
++  def valid_ext_data(schema_ref = "ext_schema.json#")
++    {
++      "$schema" => schema_ref,
++      "kind" => "extension",
++      "name" => "Xtest",
++      "type" => "unprivileged",
++      "long_name" => "Test extension",
++      "versions" => [
++        {
++          "version" => "1.0.0",
++          "state" => "ratified",
++          "ratification_date" => "2024-01"
++        }
++      ],
++      "description" => "A test extension."
++    }
++  end
++
++  def make_obj(data, gen_path)
++    resolver = make_resolver(gen_path)
++    capture_io { resolver.cfg_arch_for("_") }
++    arch = resolver.cfg_arch_for("_")
++    Udb::TopLevelDatabaseObject.new(data, Pathname.new("/fake/path.yaml"), arch)
++  end
++
++  # ── Resolver#resolve_schemas ──────────────────────────────────────────────────
++
++  def test_resolve_schemas_creates_per_schema_directories
++    Dir.mktmpdir do |tmpdir|
++      gen_path = Pathname.new(tmpdir)
++      resolver = make_resolver(gen_path)
++      resolver.resolve_schemas
++
++      # Every schema with a $id should produce a versioned output file
++      SCHEMAS_PATH.glob("*.json").each do |src|
++        next if src.basename.to_s == "json-schema-draft-07.json"
++        data = JSON.parse(src.read)
++        next unless data.key?("$id")
++
++        schema_name = src.basename.to_s
++        version = data["$id"]
++        out = gen_path / "schemas" / schema_name / version / schema_name
++        assert out.exist?, "Expected resolved schema at #{out}"
++      end
++    end
++  end
++
++  def test_resolve_schemas_sets_full_id_url
++    Dir.mktmpdir do |tmpdir|
++      gen_path = Pathname.new(tmpdir)
++      resolver = make_resolver(gen_path)
++      resolver.resolve_schemas
++
++      out = gen_path / "schemas" / "ext_schema.json" / "v0.1" / "ext_schema.json"
++      assert out.exist?
++      resolved = JSON.parse(out.read)
++      assert_equal(
++        "#{Udb::Resolver::SCHEMAS_BASE_URL}/ext_schema.json/v0.1/ext_schema.json",
++        resolved["$id"]
++      )
++    end
++  end
++
++  def test_resolve_schemas_skips_draft07_meta_schema
++    Dir.mktmpdir do |tmpdir|
++      gen_path = Pathname.new(tmpdir)
++      resolver = make_resolver(gen_path)
++      resolver.resolve_schemas
++
++      refute (gen_path / "schemas" / "json-schema-draft-07.json").exist?,
++             "json-schema-draft-07.json should not be resolved"
++    end
++  end
++
++  def test_resolve_schemas_skips_files_without_id
++    Dir.mktmpdir do |tmpdir|
++      gen_path = Pathname.new(tmpdir)
++
++      # Create a temporary schemas dir with one schema that has no $id
++      fake_schemas = Pathname.new(tmpdir) / "fake_schemas"
++      fake_schemas.mkpath
++      (fake_schemas / "no_id_schema.json").write(JSON.generate({ "type" => "object" }))
++      # Also copy a real schema so the resolver has something to work with
++      FileUtils.cp(SCHEMAS_PATH / "json-schema-draft-07.json", fake_schemas)
++
++      resolver = Udb::Resolver.new(
++        schemas_path_override: fake_schemas,
++        cfgs_path_override: UDB_GEM_ROOT / "test" / "mock_cfgs",
++        gen_path_override: gen_path,
++        std_path_override: UDB_GEM_ROOT / "test" / "mock_spec" / "isa",
++        quiet: true
++      )
++      resolver.resolve_schemas
++
++      refute (gen_path / "schemas" / "no_id_schema.json").exist?,
++             "Schema without $id should not produce output"
++    end
++  end
++
++  def test_resolve_schemas_preserves_other_fields
++    Dir.mktmpdir do |tmpdir|
++      gen_path = Pathname.new(tmpdir)
++      resolver = make_resolver(gen_path)
++      resolver.resolve_schemas
++
++      src = JSON.parse((SCHEMAS_PATH / "ext_schema.json").read)
++      out = JSON.parse((gen_path / "schemas" / "ext_schema.json" / "v0.1" / "ext_schema.json").read)
++
++      # All keys except $id should be preserved
++      (src.keys - ["$id"]).each do |key|
++        assert_equal src[key], out[key], "Field '#{key}' should be preserved in resolved schema"
++      end
++    end
++  end
++
++  # ── TopLevelDatabaseObject#validate — $schema handling ───────────────────────
++
++  def test_validate_accepts_bare_schema_ref
++    Dir.mktmpdir do |tmpdir|
++      obj = make_obj(valid_ext_data("ext_schema.json#"), Pathname.new(tmpdir))
++      resolver = make_resolver(Pathname.new(tmpdir))
++      # Should not raise
++      obj.validate(resolver)
++    end
++  end
++
++  def test_validate_accepts_versioned_schema_ref
++    Dir.mktmpdir do |tmpdir|
++      obj = make_obj(valid_ext_data("v0.1/ext_schema.json#"), Pathname.new(tmpdir))
++      resolver = make_resolver(Pathname.new(tmpdir))
++      # Should not raise — version prefix is stripped before validation
++      obj.validate(resolver)
++    end
++  end
++
++  def test_validate_raises_for_invalid_data
++    Dir.mktmpdir do |tmpdir|
++      # Drop a required field to trigger a SchemaValidationError
++      bad_data = valid_ext_data.reject { |k, _| k == "long_name" }
++      obj = make_obj(bad_data, Pathname.new(tmpdir))
++      resolver = make_resolver(Pathname.new(tmpdir))
++      assert_raises(Udb::TopLevelDatabaseObject::SchemaValidationError) do
++        obj.validate(resolver)
++      end
++    end
++  end
++
++  def test_validate_strips_version_prefix_with_multiple_segments
++    Dir.mktmpdir do |tmpdir|
++      # A deeper prefix like "v1.2/ext_schema.json#" should also be handled
++      obj = make_obj(valid_ext_data("v1.2/ext_schema.json#"), Pathname.new(tmpdir))
++      resolver = make_resolver(Pathname.new(tmpdir))
++      obj.validate(resolver)
++    end
++  end
++
++  # ── create_json_schemer_resolver ─────────────────────────────────────────────
++
++  def test_ref_resolver_loads_relative_schema_by_basename
++    Dir.mktmpdir do |tmpdir|
++      resolver = make_resolver(Pathname.new(tmpdir))
++      ref_resolver = Udb::TopLevelDatabaseObject.create_json_schemer_resolver(resolver)
++
++      # Simulate what json_schemer passes for a relative $ref like "schema_defs.json"
++      result = ref_resolver.call(URI("schema_defs.json"))
++      assert_kind_of Hash, result
++      assert result.key?("$defs") || result.key?("definitions") || result.key?("$schema"),
++             "Expected schema_defs.json content"
++    end
++  end
++
++  def test_ref_resolver_uses_basename_ignoring_path_prefix
++    Dir.mktmpdir do |tmpdir|
++      resolver = make_resolver(Pathname.new(tmpdir))
++      ref_resolver = Udb::TopLevelDatabaseObject.create_json_schemer_resolver(resolver)
++
++      # Even if the URI has a path prefix, only the basename is used
++      result_bare = ref_resolver.call(URI("schema_defs.json"))
++      result_prefixed = ref_resolver.call(URI("some/prefix/schema_defs.json"))
++      assert_equal result_bare, result_prefixed
++    end
++  end
++
++  def test_validate_uses_schema_cache_on_second_call
++    Dir.mktmpdir do |tmpdir|
++      gen = Pathname.new(tmpdir)
++      resolver = make_resolver(gen)
++      capture_io { resolver.cfg_arch_for("_") }
++      arch = resolver.cfg_arch_for("_")
++
++      obj1 = Udb::TopLevelDatabaseObject.new(valid_ext_data, Pathname.new("/a.yaml"), arch)
++      obj2 = Udb::TopLevelDatabaseObject.new(valid_ext_data, Pathname.new("/b.yaml"), arch)
++
++      # First call populates the cache; second call hits the cached branch
++      obj1.validate(resolver)
++      obj2.validate(resolver)  # exercises schemas.key?(schema_basename) == true
++    end
++  end
++
++  def test_validate_warns_when_no_schema_key
++    Dir.mktmpdir do |tmpdir|
++      gen = Pathname.new(tmpdir)
++      resolver = make_resolver(gen)
++      capture_io { resolver.cfg_arch_for("_") }
++      arch = resolver.cfg_arch_for("_")
++
++      data_without_schema = valid_ext_data.reject { |k, _| k == "$schema" }
++      obj = Udb::TopLevelDatabaseObject.new(data_without_schema, Pathname.new("/no_schema.yaml"), arch)
++
++      # Should not raise, but should log a warning
++      out, _err = capture_io { obj.validate(resolver) }
++      # The warning goes through Udb.logger; just assert no exception is raised
++      assert true
++    end
++  end
++
++  def test_validate_raises_schema_error_for_invalid_schema_file
++    Dir.mktmpdir do |tmpdir|
++      gen = Pathname.new(tmpdir)
++
++      # Build a schemas dir with a deliberately broken schema
++      fake_schemas = Pathname.new(tmpdir) / "bad_schemas"
++      fake_schemas.mkpath
++      # Copy all real schemas so $ref resolution works
++      SCHEMAS_PATH.glob("*.json").each { |f| FileUtils.cp(f, fake_schemas) }
++      # Overwrite ext_schema.json with an invalid JSON Schema
++      (fake_schemas / "ext_schema.json").write(JSON.generate({
++        "$schema" => "http://json-schema.org/draft-07/schema#",
++        "$id" => "v0.1",
++        "type" => "not-a-valid-type"
++      }))
++
++      bad_resolver = Udb::Resolver.new(
++        schemas_path_override: fake_schemas,
++        cfgs_path_override: UDB_GEM_ROOT / "test" / "mock_cfgs",
++        gen_path_override: gen,
++        std_path_override: UDB_GEM_ROOT / "test" / "mock_spec" / "isa",
++        quiet: true
++      )
++      capture_io { bad_resolver.cfg_arch_for("_") }
++      arch = bad_resolver.cfg_arch_for("_")
++
++      obj = Udb::TopLevelDatabaseObject.new(valid_ext_data, Pathname.new("/x.yaml"), arch)
++      assert_raises(Udb::TopLevelDatabaseObject::SchemaError) do
++        obj.validate(bad_resolver)
++      end
++    end
++  end
++end
+diff --git a/tools/ruby-gems/udb/test/test_yaml_resolver.rb b/tools/ruby-gems/udb/test/test_yaml_resolver.rb
+index 463edf25bc..2f4c79f156 100644
+--- a/tools/ruby-gems/udb/test/test_yaml_resolver.rb
++++ b/tools/ruby-gems/udb/test/test_yaml_resolver.rb
+@@ -10,6 +10,7 @@
+ require_relative "../lib/udb/yaml/preserving_emitter"
+ require "tmpdir"
+ require "fileutils"
++require "json"
+ require "idlc"
+ 
+ class TestYamlResolver < Minitest::Test
+@@ -97,6 +98,14 @@ def test_resolver_semantic_correctness
+       resolved_data_without_source = resolved_data.dup
+       resolved_data_without_source.delete("$source")
+ 
++      # Normalize $schema: strip the version prefix the resolver adds so the
++      # comparison is against the bare name in the original source file.
++      # (e.g. 'v0.1/csr_schema.json#' -> 'csr_schema.json#')
++      if resolved_data_without_source.key?("$schema")
++        bare = File.basename(resolved_data_without_source["$schema"].split("#").first) + "#"
++        resolved_data_without_source["$schema"] = bare
++      end
++
+       # For files without inheritance, data should match (minus $source)
+       # However, the resolver expands $inherits references, so we skip comparison
+       # for any file where the resolved data differs from original (indicating expansion)
+@@ -450,6 +459,107 @@ def test_compile_idl_all_database_files
+     end
+   end
+ 
++  # Test that versioned_schema_uri rewrites bare URIs when the schema has a $id
++  def test_versioned_schema_uri_rewrites_bare_ref
++    # Use the gem's schemas directory which has $id: "v0.1" fields
++    gem_schemas = Pathname.new(__dir__).parent / "schemas"
++    skip "gem schemas directory not found" unless gem_schemas.exist?
++
++    resolver = Udb::Yaml::Resolver.new(quiet: true, schemas_path: gem_schemas)
++
++    # Bare ref should get the version prefix
++    assert_equal "v0.1/ext_schema.json#", resolver.versioned_schema_uri("ext_schema.json#")
++    assert_equal "v0.1/csr_schema.json#", resolver.versioned_schema_uri("csr_schema.json#")
++  end
++
++  # Test that versioned_schema_uri leaves already-versioned URIs unchanged
++  def test_versioned_schema_uri_preserves_versioned_ref
++    gem_schemas = Pathname.new(__dir__).parent / "schemas"
++    skip "gem schemas directory not found" unless gem_schemas.exist?
++
++    resolver = Udb::Yaml::Resolver.new(quiet: true, schemas_path: gem_schemas)
++
++    already_versioned = "v0.1/ext_schema.json#"
++    assert_equal already_versioned, resolver.versioned_schema_uri(already_versioned)
++  end
++
++  # Test that versioned_schema_uri returns unchanged URI when no $id is found
++  def test_versioned_schema_uri_no_id_unchanged
++    Dir.mktmpdir do |tmpdir|
++      # Create a schema without $id
++      schemas_dir = Pathname.new(tmpdir) / "schemas"
++      schemas_dir.mkpath
++      (schemas_dir / "no_id_schema.json").write(JSON.generate({ "type" => "object" }))
++
++      resolver = Udb::Yaml::Resolver.new(quiet: true, schemas_path: schemas_dir)
++
++      uri = "no_id_schema.json#"
++      assert_equal uri, resolver.versioned_schema_uri(uri)
++    end
++  end
++
++  # Test that resolved files record the versioned $schema
++  def test_schema_versioning_in_resolved_files
++    gem_schemas = Pathname.new(__dir__).parent / "schemas"
++    skip "gem schemas directory not found" unless gem_schemas.exist?
++    skip "ext_schema.json not in gem schemas" unless (gem_schemas / "ext_schema.json").exist?
++
++    input_dir = Pathname.new(@test_dir) / "schema_version_input"
++    output_dir = Pathname.new(@test_dir) / "schema_version_output"
++    input_dir.mkpath
++
++    yaml_content = <<~YAML
++      $schema: ext_schema.json#
++      name: Xtest
++      kind: extension
++      type: unprivileged
++      long_name: Test extension
++      versions:
++        - version: "1.0.0"
++          state: ratified
++          ratification_date: "2024-01"
++      description: A test extension.
++    YAML
++    (input_dir / "Xtest.yaml").write(yaml_content)
++
++    resolver = Udb::Yaml::Resolver.new(quiet: true, schemas_path: gem_schemas)
++    resolver.resolve_files(input_dir, output_dir, no_checks: true)
++
++    resolved_content = File.read(output_dir / "Xtest.yaml")
++    # $schema should be rewritten to include the version prefix
++    assert_includes resolved_content, "$schema: v0.1/ext_schema.json#",
++      "Resolved file should contain versioned $schema"
++    refute_includes resolved_content, "$schema: ext_schema.json#",
++      "Resolved file should not contain bare (unversioned) $schema"
++  end
++
++  # Test that $schema stays unchanged when no schemas have $id
++  def test_schema_versioning_unchanged_without_id
++    Dir.mktmpdir do |tmpdir|
++      schemas_dir = Pathname.new(tmpdir) / "schemas"
++      schemas_dir.mkpath
++      # Schema with no $id field
++      (schemas_dir / "mock_schema.json").write(JSON.generate({
++        "$schema" => "http://json-schema.org/draft-07/schema#",
++        "type" => "object"
++      }))
++
++      input_dir = Pathname.new(@test_dir) / "no_id_input"
++      output_dir = Pathname.new(@test_dir) / "no_id_output"
++      input_dir.mkpath
++
++      (input_dir / "item.yaml").write("$schema: mock_schema.json#\nname: test\n")
++
++      resolver = Udb::Yaml::Resolver.new(quiet: true, schemas_path: schemas_dir)
++      resolver.resolve_files(input_dir, output_dir, no_checks: true)
++
++      resolved_content = File.read(output_dir / "item.yaml")
++      # Without $id in the schema, the URI should be unchanged
++      assert_includes resolved_content, "$schema: mock_schema.json#",
++        "Resolved file should keep bare $schema when schema has no $id"
++    end
++  end
++
+   private
+ 
+   # Recursively find all compiled AST hashes (identified by having a "source" hash
+diff --git a/tools/scripts/check_schema_versions.rb b/tools/scripts/check_schema_versions.rb
+new file mode 100755
+index 0000000000..c8e5d57bb7
+--- /dev/null
++++ b/tools/scripts/check_schema_versions.rb
+@@ -0,0 +1,69 @@
++#!/usr/bin/env ruby
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# Checks that each resolved schema file either:
++#   (a) does not yet exist at its published $id URL, or
++#   (b) is an identical match to the file at that URL.
++#
++# This ensures that once a schema version is published, it is immutable.
++
++require "json"
++require "net/http"
++require "uri"
++require "pathname"
++
++root = Pathname.new(__dir__).parent.parent
++gen_schemas_dir = root / "gen" / "schemas"
++
++unless gen_schemas_dir.exist?
++  warn "gen/schemas does not exist; run './do gen:schemas' first"
++  exit 1
++end
++
++failures = []
++
++gen_schemas_dir.glob("**/*.json").sort.each do |schema_file|
++  next if File.directory?(schema_file)
++  schema_data = JSON.parse(schema_file.read)
++  published_id = schema_data["$id"]
++  if published_id.nil?
++    warn "WARNING: #{schema_file} has no '$id' field (skipping version check)"
++    next
++  end
++
++  uri = URI.parse(published_id)
++  begin
++    response = Net::HTTP.get_response(uri)
++  rescue => e
++    warn "WARNING: Could not reach #{published_id}: #{e.message} (skipping)"
++    next
++  end
++
++  if response.code == "200"
++    remote_content = response.body
++    local_content = schema_file.read
++    if remote_content.strip != local_content.strip
++      failures << "Schema mismatch for #{published_id}:\n" \
++                  "  Local:  #{schema_file}\n" \
++                  "  Remote: #{published_id}\n" \
++                  "  The published schema differs from the local version.\n" \
++                  "  To fix: bump the schema version (\$id) to a new version number.\n" \
++                  "  Note: new versions are published automatically when merged to main.\n" \
++                  "  To skip this check locally, do not run check_schema_versions."
++    else
++      puts "OK (matches published): #{published_id}"
++    end
++  elsif response.code == "404"
++    puts "OK (not yet published): #{published_id}"
++  else
++    warn "WARNING: Unexpected HTTP #{response.code} for #{published_id} (skipping)"
++  end
++end
++
++if failures.any?
++  failures.each { |f| warn f }
++  exit 1
++end
++
++puts "All schema version checks passed."
+diff --git a/tools/scripts/gen_schema_index.rb b/tools/scripts/gen_schema_index.rb
+new file mode 100755
+index 0000000000..75b25535fc
+--- /dev/null
++++ b/tools/scripts/gen_schema_index.rb
+@@ -0,0 +1,54 @@
++#!/usr/bin/env ruby
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# Generates (or updates) a JSON index of all available schema versions.
++# Usage: gen_schema_index.rb <schemas_dir> <output_json>
++#
++# Each schema has its own independent version history. The directory layout is:
++#   <schemas_dir>/<schema_name>/<version>/<schema_name>
++#
++# If <output_json> already exists, its contents are used as the base and any
++# schema/version combinations found in <schemas_dir> are merged in. Entries
++# that exist in the current index but are absent from <schemas_dir> are
++# preserved, so that old versions stored only in release assets are not dropped.
++#
++# The output JSON has the structure:
++#   {
++#     "schemas": {
++#       "csr_schema.json": ["v0.1", "v0.2", ...],
++#       "ext_schema.json": ["v0.1"],
++#       ...
++#     }
++#   }
++
++require "json"
++require "pathname"
++
++schemas_dir = Pathname.new(ARGV[0])
++output_path = Pathname.new(ARGV[1])
++
++# Load existing index as the base so old versions are preserved.
++schemas =
++  if output_path.exist?
++    JSON.parse(output_path.read).fetch("schemas", {})
++  else
++    {}
++  end
++
++# Merge in any schema/version combinations present on disk.
++if schemas_dir.exist?
++  schemas_dir.each_child.select(&:directory?).sort.each do |schema_dir|
++    schema_name = schema_dir.basename.to_s
++    next if schema_name == "index.json"
++
++    versions = schema_dir.each_child.select(&:directory?).map { |d| d.basename.to_s }.sort
++    next if versions.empty?
++
++    # Union with any versions already recorded for this schema.
++    schemas[schema_name] = ((schemas[schema_name] || []) | versions).sort
++  end
++end
++
++output_path.write(JSON.pretty_generate({ "schemas" => schemas }) + "\n")
++puts "Schema index written to #{output_path}"
+diff --git a/tools/scripts/pages.html.erb b/tools/scripts/pages.html.erb
+index ab72f638cc..a46c3408ef 100644
+--- a/tools/scripts/pages.html.erb
++++ b/tools/scripts/pages.html.erb
+@@ -1,6 +1,6 @@
+ <!-- Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. -->
+ <!-- SPDX-License-Identifier: BSD-3-Clause-Clear -->
+-
++<%- require "json" -%>
+ <!doctype html>
+ <html lang="en-us">
+   <head>
+@@ -160,6 +160,30 @@
+           </ul>
+         </div>
+       </div>
++
++      <div class="row">
++        <div class="col">
++          <h3>JSON Schemas</h3>
++          <p>
++            JSON Schema files for validating riscv-unified-db data files.
++            Each version is immutable once published.
++          </p>
++          <%- schema_index_path = File.join(ENV["DEPLOY_DIR"] || "_site", "schemas", "index.json") -%>
++          <%- if File.exist?(schema_index_path) -%>
++            <%- schema_index = JSON.parse(File.read(schema_index_path)) -%>
++            <%- schema_index["schemas"].sort.each do |schema_name, versions| -%>
++          <h4><%= schema_name %></h4>
++          <ul>
++              <%- versions.sort.reverse.each do |version| -%>
++            <li><a href="<%= ENV["PAGES_URL"] %>/schemas/<%= schema_name %>/<%= version %>/<%= schema_name %>"><%= version %></a></li>
++              <%- end -%>
++          </ul>
++            <%- end -%>
++          <%- else -%>
++          <p><em>No schema versions published yet.</em></p>
++          <%- end -%>
++        </div>
++      </div>
+     </div>
+ 
+     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.bundle.min.js" integrity="sha384-ndDqU0Gzau9qJ1lfW4pNLlhNTkCfHzAVBReH9diLvGRem5+R9g2FzA8ZGN954O5Q" crossorigin="anonymous"></script>
+diff --git a/tools/scripts/publish_schemas.rb b/tools/scripts/publish_schemas.rb
+new file mode 100755
+index 0000000000..ac20278287
+--- /dev/null
++++ b/tools/scripts/publish_schemas.rb
+@@ -0,0 +1,95 @@
++#!/usr/bin/env ruby
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# Publishes resolved schema files as GitHub release assets.
++#
++# Each schema has its own independent version. For each schema found in
++# gen/schemas/<schema_name>/<version>/, this script:
++#   1. Checks if a release tag "schemas/<schema_name>/<version>" already exists.
++#   2. If not, creates a new release with that tag.
++#   3. Checks if the schema file asset already exists and whether it has changed.
++#   4. Uploads new or changed schema files as release assets.
++#
++# Requires the GH_TOKEN environment variable and the `gh` CLI to be available.
++
++require "json"
++require "pathname"
++require "open3"
++
++root = Pathname.new(__dir__).parent.parent
++gen_schemas_dir = root / "gen" / "schemas"
++
++unless gen_schemas_dir.exist?
++  warn "gen/schemas does not exist; run './do gen:schemas' first"
++  exit 1
++end
++
++def run_cmd(*args)
++  stdout, stderr, status = Open3.capture3(*args)
++  unless status.success?
++    warn "Command failed: #{args.join(' ')}\n#{stderr}"
++    exit 1
++  end
++  stdout
++end
++
++def gh(*args)
++  run_cmd("gh", *args)
++end
++
++def release_exists?(tag)
++  _stdout, _stderr, status = Open3.capture3("gh", "release", "view", tag)
++  status.success?
++end
++
++def asset_content(tag, asset_name)
++  stdout, _stderr, status = Open3.capture3(
++    "gh", "release", "download", tag,
++    "--pattern", asset_name,
++    "--output", "-"
++  )
++  status.success? ? stdout : nil
++end
++
++# gen/schemas/<schema_name>/<version>/<schema_name>
++gen_schemas_dir.each_child.select(&:directory?).sort.each do |schema_dir|
++  schema_name = schema_dir.basename.to_s
++
++  schema_dir.each_child.select(&:directory?).sort.each do |version_dir|
++    version = version_dir.basename.to_s
++    tag = "schemas/#{schema_name}/#{version}"
++
++    puts "Processing #{schema_name} #{version}"
++
++    unless release_exists?(tag)
++      puts "  Creating release #{tag}..."
++      gh(
++        "release", "create", tag,
++        "--title", "#{schema_name} #{version}",
++        "--notes", "#{schema_name} version #{version} for riscv-unified-db.\n\n" \
++                   "Published at:\n" \
++                   "https://riscv.github.io/riscv-unified-db/schemas/#{schema_name}/#{version}/#{schema_name}",
++        "--latest=false"
++      )
++    end
++
++    version_dir.glob("*.json").sort.each do |schema_file|
++      asset_name = schema_file.basename.to_s
++      local_content = schema_file.read
++      remote_content = asset_content(tag, asset_name)
++
++      if remote_content.nil?
++        puts "  Uploading new asset: #{asset_name}"
++        gh("release", "upload", tag, schema_file.to_s, "--clobber")
++      elsif remote_content.strip != local_content.strip
++        puts "  Updating changed asset: #{asset_name}"
++        gh("release", "upload", tag, schema_file.to_s, "--clobber")
++      else
++        puts "  Unchanged: #{asset_name}"
++      end
++    end
++  end
++end
++
++puts "Schema release publishing complete."
+diff --git a/tools/test/regress-tests.yaml b/tools/test/regress-tests.yaml
+index 18927ed2ef..45c19a4867 100644
+--- a/tools/test/regress-tests.yaml
++++ b/tools/test/regress-tests.yaml
+@@ -127,6 +127,7 @@ tests:
+           - cfg
+           - mmr
+           - mmr_schema
++          - schema_versioning
+           - instruction
+           - z3
+           - z3_extensions
+@@ -335,6 +336,14 @@ tests:
+           UPPER_PROFILE="${PROFILE_NAME^^}"
+           ./do gen:profile_release_pdf[${PROFILE_NAME}]
+ 
++  regress-schema-versions:
++    ci_stage: pr
++    tags:
++      - smoke
++    test:
++      - name: Check schema versions against published URLs
++        run: ./do gen:schemas && ./bin/ruby tools/scripts/check_schema_versions.rb
++
+   build-idl-doc:
+     ci_stage: merge_queue
+     gh_save_artifact:

@@ -1,0 +1,2 @@
+- `RRIDSCP.stat` returns 3 regardless of written `RRIDSCP.op`
+- Add new `rridscp_unselectable[]` configuration indicating RRID is unselectable in RRIDSCP.rrid

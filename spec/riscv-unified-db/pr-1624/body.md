@@ -1,0 +1,6 @@
+- Switch to json5 so we can include comments
+- Don't rebase branches outside of scheduled window
+- Another attempt at only updating LLVM weekly
+- Extend default github-actions manager instead of using a custom manager for CI templates
+- Reenable Dockerfile updates now that Singularity is gone
+- Add .mise.toml and Gemfile to list of files that should bump the container tag

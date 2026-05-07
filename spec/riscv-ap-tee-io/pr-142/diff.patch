@@ -1,0 +1,266 @@
+diff --git a/src/06-arch_overview.adoc b/src/06-arch_overview.adoc
+index 80ee9bc..a59ed9a 100644
+--- a/src/06-arch_overview.adoc
++++ b/src/06-arch_overview.adoc
+@@ -23,8 +23,8 @@ confidential memory from them. TVMs can interact with the TSM through the
+ 
+ CoVE-IO extends both the `COVH` and `COVG` ABIs for bringing TEE-IO capable
+ devices into the trust boundary of TVMs. These extensions allow for configuring
+-and registering IOMMUs and PCIe root ports, and then binding physical devices
+-interfaces (TDI) and TVMs together.
++and registering PCIe root ports and then binding physical devices interfaces
++(TDI) and TVMs together.
+ 
+ With the CoVE-IO ABIs and flows, TDIs can access TVM confidential memory
+ directly through DMA. Based on the TVM configuration, the DMA accessible
+diff --git a/src/07-theory_operations.adoc b/src/07-theory_operations.adoc
+index b5d0f37..0f39c84 100644
+--- a/src/07-theory_operations.adoc
++++ b/src/07-theory_operations.adoc
+@@ -13,60 +13,32 @@ devices.
+ The following sections describe the functionality of the TSM-provided CoVE-IO
+ extensions to support trusted I/O on CoVE-enabled platforms.
+ 
+-=== Platform Initialization
+-
+-==== IOMMU Registration and Setup
+-
+-A TSM relies on being granted exclusive control over at least one IOMMU instance
+-on the platform. An IOMMU instance refers to any instantiation of a RISC-V IOMMU
+-Register Programming Interface (RPI), which could range from an actual IOMMU
+-instance to an MTT-enforced, memory-mapped access to a physically partitioned
+-IOMMU.
+-
+-Those exclusvely assigned IOMMU instances allow the TSM to enforce the integrity
+-of address translations and protection from DMA into confidential memory, as
+-well as  interrupts originating from assigned TDIs. The hosting Supervisor Domain
+-may assign one or more IOMMU instances to a TSM Supervisor Domain, after which,
+-only the TSM can access and program the assigned IOMMU instances.
+-
+-IOMMUs assigned to a TSM Supervisor Domain may generate MSIs in order to signal
+-the TSM about command completions, transaction faults or device page requests.
+-Those MSIs target system physical memory, which is owned by the host security
+-domain manager, e.g. the host VMM. As a consequence, it is the host security
+-domain's responsibility to reserve the MSI addresses and then rely on the TSM to
+-program the IOMMUs with those reserved addresses. This IOMMU registration
+-process is driven by the untrusted domain manager for all IOMMUs that
+-participate in TEE-IO and operates as described in the following steps:
+-
+-1. A TSM is loaded into a Supervisor Domain and provisioned with a CoVE-IO
+-   manifest. It is recommended that the TSM is measured by the root-of-trust for
+-   measurement (RTM) for subsequent attestation.
+-2. The hosting Supervisor Domain manager (e.g. the host VMM) enumerates all
+-   platform IOMMUs as PCIe devices.
+-3. The host IOMMU driver is loaded and probed.
+-4. The host IOMMU driver allocates MSI vectors for the trusted domain
+-   IOMMUs. Those vectors must point to the untrusted IOMMU driver as the TSM can
+-   not handle external interrupts.
+-5. The hosting Supervisor Domain manager registers the IOMMUs with the TSM by
+-   calling the `sbi_covh_register_iommu()` `COVH` function. The TSM gets the
+-   allocated MSI vectors and configures the trusted IOMMU `s_msi_cfg_table`
+-   register accordingly.
+-6. When a trusted IOMMU sends an MSI, the untrusted IOMMU driver handles it and
+-   notifies the TSM about a pending trusted IOMMU MSI by calling the
+-   `sbi_covh_notify_iommu_msi()` `COVH` function.
+-7. The TSM verifies that there is a pending MSI by reading the IOMMU `s_ipsr`
+-   register, and handles the interrupts as needed.
+-
+-The host IOMMU driver may be malicious and attempt to trick the TSM by either
+-invoking the `sbi_covh_notify_iommu_msi()` `COVH` function while there are no
+-pending MSI from the trusted IOMMU or not invoking it when there actually is one
+-such pending interrupt. In the former case, the TSM can verify that there really
+-is a pending MSI by checking the trusted IOMMU status registers. The latter case
+-could cause a denial of service, which is not in scope of the confidential
+-computing threat model. If the TSM must ensure that a given command is completed
+-without having to rely on untrusted IOMMU driver MSI notifications, it can queue
+-an `IOFENCE.C` command after the desired command and check for the `cqh`
+-advancing past the `IOFENCE.C` command index.
++=== Platform Management
++
++==== IOMMU Assignment
++
++For CoVE-IO, a TSM relies on being granted exclusive control over one IOMMU
++instance on the platform. An IOMMU instance refers to any instantiation of a
++RISC-V IOMMU Register Programming Interface (RPI), which could range from an
++actual IOMMU instance to an MPT-enforced, memory-mapped access to a physically
++partitioned IOMMU.
++
++This exclusvely assigned IOMMU RPI allows the TSM to enforce the integrity of
++address translations and protection from DMA into confidential memory, as well
++as interrupts originating from TDIs assigned to TVMs under the TSM control.
++
++When creating a Supervisor Domain (SD), the RDSM can optionally establish
++exclusive access to an IOMMU RPI for the SD TSM, prior to loading and scheduling
++said TSM. The RDSM creates <<Smmpt>> mappings to assign the IOMMU RPI to the SD
++and isolate it from any other domain, including the hosting SD.
++
++When the hosting SD requests a TDI to be bound to a TVM, the RDSM programs the
++I/O-MPT Supervisor Domain Classifier (SDCL) to map DMA requests originating from
++the TDI to the TVM's SD and its IOMMU. Concurrently, the TSM programs the IOMMU
++RPI with the necessary IOVA translations and interrupt remappings. However, to
++maintain security, the TSM must not enable these mappings until the TVM has
++successfully verified and accepted the TDI, as detailed in the
++xref:tdi-verification-and-acceptation[TDI acceptance] section.
+ 
+ ==== PCIe Root Port Registration
+ 
+diff --git a/src/09-coveio_abi.adoc b/src/09-coveio_abi.adoc
+index 1a1e7d8..ed627c2 100644
+--- a/src/09-coveio_abi.adoc
++++ b/src/09-coveio_abi.adoc
+@@ -9,64 +9,10 @@ must be in the `[1024:1087]` range.
+ 
+ === CoVE IO Host Extension (EID #0x434F5648 "COVH")
+ 
+-==== IOMMU Management
+-
+-[#sbi_covh_register_iommu()]
+-===== Function: CoVE Host Register IOMMU (FID #1024)
+-[source, C]
+------
+-struct sbiret sbi_covh_register_iommu(unsigned long iommu_id,
+-                                      unsigned long msi_cfg[3]);
+------
+-
+-Registers an IOMMU (`iommu_id`) with a TSM. The `msi_cfg` MSI vectors are
+-allocated by the host Supervisor Domain manager (e.g. the host VMM).
+-
+-The TSM configures the IOMMU TSM Supervisor Domain programming interface
+-`s_msi_cfg_table` with the provided MSI vectors.
+-
+-The possible error codes returned in `sbiret.error` are shown below.
+-
+-[#table_sbi_covh_register_iommu]
+-.CoVE Host Register IOMMU
+-[cols="2,3", width=90%, align="center", options="header"]
+-|===
+-| Error code              | Description
+-| SBI_SUCCESS             | The operation completed successfully.
+-| SBI_ERR_INVALID_PARAMS  | The `iommu_id` index is invalid.
+-| SBI_ERR_FAILED          | The operation failed for unknown reasons.
+-|===
+-
+-[#sbi_covh_notify_iommu_msi]
+-===== Function: CoVE Host Notify IOMMU MSI (FID #1025)
+-[source, C]
+------
+-struct sbiret sbi_covh_notify_iommu_msi(unsigned long iommu_id);
+------
+-
+-Notifies the TSM about a pending MSI for the TSM Supervisor Domain.
+-
+-When servicing this request, the TSM must first verify that there are pending
+-MSIs, by reading the IOMMU `s_ipsr` register from the IOMMU TSM security
+-domain programming interface. If there are some, it handles the interrupts as
+-needed.
+-
+-The possible error codes returned in `sbiret.error` are shown below.
+-
+-[#table_sbi_covh_notify_iommu_msi]
+-.CoVE Host Notify IOMMU MSI
+-[cols="2,3", width=90%, align="center", options="header"]
+-|===
+-| Error code              | Description
+-| SBI_SUCCESS             | The operation completed successfully.
+-| SBI_ERR_INVALID_PARAMS  | The `iommu_id` index is invalid.
+-| SBI_ERR_FAILED          | The operation failed for unknown reasons.
+-|===
+-
+ ==== PCIe Root Port Management
+ 
+ [#sbi_covh_register_rp]
+-===== Function: CoVE Host Register PCIe Root Port (FID #1026)
++===== Function: CoVE Host Register PCIe Root Port (FID #1024)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_register_rp(unsigned long rp_id,
+@@ -97,7 +43,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ ==== Physical Device Management
+ 
+ [#sbi_covh_connect_device]
+-===== Function: CoVE Host Connect Device (FID #1027)
++===== Function: CoVE Host Connect Device (FID #1025)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_connect_device()(unsigned long device_id,
+@@ -140,7 +86,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ |===
+ 
+ [#sbi_covh_disconnect_device]
+-===== Function: CoVE Host Disconnect Device (FID #1028)
++===== Function: CoVE Host Disconnect Device (FID #1026)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_disconnect_device()(unsigned long device_id);
+@@ -167,7 +113,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ ==== TVM Memory Management
+ 
+ [#sbi_covh_add_tvm_interface_region]
+-===== Function: CoVE Host Add TVM Interface Region (FID #1029)
++===== Function: CoVE Host Add TVM Interface Region (FID #1027)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_add_tvm_interface_region(unsigned long tvm_id,
+@@ -201,7 +147,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ | SBI_ERR_FAILED          | The operation failed for unknown reasons.
+ |===
+ 
+-===== Function: CoVE Host Reclaim TVM Interface Region (FID #1030)
++===== Function: CoVE Host Reclaim TVM Interface Region (FID #1028)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_reclaim_tvm_interface_region(unsigned long tvm_id,
+@@ -237,7 +183,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ ==== Device Interface Management
+ 
+ [#sbi_covh_bind_interface]
+-===== Function: CoVE Host Bind Interface (FID #1031)
++===== Function: CoVE Host Bind Interface (FID #1029)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_bind_interface()(unsigned long tvm_id,
+@@ -264,7 +210,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ |===
+ 
+ [#sbi_covh_unbind_interface]
+-===== Function: CoVE Host Unbind Interface (FID #1032)
++===== Function: CoVE Host Unbind Interface (FID #1030)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_unbind_interface()(unsigned long tvm_id,
+@@ -289,7 +235,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ |===
+ 
+ [#sbi_covh_spdm_key_update]
+-===== Function: CoVE Host SPDM Key Update (FID #1033)
++===== Function: CoVE Host SPDM Key Update (FID #1031)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_spdm_key_update(unsigned long device_id);
+@@ -310,7 +256,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ |===
+ 
+ [#sbi_covh_ide_key_refresh]
+-===== Function: CoVE Host IDE Key Refresh (FID #1034)
++===== Function: CoVE Host IDE Key Refresh (FID #1032)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_ide_key_refresh(unsigned long device_id,
+@@ -331,7 +277,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ |===
+ 
+ [#sbi_covh_spdm_heartbeat]
+-===== Function: CoVE Host SPDM Heartbeat (FID #1035)
++===== Function: CoVE Host SPDM Heartbeat (FID #1033)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_spdm_heartbeat(unsigned long device_id);
+@@ -352,7 +298,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ |===
+ 
+ [#sbi_covh_spdm_data]
+-===== Function: CoVE Host Device Connection Transcript (FID #1036)
++===== Function: CoVE Host Device Connection Transcript (FID #1034)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_get_device_connection_transcript(unsigned long device_id,

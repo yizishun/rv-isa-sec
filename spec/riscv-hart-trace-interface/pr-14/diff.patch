@@ -1,0 +1,126 @@
+diff --git a/Makefile b/Makefile
+index 1b436a8..39f5018 100644
+--- a/Makefile
++++ b/Makefile
+@@ -17,7 +17,7 @@ DOCS := \
+ 
+ 
+ DATE ?= $(shell date +%Y-%m-%d)
+-VERSION ?= v0.8.0
++VERSION ?= v0.8.1
+ REVMARK ?= Draft
+ DOCKER_IMG := riscvintl/riscv-docs-base-container-image:latest
+ ifneq ($(SKIP_DOCKER),true)
+diff --git a/src/extensions.adoc b/src/extensions.adoc
+new file mode 100644
+index 0000000..8a4c275
+--- /dev/null
++++ b/src/extensions.adoc
+@@ -0,0 +1,63 @@
++[[sec:extensions]]
++== Hart to Trace Encoder interface extensions
++
++This chapter specifies the following standard extensions to the base Hart to Trace Interface.
++
++[%autowidth,float="center",align="center",cols="^,^,^",options="header",]
++|===
++|       Specification                                        |Version |Status
++| <<sec:trcstate, *Trace State*>>|*0.8* |*Fast-track*
++
++
++|===
++[[sec:trcstate]]
++=== Trace State
++The *halted* signal defined in <<tab:ingress-side-band, Optional sideband encoder input signals>> provides a mechanism to inhibit tracing whilst the hart is in Debug mode.  However, since this was defined, other conditions that require similar behaviour have been identified:
++
++* Inhibiting trace for security reasons;
++
++* Pausing trace due to a Wait for Interrupt (WFI) instruction.
++
++To accomplish this, the *halted* signal is replaced with the multi-bit *trcstate* signal defined below:
++
++[[tab:ingress-side-band-sdsec]]
++.Optional sideband encoder input signal for trace state
++[%autowidth,align="center",float="center",cols="<,<,<",options="header"]
++|===
++| *Signal* | *Group* | *Function*
++|*trcstate[1:0]* | O | 00: Tracing uninhibited by the hart +
++01: Inhibit trace as the hart is in debug mode. +
++10: Inhibit trace for security reasons. +
++11: Pause trace due to WFI.
++|===
++
++When set to any non-zero value, the encoder will output a packet containing the information the decoder requires in order to determine the final instruction retired up to this point (e.g. the address of that instruction, or the instruction count since the last reported instruction).  If trace is inhibited (but not paused), the encoder will then also indicate that tracing has stopped.
++
++Upon return to zero, the encoder may start tracing again (subject to any other filtering), commencing with a synchronization packet.
++
++If there are simultaneously multiple different reasons for the hart to drive a non-zero value, it should prioritize the lowest numerical value.
++
++*Note:* If neither *halted* nor *trcstate* are provided, it is strongly recommended that Debug mode can be signalled
++via a 3-bit *privilege* signal. This will allow tracing in Debug mode to
++be controlled via the optional filtering capabilities.
++
++[[sec:sdsec]]
++==== External Debug Security (sdsec)
++
++The External Debug Security specification introduces the concept of the logical 'sec_inhibit' signal, which when active requires trace to be inhibited.  This can be achieved by setting *trcstate* to 01 when 'sec_inhibit' is true.
++
++[[sec:wfi]]
++==== Wait for Interrupt
++
++The Wait for Interrupt (WFI) instruction can result in a long pause in activity, and in some cases (possibly as the result of a software bug), the pause may be indefinite.
++
++Providing a mechanism for the trace encoder to indicate that WFI has been entered allows the user to be informed of this, and if timestamps are enabled gives an indication of the time of entry.  Combined with a timestamped sync packet following exit from WFI, this allows the user to determine how long the hart spent in the WFI state.
++
++Without this mechanism, WFI has no direct impact on the trace stream (it is treated as an ordinary instruction with *itype* = 0 when it retires).  If an indefinite WFI occurs, the trace message stream simply stops without any indication as to why.
++
++WFI may also disable the hart clock, and by extension the clock used by the trace encoder.  For encoders that utilize partial timestamps, any accrued branch history must be reported within a maximum time from the last packet in order to maintain timestamp integrity, and this cannot be done if the clock is stopped.  Outputting any such history when *trcstate* becomes 11 prior to disabling the clock avoids this potential issue.
++
++==== Backwards compatibility considerations
++
++* A hart which supports *halted* can be connected to a Trace Encoder that supports *trcstate* by wiring *halted* to *trcstate[0]*, and tying *trcstate[1]* to 0.
++* A hart which supports *trcstate* can be connected to a Trace Encoder that supports *halted* by connecting the OR of both bits of the hart's *trcstate* output to the encoder's *halted* input.
+diff --git a/src/hart-trace-interface.adoc b/src/hart-trace-interface.adoc
+index d7b7deb..ee36b17 100644
+--- a/src/hart-trace-interface.adoc
++++ b/src/hart-trace-interface.adoc
+@@ -3,8 +3,8 @@ Authors: Iain Robertson
+ include::../docs-resources/global-config.adoc[]
+ :docgroup: RISC-V Task Group
+ :description: RISC-V Hart to Trace Interface Specification
+-:revdate: 11/6/2025
+-:revnumber: 0.8
++:revdate: 12/8/2025
++:revnumber: 0.8.1
+ :revremark: This document is under development. Expect potential changes. Visit http://riscv.org/spec-state for further details.
+ :revinfo:
+ :preface-title: Preamble
+@@ -60,10 +60,14 @@ Copyright 2025 by RISC-V International.
+ [colophon]
+ 
+ *_Preface to Version TBD_*
++
+ Chapter 2 of this document is based on Chapter 4 of *Version 20250616* of the https://github.com/riscv-non-isa/riscv-trace-spec/releases/latest/[Efficient Trace for RISC-V Specification], which is the ratified 2.0 specification with some informative clarifications and corrections.
+ 
++Chapter 3 includes extensions to this.
++
+ [preface]
+ include::contributors.adoc[]
+ 
+ include::intro.adoc[]
+ include::hti.adoc[]
++include::extensions.adoc[]
+diff --git a/src/hti.adoc b/src/hti.adoc
+index fb23deb..a0065ee 100644
+--- a/src/hti.adoc
++++ b/src/hti.adoc
+@@ -472,7 +472,8 @@ packet containing the information the decoder requires in order to determine the
+ commencing with a synchronization packet. *Note:* If this signal is not
+ provided, it is strongly recommended that Debug mode can be signalled
+ via a 3-bit *privilege* signal. This will allow tracing in Debug mode to
+-be controlled via the optional filtering capabilities.
++be controlled via the optional filtering capabilities. +
++(This signal has been superseded by the <<sec:trcstate, *Trace State*>> extension.)
+ |*reset* | O | Hart is in reset. Provided the encoder is in a different
+ reset domain to the hart, this allows the encoder to indicate that
+ tracing has ended on entry to reset, and restarted on exit. Behavior is

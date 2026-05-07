@@ -1,0 +1,96 @@
+PR #2397  target=opensbi  overall=compliant
+Spec: PMP byte-range match takes priority over M-mode privilege exemption; OpenSBI must ensure PMP entries under reconfiguration never overlap its own firmware code/stack/data on M-mode-PMP-checking implementations, or risk self-fault
+Violation: OpenSBI M-mode code (e.g., during PMP reprogramming in domain context switch, HSM resume, or cold boot) writes a new PMP entry that matches a sub-range of the firmware's own code/logic or scratch buffer. On implementations where PMP checks apply to M-mode, the byte-range match rule triggers a fault even when L=0 (unlocked) and privilege=M — because the rule that 'if no PMP entry matches, M-mode succeeds' is superseded by the byte-range-match rule: if any PMP entry matches even part of the access, the L/R/W/X bits govern the outcome. A partially-overlapping PMP entry with X=0 or W=0 would cause a fault on the next instruction fetch or stack write within OpenSBI itself.
+Consequence: denial_of_service
+Pattern: pmp_set|pmp_set_addr|pmpcfg_write.*(?!.*sfence|.*fence).*scratch|sbi_domain_context|sbi_hsm.*resume.*pmp
+------------------------------------------------------------
+[compliant] lib/sbi/sbi_domain_context.c:102-169  switch_to_next_domain_context
+  Domain context switch properly unconfigures PMP before reconfiguring for new domain. sbi_hart_pmp_unconfigure() preserves firmware PMP entries (fw_smepmp_ids bitmap check at sbi_hart_pmp.c:306-307), so M-mode retains RX+RW access to firmware code/data and scratch buffer throughout the transition. The subsequent configure() (line 128) calls sbi_hart_pmp_fence() internally (both Smepmp at line 216 and old PMP at line 296), executing SFENCE.VMA after all PMP writes. No window where M-mode loses firmware access.
+  | sbi_hart_protection_unconfigure(scratch);
+  | sbi_hart_protection_configure(scratch);
+  | /* Save current CSR context and restore target domain's CSR context */
+  | ctx->sstatus = csr_swap(CSR_SSTATUS, dom_ctx->sstatus);
+
+[compliant] lib/sbi/sbi_hart_pmp.c:121-218  sbi_hart_smepmp_configure
+  Smepmp PMP configuration follows correct ordering: (1) Set RLB in mseccfg to bypass locked-entry enforcement during programming (line 139). (2) Disable reserved entry 0. (3) Program M-only regions first (lines 145-180), including firmware entries tracked via fw_smepmp_ids bitmap. These get PMP_L from sbi_domain_get_smepmp_flags(). (4) Set MML in mseccfg via csr_set (line 185) — this is a bit-set, not a full csrw, preserving RLB. (5) Program SU/shared regions (lines 188-206). (6) Disable remaining entries. (7) Execute sbi_hart_pmp_fence() (line 216) which performs SFENCE.VMA (and HFENCE.GVMA if H-extension present). Firmware regions are sorted first (is_region_before at sbi_domain.c:309-314), guaranteeing lowest PMP indices cover firmware code/data — thus no byte-range conflict with later entries. No M-mode self-fault window.
+  | csr_set(CSR_MSECCFG, MSECCFG_RLB);
+  | …
+  | if (SBI_DOMAIN_MEMREGION_IS_FIRMWARE(reg->flags))
+  |     bitmap_set(fw_smepmp_ids, pmp_idx, 1);
+  | …
+  | csr_set(CSR_MSECCFG, MSECCFG_MML);
+  | …
+  | sbi_hart_pmp_fence();
+
+[compliant] lib/sbi/sbi_hart_pmp.c:300-312  sbi_hart_pmp_unconfigure
+  PMP unconfigure correctly skips firmware PMP entries via sbi_hart_smepmp_is_fw_region() guard (line 306). This preserves M-mode access to firmware code (RX) and data/stack/heap/scratch (RW) while disabling all other entries. The fw_smepmp_ids bitmap is populated during the first configure() call and correctly tracks which PMP indices hold firmware entries. Platforms like EIC770X (eswin_eic7700_pmp_protection) implement their own unconfigure that similarly preserves firmware entries at indices 0-1 by only touching free-range entries.
+  | for (i = 0; i < pmp_count; i++) {
+  |     if (sbi_hart_smepmp_is_fw_region(i))
+  |         continue;
+  |     sbi_platform_pmp_disable(…, i);
+  |     pmp_disable(i);
+  | }
+
+[compliant] lib/sbi/riscv_asm.c:333-381  pmp_set
+  pmp_set() is the CSR programming primitive. It writes PMPADDR CSR first (line 377), then PMPCFG CSR (line 378). This is the standard safe order — address is staged before the config byte enables address matching. No SFENCE.VMA is executed inside this primitive; callers are responsible for fencing. All callers (sbi_hart_smepmp_configure, sbi_hart_oldpmp_configure, platform init) either call sbi_hart_pmp_fence() after completing all PMP writes or run before S-mode is active (making fence unnecessary). NAPOT encoding correctly uses top bit for naturally-aligned power-of-two regions.
+  | csr_write_num(pmpaddr_csr, pmpaddr);
+  | csr_write_num(pmpcfg_csr, pmpcfg);
+  | return 0;
+
+[compliant] lib/sbi/sbi_hsm.c:408-433  __sbi_hsm_suspend_non_ret_save
+  Non-retentive suspend save correctly reads menvcfg into hdata->saved_menvcfg (line 432) alongside mie, mip (S-mode bits only), medeleg, mideleg, and menvcfg. On rv32, csr_read64 reads both MENVCFG and MENVCFGH. The save does not write any CSRs, so no fence concern.
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  |     hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+
+[compliant] lib/sbi/sbi_init.c:483-499  init_warm_resume
+  Warm resume after non-retentive suspend calls sbi_hart_protection_configure() (line 494) which re-programs all PMP entries from domain memory region data (preserved in DRAM). The configure function includes sbi_hart_pmp_fence() (SFENCE.VMA). sbi_hart_reinit() (line 490) only resets mstatus and FPU — it does not restore menvcfg/mideleg/medeleg, which are restored later in __sbi_hsm_suspend_non_ret_restore() via sbi_hsm_hart_resume_finish(). The PMP reprogramming does not depend on those CSRs, so the ordering is safe. Since the warm boot path reconstructs the SAME menvcfg value (same hart, same domain, same extensions), the menvcfg restore in resume_finish is effectively a no-op.
+  | sbi_hsm_hart_resume_start(scratch);
+  | rc = sbi_hart_reinit(scratch);
+  | rc = sbi_hart_protection_configure(scratch);
+  | sbi_hsm_hart_resume_finish(scratch, hartid);
+
+[compliant] lib/sbi/sbi_init.c:224-405  init_coldboot
+  Cold boot correctly initializes all security CSRs before handing off to S-mode. Ordering: domains finalized (line 331) → platform final init (line 343) → ecalls initialized (line 365) → domains started (line 383) → sbi_hart_protection_configure() called LAST (line 394) with explicit comment: 'Configure hart isolation at last because if SMEPMP is detected, M-mode access to the S/U space will be rescinded.' PMP configuration (including SFENCE.VMA) completes before any S-mode entry. mstatus_init() (called via sbi_hart_init at line 268) also writes menvcfg on priv >= 1.12, but at that point no translation is active (SATP is zeroed at line 188).
+  | /* Configure hart isolation at last because if SMEPMP is,
+  |  * detected, M-mode access to the S/U space will be rescinded.
+  |  */
+  | rc = sbi_hart_protection_configure(scratch);
+
+[compliant] lib/sbi/sbi_fwft.c:170-182  fwft_set_adue
+  ADUE bit modification via fwft_menvcfg_set_bit() is immediately followed by __sbi_sfence_vma_all() (line 175) and __sbi_hfence_gvma_all() if H-extension present (lines 177-178). This correctly synchronizes address-translation caches after changing menvcfg.ADUE, matching the PR review comment: 'ADUE updates be synchronized in a fashion analogous to PBMTE.' The fence is only executed on success (res == SBI_OK), avoiding unnecessary overhead on failure.
+  | int res = fwft_menvcfg_set_bit(value, ENVCFG_ADUE_SHIFT);
+  | if (res == SBI_OK) {
+  |     __sbi_sfence_vma_all();
+  |     if (misa_extension('H'))
+  |         __sbi_hfence_gvma_all();
+  | }
+
+[compliant] lib/sbi/sbi_fwft.c:237-270  fwft_set_pmlen
+  PMM (Pointer Masking for M-mode) bit update uses csr_read_clear + csr_set pattern. The intermediate state (PMM cleared between lines 255-256) only affects pointer masking, not address translation. No SFENCE.VMA is needed because PMM bits do not affect translation caches — they only control whether virtual addresses undergo pointer masking. The rollback path (csr_write at line 259) writes the original menvcfg value with PMM cleared, which also does not change ADUE/PBMTE since prev was just read with only PMM bits cleared.
+  | prev = csr_read_clear(CSR_MENVCFG, ENVCFG_PMM);
+  | csr_set(CSR_MENVCFG, pmm);
+  | if ((csr_read(CSR_MENVCFG) & ENVCFG_PMM) != pmm) {
+  |     csr_write(CSR_MENVCFG, prev);
+  |     return SBI_EINVAL;
+  | }
+
+[compliant] lib/sbi/sbi_hart.c:455-472  hart_pmp_get_allowed_addr
+  PMP probing during cold boot HART init temporarily writes CSR_PMPCFG0=0 (disabling all address matching) and CSR_PMPADDR0=PMP_ADDR_MASK (all-ones). Since PMPCFG0.A=0 during the probe, no PMP entry is active, so no access-check side effects. This probe runs during sbi_hart_init(), well before S-mode is started (cold boot path) — no concurrent execution, no speculative risk.
+  | csr_write_allowed(CSR_PMPCFG0, &trap, 0);
+  | csr_write_allowed(CSR_PMPADDR0, &trap, PMP_ADDR_MASK);
+  | val = csr_read_allowed(CSR_PMPADDR0, &trap);
+
+[compliant] platform/generic/eswin/eic770x.c:228-281  eswin_eic7700_early_final_init
+  EIC770X early PMP setup creates a locked entry at index 6 (PMP_RESERVED_B) with L=1, base=0 covering the entire memory port. In old PMP (no SMEPMP), L=1 with R=W=X=0 means 'locked, no S/U access', but M-mode always succeeds regardless. Firmware regions at indices 0-1 (RX and RW) are programmed first, covering firmware fw_start..fw_start+fw_size with explicit permissions. Since PMP uses lowest-index priority, the firmware entries match before the catch-all locked entry. No byte-range conflict between firmware entries and the catch-all block — firmware entries are at lower indices. No M-mode self-fault potential.
+  | pmp_set(pmp_idx++, sbi_domain_get_oldpmp_flags(reg), reg->base, reg->order);
+  | …
+  | pmp_set(PMP_RESERVED_B, PMP_L, 0, log2roundup(EIC770X_MEMPORT_LIMIT));
+
+[compliant] lib/sbi/sbi_domain.c:146-218  sbi_domain_get_smepmp_flags
+  Smepmp flag computation correctly rejects M-mode RWX (all-permissions) combination at line 189-192: 'M-mode only regions cannot have RWX permissions' — a hardware constraint under Smepmp. All M-only firmware regions get PMP_L set (line 195) plus specific R/W/X bits. For firmware code (M_READABLE|M_EXECUTABLE): flags = PMP_L|PMP_R|PMP_X = L=1,RWX=101, which under Smepmp MML=1 decodes as 'shared read-execute' — granting read+execute to both M and S/U. This is the correct Smepmp encoding since Smepmp has no 'M-only read-execute but deny S/U' encoding; denying S/U access to firmware would require a separate SU-blocking region at a higher PMP index.
+  | if ((reg->flags & SBI_DOMAIN_MEMREGION_M_ACCESS_MASK) == SBI_DOMAIN_MEMREGION_M_RWX) {
+  |     sbi_printf("%s: M-mode only regions cannot have RWX permissions\n", __func__);
+  |     return 0;
+  | }
+  | pmp_flags |= PMP_L;
+

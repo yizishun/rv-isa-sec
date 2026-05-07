@@ -1,0 +1,116 @@
+{
+  "pr_number": 822,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 822,
+    "violation_condition": "Linux kernel in S-mode accesses stopei, eip[k], or eie[k] CSRs while mstateen0 bit 58 (IMSIC state enable) is zero, either because M-mode firmware (e.g., OpenSBI) did not set it, or because the kernel failed to check the bit before touching these CSRs even though the Smstateen extension is implemented in hardware.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csr_read|csr_write|__ASM_STR(\"csrr|csrw).*(stopei|eip|eie)",
+    "affected_entities": [
+      "stopei",
+      "eip[k]",
+      "eie[k]",
+      "mstateen0[58]"
+    ],
+    "summary": "Access to ACLIC-reused IMSIC CSRs (stopei, eip, eie) from S-mode is now gated by mstateen0 bit 58; if M-mode firmware or early kernel init neglects to check/set this bit, any AIA interrupt delivery path will trap with an illegal instruction exception, crashing the kernel."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-imsic-early.c",
+        "function_name": "imsic_handle_irq",
+        "line_start": 93,
+        "line_end": 125,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "S-mode csr_swap(CSR_TOPEI, 0) accesses STOPEI (0x15c) on the critical external-interrupt hot path without any prior check that mstateen0 bit 58 (IMSIC state enable) is set. If M-mode firmware left mstateen0[58]=0, every external interrupt delivery via IMSIC causes an illegal-instruction trap and the kernel cannot handle any IMSIC-delivered interrupts. The kernel cannot even read mstateen0 from S-mode — it must trust M-mode firmware, but no runtime validation of sstateen0[58] exists either.",
+      "snippet": "while ((local_id = csr_swap(CSR_TOPEI, 0))) {\n    local_id >>= TOPEI_ID_SHIFT;\n    ...\n    generic_handle_irq(lpriv->vectors[local_id].irq);\n}"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-imsic-state.c",
+        "function_name": "imsic_csr_read",
+        "line_start": 35,
+        "line_end": 39,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "imsic_csr_read() writes CSR_SISELECT (0x150) then reads CSR_SIREG (0x151) to access IMSIC EIP[k]/EIE[k] registers indirectly. Under Smstateen, accessing these registers via ISELECT/IREG when mstateen0[58]=0 causes an illegal-instruction exception. No gating check on mstateen0 or sstateen0 bit 58 is performed before this indirect register access.",
+      "snippet": "static inline unsigned long imsic_csr_read(unsigned long reg)\n{\n    csr_write(CSR_ISELECT, reg);\n    return csr_read(CSR_IREG);\n}"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-imsic-state.c",
+        "function_name": "imsic_csr_write",
+        "line_start": 29,
+        "line_end": 33,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "imsic_csr_write() writes CSR_SISELECT then CSR_SIREG to program IMSIC EIP[k]/EIE[k] registers. Same vulnerability: no check of mstateen0[58] or sstateen0[58] before the indirect CSR access. This function is called from imsic_local_delivery(), __imsic_eix_update(), and the local sync path — all operate without the state-enable guard.",
+      "snippet": "static inline void imsic_csr_write(unsigned long reg, unsigned long val)\n{\n    csr_write(CSR_ISELECT, reg);\n    csr_write(CSR_IREG, val);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "imsic_eix_read",
+        "line_start": 62,
+        "line_end": 100,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM imsic_vs_csr_read() macro accesses guest IMSIC registers via CSR_VSISELECT/CSR_VSIREG. KVM correctly configures hstateen0 with SMSTATEEN0_AIA_IMSIC for the guest, but if mstateen0[58] is 0, writing hstateen0[58]=1 has no architectural effect — the host's own siselect/sireg accesses would fault. This silently breaks KVM IMSIC virtualization when M-mode firmware does not set the bit.",
+      "snippet": "#define imsic_vs_csr_read(__c)         \\\n({                                      \\\n    unsigned long __r;                  \\\n    csr_write(CSR_VSISELECT, __c);      \\\n    __r = csr_read(CSR_VSIREG);        \\\n    __r;                                \\\n})"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_setup_config",
+        "line_start": 564,
+        "line_end": 572,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM correctly sets hstateen0 with SMSTATEEN0_AIA_IMSIC | SMSTATEEN0_AIA | SMSTATEEN0_AIA_ISEL when the guest ISA includes SSAIA. This is the correct virtualization behavior: KVM's job is to configure hstateen0 to grant the guest access to these CSRs. The underlying issue (mstateen0[58] being zero) is M-mode firmware's responsibility, not KVM's. KVM cannot fix a broken M-mode firmware configuration from HS-mode.",
+      "snippet": "if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SMSTATEEN)) {\n    cfg->hstateen0 |= SMSTATEEN0_HSENVCFG;\n    if (riscv_isa_extension_available(isa, SSAIA))\n        cfg->hstateen0 |= SMSTATEEN0_AIA_IMSIC |\n                          SMSTATEEN0_AIA |\n                          SMSTATEEN0_AIA_ISEL;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "CSR definitions",
+        "line_start": 233,
+        "line_end": 243,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The Smstateen bit definitions are correctly defined: SMSTATEEN0_AIA_IMSIC at bit 58, SMSTATEEN0_AIA at bit 59, SMSTATEEN0_AIA_ISEL at bit 60. CSR addresses STOPEI (0x15c), SISELECT (0x150), SIREG (0x151) are correctly defined. The infrastructure for checking these bits exists but is never used by the S-mode IMSIC driver at runtime.",
+      "snippet": "#define SMSTATEEN0_AIA_IMSIC_SHIFT   58\n#define SMSTATEEN0_AIA_IMSIC          (_ULL(1) << SMSTATEEN0_AIA_IMSIC_SHIFT)\n#define SMSTATEEN0_AIA_SHIFT         59\n#define SMSTATEEN0_AIA                (_ULL(1) << SMSTATEEN0_AIA_SHIFT)\n#define SMSTATEEN0_AIA_ISEL_SHIFT    60"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "imsic_vsfile_local_read",
+        "line_start": 372,
+        "line_end": 420,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "imsic_vsfile_local_read() accesses IMSIC VS-file registers (EIDELIVERY, EITHRESHOLD, EIP[k], EIE[k]) via CSR_VSISELECT/CSR_VSIREG on a remote CPU using on_each_cpu_mask(). If mstateen0[58] is zero, this IPI-based cross-CPU access will trap with an illegal-instruction exception on the target CPU's S-mode context, potentially crashing that CPU or triggering undefined behavior in the IPI handler.",
+      "snippet": "mrif->eidelivery = imsic_vs_csr_swap(IMSIC_EIDELIVERY, 0);\nmrif->eithreshold = imsic_vs_csr_swap(IMSIC_EITHRESHOLD, 0);\neix->eip[0] = imsic_eix_swap(IMSIC_EIP0 + i * 2, 0);\neix->eie[0] = imsic_eix_swap(IMSIC_EIE0 + i * 2, 0);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia.c",
+        "function_name": "hgei_interrupt",
+        "line_start": 465,
+        "line_end": 485,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hgei_interrupt() only reads CSR_HGEIP and CSR_HGEIE and writes CSR_HGEIE — these are hypervisor-level CSRs not gated by mstateen0 bit 58. The IMSIC-specific CSRs (stopei/eip/eie) gated by bit 58 are accessed in the aia_imsic.c functions called later in the VCPU run loop, not in this interrupt handler itself.",
+      "snippet": "hgei_mask = csr_read(CSR_HGEIP) & csr_read(CSR_HGEIE);\ncsr_clear(CSR_HGEIE, hgei_mask);"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

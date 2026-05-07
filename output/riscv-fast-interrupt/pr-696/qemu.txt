@@ -1,0 +1,62 @@
+PR #696  target=qemu  overall=potential_risk
+Spec: IPRIO for threshold comparison must use xtopi CSR-reported value (read_mtopi/read_stopi path), but riscv_cpu_pending_to_irq() derives a different effective priority (1 vs 0) for iprio=0 high-default-priority interrupts — using the wrong derivation for threshold filtering would incorrectly mask high-priority local interrupts
+Violation: QEMU's interrupt priority derivation is inconsistent: read_mtopi() reports iprio=0 (unmasked) for local interrupts with iprio[]=0 and default_priority <= IPRIO_DEFAULT_M, but riscv_cpu_pending_to_irq() assigns effective priority=1 to the same interrupts. The spec now mandates that the threshold masking condition IPRIO >= xithreshold & NIPPRIO_MASK must use the xtopi CSR-reported IPRIO value. If QEMU adds local interrupt threshold filtering (or repurposes pending_to_irq's prio for threshold comparison), the priority mismatch means iprio=0 sources with high default priority would be compared as prio=1 instead of prio=0, causing them to be incorrectly masked when xithreshold=1.
+Consequence: denial_of_service
+Pattern: (read_mtopi|read_stopi|riscv_cpu_pending_to_irq|rmw_iprio).*iprio.*default_priority|(!prio|!iprio).*(IPRIO_DEFAULT|extirq_def_prio|IPRIO_MMAXIPRIO)
+------------------------------------------------------------
+[potential_risk] target/riscv/csr.c:2355-2376  read_mtopi
+  read_mtopi() reports iprio=0 for local interrupts with iprio[]=0 and default_priority <= IPRIO_DEFAULT_M (16), but riscv_cpu_pending_to_irq() assigns prio=1 to the same interrupts in its else branch (line 457). The iprio[]=0 case only hits MEIP (irq=11) with current defaults — where pending_to_irq uses prio=extirq_def_prio=16. The divergent priority representations (0 vs 16) are a latent inconsistency: if threshold masking (IPRIO >= xithreshold) is ever implemented using pending_to_irq's prio, MEIP would be incorrectly masked when xithreshold=1 to 15, despite read_mtopi reporting it as iprio=0 (unmasked/highest urgency). Currently no threshold filtering exists in the interrupt delivery path, so no actual DoS.
+  | iprio = env->miprio[irq];
+  | if (!iprio) {
+  |     if (riscv_cpu_default_priority(irq) > IPRIO_DEFAULT_M) {
+  |         iprio = IPRIO_MMAXIPRIO;
+  |     }
+  | }
+  | *val |= iprio;
+
+[potential_risk] target/riscv/csr.c:4569-4594  read_stopi
+  Same latent inconsistency as read_mtopi: reports iprio=0 for local interrupts with iprio[]=0 and default_priority <= IPRIO_DEFAULT_S (19). Only hits SEIP (irq=9) with current defaults — where pending_to_irq assigns prio=extirq_def_prio=19. Divergent values (0 vs 19) would cause incorrect threshold masking if threshold filtering is ever implemented using pending_to_irq's prio.
+  | iprio = env->siprio[irq];
+  | if (!iprio) {
+  |     if (riscv_cpu_default_priority(irq) > IPRIO_DEFAULT_S) {
+  |         iprio = IPRIO_MMAXIPRIO;
+  |     }
+  | }
+  | *val |= iprio;
+
+[potential_risk] target/riscv/cpu_helper.c:433-470  riscv_cpu_pending_to_irq
+  pending_to_irq() derives effective priority differently from read_mtopi/read_stopi: for iprio[]=0, it splits into three branches — (a) irq==extirq → prio=extirq_def_prio (16 or 19), (b) default_priority < extirq_def_prio → prio=1, (c) otherwise → prio=IPRIO_MMAXIPRIO (255). Branch (b) assigns prio=1, which contradicts read_mtopi/read_stopi's iprio=0 for the same source. Currently only branch (a) is reachable with current defaults, since all non-extirq local interrupts have default_priority > extirq_def_prio. The divergence from xtopi CSR-reported IPRIO makes this function unsuitable for threshold-aware interrupt selection unless unified.
+  | prio = iprio[irq];
+  | if (!prio) {
+  |     if (irq == extirq) {
+  |         prio = extirq_def_prio;
+  |     } else {
+  |         prio = (riscv_cpu_default_priority(irq) < extirq_def_prio) ?
+  |                1 : IPRIO_MMAXIPRIO;
+  |     }
+  | }
+
+[compliant] target/riscv/csr.c:2482-2525  rmw_iprio
+  rmw_iprio() correctly enforces read-only-zero for M-level and S-level external IRQ priority fields (line 2517: skip write for firq+i == ext_irq_no). Writes to other iprio slots correctly use 0xff mask. No WARL/WLRL violations.
+  | if ((firq + i) == ext_irq_no) {
+  |     continue;
+  | }
+  | iprio[firq + i] = (new_val >> (IPRIO_IRQ_BITS * i)) & 0xff;
+
+[compliant] target/riscv/cpu_helper.c:519-595  riscv_cpu_local_irq_pending
+  Interrupt delivery path correctly checks privilege-mode enables (mie/hsie/vsie) and delegation chain (mideleg/hideleg) before selecting the highest-priority pending IRQ via pending_to_irq. No threshold (xithreshold/eithreshold) comparison is performed — threshold masking is entirely absent from the interrupt-taking path. This is a pre-existing missing feature, not a bug introduced by the current change.
+  | irqs = pending & ~env->mideleg & -mie;
+  | if (irqs) {
+  |     return riscv_cpu_pending_to_irq(env, IRQ_M_EXT, IPRIO_DEFAULT_M,
+  |                                     irqs, env->miprio);
+  | }
+
+[compliant] target/riscv/csr.c:4479-4549  read_vstopi
+  read_vstopi() correctly handles VS-level interrupt priority resolution from multiple sources: hvictl-injected interrupts, pending VS-level local interrupts, and IMSIC TOPEI. Uses correct HVICTL_IPRIO, IMSIC_TOPEI_IPRIO_MASK, and HVICTL_IPRIOM thresholds. No inconsistency with pending_to_irq for VS-level path.
+  | for (s = 0; s < scount; s++) {
+  |     if (siprio[s] < iprio) {
+  |         iid = siid[s];
+  |         iprio = siprio[s];
+  |     }
+  | }
+

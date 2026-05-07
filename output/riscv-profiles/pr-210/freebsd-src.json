@@ -1,0 +1,116 @@
+{
+  "pr_number": 210,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 210,
+    "violation_condition": "In the FreeBSD kernel, when cpu_switch() or savectx() saves/restores CHERI capability registers (PCC, DDC, CSP, CGP, CTP, and all GPR capability metadata/tags) using an implicitly assumed capability encoding format, but the RVYA25 profile mandates only Zydefaultcap (uycfg.base=0) without specifying the actual encoding layout—if the kernel's struct pcb or trapframe uses a fixed-size capability representation that diverges from the hardware's actual encoding (e.g., 128-bit vs 256-bit capabilities, different tag-bit positions, or different bounds-compression schemes), capability bounds, permissions, or tag bits are silently truncated, widened, or corrupted across context switches.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "struct pcb.*cap|savectx.*cap|restorectx.*cap|CHERICap|cap_register|sizeof.*pcb|trapframe.*cap|cpu_switch.*cap|__capability.*struct|capability.*encoding|szcap|CAP_SIZE",
+    "affected_entities": [
+      "Zydefaultcap",
+      "Zyhybrid",
+      "Ssnpm",
+      "Supm"
+    ],
+    "summary": "RVYA25 profile mandates Zydefaultcap capability encoding but omits the actual encoding format specification; FreeBSD's context-switch and signal-delivery paths (cpu_switch.S, sendsig, ptrace) rely on knowing the exact in-memory and in-register capability layout to safely save/restore process capability state without privilege-boundary corruption"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "struct pcb stores all context as plain uint64_t (pcb_ra, pcb_sp, pcb_gp, pcb_tp, pcb_s[12], pcb_x[32][2], pcb_fcsr). No CHERI capability metadata/tag/bounds fields exist, no __capability-qualified fields, and no conditional CHERI compilation guards. The PCB is sized for baseline RV64, not RV64CHERI. This is correct for a non-CHERI kernel — there is no capability encoding to diverge from.",
+      "snippet": "struct pcb {\n    uint64_t pcb_ra;\n    uint64_t pcb_sp;\n    uint64_t pcb_gp;\n    uint64_t pcb_tp;\n    uint64_t pcb_s[12];"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/frame.h",
+        "function_name": "struct trapframe",
+        "line_start": 46,
+        "line_end": 58,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "struct trapframe stores all GPRs and CSRs as plain uint64_t. No capability-aware fields for DDC, PCC, or GPR capability metadata. get_mcontext()/set_mcontext() copy trapframe fields to the user-visible mcontext_t struct gpregs which uses __register_t (= __int64_t). No capability encoding divergence is possible because no CHERI registers are represented.",
+      "snippet": "struct trapframe {\n    uint64_t tf_ra, tf_sp, tf_gp, tf_tp;\n    uint64_t tf_t[7], tf_s[12], tf_a[8];\n    uint64_t tf_sepc, tf_sstatus, tf_stval, tf_scause;\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "cpu_switch() saves/restores only ra, sp, s[0-11], and conditionally FPE state using plain sd/ld instructions. No save/restore of CHERI capability registers (PCC, DDC, CSP, CGP, CTP) or capability tags/metadata. On baseline RV64 this is complete; CHERI register save/restore would require new infrastructure not present in this tree.",
+      "snippet": "sd ra, (PCB_RA)(x13)\nsd sp, (PCB_SP)(x13)\nsd s0, (PCB_S + 0 * 8)(x13)\n...\nld ra, (PCB_RA)(x13)\nld sp, (PCB_SP)(x13)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "savectx() saves ra, sp, tp, gp, s[0-11], and FPE state using plain sd. No CHERI-specific registers are saved. The function is a non-CHERI context dump. Since no CHERI hardware is targeted, there is no implicit encoding assumption at risk.",
+      "snippet": "sd ra, (PCB_RA)(a0)\nsd sp, (PCB_SP)(a0)\nsd tp, (PCB_TP)(a0)\nsd gp, (PCB_GP)(a0)\n__fpe_state_save a0"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 206,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "cpu_throw() restores ra, sp, s[0-11], and conditionally FPE state from the new thread's pcb. No CHERI registers restored. The function path is consistent with the non-CHERI struct pcb layout.",
+      "snippet": "ld ra, (PCB_RA)(x13)\nld sp, (PCB_SP)(x13)\nld s0, (PCB_S + 0 * 8)(x13)\n...\n__fpe_state_load x13"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/vm_machdep.c",
+        "function_name": "cpu_fork",
+        "line_start": 87,
+        "line_end": 129,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "cpu_fork() copies PCB and trapframe via bcopy(..., sizeof(*pcb2)). sizeof(struct pcb) and sizeof(struct trapframe) are fixed at compile time for baseline RV64. In a CHERI kernel, struct pcb would need conditional sizeof based on the capability encoding width, but this tree is non-CHERI so the fixed size is correct.",
+      "snippet": "bcopy(td1->td_pcb, pcb2, sizeof(*pcb2));\nbcopy(td1->td_frame, tf, sizeof(*tf));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/vmm.h",
+        "function_name": "enum vm_reg_name",
+        "line_start": 59,
+        "line_end": 94,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "bhyve/vmm guest register set defines only standard RV64 GPRs (RA, SP, GP, TP, T0-T6, S0-S11, A0-A7, SEPC) as uint64_t values. No CHERI capability registers (PCC, DDC, CSP, CGP, CTP) are enumerated, and no per-register capability metadata/tag fields exist. Guest capability state is not virtualized because the kernel targets baseline RV64, not CHERI.",
+      "snippet": "enum vm_reg_name {\n    VM_REG_GUEST_ZERO, VM_REG_GUEST_RA, VM_REG_GUEST_SP,\n    VM_REG_GUEST_GP, VM_REG_GUEST_TP, VM_REG_GUEST_T0,\n    ...\n    VM_REG_GUEST_SEPC, VM_REG_LAST\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/_types.h",
+        "function_name": "__register_t typedef",
+        "line_start": 51,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "__register_t = __int64_t. On CHERI platforms this would need to be at minimum a 128/256-bit capability type to hold both address and metadata. The 64-bit definition confirms this is a baseline RV64 port. The user-visible ABI types (struct reg, struct gpregs, mcontext_t) derived from __register_t are internally consistent: they are all non-CHERI, so no cross-context-switch encoding mismatch can occur.",
+      "snippet": "typedef __int64_t __register_t;"
+    }
+  ],
+  "overall_severity": "compliant"
+}

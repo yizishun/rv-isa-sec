@@ -1,0 +1,29 @@
+PR #2573  target=linux  overall=compliant
+Spec: Non-atomic SPMP context-switch reconfiguration without interrupt disabling enables privilege escape via partially-applied memory protections
+Violation: In the Linux kernel, when Sspmp is implemented and a context switch reconfigures SPMP entries (spmpaddr/spmpcfg) or updates spmpen without first disabling interrupts (clearing SIE in sstatus), an interrupt or exception during the reconfiguration window leaves the running hart with either the outgoing task's SPMP protections removed but the incoming task's not yet applied, or kernel S-mode entries momentarily disabled, allowing the interrupt handler or a rescheduled U-mode task to access memory regions it should not.
+Consequence: privilege_escape
+Pattern: arch/riscv.*(spmp|SPMP|spmpen|spmpcfg|spmpaddr|siselect|sireg|__switch_to|switch_mm|cpu_switch_to|flush_icache|SFENCE\.VMA).*
+------------------------------------------------------------
+[compliant] arch/riscv/include/asm/csr.h:1-1  N/A (CSR definitions)
+  No SPMP-related CSRs (spmpen, spmpcfg, spmpaddr, siselect, sireg) are defined in csr.h. The only PMP CSRs defined are the legacy M-mode PMP (CSR_PMPCFG0 at 0x3a0, CSR_PMPADDR0 at 0x3b0). Without Sspmp CSR definitions, no kernel code can touch SPMP state.
+  | N/A — no SPMP CSRs exist
+
+[compliant] arch/riscv/kernel/entry.S:421-471  __switch_to
+  __switch_to saves/restores callee-saved registers (ra, sp, s0-s11), sstatus (for SR_SUM), and shadow call stack. No SPMP CSRs are touched. Since Sspmp is not implemented in this kernel, the vulnerability precondition ('when Sspmp is implemented') is not met, and this code is compliant with respect to the specified pattern.
+  | REG_S ra,  TASK_THREAD_RA_RA(a3)
+  | REG_S sp,  TASK_THREAD_SP_RA(a3)
+  | REG_S s0,  TASK_THREAD_S0_RA(a3)
+  | // ... only callee-saved regs, sstatus/SUM, SCS — no SPMP CSRs
+
+[compliant] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The switch_to macro handles FPU, vector, icache flush, and ENVCFG CSR before calling __switch_to. No SPMP CSR reconfiguration happens here. The absence of SPMP handling means the vulnerability pattern (reconfiguring SPMP without disabling interrupts) cannot be triggered.
+  | if (has_fpu()) __switch_to_fpu(__prev, __next);
+  | if (has_vector()) __switch_to_vector(__prev, __next);
+  | __switch_to_envcfg(__next);
+  | ((last) = __switch_to(__prev, __next));
+
+[compliant] arch/riscv/kvm/vcpu.c:749-775  kvm_riscv_vcpu_swap_in_guest_state
+  KVM VCPU guest/host swap only handles scounteren, senvcfg, and sstateen0 CSRs. No SPMP virtualization is performed. On Sspmp-capable hardware, guest SPMP state would not be saved/restored, but this is not the vulnerability pattern under audit (which concerns in-kernel SPMP reconfiguration during context switch without disabling interrupts).
+  | vcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);
+  | // ... scounteren, sstateen0 only — no SPMP CSRs
+

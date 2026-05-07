@@ -1,0 +1,1 @@
+We're in the process of stumbling into another round of these bugs related to insufficient alignment bytes.  The idea of adding another alignment reloation that rounds down has come up a few times, but I don't remember if anyone's actually written the spec.  So here's one.

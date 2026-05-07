@@ -1,0 +1,50 @@
+PR #2608  target=freebsd-src  overall=compliant
+Spec: sstateen* CSRs gate user-mode access to ISA extension state (FPU/vector/custom) but FreeBSD's context-switch path has no awareness of them; if populated per-process, bits bleed across context-switch boundaries, letting an unprivileged process access extensions the kernel meant to deny
+Violation: FreeBSD's cpu_switch (sys/riscv/riscv/swtch.S) saves only GPRs and FPU state but never saves/restores sstateen* CSRs. If the kernel writes per-process values to sstateen* to control which ISA extensions each process may access, a context switch leaks the previous process's sstateen bitmask into the next process, since the CSR file is hart-local and survives context switch.
+Consequence: privilege_escape
+Pattern: csr_write\(sstateen|csr_read\(sstateen|csrw\s+sstateen|csrr\s+sstateen
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/swtch.S:258-358  cpu_switch
+  cpu_switch saves GPRs (ra, sp, s0-s11) and conditionally saves/restores FPU state, but does not save/restore sstateen* CSRs. However, FreeBSD has zero smstateen implementation: no sstateen CSR reads/writes exist anywhere in the kernel (sys/riscv/), the PCB has no sstateen fields, bhyve has no sstateen virtualization, and the init/boot path does not configure smstateen. Since the kernel never writes per-process sstateen values, the violation precondition (per-process sstateen leakage) cannot be triggered. The CSR file persists across context switches, but its value is never modified from hardware reset default.
+  | ENTRY(cpu_switch)
+  |         /* Store the new curthread */
+  |         sd      a1, PC_CURTHREAD(tp)
+  |         /* And the new pcb */
+  |         ld      x13, TD_PCB(a1)
+  |         sd      x13, PC_CURPCB(tp)
+
+[compliant] sys/riscv/riscv/swtch.S:206-248  cpu_throw
+  cpu_throw restores only GPRs and optionally FPU state. No sstateen* CSR restore. Same rationale as cpu_switch: FreeBSD does not implement smstateen, so no per-process sstateen state exists to leak or restore.
+  | ENTRY(cpu_throw)
+  |         /* Activate the new thread's pmap. */
+  |         mv      s0, a1
+  |         mv      a0, a1
+  |         call    _C_LABEL(pmap_activate_sw)
+
+[compliant] sys/riscv/include/pcb.h:42-54  struct pcb
+  PCB structure has no sstateen-related fields (only ra, sp, gp, tp, s[12], x[32][2], fcsr, fpflags, onfault). This is correct given the current lack of smstateen usage. If smstateen support is added, this struct must be extended with per-process sstateen0/1/2/3 save slots.
+  | struct pcb {
+  |         uint64_t        pcb_ra;
+  |         uint64_t        pcb_sp;
+  |         uint64_t        pcb_gp;
+  |         uint64_t        pcb_tp;
+  |         uint64_t        pcb_s[12];
+
+[compliant] sys/riscv/riscv/swtch.S:434-457  savectx
+  savectx saves GPRs and FPU state but no sstateen* CSRs. Consistent with the rest of the context-switch infrastructure — no smstateen support exists to require saving.
+  | ENTRY(savectx)
+  |         /* Store ra, sp and the callee-saved registers */
+  |         sd      ra, (PCB_RA)(a0)
+  |         sd      sp, (PCB_SP)(a0)
+  |         sd      tp, (PCB_TP)(a0)
+  |         sd      gp, (PCB_GP)(a0)
+
+[compliant] sys/riscv/riscv/swtch.S:365-432  fork_trampoline
+  fork_trampoline restores sstatus and sepc (via csrw) and sscratch (for user trap handling) but no sstateen* CSRs. The fork path inherits whatever sstateen value the hardware has from reset — no per-process differentiation exists.
+  | /* Restore sstatus */
+  |         ld      t0, (TF_SSTATUS)(sp)
+  |         ...
+  |         csrw    sstatus, t0
+  |         ...
+  |         csrw    sepc, t0
+

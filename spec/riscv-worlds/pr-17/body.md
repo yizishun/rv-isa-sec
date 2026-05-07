@@ -1,0 +1,3 @@
+- the diagrams now show transactions from all privilege levels
+- improved visual consistency
+- correction that Smlwidlist depends on Smlwid, not Smwid. (Though if Smwid is not enabled, then mlwidlist can't be lockable.)

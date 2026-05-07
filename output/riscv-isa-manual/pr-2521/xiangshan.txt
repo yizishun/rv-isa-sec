@@ -1,0 +1,94 @@
+PR #2521  target=xiangshan  overall=compliant
+Spec: SPMP/paging mutual exclusivity enforcement: failure to atomically synchronize satp.MODE-based SPMP gating with the pipeline creates a window where memory accesses are checked by neither SPMP nor paging, allowing U-mode to access arbitrary physical memory
+Violation: In XiangShan RTL, the SPMP check enable signal is derived from satp.MODE==Bare decoded in the TLB/MMU module. If the satp CSR write takes effect immediately in the CSR register file but the corresponding SPMP disable/enable transition is not synchronized with pipeline flushes, in-flight memory instructions in the load/store queue or instruction prefetch buffer may be checked against the wrong isolation mechanism — either SPMP rules when paging is newly enabled (causing spurious page faults), or paging page-table walks when Bare+SPMP is newly selected (bypassing SPMP protection entirely). Additionally, when V=1 and hgatp.MODE goes from non-Bare to Bare, stale VS/VU accesses in the pipeline could bypass SPMP enforcement if the SPMP activation signal is a multicycle path that lags behind hgatp.MODE updates. The spec mandates strict mutual exclusivity: satp.MODE!=Bare means paged virtual memory only, satp.MODE==Bare with Sspmp means SPMP only, and at no point may both or neither apply to S/U-mode accesses.
+Consequence: privilege_escape
+Pattern: Mux(condition = satp.mode === Bare) selecting between TLB page-table-walk result and SPMP match result; OR wire spmp_active = (satp_mode === Bare) & sspmp_implemented used as enable without pipeline synchronization; OR any combinational path where hgatp.MODE change doesn't immediately gate spmp_check_en in the load/store unit
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1402-1411  CSRMod.io.status.instrAddrTransType assignment
+  The instrAddrTransType.bare signal is correctly derived from satp/hgatp MODE fields combinationally. M-mode is explicitly gated (privState.isModeM), HS/VS virtual cases are correctly distinguished (isVirtual && vsatp+hgatp checks). An assertion at line 1411 enforces exactly one translation type is active. No SPMP-specific logic exists yet, so there is no SPMP activation/deactivation timing vulnerability currently. If SPMP were added, the bare-propagated signal would need to be split into 'mBare' (PMP) and 'sBare' (SPMP) cases, and the new SPMP path would need pipeline synchronization matching the existing sfence.vma-based TLB flush protocol.
+  | io.status.instrAddrTransType.bare := privState.isModeM ||
+  |   (!privState.isVirtual && satp.regOut.MODE === SatpMode.Bare) ||
+  |   (privState.isVirtual && vsatp.regOut.MODE === SatpMode.Bare && hgatp.regOut.MODE === HgatpMode.Bare)
+  | assert(PopCount(io.status.instrAddrTransType.asUInt) === 1.U, "Exactly one inst trans type should be asserted")
+
+[compliant] src/main/scala/xiangshan/cache/mmu/TLB.scala:95-106  TLB.s2xlate Mux (req_in_s2xlate)
+  Two-stage translation selection correctly handles all four virtualization+translation combinations: (a) both vsatp and hgatp non-Bare → allStage, (b) vsatp Bare + hgatp non-Bare → onlyStage2 (sv39x4/sv48x4), (c) vsatp non-Bare + hgatp Bare → onlyStage1, (d) both Bare → noS2xlate. The 'both Bare' case is the path where SPMP would activate for VS/VU-mode accesses. Currently, this path simply disables all translation (pass-through to PMP check), which is correct behavior when SPMP is not implemented. When both hgatp and vsatp are Bare, the gate at line 132-134 (s2xlateEnable requiring non-Bare modes for s2xlate) ensures no second-stage translation is attempted.
+  | val req_in_s2xlate = (0 until Width).map(i => MuxCase(noS2xlate, Seq(
+  |   (!(virt_in || req_in(i).bits.hyperinst)) -> noS2xlate,
+  |   (csr.vsatp.mode =/= 0.U && csr.hgatp.mode =/= 0.U) -> allStage,
+  |   (csr.vsatp.mode === 0.U) -> onlyStage2,
+  |   (csr.hgatp.mode === 0.U) -> onlyStage1
+  | )))
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:413-456  PMPCheckMethod.pmp_match_res
+  PMP matching implements RISC-V PMP priority rules correctly. passThrough is asserted when mode > 1 (i.e., M-mode=3, or when pmpEntries is empty), granting all permissions. When mode ≤ 1 (S/U-mode), PMP entries are checked in priority order (lower index = higher priority) via ParallelPriorityMux. The TOR matching logic (is_match) follows the spec: an address matches entry i if addr matches entry i's TOR range AND does not match entry i-1's TOR range (achieved by passing pmpDefault +: pmpEntries.take(num-1) as last_pmp). Lock bit (L) enforcement on line 435: 'ignore = passThrough && !pmp.cfg.l' prevents L-locked entries from being bypassed even when passThrough fires. Entry alignment check (aligned) on line 436 ensures accesses spanning PMP boundaries are caught. This is a correct PMP implementation and would serve as a template for an SPMP checker.
+  | val passThrough = if (pmpEntries.isEmpty) true.B else (mode > 1.U)
+  | val match_vec = Wire(Vec(num+1, Bool()))
+  | val cfg_vec = Wire(Vec(num+1, new PMPEntry()))
+  | ParallelPriorityMux(match_vec, cfg_vec)
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:556-617  PMPChecker
+  PMPChecker combines PMP match (pmp_match_res), PMA match (pma_match_res), and KeyID check into a unified response via bitwise OR (line 610). The mode parameter (io.check_env.mode) flows into pmp_match_res where passThrough is correctly computed. KeyID check (lines 596-598) correctly gates on mode < 3 (non-M-mode) and cmode=0 (non-confidential), preventing keyID-based side channels in M-mode or confidential VMs. When SPMP is added, this checker would need either a second parallel checker instance (with SPMP entries + mode ≤ 1 condition) or a mux selecting between pmp_check and spmp_check outputs based on satp.MODE==Bare. The current single-checker design has no SPMP-related vulnerability because SPMP doesn't exist yet, but the architecture would need careful pipelining of the satp.MODE-gated mux to avoid the timing window described in the security spec.
+  | val res_pmp = pmp_match_res(leaveHitMux, io.req.valid)(check_addr, req.size, io.check_env.pmp, io.check_env.mode, lgMaxSize)
+  | val res_pma = pma_match_res(leaveHitMux, io.req.valid)(check_addr, req.size, io.check_env.pma, io.check_env.mode, lgMaxSize)
+  | val resp = if (pmpUsed) (resp_pmp | resp_pma | resp_keyid) else (resp_pma | resp_keyid)
+
+[compliant] src/main/scala/xiangshan/cache/mmu/TLB.scala:66-71  TLB CSR delay and flush synchronization
+  The TLB correctly delays CSR inputs by FenceDelay cycles (csr = DelayN(io.csr, q.fenceDelay)) to align them with the sfence signal timing. The comment at line 86 explicitly documents the timing constraint: 'csr and flush from backend are delayed. csr should not be later than flush.' The combined flush signal (flush_mmu) ORs sfence.valid, satp.changed (ASID change), vsatp.changed (ASID change), hgatp.changed (VMID change), and virt_changed. This ensures that all TLB entries, in-flight PTW requests, and cached state are invalidated when any address translation context changes. For the SPMP case specifically, a satp.MODE transition from Sv39 to Bare (or vice versa) would be handled either by an sfence.vma instruction (which software must execute per the privileged spec) or would leave in-flight requests using the old MODE value - the latter being correct behavior since those instructions were fetched under the old translation regime.
+  | val sfence = DelayN(io.sfence, q.fenceDelay)
+  | val csr = DelayN(io.csr, q.fenceDelay)
+  | val flush_mmu = sfence.valid || csr.satp.changed || csr.vsatp.changed || csr.hgatp.changed || csr.priv.virt_changed
+  | val mmu_flush_pipe = sfence.valid && sfence.bits.flushPipe
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1450-1456  CSRMod TLB changed signal generation
+  The three 'changed' signals to the TLB are correctly generated: satpASIDChanged fires on satp ASID change, vsatpASIDChanged fires on vsatp ASID change, hgatpVMIDChanged fires on hgatp VMID change. Each uses GatedValidRegNext to ensure the signal is valid only for one cycle after the write. Importantly, MODE changes are intentionally NOT monitored here because the RISC-V privileged spec requires explicit sfence.vma after satp writes (which provides the flush), and automatic MODE-change-triggered flushes could be incorrect during svinval sequences. If SPMP were added, a satpMODEChanged signal might be needed specifically for SPMP context switching, but this would need to be gated on the Sspmp enable bit (menvcfg.SSPMP) to avoid unnecessary flushes on systems not using SPMP.
+  | io.tlb.satpASIDChanged  := GatedValidRegNext(satp.w.wen  && satp .regOut.ASID =/=  satp.w.wdataFields.ASID)
+  | io.tlb.vsatpASIDChanged := GatedValidRegNext(vsatp.w.wen && vsatp.regOut.ASID =/= vsatp.w.wdataFields.ASID)
+  | io.tlb.hgatpVMIDChanged := GatedValidRegNext(hgatp.w.wen && hgatp.regOut.VMID =/= hgatp.w.wdataFields.VMID)
+
+[potential_risk] src/main/scala/xiangshan/Bundle.scala:465-496  TlbSatpBundle.apply and TlbHgatpBundle.apply (changed signal)
+  The TlbSatpBundle.changed signal is computed solely from ASID changes (DataChanged(sa.asid)), and TlbHgatpBundle.changed from VMID changes (DataChanged(sa.vmid)). The ppn field does NOT trigger a changed signal (the comment says 'when ppn is changed, software need do the flush' implying sfence.vma handles it). For a future SPMP implementation, this is a latent risk: if SPMP activation/deactivation is gated on satp.MODE==Bare, any MODE transition (Bare→Sv39 or Sv39→Bare) without a corresponding sfence.vma could leave in-flight load/store queue entries using the wrong protection mechanism. Currently this is not a vulnerability because (a) SPMP isn't implemented and (b) the privileged spec mandates sfence.vma after any satp write that changes MODE. However, adding an spmpActiveChanged signal derived from MODE transitions would be a defensive hardening measure for future SPMP support.
+  | changed := DataChanged(sa.asid) // when ppn is changed, software need do the flush
+  | // ...
+  | changed := DataChanged(sa.vmid) // when ppn is changed, software need do the flush
+
+[compliant] src/main/scala/xiangshan/frontend/Frontend.scala:157-183  Frontend PMPChecker instantiation
+  Instruction-side PMP checkers use sameCycle=true (combinational PMP result in the same cycle as the request) for i-cache performance. The mode parameter is tlbCsr.priv.imode (instruction fetch privilege mode from CSR). Since SPMP only applies to S/U-mode data accesses (not instruction fetches, which remain under PMP), the instruction-side path is unaffected by SPMP. The PMP checker correctly handles modes 0-3, and sameCycle combinational logic means there's no registered stale state to worry about.
+  | private val pmpChecker = VecInit(Seq.fill(coreParams.ipmpPortNum)(Module(new PMPChecker(sameCycle = true)).io))
+  | checker.apply(tlbCsr.priv.imode, pmp.io.pmp, pmp.io.pma, requestor.req)
+  | requestor.resp := checker.resp
+
+[compliant] src/main/scala/xiangshan/mem/MemBlock.scala:693-710  MemBlock PMPChecker for data-side TLB
+  Data-side PMP checkers use leaveHitMux=true (registered PMP match vector and config selected by registered priority mux) for timing closure across the 4-cycle DTlb pipeline. The mode parameter is tlbcsr.priv.dmode (data-side privilege mode, which includes MPRV override logic from NewCSR.scala:1470-1474). The registered pipeline (leaveHitMux) means that a satp.MODE change that occurs during an in-flight TLB access would need sfence.vma to invalidate the stale PMP result — which is exactly how the privileged spec intends it. If SPMP is added, the dtlb_pmps wire carrying (check_addr, size, cmd) from each TLB port must also carry the satp.MODE context so the PMPChecker can select between PMP and SPMP entry sets atomically with the translation result.
+  | val pmp_checkers = Seq.fill(DTlbSize)(Module(new PMPChecker(4, leaveHitMux = true)))
+  | val pmp_check = pmp_checkers.map(_.io)
+  | p.apply(tlbcsr.priv.dmode, pmp.io.pmp, pmp.io.pma, d)
+
+[compliant] src/main/scala/xiangshan/cache/mmu/TLB.scala:384-391  TLB.pmp_check method
+  The pmp_check wrapper correctly handles non-translated addresses: pmp.valid is asserted for both translated hits AND non-translated requests (valid || noTranslate). The address used for PMP check is the physical address (from line 257: Mux(noTranslateReg, pmp_addr, pmp_addr(i))). This means pass-through/Bare mode addresses go directly to PMP checking without a translation pipeline dependency, which is correct. For SPMP, this same method would route Bare-mode S/U accesses to an SPMP checker instead of (or in addition to) the PMP checker, requiring a mode-dependent mux in the connection.
+  | def pmp_check(addr: UInt, size: UInt, cmd: UInt, noTranslate: Bool, idx: Int): Unit = {
+  |   pmp(idx).valid := resp(idx).valid || noTranslate
+  |   pmp(idx).bits.addr := addr
+  |   pmp(idx).bits.size := size
+  |   pmp(idx).bits.cmd := cmd
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/CSREvent.scala:85-109  genTrapVA
+  The trap virtual address generation correctly detects Bare mode using the same pattern as instrAddrTransType: M-mode OR HS/HU with satp Bare OR virtual with both vsatp and hgatp Bare. This pattern appears consistently across all trap entry events (MretEvent:42-49, SretEvent:52-59, DretEvent:42-49, MNretEvent:44-51). For a future SPMP implementation, these trap handlers would need to be aware that Bare mode in S/U-domain implies SPMP, not pure pass-through, but this is a software concern — the hardware correctly reports the translation context.
+  | val isBare =
+  |   transMode.isModeM ||
+  |   transMode.isModeHSorHU &&  satp.MODE === SatpMode.Bare ||
+  |   transMode.isVirtual    && vsatp.MODE === SatpMode.Bare && hgatp.MODE === HgatpMode.Bare
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala:245-252  SatpBundle reset value
+  satp.MODE resets to Bare (0), ASID resets to 0, PPN resets to 0. This is correct per the privileged spec: after reset, no virtual memory is enabled, and all S/U-mode accesses use physical addresses (checked by PMP, or in the future by SPMP). The WARL comment indicates write filtering happens in SatpModule/VSatpModule (not shown here, but the infrastructure is referenced). The 44-bit ASID field (44-1+ASIDLEN to 44) is configured by parameter, supporting up to 16-bit ASIDs for Sv39/Sv48.
+  | val MODE = SatpMode(63, 60, null).withReset(SatpMode.Bare)
+  | val ASID = RW(44 - 1 + ASIDLEN, 44).withReset(0.U)
+  | val PPN  = RW(43, 0).withReset(0.U)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:356-362  HgatpBundle reset value
+  hgatp.MODE resets to Bare (0), VMID resets to 0, PPN resets to 0. This is correct: at reset, G-stage translation is disabled, so VS/VU-mode accesses with vsatp=Bare+hgatp=Bare see physical addresses. The mode field uses wNoFilter (no WARL filtering on hypervisor CSRs, since the hypervisor is trusted to write legal values). When SPMP is added, the hgatp.MODE transition from non-Bare to Bare in V=1 context would need to instantaneously switch from G-stage-PMP to SPMP for VS/VU accesses — this is the exact scenario described in the security spec's hgatp concern. The key protection currently is that sfence.vma (and hfence.gvma for G-stage) must be executed after hgatp writes, which the hypervisor specification mandates.
+  | val MODE = HgatpMode(63, 60, wNoFilter).withReset(HgatpMode.Bare)
+  | val VMID = RW(44 - 1 + VMIDLEN, 44).withReset(0.U)
+  | val PPN = RW(43, 0).withReset(0.U)
+

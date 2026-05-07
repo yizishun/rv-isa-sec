@@ -1,0 +1,1 @@
+The complete explanation of the misaligned atomicity granule in the PMA section of the Machine mode chapter includes compressed instructions, but the brief summary of the PMA in the A extension chapter was missing them. Update the text to match.

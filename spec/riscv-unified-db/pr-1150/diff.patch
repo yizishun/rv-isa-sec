@@ -1,0 +1,917 @@
+diff --git a/spec/schemas/register_file_schema.json b/spec/schemas/register_file_schema.json
+new file mode 100644
+index 0000000000..4f0630f0be
+--- /dev/null
++++ b/spec/schemas/register_file_schema.json
+@@ -0,0 +1,124 @@
++{
++  "$schema": "http://json-schema.org/draft-07/schema#",
++
++  "title": "Register File Schema",
++  "description": "Schema for describing a register file",
++
++  "$defs": {
++    "register_entry": {
++      "type": "object",
++      "required": ["name"],
++      "additionalProperties": false,
++      "properties": {
++        "name": {
++          "$ref": "schema_defs.json#/$defs/register_name"
++        },
++        "abi_mnemonics": {
++          "type": "array",
++          "items": {
++            "$ref": "schema_defs.json#/$defs/register_alias"
++          },
++          "minItems": 1,
++          "uniqueItems": true,
++          "description": "ABI mnemonic names for the register"
++        },
++        "description": {
++          "$ref": "schema_defs.json#/$defs/spec_text"
++        },
++        "when": {
++          "$ref": "schema_defs.json#/$defs/requires_entry"
++        },
++        "arch_read()": {
++          "type": "string",
++          "description": "Function describing the architecturally defined read behavior. Use this for architecturally mandated effects (e.g., x0 always reads as zero)."
++        },
++        "arch_write(value)": {
++          "type": "string",
++          "description": "Function describing the architecturally defined write behavior. Given a 'value', return the architecturally required result (e.g., x0 ignores writes and always yields zero)."
++        },
++        "caller_saved": {
++          "type": "boolean",
++          "default": false,
++          "description": "Whether the register is caller-saved"
++        },
++        "callee_saved": {
++          "type": "boolean",
++          "default": false,
++          "description": "Whether the register is callee-saved"
++        },
++        "roles": {
++          "type": "array",
++          "items": {
++            "type": "string",
++            "enum": [
++              "zero",
++              "return_address",
++              "alternate_link_register",
++              "stack_pointer",
++              "global_pointer",
++              "thread_pointer",
++              "frame_pointer",
++              "return_value",
++              "argument",
++              "temporary"
++            ]
++          },
++          "uniqueItems": true
++        }
++      }
++    },
++    "register_file": {
++      "type": "object",
++      "required": [
++        "$schema",
++        "kind",
++        "name",
++        "long_name",
++        "description",
++        "register_length",
++        "registers"
++      ],
++      "additionalProperties": false,
++      "properties": {
++        "$schema": {
++          "format": "uri-reference",
++          "const": "register_file_schema.json#",
++          "description": "Path to schema, relative to <UDB ROOT>/schemas"
++        },
++        "kind": {
++          "const": "register_file"
++        },
++        "name": {
++          "$ref": "schema_defs.json#/$defs/register_file_name"
++        },
++        "long_name": {
++          "type": "string"
++        },
++        "description": {
++          "$ref": "schema_defs.json#/$defs/spec_text"
++        },
++        "definedBy": {
++          "$ref": "schema_defs.json#/$defs/requires_entry"
++        },
++        "register_class": {
++          "type": "string",
++          "enum": ["general_purpose", "floating_point", "vector"]
++        },
++        "register_length": {
++          "$ref": "schema_defs.json#/$defs/bit_length_value"
++        },
++        "registers": {
++          "type": "array",
++          "minItems": 1,
++          "items": {
++            "$ref": "#/$defs/register_entry"
++          }
++        },
++        "$source": {
++          "type": "string",
++          "format": "uri-reference"
++        }
++      }
++    }
++  }
++}
+diff --git a/spec/schemas/schema_defs.json b/spec/schemas/schema_defs.json
+index 8b0e1f5bcd..01f22cfa32 100644
+--- a/spec/schemas/schema_defs.json
++++ b/spec/schemas/schema_defs.json
+@@ -43,6 +43,35 @@
+       ],
+       "description": "Location of a field in a register"
+     },
++    "bit_length_value": {
++      "description": "Bit width value for a register or field",
++      "oneOf": [
++        {
++          "type": "integer",
++          "minimum": 1
++        },
++        {
++          "type": "string",
++          "minLength": 1,
++          "enum": ["MXLEN", "FLEN", "VLEN"]
++        }
++      ]
++    },
++    "register_name": {
++      "type": "string",
++      "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$",
++      "description": "Register name"
++    },
++    "register_file_name": {
++      "type": "string",
++      "pattern": "^[A-Z]$",
++      "description": "Register file name"
++    },
++    "register_alias": {
++      "type": "string",
++      "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$",
++      "description": "Register alias or ABI mnemonic"
++    },
+     "possibly_split_field_location": {
+       "description": "Location specifier for a field",
+       "oneOf": [
+diff --git a/spec/std/isa/README.adoc b/spec/std/isa/README.adoc
+index 809631ea88..25731c87f2 100644
+--- a/spec/std/isa/README.adoc
++++ b/spec/std/isa/README.adoc
+@@ -29,8 +29,8 @@ Three standard configs are present:
+  * `rv64`: A configuration where only `MXLEN` is known to be 64, i.e., the RV64 ISA.
+ 
+ The architecture is specified in a series of https://en.wikipedia.org/wiki/YAML[YAML]
+-files for _Extensions_, _Instructions_, and _Control and Status Registers (CSRs)_.
+-Each extension/instruction/CSR has its own file.
++files for _Extensions_, _Instructions_, _RegFiles_, and _Control and Status Registers (CSRs)_.
++Each extension/instruction/regfile/CSR has its own file.
+ 
+ == Flow
+ 
+@@ -142,6 +142,40 @@ H: # <1>
+ 
+ === Instructions
+ 
++=== Register Files
++
++.Example register file specification
++[source,yaml]
++----
++$schema: register_file_schema.json#
++kind: register_file
++name: X
++long_name: Integer General Purpose Registers
++definedBy: I
++register_class: general_purpose
++register_length: MXLEN # <1>
++registers:
++  - name: x0    # <2>
++    abi_mnemonics: [zero] # <3>
++    roles: [zero]
++    arch_read(): | # <4>
++      return 0;
++    arch_write(value): |
++      # x0 ignores all writes
++  - name: x1
++    abi_mnemonics: [ra]
++    roles: [return_address]
++  - name: x8
++    abi_mnemonics: [s0, fp] # <5>
++    roles: [callee_saved, frame_pointer]
++----
++
++<1> The registers in a register file have identical fixed widths, either an explicit width or from a parameter (e.g. MXLEN or VLEN).
++<2> Each register has a unique name (e.g., x0, x1, x2, etc.). The register's index is inferred from its position in the array (starting from 0).
++<3> Registers can optionally have ABI mnemonics (e.g., ra, sp, fp, etc.).
++<4> Individual registers can define `arch_read()` and `arch_write()` for architecturally mandated behavior (e.g., x0 hardwired to zero).
++<5> A register can have multiple ABI mnemonics (e.g., x8 is known as both s0 and fp).
++
+ [source,yaml]
+ ----
+ add: # <1>
+diff --git a/spec/std/isa/register_file/F.yaml b/spec/std/isa/register_file/F.yaml
+new file mode 100644
+index 0000000000..c628a362d0
+--- /dev/null
++++ b/spec/std/isa/register_file/F.yaml
+@@ -0,0 +1,165 @@
++# Copyright (c) Animesh Agarwal
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../../../schemas/register_file_schema.json
++
++$schema: register_file_schema.json#
++kind: register_file
++name: F
++long_name: Floating-Point Registers
++description: |
++  The 'F' register file contains the 32 floating-point registers used by
++  RISC-V floating-point extensions. Each register stores FLEN bits of state and
++  participates in the standard calling convention defined by the RISC-V ABI spec.
++definedBy: F
++register_class: floating_point
++register_length: FLEN
++registers:
++  - name: f0
++    abi_mnemonics: [ft0]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f1
++    abi_mnemonics: [ft1]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f2
++    abi_mnemonics: [ft2]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f3
++    abi_mnemonics: [ft3]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f4
++    abi_mnemonics: [ft4]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f5
++    abi_mnemonics: [ft5]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f6
++    abi_mnemonics: [ft6]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f7
++    abi_mnemonics: [ft7]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f8
++    abi_mnemonics: [fs0]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f9
++    abi_mnemonics: [fs1]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f10
++    abi_mnemonics: [fa0]
++    caller_saved: true
++    roles: [argument, return_value]
++    description: Floating-point argument / return value register 0.
++  - name: f11
++    abi_mnemonics: [fa1]
++    caller_saved: true
++    roles: [argument, return_value]
++    description: Floating-point argument / return value register 1.
++  - name: f12
++    abi_mnemonics: [fa2]
++    caller_saved: true
++    roles: [argument]
++    description: Floating-point argument register 2.
++  - name: f13
++    abi_mnemonics: [fa3]
++    caller_saved: true
++    roles: [argument]
++    description: Floating-point argument register 3.
++  - name: f14
++    abi_mnemonics: [fa4]
++    caller_saved: true
++    roles: [argument]
++    description: Floating-point argument register 4.
++  - name: f15
++    abi_mnemonics: [fa5]
++    caller_saved: true
++    roles: [argument]
++    description: Floating-point argument register 5.
++  - name: f16
++    abi_mnemonics: [fa6]
++    caller_saved: true
++    roles: [argument]
++    description: Floating-point argument register 6.
++  - name: f17
++    abi_mnemonics: [fa7]
++    caller_saved: true
++    roles: [argument]
++    description: Floating-point argument register 7.
++  - name: f18
++    abi_mnemonics: [fs2]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f19
++    abi_mnemonics: [fs3]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f20
++    abi_mnemonics: [fs4]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f21
++    abi_mnemonics: [fs5]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f22
++    abi_mnemonics: [fs6]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f23
++    abi_mnemonics: [fs7]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f24
++    abi_mnemonics: [fs8]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f25
++    abi_mnemonics: [fs9]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f26
++    abi_mnemonics: [fs10]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f27
++    abi_mnemonics: [fs11]
++    callee_saved: true
++    description: Callee-saved floating-point register.
++  - name: f28
++    abi_mnemonics: [ft8]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f29
++    abi_mnemonics: [ft9]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f30
++    abi_mnemonics: [ft10]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
++  - name: f31
++    abi_mnemonics: [ft11]
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved temporary register.
+diff --git a/spec/std/isa/register_file/V.yaml b/spec/std/isa/register_file/V.yaml
+new file mode 100644
+index 0000000000..d2802916a6
+--- /dev/null
++++ b/spec/std/isa/register_file/V.yaml
+@@ -0,0 +1,146 @@
++# Copyright (c) Animesh Agarwal
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../../../schemas/register_file_schema.json
++
++$schema: register_file_schema.json#
++kind: register_file
++name: V
++long_name: Vector Registers
++description: |
++  The 'V' register file contains the 32 vector registers defined by the RISC-V
++  Vector Extension (RVV). Each register holds VLEN bits of data. Under the
++  current ABI spec all vector registers are caller-saved temporaries and do not
++  participate in argument passing or return values.
++definedBy: V
++register_class: vector
++register_length: VLEN
++registers:
++  - name: v0
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v1
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v2
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v3
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v4
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v5
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v6
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v7
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v8
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v9
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v10
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v11
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v12
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v13
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v14
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v15
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v16
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v17
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v18
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v19
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v20
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v21
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v22
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v23
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v24
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v25
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v26
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v27
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v28
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v29
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v30
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
++  - name: v31
++    caller_saved: true
++    roles: [temporary]
++    description: Caller-saved vector temporary register.
+diff --git a/spec/std/isa/register_file/X.yaml b/spec/std/isa/register_file/X.yaml
+new file mode 100644
+index 0000000000..0d48db7463
+--- /dev/null
++++ b/spec/std/isa/register_file/X.yaml
+@@ -0,0 +1,201 @@
++# Copyright (c) Animesh Agarwal
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../../schemas/register_file_schema.json
++
++$schema: register_file_schema.json#
++kind: register_file
++name: X
++long_name: General Purpose Registers
++description: |
++  The 'X' register file contains the general-purpose integer registers. Each register
++  is MXLEN bits wide, but will appear to be XLEN bits wide if XLEN<MXLEN. Register
++  'x0' is hardwired to zero, while the remaining registers hold architecturally
++  visible integer state used by the calling convention and execution environment.
++definedBy: I
++register_class: general_purpose
++register_length: MXLEN
++registers:
++  - name: x0
++    abi_mnemonics: [zero]
++    roles: [zero]
++    description: |
++      Register x0 is hardwired with all bits equal to 0.
++    arch_read(): |
++      return 0;
++    arch_write(value): |
++      return 0;
++  - name: x1
++    abi_mnemonics: [ra]
++    caller_saved: true
++    roles: [return_address]
++    description: Return address register used by CALL/JAL instructions.
++  - name: x2
++    abi_mnemonics: [sp]
++    callee_saved: true
++    roles: [stack_pointer]
++    description: Stack pointer.
++  - name: x3
++    abi_mnemonics: [gp]
++    roles: [global_pointer]
++    description: Global pointer.
++  - name: x4
++    abi_mnemonics: [tp]
++    roles: [thread_pointer]
++    description: Thread pointer or TLS base.
++  - name: x5
++    abi_mnemonics: [t0]
++    caller_saved: true
++    roles: [temporary, alternate_link_register]
++    description: Temporary register / linkage scratch.
++  - name: x6
++    abi_mnemonics: [t1]
++    caller_saved: true
++    roles: [temporary]
++    description: Temporary register.
++  - name: x7
++    abi_mnemonics: [t2]
++    caller_saved: true
++    roles: [temporary]
++    description: Temporary register.
++  - name: x8
++    abi_mnemonics: [s0, fp]
++    callee_saved: true
++    roles: [frame_pointer]
++    description: Callee-saved register; used as frame pointer when required.
++  - name: x9
++    abi_mnemonics: [s1]
++    callee_saved: true
++    description: Callee-saved register.
++  - name: x10
++    abi_mnemonics: [a0]
++    caller_saved: true
++    roles: [argument, return_value]
++    description: Function argument / return value register 0.
++  - name: x11
++    abi_mnemonics: [a1]
++    caller_saved: true
++    roles: [argument, return_value]
++    description: Function argument / return value register 1.
++  - name: x12
++    abi_mnemonics: [a2]
++    caller_saved: true
++    roles: [argument]
++    description: Function argument register 2.
++  - name: x13
++    abi_mnemonics: [a3]
++    caller_saved: true
++    roles: [argument]
++    description: Function argument register 3.
++  - name: x14
++    abi_mnemonics: [a4]
++    caller_saved: true
++    roles: [argument]
++    description: Function argument register 4.
++  - name: x15
++    abi_mnemonics: [a5]
++    caller_saved: true
++    roles: [argument]
++    description: Function argument register 5.
++  - name: x16
++    abi_mnemonics: [a6]
++    caller_saved: true
++    roles: [argument]
++    description: Function argument register 6.
++    when:
++      not: { name: E }
++  - name: x17
++    abi_mnemonics: [a7]
++    caller_saved: true
++    roles: [argument]
++    description: Function argument register 7 / syscall ID.
++    when:
++      not: { name: E }
++  - name: x18
++    abi_mnemonics: [s2]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x19
++    abi_mnemonics: [s3]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x20
++    abi_mnemonics: [s4]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x21
++    abi_mnemonics: [s5]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x22
++    abi_mnemonics: [s6]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x23
++    abi_mnemonics: [s7]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x24
++    abi_mnemonics: [s8]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x25
++    abi_mnemonics: [s9]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x26
++    abi_mnemonics: [s10]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x27
++    abi_mnemonics: [s11]
++    callee_saved: true
++    description: Callee-saved register.
++    when:
++      not: { name: E }
++  - name: x28
++    abi_mnemonics: [t3]
++    caller_saved: true
++    roles: [temporary]
++    description: Temporary register.
++    when:
++      not: { name: E }
++  - name: x29
++    abi_mnemonics: [t4]
++    caller_saved: true
++    roles: [temporary]
++    description: Temporary register.
++    when:
++      not: { name: E }
++  - name: x30
++    abi_mnemonics: [t5]
++    caller_saved: true
++    roles: [temporary]
++    description: Temporary register.
++    when:
++      not: { name: E }
++  - name: x31
++    abi_mnemonics: [t6]
++    caller_saved: true
++    roles: [temporary]
++    description: Temporary register.
++    when:
++      not: { name: E }
+diff --git a/tools/ruby-gems/udb/lib/udb/architecture.rb b/tools/ruby-gems/udb/lib/udb/architecture.rb
+index 6b62e72c3a..60d5840a78 100644
+--- a/tools/ruby-gems/udb/lib/udb/architecture.rb
++++ b/tools/ruby-gems/udb/lib/udb/architecture.rb
+@@ -50,6 +50,7 @@
+ require_relative "obj/certificate"
+ require_relative "obj/csr"
+ require_relative "obj/csr_field"
++require_relative "obj/register_file"
+ require_relative "obj/exception_code"
+ require_relative "obj/extension"
+ require_relative "obj/instruction"
+@@ -123,6 +124,12 @@ def validate(resolver, show_progress: true)
+         klass: Csr,
+         kind: DatabaseObject::Kind::Csr
+       },
++      {
++        fn_name: "register_file",
++        arch_dir: "register",
++        klass: RegisterFile,
++        kind: DatabaseObject::Kind::RegisterFile
++      },
+       {
+         fn_name: "param",
+         arch_dir: "param",
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb b/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb
+index 9a56a065b0..2415abea89 100644
+--- a/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb
++++ b/tools/ruby-gems/udb/lib/udb/obj/database_obj.rb
+@@ -26,6 +26,7 @@ class Kind < T::Enum
+         Csr = new("csr")
+         CsrField = new("csr_field")
+         Extension = new("extension")
++        RegisterFile = new("register_file")
+         Parameter = new("parameter")
+         ExceptionCode = new("exception_code")
+         InterruptCode = new("interrupt_code")
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/register_file.rb b/tools/ruby-gems/udb/lib/udb/obj/register_file.rb
+new file mode 100644
+index 0000000000..c473936b84
+--- /dev/null
++++ b/tools/ruby-gems/udb/lib/udb/obj/register_file.rb
+@@ -0,0 +1,118 @@
++# Copyright (c) Animesh Agarwal
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# typed: true
++# frozen_string_literal: true
++
++require_relative "database_obj"
++require_relative "../condition"
++
++module Udb
++
++class RegisterFile < TopLevelDatabaseObject
++  extend T::Sig
++
++  class RegisterEntry
++    extend T::Sig
++
++    class Role < T::Enum
++      enums do
++        Zero = new("zero")
++        ReturnAddress = new("return_address")
++        AlternateLinkRegister = new("alternate_link_register")
++        StackPointer = new("stack_pointer")
++        GlobalPointer = new("global_pointer")
++        ThreadPointer = new("thread_pointer")
++        FramePointer = new("frame_pointer")
++        ReturnValue = new("return_value")
++        Argument = new("argument")
++        Temporary = new("temporary")
++      end
++    end
++
++  sig { returns(T::Hash[String, T.untyped]) }
++  attr_reader :data
++
++    sig { returns(Integer) }
++    attr_reader :index
++
++    sig { params(file: RegisterFile, data: T::Hash[String, T.untyped], index: Integer).void }
++    def initialize(file, data, index)
++      @file = file
++      @data = data
++      @index = index
++    end
++
++    sig { returns(String) }
++    def name = @data.fetch("name")
++
++    sig { returns(T::Array[String]) }
++    def abi_mnemonics = @data.fetch("abi_mnemonics", [])
++
++    sig { returns(T.any(Integer, String)) }
++    def index = @index
++
++    sig { returns(T.nilable(String)) }
++    def description = @data["description"]
++
++    sig { returns(T::Array[Role]) }
++    def roles
++      @roles ||= @data.fetch("roles", []).map { |role| Role.deserialize(role) }
++    end
++
++    sig { returns(T.nilable(T::Boolean)) }
++    def caller_saved = @data["caller_saved"]
++
++    sig { returns(T.nilable(T::Boolean)) }
++    def callee_saved = @data["callee_saved"]
++
++    sig { returns(T.nilable(String)) }
++    def arch_read
++      @data["arch_read()"] || @data["sw_read()"]
++    end
++
++    sig { returns(T.nilable(String)) }
++    def arch_write
++      @data["arch_write(value)"] || @data["sw_write(value)"]
++    end
++
++    sig { returns(T.nilable(String)) }
++    def sw_read = arch_read
++
++    sig { returns(T.nilable(String)) }
++    def sw_write = arch_write
++
++    sig { returns(T.nilable(AbstractCondition)) }
++    def defined_by_condition
++      return nil unless @data.key?("definedBy")
++
++      @defined_by_condition ||= Condition.new(@data.fetch("definedBy"), @file.arch)
++    end
++
++    sig { returns(T.nilable(Condition)) }
++    def when_condition
++      return nil unless @data.key?("when")
++
++      @when_condition ||= Condition.new(@data.fetch("when"), @file.arch)
++    end
++  end
++
++  sig { returns(T.any(Integer, String)) }
++  def register_length = @data.fetch("register_length")
++
++  sig { returns(T.nilable(String)) }
++  def summary = @data["summary"]
++
++  sig { returns(T.nilable(String)) }
++  def register_class = @data["register_class"]
++
++  sig { returns(T::Array[RegisterEntry]) }
++  def registers
++    @registers ||= @data.fetch("registers", []).map.with_index { |reg, idx| RegisterEntry.new(self, reg, idx) }
++  end
++
++  sig { returns(T::Array[T::Hash[String, T.untyped]]) }
++  def templates = @data.fetch("templates", [])
++ end
++
++end

@@ -1,0 +1,221 @@
+{
+  "pr_number": 2608,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2608,
+    "violation_condition": "QEMU implements smstateen CSRs (mstateen0-3, sstateen0-3, hstateen0-3) but fails to check the corresponding stateen bit before allowing access to a controlled CSR (e.g., senvcfg, siselect/sireg*, scontext, jvt, stopei, srmcfg). Specifically, when a guest in S-mode or U-mode accesses a CSR that is under stateen control, QEMU must raise an illegal-instruction exception if the governing stateen bit is 0, yet no check is performed in the CSR read/write handler. The hierarchical nature compounds this: mstateen0 bit 63 gates access to sstateen0/hstateen0 themselves, and hstateen0 bits mask sstateen0 bits when accessed in VS-mode — missing any link in this chain breaks the entire access-control hierarchy.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "check stateen bit before CSR access; sstateen hstateen mstateen access control illegal-instruction exception WARL ROZ masking VS-mode",
+    "affected_entities": [
+      "mstateen0",
+      "mstateen1",
+      "mstateen2",
+      "mstateen3",
+      "sstateen0",
+      "sstateen1",
+      "sstateen2",
+      "sstateen3",
+      "hstateen0",
+      "hstateen1",
+      "hstateen2",
+      "hstateen3",
+      "senvcfg",
+      "henvcfg",
+      "siselect",
+      "sireg*",
+      "vsiselect",
+      "vsireg*",
+      "scontext",
+      "hcontext",
+      "stopei",
+      "vstopei",
+      "jvt",
+      "srmcfg",
+      "hedelegh"
+    ],
+    "summary": "QEMU must enforce full stateen access-control hierarchy: check governing stateen CSR bit before every controlled-CSR access and raise illegal-instruction exception if bit is 0, with hstateen masking sstateen bits in VS-mode"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_mstateen0",
+        "line_start": 3455,
+        "line_end": 3489,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SMSTATEEN0_JVT (bit 2) is missing from the writable mask in write_mstateen0. The zcmt() predicate (line 180) and helper_zcmt_jvt_tbl() (zce_helper.c:30) both call smstateen_acc_ok(env, 0, SMSTATEEN0_JVT), but M-mode software can never set mstateen0 bit 2 because the writable mask doesn't include it. This means the JVT CSR (0x017) is effectively inaccessible from S-mode and U-mode even when Zcmt is enabled — an overly-restrictive emulation bug. The writable mask should include SMSTATEEN0_JVT when ext_zcmt is enabled.",
+      "snippet": "uint64_t wr_mask = SMSTATEEN_STATEEN | SMSTATEEN0_HSENVCFG;\n// ... SMSTATEEN0_JVT (1ULL << 2) never added to wr_mask\ngoes here\nif (riscv_cpu_cfg(env)->ext_ssctr) {\n    wr_mask |= SMSTATEEN0_CTR;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_hstateen0",
+        "line_start": 3577,
+        "line_end": 3608,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same SMSTATEEN0_JVT (bit 2) omission as write_mstateen0. hstateen0 write mask also lacks SMSTATEEN0_JVT, so a hypervisor cannot enable JVT access for its VS-mode guest via the stateen hierarchy. This is a secondary instance of the same bug.",
+      "snippet": "uint64_t wr_mask = SMSTATEEN_STATEEN | SMSTATEEN0_HSENVCFG;\n// ... SMSTATEEN0_JVT missing here too\ngoes here\nif (riscv_cpu_cfg(env)->ext_ssctr) {\n    wr_mask |= SMSTATEEN0_CTR;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_sstateen0",
+        "line_start": 3706,
+        "line_end": 3716,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "write_sstateen0 writable mask starts at 0 and only adds SMSTATEEN0_FCSR (when !RVF). It lacks SMSTATEEN0_JVT, SMSTATEEN0_HSENVCFG, SMSTATEEN0_SVSLCT, SMSTATEEN0_AIA, SMSTATEEN0_IMSIC, SMSTATEEN0_CTR — all bits that S-mode must be able to write to delegate state-enable to U-mode. While the downstream write_sstateen() correctly masks by mstateen[index] and hstateen[index], if the requested mask (second parameter) doesn't include these bits, the mstateen masking has no effect. S-mode is thus prevented from enabling U-mode access to any smstateen-controlled resource.",
+      "snippet": "uint64_t wr_mask = 0;\n\nif (!riscv_has_ext(env, RVF)) {\n    wr_mask |= SMSTATEEN0_FCSR;\n}\n\nreturn write_sstateen(env, csrno, wr_mask, new_val);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "smstateen_acc_ok",
+        "line_start": 48,
+        "line_end": 77,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The core access-check function is correctly implemented. It properly enforces the full hierarchical chain: (1) M-mode bypasses all checks, (2) mstateen[index] & bit is checked first — returns ILLEGAL_INST on failure, (3) in V=1 mode, hstateen[index] & bit is checked — returns VIRT_INSTRUCTION_FAULT on failure, (4) for U-mode in V=1, sstateen[index] & bit is also checked — returns VIRT_INSTRUCTION_FAULT on failure, (5) for U-mode with S-extension, sstateen[index] & bit is checked — returns ILLEGAL_INST on failure. All return codes match the spec's required exception types.",
+      "snippet": "if (!(env->mstateen[index] & bit)) {\n    return RISCV_EXCP_ILLEGAL_INST;\n}\nif (virt) {\n    if (!(env->hstateen[index] & bit)) {\n        return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;\n    }\n    if (env->priv == PRV_U && !(env->sstateen[index] & bit)) {\n        return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;\n    }\n}\nif (env->priv == PRV_U && riscv_has_ext(env, RVS)) {\n    if (!(env->sstateen[index] & bit)) {\n        return RISCV_EXCP_ILLEGAL_INST;\n    }\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_senvcfg, write_senvcfg, read_henvcfg, write_henvcfg, read_henvcfgh, write_henvcfgh",
+        "line_start": 3259,
+        "line_end": 3417,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All senvcfg and henvcfg (plus RV32 H-variants) read/write handlers properly call smstateen_acc_ok(env, 0, SMSTATEEN0_HSENVCFG) before performing the read or write. Access is correctly denied with ILLEGAL_INST if the HSENVCFG stateen bit (bit 62) is not set.",
+      "snippet": "ret = smstateen_acc_ok(env, 0, SMSTATEEN0_HSENVCFG);\nif (ret != RISCV_EXCP_NONE) {\n    return ret;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xiselect",
+        "line_start": 2417,
+        "line_end": 2427,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The siselect/vsiselect/miselect CSR handler (rmw_xiselect) properly calls smstateen_acc_ok(env, 0, SMSTATEEN0_SVSLCT) before translating the CSR number and dispatching to the per-mode iselect register. Access is correctly denied if the SVSLCT bit (bit 60) is not set.",
+      "snippet": "ret = smstateen_acc_ok(env, 0, SMSTATEEN0_SVSLCT);\nif (ret != RISCV_EXCP_NONE) {\n    return ret;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xiregi, rmw_xireg",
+        "line_start": 2852,
+        "line_end": 2892,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Both sireg/vsireg/mireg handler variants (rmw_xiregi for sireg, rmw_xireg for sireg2-6) properly call smstateen_acc_ok(env, 0, SMSTATEEN0_SVSLCT) before dispatching to the indirect register read/write function. Access correctly controlled by bit 60.",
+      "snippet": "ret = smstateen_acc_ok(env, 0, SMSTATEEN0_SVSLCT);\nif (ret != RISCV_EXCP_NONE) {\n    return ret;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "aia_smode, aia_hmode, aia_smode32, aia_hmode32",
+        "line_start": 353,
+        "line_end": 395,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "AIA CSR predicates correctly dispatch stateen checks: stopei uses SMSTATEEN0_IMSIC (bit 58), other AIA CSRs use SMSTATEEN0_AIA (bit 59). The aia_hmode variants for VS-mode CSRs (vstopei, etc.) also check through the same hierarchy, with the smstateen_acc_ok function properly adding hstateen masking in V=1.",
+      "snippet": "if (csrno == CSR_STOPEI) {\n    ret = smstateen_acc_ok(env, 0, SMSTATEEN0_IMSIC);\n} else {\n    ret = smstateen_acc_ok(env, 0, SMSTATEEN0_AIA);\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_mstateen, write_mstateen, read_hstateen, write_hstateen, read_sstateen, write_sstateen",
+        "line_start": 3436,
+        "line_end": 3722,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Read/write handlers for the stateen CSRs themselves properly implement hierarchical masking. read_hstateen returns hstateen & mstateen (line 3559). read_sstateen returns sstateen & mstateen & hstateen(when virt) (line 3679-3681). write_hstateen masks writable bits by mstateen (line 3571). write_sstateen masks writable bits by mstateen & hstateen(when virt) (line 3695-3697). Only SMSTATEEN_STATEEN (bit 63) is writable in mstateen1-3/hstateen1-3/sstateen1-3, correctly reflecting that upper indices only have a 'next-stateen' bit. Reserved bits are properly read-as-zero and write-ignored.",
+      "snippet": "*val = env->hstateen[index] & env->mstateen[index];\n// ...\nwr_mask = env->mstateen[index] & mask;\n*reg = (*reg & ~wr_mask) | (new_val & wr_mask);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "hstateen_pred, sstateen",
+        "line_start": 514,
+        "line_end": 583,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Predicate functions for accessing hstateen and sstateen CSRs correctly implement the hierarchical gating of the stateen CSRs themselves. hstateen_pred (line 529-533) checks mstateen[].bit63 before allowing non-M-mode access to hstateen CSRs. sstateen (line 570-579) checks mstateen[].bit63 (and hstateen[].bit63 when V=1) before allowing access to sstateen CSRs. This correctly implements the 'mstateen bit 63 gates access to sstateen/hstateen themselves' requirement.",
+      "snippet": "if (env->priv < PRV_M) {\n    if (!(env->mstateen[csrno - base] & SMSTATEEN_STATEEN)) {\n        return RISCV_EXCP_ILLEGAL_INST;\n    }\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_smstateen",
+        "line_start": 271,
+        "line_end": 282,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All three stateen arrays (mstateen[4], hstateen[4], sstateen[4]) are included in the VMState subsection vmstate_smstateen, guarded by smstateen_needed() which returns true only when ext_smstateen is enabled. No missing fields — live migration correctly preserves stateen state.",
+      "snippet": "VMSTATE_UINT64_ARRAY(env.mstateen, RISCVCPU, 4),\nVMSTATE_UINT64_ARRAY(env.hstateen, RISCVCPU, 4),\nVMSTATE_UINT64_ARRAY(env.sstateen, RISCVCPU, 4),"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "ctr_smode",
+        "line_start": 687,
+        "line_end": 702,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The CTR S-mode CSRs predicate correctly checks smstateen_acc_ok(env, 0, SMSTATEEN0_CTR) before allowing access. Additionally, sctrdepth is correctly flagged as VIRT_INSTRUCTION_FAULT when accessed in V=1 mode. The op_helper.c:521 helper_ctr_clear also independently checks SMSTATEEN0_CTR.",
+      "snippet": "RISCVException ret = smstateen_acc_ok(env, 0, SMSTATEEN0_CTR);\nif (ret == RISCV_EXCP_NONE && csrno == CSR_SCTRDEPTH &&\n    env->virt_enabled) {\n    return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_hedelegh, write_hedelegh",
+        "line_start": 4649,
+        "line_end": 4674,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hedelegh (Priv 1.13 upper-half hedeleg for RV32) correctly checks smstateen_acc_ok(env, 0, SMSTATEEN0_P1P13) before allowing access. read_hedelegh returns 0 (reserved, read-as-zero), write_hedelegh ignores writes (reserved, write-ignored).",
+      "snippet": "ret = smstateen_acc_ok(env, 0, SMSTATEEN0_P1P13);\nif (ret != RISCV_EXCP_NONE) {\n    return ret;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "zcmt",
+        "line_start": 173,
+        "line_end": 187,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The zcmt() predicate that guards CSR_JVT access correctly calls smstateen_acc_ok(env, 0, SMSTATEEN0_JVT). While the corresponding stateen bit is not writable (see bug above), the check itself is correctly positioned and would properly deny access if the bit could be set.",
+      "snippet": "RISCVException ret = smstateen_acc_ok(env, 0, SMSTATEEN0_JVT);\nif (ret != RISCV_EXCP_NONE) {\n    return ret;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_cfg_fields.h.inc",
+        "function_name": "ext_smstateen (initialization)",
+        "line_start": 91,
+        "line_end": 92,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ext_zvknha and ext_zvknhb are separate BOOL_FIELD entries. They are independently configurable. However, this is NOT a violation of the spec because zvknhb does not 'imply' zvknha at the ISA string level — they are separate extensions. The relationship is that zvknhb is a proper superset of zvknha's functionality (SHA-256 + SHA-512 vs SHA-256 only). No misa-like dependency exists; users should not enable both. The stateen CSR gating of actual CSR accesses (sha2* instructions checking ext_zvknha/ext_zvknhb via vsha_check_sew at trans_rvvk.c.inc:414-419) correctly checks the per-extension cfg flag.",
+      "snippet": "BOOL_FIELD(ext_zvknha)\nBOOL_FIELD(ext_zvknhb)"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

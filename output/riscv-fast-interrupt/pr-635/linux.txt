@@ -1,0 +1,67 @@
+PR #635  target=linux  overall=potential_risk
+Spec: CLIC Smivt repurposes scause exception code field when stvec.MODE=11 for external interrupts, splitting into major[15:0]/minor[XLEN-2:16] identity; kernel scause parsing assumes unpartitioned flat interrupt numbering and would yield garbage hwirq values and incorrect trap dispatching.
+Violation: The kernel extracts the interrupt identifier from scause by masking with ~CAUSE_IRQ_FLAG and using the full remaining XLEN-1 bits as a flat interrupt number (e.g., in riscv_intc_irq at drivers/irqchip/irq-riscv-intc.c:31). Under Smivt/CLIC with stvec.MODE=11, external interrupts encode Major Interrupt Identity in bits 15:0 and Minor Interrupt Identity in bits XLEN-2:16 of xcause, producing a corrupted composite value when parsed with the standard flat-numbering mask. The kernel also uses raw scause values to index the excp_vect_table in entry.S by left-shifting the full scause value, which would compute a wildly incorrect table offset if scause were in CLIC format. Any code path where the kernel or KVM host sets stvec.MODE=11 without corresponding updates to scause parsing triggers this mismatch.
+Consequence: denial_of_service
+Pattern: cause & ~CAUSE_IRQ_FLAG
+------------------------------------------------------------
+[potential_risk] drivers/irqchip/irq-riscv-intc.c:31-31  riscv_intc_irq
+  Uses the standard flat-numbering mask `cause & ~CAUSE_IRQ_FLAG` to extract the interrupt identifier from scause. Under Smivt/CLIC with stvec.MODE=11, external interrupts encode Major Interrupt Identity in bits 15:0 and Minor Interrupt Identity in bits XLEN-2:16 of xcause, so this mask would produce a corrupted composite value. Currently no kernel code sets stvec.MODE=11 — stvec is always configured to direct mode (MODE=00) via `csrw CSR_TVEC, handle_exception` in head.S:206 — so this is latent and not actively triggerable. However, if firmware or a hypervisor were to enable CLIC vectoring mode, or if the kernel adds Smivt support without updating this parsing, the interrupt handler would misidentify interrupts, leading to denial of service.
+  | unsigned long cause = regs->cause & ~CAUSE_IRQ_FLAG;
+  | 
+  | if (generic_handle_domain_irq(intc_domain, cause))
+  | 	pr_warn_ratelimited("Failed to handle interrupt (cause: %ld)\n", cause);
+
+[compliant] drivers/irqchip/irq-riscv-intc.c:188-193  riscv_intc_init_common
+  When AIA (SxAIA) is available, the kernel uses riscv_intc_aia_irq() which reads from the TOPI CSR instead of parsing scause with the flat-numbering mask. TOPI-based interrupt identification is correct regardless of stvec mode, so this path would be immune to the Smivt/CLIC parsing mismatch. The vulnerable riscv_intc_irq() is only selected when AIA is absent.
+  | if (riscv_isa_extension_available(NULL, SxAIA)) {
+  | 	riscv_intc_nr_irqs = 64;
+  | 	rc = set_handle_irq(&riscv_intc_aia_irq);
+  | } else {
+  | 	rc = set_handle_irq(&riscv_intc_irq);
+  | }
+
+[compliant] arch/riscv/kernel/entry.S:225-231  handle_exception
+  The excp_vect_table indexing via `slli t0, s4, RISCV_LGPTR` left-shifts the full scause value to compute a table offset. This code is only reached for exceptions (non-interrupts), guarded by `bge s4, zero, 1f` at line 218 which branches to the IRQ handler for interrupts. Under CLIC, exception cause values remain in standard Privileged Architecture encoding — only interrupt causes are in CLIC format. Therefore this table lookup is not affected by Smivt/CLIC.
+  | slli t0, s4, RISCV_LGPTR
+  | la t1, excp_vect_table
+  | la t2, excp_vect_table_end
+  | add t0, t1, t0
+  | bgeu t0, t2, 3f
+  | REG_L t1, 0(t0)
+
+[potential_risk] arch/riscv/kernel/entry.S:187-193  handle_exception
+  The raw scause value (s4 from CSR_CAUSE) is stored verbatim into pt_regs->cause at PT_CAUSE(sp). This raw value is later consumed by riscv_intc_irq() which applies the `& ~CAUSE_IRQ_FLAG` flat-numbering mask. Under CLIC MODE=11, the raw scause for external interrupts would contain the composite Major/Minor identity encoding rather than a flat interrupt number. However, the kernel does not set MODE=11, so this is currently latent. The MSB check at line 218 (`bge s4, zero, 1f`) for distinguishing interrupts from exceptions remains correct under CLIC since the MSB still carries the interrupt/exception flag.
+  | csrr s4, CSR_CAUSE
+  | csrr s5, CSR_SCRATCH
+  | REG_S s0, PT_SP(sp)
+  | REG_S s1, PT_STATUS(sp)
+  | REG_S s2, PT_EPC(sp)
+  | REG_S s3, PT_BADADDR(sp)
+  | REG_S s4, PT_CAUSE(sp)
+
+[compliant] arch/riscv/kvm/vcpu_exit.c:192-194  kvm_riscv_vcpu_exit
+  The IRQ flag check `trap->scause & CAUSE_IRQ_FLAG` only tests the MSB to distinguish host interrupts from guest traps. Under CLIC encoding, the MSB still serves as the interrupt/exception flag, so this check is correct regardless of stvec mode. The KVM host's own stvec is set to `__kvm_riscv_unpriv_trap` (direct mode) during unpriv reads, and the host kernel stvec is always in direct mode, so scause on VM exit is never in CLIC format from the host side.
+  | if (trap->scause & CAUSE_IRQ_FLAG)
+  | 	return 1;
+
+[compliant] arch/riscv/kvm/vcpu_exit.c:70-75  kvm_riscv_vcpu_unpriv_read
+  KVM temporarily redirects stvec to `__kvm_riscv_unpriv_trap` (a direct-mode address, MODE=00) for HLV/HLVX guest memory access emulation. Both the saved old_stvec and the temporary stvec are direct-mode values. The stvec swap is properly restored at line 125. No MODE=11 is ever set, so scause values during this window remain in flat format.
+  | unsigned long flags, val, tmp, old_stvec, old_hstatus;
+  | 
+  | local_irq_save(flags);
+  | 
+  | old_hstatus = csr_swap(CSR_HSTATUS, vcpu->arch.guest_context.hstatus);
+  | old_stvec = csr_swap(CSR_STVEC, (ulong)&__kvm_riscv_unpriv_trap);
+
+[compliant] arch/riscv/kvm/vcpu.c:856-857  kvm_arch_vcpu_ioctl_run (via __kvm_riscv_switch_to)
+  KVM reads scause via `csr_read(CSR_SCAUSE)` at VM exit. Since the KVM host's stvec is in direct mode (MODE=00), the scause value on VM exit is always in standard flat format, not CLIC format. The VM exit occurs because the host took the interrupt, so scause reflects the host-side cause. Even if the guest internally used CLIC vectoring, the VM exit would still present a host-formatted scause.
+  | trap->sepc = gcntx->sepc;
+  | trap->scause = csr_read(CSR_SCAUSE);
+
+[compliant] arch/riscv/kernel/head.S:203-206  .Lsetup_trap_vector
+  The kernel trap vector is configured to direct mode by writing `handle_exception` address directly to CSR_TVEC (stvec). No MODE bits are set — the address of handle_exception is naturally aligned to at least 4 bytes, so bits 1:0 of stvec are 0, meaning MODE=00 (Direct). This is the only place where stvec is configured for normal kernel operation, confirming the kernel never enables CLIC vectoring mode.
+  | .Lsetup_trap_vector:
+  | 	/* Set trap vector to exception handler */
+  | 	la a0, handle_exception
+  | 	csrw CSR_TVEC, a0
+

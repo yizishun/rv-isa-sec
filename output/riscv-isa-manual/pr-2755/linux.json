@@ -1,0 +1,104 @@
+{
+  "pr_number": 2755,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2755,
+    "violation_condition": "Linux kernel reads sip.STIP as a hardware timer interrupt signal while menvcfg.STCE=0 and stimecmp is implemented. In this state, STIP in mip (and thus sip) is writable by M-mode firmware — not read-only as previously assumed — so a set STIP bit may originate from an M-mode write rather than from an stimecmp hardware comparison.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csr_read.*sip.*STIP|IE_SIP.*timer|riscv_timer_interrupt.*sip|csrr.*sip.*0x20",
+    "affected_entities": [
+      "sip",
+      "mip",
+      "stimecmp",
+      "menvcfg.STCE"
+    ],
+    "summary": "STIP in sip/mip is only hardware-gated when both stimecmp exists AND STCE=1; kernel timer ISR that trusts sip.STIP without correlating STCE state risks acting on M-mode-injected spurious interrupts"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "drivers/clocksource/timer-riscv.c",
+        "function_name": "riscv_timer_interrupt",
+        "line_start": 148,
+        "line_end": 156,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Timer ISR does NOT read CSR_SIP/STIP. Interrupt is dispatched via the generic IRQ domain from scause (hardware trap cause), not by polling sip. The handler clears the condition by writing ULONG_MAX to STIMECMP (or SBI call), never by clearing STIP in sip.",
+      "snippet": "static irqreturn_t riscv_timer_interrupt(int irq, void *dev_id)\n{\n\tstruct clock_event_device *evdev = this_cpu_ptr(&riscv_clock_event);\n\triscv_clock_event_stop();\n\tevdev->event_handler(evdev);"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-intc.c",
+        "function_name": "riscv_intc_irq",
+        "line_start": 29,
+        "line_end": 35,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Interrupt dispatch reads scause (via pt_regs->cause) to determine interrupt source, then dispatches via generic_handle_domain_irq(). No sip polling — the hardware trap mechanism inherently delivers the correct cause number. A spurious STIP bit written by M-mode firmware cannot trigger this path unless accompanied by an actual trap with cause=IRQ_S_TIMER.",
+      "snippet": "static void riscv_intc_irq(struct pt_regs *regs)\n{\n\tunsigned long cause = regs->cause & ~CAUSE_IRQ_FLAG;\n\tif (generic_handle_domain_irq(intc_domain, cause))\n\t\tpr_warn_ratelimited(\"Failed to handle interrupt (cause: %ld)\\n\", cause);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 218,
+        "line_end": 222,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Trap entry reads CSR_CAUSE (scause) to distinguish interrupts from exceptions. The MSB of scause signals interrupt vs. exception; the cause number identifies timer interrupt. sip is never read on this path — a spurious STIP bit in sip cannot cause a spurious timer interrupt dispatch.",
+      "snippet": "\tbge s4, zero, 1f\n\t/* Handle interrupts */\n\tcall do_irq\n\tj ret_from_exception"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/suspend.c",
+        "function_name": "suspend_save_csrs",
+        "line_start": 22,
+        "line_end": 30,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Explicitly documents awareness that SIP is set by M-mode firmware (not directly by hardware), and intentionally omits SIP from save/restore. This shows design understanding that SIP is managed by M-mode. STIMECMP is saved/restored separately when SSTC is available.",
+      "snippet": "/*\n * No need to save/restore IP CSR (i.e. MIP or SIP) because:\n * ...\n * 2. For MMU (S-mode) kernel, the bits in SIP are set by\n *    M-mode firmware and external devices (such as interrupt\n *    controller, etc).\n */"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_timer.c",
+        "function_name": "kvm_riscv_vcpu_timer_save",
+        "line_start": 340,
+        "line_end": 366,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM VCPU timer save/restore operates on vstimecmp only, not on sip/hvip.STIP. Guest timer interrupts are managed via kvm_riscv_vcpu_set_interrupt() → hstatus/hvip writes. sip is never read for timer interrupt detection in the KVM path.",
+      "snippet": "void kvm_riscv_vcpu_timer_save(struct kvm_vcpu *vcpu)\n{\n\tif (!t->sstc_enabled)\n\t\treturn;\n\t/* ... */\n\tcsr_write(CSR_VSTIMECMP, -1UL);"
+    },
+    {
+      "location": {
+        "file_path": "drivers/clocksource/timer-riscv.c",
+        "function_name": "riscv_clock_event_stop",
+        "line_start": 35,
+        "line_end": 44,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Timer stop clears the condition by writing ULONG_MAX to STIMECMP (with SSTC) or calling sbi_set_timer(U64_MAX) (without SSTC). It never clears STIP in sip. This is correct per RISC-V spec: stimecmp comparison is the root cause; clearing sip.STIP directly would be fragile and incomplete.",
+      "snippet": "if (static_branch_likely(&riscv_sstc_available)) {\n\tcsr_write(CSR_STIMECMP, ULONG_MAX);\n} else {\n\tsbi_set_timer(U64_MAX);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi-ipi.c",
+        "function_name": "riscv_clear_ipi",
+        "line_start": 27,
+        "line_end": 27,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Only SIP write in the operational kernel is clearing IE_SIE (software interrupt) in sip after IPI handling — this is a software-generated interrupt bit that is explicitly set by S-mode itself via SBI, not subject to the STCE/STIP concern.",
+      "snippet": "csr_clear(CSR_IP, IE_SIE);"
+    }
+  ],
+  "overall_severity": "compliant"
+}

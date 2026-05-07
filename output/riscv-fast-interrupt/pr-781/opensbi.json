@@ -1,0 +1,110 @@
+{
+  "pr_number": 781,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 781,
+    "violation_condition": "OpenSBI M-mode firmware configures PMP/ePMP entries during domain protection setup (sbi_hart_oldpmp_configure / sbi_hart_smepmp_configure) that deny execute permission from S/U-mode to memory regions containing shared vector tables, when CLIC-style xivt/xeivt (or analogous mivt/meivt) CSRs are programmed to share a single vector table across M-mode and S-mode.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "PMP entry with L=1 and X=0 (or Smepmp locked-shared-code with X=0) whose address range covers the vector table base in a system where xivt/xeivt enables cross-privilege vector-table sharing; also: domain memory regions that omit the vector table page entirely from the S-mode domain's allowed-PMP set.",
+    "affected_entities": [
+      "pmpcfg",
+      "pmpaddr",
+      "mivt",
+      "meivt",
+      "sivt",
+      "seivt",
+      "mtvec",
+      "stvec",
+      "CSR_MTVT",
+      "CSR_STVT"
+    ],
+    "summary": "OpenSBI PMP configuration must grant execute permission to S/U-mode for shared vector table regions when CLIC-style xivt/xeivt sharing is enabled, or S-mode interrupt delivery fails due to PMP execute faults."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain.c",
+        "function_name": "sbi_domain_init",
+        "line_start": 916,
+        "line_end": 954,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Root domain firmware regions are configured as M-only (no SU_READABLE/SU_EXECUTABLE bits), and the catch-all SU RWX region only covers addresses NOT matched by firmware entries. If a CLIC-style shared vector table (mivt/meivt/xivt/xeivt) resides in firmware address space, S-mode will be denied all access because PMP entry priority causes the M-only firmware entry to match first, blocking the SU catch-all. This would cause denial-of-service when CLIC hardware shares the vector table page across privilege modes.",
+      "snippet": "sbi_domain_memregion_init(scratch->fw_start, scratch->fw_size,\n    (SBI_DOMAIN_MEMREGION_M_READABLE |\n     SBI_DOMAIN_MEMREGION_M_WRITABLE |\n     SBI_DOMAIN_MEMREGION_M_EXECUTABLE |\n     SBI_DOMAIN_MEMREGION_FW), ...);\n/* ... later catch-all: */\nsbi_domain_memregion_init(0, ~0UL,\n    (SBI_DOMAIN_MEMREGION_SU_READABLE |\n     SBI_DOMAIN_MEMREGION_SU_WRITABLE |\n     SBI_DOMAIN_MEMREGION_SU_EXECUTABLE), ...);"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_oldpmp_configure",
+        "line_start": 273,
+        "line_end": 296,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Old PMP configure iterates domain regions and programs PMP entries via pmp_set() in index-priority order. Firmware regions (M-only) come first in the sorted region list and will match before the SU catch-all. If a shared vector table page falls within a firmware region's address range, S/U-mode execute/read is denied with no recovery path. The function has no awareness of CLIC-style vector table sharing and provides no mechanism to carve out an exception for the shared vector table page.",
+      "snippet": "pmp_idx = 0;\nsbi_domain_for_each_memregion(dom, reg) {\n    pmp_flags = sbi_domain_get_oldpmp_flags(reg);\n    pmp_set(pmp_idx++, pmp_flags, reg->base, reg->order);\n}\nfor(; pmp_idx < pmp_count; pmp_idx++)\n    pmp_disable(pmp_idx);"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 144,
+        "line_end": 216,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Smepmp configure uses a two-pass approach (M-only regions with MML=0, then shared/SU regions with MML=1). Firmware regions are tracked in fw_smepmp_ids bitmap and preserved across domain switches. Under Smepmp, M-mode only gets explicit access to listed regions, making the separation even stricter than old PMP. If a CLIC shared vector table is in firmware memory, S-mode has no entry covering it — the M-only firmware entry matches first. No carve-out mechanism exists for shared vector table pages that need cross-privilege access.",
+      "snippet": "/* First pass: M-only regions */\nsbi_domain_for_each_memregion(dom, reg) {\n    if (!SBI_DOMAIN_MEMREGION_M_ONLY_ACCESS(reg->flags)) continue;\n    if (SBI_DOMAIN_MEMREGION_IS_FIRMWARE(reg->flags))\n        bitmap_set(fw_smepmp_ids, pmp_idx, 1);\n    sbi_hart_smepmp_set(scratch, dom, reg, pmp_idx++, pmp_flags, ...);\n}\ncsr_set(CSR_MSECCFG, MSECCFG_MML);\n/* Second pass: shared/SU regions — firmware already matched at lower index */"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain.c",
+        "function_name": "sbi_domain_get_oldpmp_flags",
+        "line_start": 124,
+        "line_end": 144,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Flag translation correctly maps SBI_DOMAIN_MEMREGION_SU_EXECUTABLE to PMP_X. For regions without SU_EXECUTABLE, PMP_X is not set, correctly denying execute. This function itself is correct — the risk lies in domain region definitions, not the flag translation.",
+      "snippet": "if (reg->flags & SBI_DOMAIN_MEMREGION_SU_READABLE)\n    pmp_flags |= PMP_R;\nif (reg->flags & SBI_DOMAIN_MEMREGION_SU_WRITABLE)\n    pmp_flags |= PMP_W;\nif (reg->flags & SBI_DOMAIN_MEMREGION_SU_EXECUTABLE)\n    pmp_flags |= PMP_X;"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain.c",
+        "function_name": "sbi_domain_get_smepmp_flags",
+        "line_start": 161,
+        "line_end": 181,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Smepmp flag translation correctly maps shared-region types to Smepmp encoding. For SURW_MRW (shared read/write), the encoding is PMP_W|PMP_X which under MML=1 grants SU R/W without execute — correct deny-execute behavior. For SUR_MR (shared read-only), encoding PMP_L|PMP_R|PMP_W|PMP_X grants SU read-only. No encoding error here.",
+      "snippet": "/* Read/Write for both M and SU modes */\nelse if (SBI_DOMAIN_MEMREGION_IS_SURW_MRW(reg->flags))\n    pmp_flags = (PMP_W | PMP_X);\n/* Read only for SU mode but Read/Write for M mode */\nelse if (SBI_DOMAIN_MEMREGION_IS_SUR_MRW(reg->flags))\n    pmp_flags = (PMP_W);"
+    },
+    {
+      "location": {
+        "file_path": "platform/generic/eswin/eic770x.c",
+        "function_name": "eswin_eic7700_pmp_configure",
+        "line_start": 296,
+        "line_end": 327,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "EIC770x custom PMP configure skips firmware regions entirely (line 296-297), meaning the shared vector table page — if it overlaps firmware memory — gets no PMP entry at all. Subsequent non-firmware regions are programmed with oldpmp flags, and unused slots are disabled. In the gap between firmware entries (configured in early_init) and the skipped firmware regions, the PMP default-deny behavior denies all S/U-mode access. No explicit handling for shared vector table carve-out.",
+      "snippet": "sbi_domain_for_each_memregion_idx(dom, reg, i) {\n    if (SBI_DOMAIN_MEMREGION_IS_FIRMWARE(reg->flags))\n        continue;\n    /* ... */\n    pmp_set(pmp_idx++, sbi_domain_get_oldpmp_flags(reg),\n            reg->base, reg->order);\n}"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain_context.c",
+        "function_name": "switch_to_next_domain_context",
+        "line_start": 126,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Domain context switch correctly unconfigures old PMP and configures new PMP for the target domain. The unconfigure path (sbi_hart_pmp_unconfigure) preserves Smepmp firmware entries. No stale-PMP risk across domain switches.",
+      "snippet": "/* Reconfigure PMP settings for the new domain */\nsbi_hart_protection_unconfigure(scratch);\nsbi_hart_protection_configure(scratch);"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

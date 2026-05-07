@@ -1,0 +1,101 @@
+{
+  "pr_number": 2902,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2902,
+    "violation_condition": "In QEMU TCG, when the RISC-V H extension is NOT implemented (riscv_has_ext(env, RVH) is false), riscv_do_nmi() at target/riscv/cpu_helper.c:2186 unconditionally sets mnstatus.MNPV to the guest virtualization mode. Since read_mnstatus() at target/riscv/csr.c:5491 returns the raw env->mnstatus without masking MNPV when H is absent, guest software can read the MNPV bit and observe non-zero emulation state that the spec requires to be non-existent (hardwired to 0) when the H extension is not implemented.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "set_field(env->mnstatus, MNSTATUS_MNPV, ...) without gating on riscv_has_ext(env, RVH); also read_mnstatus returning raw env->mnstatus without RVH-conditional masking of MNPV",
+    "affected_entities": [
+      "mnstatus"
+    ],
+    "summary": "mnstatus.MNPV is unconditionally set on RNMI entry and exposed on read even when H extension is absent, leaking internal virt state that should be hardwired to 0 per spec"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_do_nmi",
+        "line_start": 2186,
+        "line_end": 2186,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Unconditionally writes virt parameter into MNSTATUS_MNPV without gating on riscv_has_ext(env, RVH). When RVH is absent, MNPV must be hardwired to 0 (non-existent per smrnmi spec), but this stores env->virt_enabled (caller at line 2244) or false (caller at line 2480) into the backing storage regardless. The stored value then leaks through the read path.",
+      "snippet": "env->mnstatus = set_field(env->mnstatus, MNSTATUS_MNPV, virt);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_mnstatus",
+        "line_start": 5488,
+        "line_end": 5493,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Returns raw env->mnstatus without masking MNPV when RVH is absent. The smrnmi spec requires MNPV to be hardwired to 0 (read-as-zero) when H extension is not implemented. Guest software executing csrr mnstatus observes the stale MNPV bit written by riscv_do_nmi(). This is an information leak of internal emulation state. Contrast with write_mnstatus() at line 5506 which correctly gates MNPV on riscv_has_ext(env, RVH).",
+      "snippet": "*val = env->mnstatus;\nreturn RISCV_EXCP_NONE;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "helper_mnret",
+        "line_start": 466,
+        "line_end": 467,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Reads MNSTATUS_MNPV from env->mnstatus without checking riscv_has_ext(env, RVH) to compute prev_virt. When MNPV was incorrectly set by riscv_do_nmi() (location 1), this propagates the stale virtualization bit through riscv_cpu_set_mode(env, prev_priv, prev_virt) at line 491 and riscv_cpu_swap_hypervisor_regs() at line 488. This corrupts architectural control flow on MNRET.",
+      "snippet": "prev_virt = get_field(env->mnstatus, MNSTATUS_MNPV) &&\n            (prev_priv != PRV_M);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_mnstatus",
+        "line_start": 5495,
+        "line_end": 5512,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correctly gates MNPV inclusion in the writable mask on riscv_has_ext(env, RVH) at line 5500-5507. Also correctly preserves NMIE (hardware-only clear) at line 5510. This is the reference implementation that read_mnstatus and riscv_do_nmi should follow.",
+      "snippet": "if (riscv_has_ext(env, RVH)) {\n    if ((val ^ env->mnstatus) & MNSTATUS_MNPV) {\n        tlb_flush(env_cpu(env));\n    }\n    mask |= MNSTATUS_MNPV;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "register_csr_ops (CSR_MNSTATUS)",
+        "line_start": 6060,
+        "line_end": 6061,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR dispatch table correctly wires CSR_MNSTATUS to read_mnstatus/write_mnstatus and predicates on rnmi availability and PRIV_VERSION_1_12_0. The vulnerability is in the read handler implementation, not in the CSR registration.",
+      "snippet": "[CSR_MNSTATUS]  = { \"mnstatus\",  rnmi, read_mnstatus,  write_mnstatus,\n                    .min_priv_ver = PRIV_VERSION_1_12_0               },"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt (NMI dispatch)",
+        "line_start": 2243,
+        "line_end": 2244,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The primary NMI entry point passes env->virt_enabled directly to riscv_do_nmi() as the virt parameter. When RVH is absent, virt_enabled should always be false, but this relies on an implicit invariant rather than an explicit check. If virt_enabled is corrupted (e.g., via migration of a handcrafted stream), this path will write non-zero MNPV.",
+      "snippet": "riscv_do_nmi(env, cause | ((target_ulong)1U << (mxlen - 1)),\n             env->virt_enabled);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_riscv_cpu",
+        "line_start": 483,
+        "line_end": 484,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "env->mnstatus is NOT serialized in the VMStateDescription — neither in the main fields (lines 444-483) nor in any subsection. This means mnstatus is implicitly zeroed on migration destination, which masks the bug on the receive side but means the MNPV state (and all mnstatus) is silently lost during live migration. If mnstatus VMState is added in the future, a post_load check must mask MNPV when RVH absent.",
+      "snippet": "VMSTATE_END_OF_LIST()\n},"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

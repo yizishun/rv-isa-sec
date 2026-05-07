@@ -1,0 +1,103 @@
+{
+  "pr_number": 77,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 77,
+    "violation_condition": "QEMU's TCG implementation of HLV*/HSV* performs memory tag checks without first consulting hstatus.MTAG_I (which should suppress checks when set) and without checking VS-stage leaf PTE.X (which also forces unchecked loads), causing tag faults or unchecked accesses at times the spec forbids",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "helper_hlv.*tag|hlv.*mte|hlv.*check.*tag|hstatus.*MTAG|MTAG_I.*hlv|riscv_cpu_tlb_fill.*hlv|get_physical_address.*hlv|helper_hyp_load|helper_hyp_store",
+    "affected_entities": [
+      "HLV.B",
+      "HLV.BU",
+      "HLV.H",
+      "HLV.HU",
+      "HLV.W",
+      "HLV.WU",
+      "HLV.D",
+      "HLVX.HU",
+      "HLVX.WU",
+      "HSV.B",
+      "HSV.H",
+      "HSV.W",
+      "HSV.D",
+      "hstatus",
+      "mstatus"
+    ],
+    "summary": "HLV/HSV tag-check opt-out via hstatus.MTAG_I and VS-stage PTE.X: if QEMU TCG helper_hyp_load/store does not suppress MTE tag checks when hstatus.MTAG_I==1 or VS-stage leaf PTE.X==1, the hypervisor experiences spurious tag faults on code-page accesses, allowing a malicious guest to construct page tables where hypervisor-emulated loads diverge from guest-native loads and bypass memory tagging enforcement"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "check_access_hlsv",
+        "line_start": 620,
+        "line_end": 635,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "check_access_hlsv() sets mmu_idx for HLV/HSV helpers. No MTE/MemTag infrastructure exists for RISC-V in this QEMU (no hstatus.MTAG_I bit, no PTE.MTAG bit, no tag-check logic). The function correctly computes privilege mode and two-stage translation attributes for the HLV/HSV access path. There is nothing to opt out of because MTE is not implemented.",
+      "snippet": "static int check_access_hlsv(CPURISCVState *env, bool x, uintptr_t ra)\n{\n    if (env->priv == PRV_M) {\n        /* always allowed */\n    } else if (env->virt_enabled) {"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "HSTATUS bit definitions",
+        "line_start": 672,
+        "line_end": 683,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "No HSTATUS_MTAG_I or HSTATUS_MTAG bit is defined. The hstatus register lacks any MTE/MemTag control field. Without this bit, no HLV/HSV tag suppression can occur — neither correctly nor incorrectly.",
+      "snippet": "#define HSTATUS_VSBE         0x00000020\n#define HSTATUS_GVA          0x00000040\n...\n#define HSTATUS_HUPMM        0x3000000000000"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "PTE bit definitions",
+        "line_start": 728,
+        "line_end": 740,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "No PTE.MTAG bit is defined in the PTE bit layout. The page table entry format has no memory-tagging field, so the VS-stage leaf PTE.X override path described in the security spec cannot exist.",
+      "snippet": "#define PTE_R               0x002\n#define PTE_X               0x008\n...\n#define PTE_ATTR            (PTE_N | PTE_PBMT)"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "helper_hyp_hlv_bu through helper_hyp_hsv_d",
+        "line_start": 637,
+        "line_end": 707,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All HLV/HSV helper functions (hlv_bu, hlv_hu, hlv_wu, hlv_d, hsv_b, hsv_h, hsv_w, hsv_d) perform standard cpu_ld*_mmu / cpu_st*_mmu accesses through check_access_hlsv(). No MTE tag check logic exists to incorrectly trigger tag faults or incorrectly suppress them.",
+      "snippet": "target_ulong helper_hyp_hlv_bu(CPURISCVState *env, target_ulong addr)\n{\n    uintptr_t ra = GETPC();\n    int mmu_idx = check_access_hlsv(env, false, ra);\n    MemOpIdx oi = make_memop_idx(MO_UB, mmu_idx);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_tlb_fill",
+        "line_start": 1814,
+        "line_end": 1827,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "riscv_cpu_tlb_fill() handles TLB fills for HLV/HSV accesses via the two-stage lookup path. Contains no MTE/MemTag logic — no tag checks, no hstatus.MTAG_I consultation. Since MTE is not implemented for RISC-V, this is the correct baseline behavior.",
+      "snippet": "bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,\n                        MMUAccessType access_type, int mmu_idx,\n                        bool probe, uintptr_t retaddr)\n{\n    RISCVCPU *cpu = RISCV_CPU(cs);\n    CPURISCVState *env = &cpu->env;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address",
+        "line_start": 1237,
+        "line_end": 1415,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "get_physical_address() performs the page-table walk for address translation. Contains no MTE/MemTag logic. The PTE bit checks handle R/W/X/A/D/U/G/PBMT/N but not MTAG. No tag-check or tag-suppression logic is present, which is correct since the feature is unimplemented.",
+      "snippet": "static int get_physical_address(CPURISCVState *env, hwaddr *physical,\n                                int *ret_prot, vaddr addr,\n                                target_ulong *fault_pte_addr,\n                                int access_type, int mmu_idx,\n                                bool first_stage, bool two_stage,"
+    }
+  ],
+  "overall_severity": "compliant"
+}

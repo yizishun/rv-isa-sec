@@ -1,0 +1,5 @@
+- Modeled vector load and store operations
+- Fixed the range of destination vector register for the (previously modelled) add operation
+- Manually wrote simple self-checking tests for vl8, vse8 and vadd.vv instructions
+- Validated the above tests against the Sail RISC-V model
+- Verified the UDB implementation by running the above tests on the generated ISS

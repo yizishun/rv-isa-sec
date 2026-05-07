@@ -1,0 +1,80 @@
+{
+  "pr_number": 2091,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2091,
+    "violation_condition": "When a guest executes a Zalasr load-acquire instruction (funct5=00110) with a non-zero rs2 field, QEMU's insn32.decode pattern '00110 . . ..... ..... <width> ..... 0101111 @atom_st' matches any rs2 value due to the wildcard '.....', and the gen_load_acquire trans function never validates that rs2==0. The spec encoding diagram explicitly constrains rs2 to 0 (attr: ['5', '0']). QEMU silently executes these reserved encodings as valid load-acquire instructions instead of raising an illegal instruction exception.",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "Zalasr load-acquire decode @atom_st wildcard rs2 not validated against spec encoding constraint rs2=0",
+    "affected_entities": [
+      "lb_aqrl",
+      "lh_aqrl",
+      "lw_aqrl",
+      "ld_aqrl"
+    ],
+    "summary": "Zalasr load-acquire decode patterns accept any rs2 value via @atom_st wildcard, but the spec encoding diagram requires rs2=0 — reserved encodings silently execute instead of trapping"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/insn32.decode",
+        "function_name": "(decode pattern)",
+        "line_start": 76,
+        "line_end": 76,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The @atom_st pattern uses '%rs2' (variable) with no constraint, while @atom_ld (line 75) correctly uses 'rs2=0'. Zalasr load-acquire instructions (funct5=00110) are defined via @atom_st, inheriting the unconstrained rs2 field. Per the Zalasr spec encoding diagram, load-acquire instructions must have rs2=0; non-zero rs2 values are reserved encodings that should raise illegal instruction exceptions.",
+      "snippet": "@atom_st ..... aq:1 rl:1 ..... ........ ..... ....... &atomic %rs2      %rs1 %rd\n(compare with:)\n@atom_ld ..... aq:1 rl:1 ..... ........ ..... ....... &atomic rs2=0     %rs1 %rd"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn32.decode",
+        "function_name": "(decode entries)",
+        "line_start": 1079,
+        "line_end": 1082,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Zalasr load-acquire decode entries (lb_aqrl, lh_aqrl, lw_aqrl, ld_aqrl) use @atom_st which passes the rs2 field as a variable. The spec encoding diagram constrains rs2=0 (attr: ['5', '0']). The decode wildcard '.....' for rs2 matches any value, so reserved encodings with non-zero rs2 are silently decoded as valid load-acquire instructions instead of raising illegal instruction exceptions.",
+      "snippet": "lb_aqrl  00110 . . ..... ..... 000 ..... 0101111 @atom_st\nlh_aqrl  00110 . . ..... ..... 001 ..... 0101111 @atom_st\nlw_aqrl  00110 . . ..... ..... 010 ..... 0101111 @atom_st\nld_aqrl  00110 . . ..... ..... 011 ..... 0101111 @atom_st"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvzalasr.c.inc",
+        "function_name": "gen_load_acquire",
+        "line_start": 19,
+        "line_end": 42,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "gen_load_acquire() never validates that a->rs2 == 0. It validates a->aq (mandatory acquire bit), but completely ignores the rs2 field. When the decoder passes a non-zero rs2 from a reserved encoding, the function silently executes the load-acquire as if it were a valid instruction. This is a violation condition: reserved encodings execute instead of trapping.",
+      "snippet": "static bool gen_load_acquire(DisasContext *ctx, arg_lb_aqrl *a, MemOp memop)\n{\n    decode_save_opc(ctx, 0);\n    TCGv addr = get_address(ctx, a->rs1, 0);\n    TCGv dest = get_gpr(ctx, a->rd, EXT_NONE);\n    /* ... no check for a->rs2 == 0 ... */"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvzalasr.c.inc",
+        "function_name": "trans_lb_aqrl",
+        "line_start": 44,
+        "line_end": 48,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Individual trans functions (trans_lb_aqrl, trans_lh_aqrl, trans_lw_aqrl, trans_ld_aqrl) do not validate rs2==0 before calling gen_load_acquire(). Each trans function only checks REQUIRE_ZALASR(ctx), then delegates to gen_load_acquire() which also lacks the rs2 check. Both layers fail to validate the spec-mandated encoding constraint.",
+      "snippet": "static bool trans_lb_aqrl(DisasContext *ctx, arg_lb_aqrl *a)\n{\n    REQUIRE_ZALASR(ctx);\n    return gen_load_acquire(ctx, a, MO_SB);\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvzalasr.c.inc",
+        "function_name": "gen_store_release",
+        "line_start": 69,
+        "line_end": 90,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Store-release instructions (funct5=00111) correctly use the rs2 field as the store data operand, which is the intended and spec-compliant behavior. The RL bit is validated (line 78-80). No rs2=0 constraint is required for store-release — rs2 holds the value to be stored.",
+      "snippet": "static bool gen_store_release(DisasContext *ctx, arg_sb_aqrl *a, MemOp memop)\n{\n    /* ... */\n    TCGv data = get_gpr(ctx, a->rs2, EXT_NONE);\n    if (!a->rl) { return false; }\n}"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

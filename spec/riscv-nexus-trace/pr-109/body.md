@@ -1,0 +1,1 @@
+Adds the new trTeDisSelfHosted bit for reserving the TE for debugger use.  Part of the self-hosted trace suite of extensions, so should not be merged until self-hosted trace (Smstrc*/Ssstrc*) is ratified.

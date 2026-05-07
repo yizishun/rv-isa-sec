@@ -1,0 +1,76 @@
+PR #501  target=linux  overall=potential_risk
+Spec: Kernel unwinder must use PTRSZ (pointer width), not XLEN, to index frame records; using XLEN on RV64ILP32 userspace would follow garbage frame pointers and crash the kernel
+Violation: The kernel stack unwinder computes frame-record slot offsets using XLEN (or sizeof(unsigned long)) rather than the pointer size of the target context, causing misaligned reads of the saved return address and previous frame pointer on ABIs where PTRSZ != XLEN (e.g., RV64ILP32 userspace, or future RVY with YLEN=2*XLEN).
+Consequence: denial_of_service
+Pattern: XLEN/8 or sizeof(unsigned long) used as frame-record slot stride in arch/riscv/kernel/stacktrace.c or perf_callchain.c instead of the target pointer width
+------------------------------------------------------------
+[potential_risk] arch/riscv/include/asm/stacktrace.h:9-12  struct stackframe
+  struct stackframe defines fp and ra as unsigned long (XLEN-sized). On ABIs where pointer size != XLEN (e.g., RV64ILP32 userspace with 32-bit pointers on a 64-bit kernel), sizeof(struct stackframe) = 16 bytes but actual frame-record slots are only 2×4=8 bytes. This is the root definition that propagates the wrong stride to all unwinding paths.
+  | struct stackframe {
+  | 	unsigned long fp;
+  | 	unsigned long ra;
+  | };
+
+[potential_risk] arch/riscv/kernel/stacktrace.c:38-46  fp_is_valid
+  fp_is_valid() computes low = sp + sizeof(struct stackframe) using XLEN-based frame size. This validates the frame pointer against a boundary that is XLEN-strided rather than pointer-width-strided, potentially accepting invalid frame pointers or rejecting valid ones on mixed-pointer-size ABIs.
+  | static inline int fp_is_valid(unsigned long fp, unsigned long sp)
+  | {
+  | 	unsigned long low, high;
+  | 
+  | 	low = sp + sizeof(struct stackframe);
+  | 	high = ALIGN(sp, THREAD_SIZE);
+  | 
+  | 	return !(fp < low || fp > high || fp & 0x07);
+
+[potential_risk] arch/riscv/kernel/stacktrace.c:80-91  walk_stackframe
+  walk_stackframe() computes frame = (struct stackframe *)fp - 1, using XLEN-based pointer arithmetic. The subsequent reads of frame->fp and frame->ra access fields at XLEN offsets. On ABIs where kernel-mode pointer size != XLEN, these reads would consume the wrong stack slots, misinterpreting the saved return address and frame pointer.
+  | /* Unwind stack frame */
+  | frame = (struct stackframe *)fp - 1;
+  | sp = fp;
+  | if (regs && (regs->epc == pc) && fp_is_valid(frame->ra, sp)) {
+  | 	/* We hit function where ra is not saved on the stack */
+  | 	fp = frame->ra;
+  | 	pc = regs->ra;
+  | } else {
+  | 	fp = READ_ONCE_TASK_STACK(task, frame->fp);
+  | 	pc = READ_ONCE_TASK_STACK(task, frame->ra);
+
+[potential_risk] arch/riscv/kernel/stacktrace.c:189-212  unwind_user_frame
+  unwind_user_frame() computes the userspace frame tail as fp - sizeof(struct stackframe), using XLEN (16 bytes on RV64) rather than the userspace pointer width. For RV64ILP32 compat userspace where frame slots are 4 bytes each, the computed offset (fp-16) would land 8 bytes before the actual frame record (at fp-8), reading garbage as the saved fp/ra.
+  | static unsigned long unwind_user_frame(stack_trace_consume_fn consume_entry,
+  | 				       void *cookie, unsigned long fp,
+  | 				       unsigned long reg_ra)
+  | {
+  | 	struct stackframe buftail;
+  | 	unsigned long ra = 0;
+  | 	unsigned long __user *user_frame_tail =
+  | 		(unsigned long __user *)(fp - sizeof(struct stackframe));
+
+[potential_risk] arch/riscv/kernel/perf_callchain.c:28-37  perf_callchain_user
+  perf_callchain_user() calls arch_stack_walk_user() which internally uses unwind_user_frame() with XLEN-based sizeof(struct stackframe). perf callchain sampling of ILP32 userspace processes on RV64 would produce corrupted callchains, leaking incorrect kernel pointers to userspace via PERF_SAMPLE_CALLCHAIN.
+  | void perf_callchain_user(struct perf_callchain_entry_ctx *entry,
+  | 			 struct pt_regs *regs)
+  | {
+  | 	if (perf_guest_state()) {
+  | 		/* TODO: We don't support guest os callchain now */
+  | 		return;
+  | 	}
+  | 
+  | 	arch_stack_walk_user(fill_callchain, entry, regs);
+
+[potential_risk] arch/riscv/kernel/perf_callchain.c:39-48  perf_callchain_kernel
+  perf_callchain_kernel() calls walk_stackframe() which uses XLEN-based struct stackframe. While the kernel itself runs in LP64 where XLEN==PTRSZ, this helper would produce incorrect kernel callchains if a future kernel ABI has pointer width != XLEN.
+  | void perf_callchain_kernel(struct perf_callchain_entry_ctx *entry,
+  | 			   struct pt_regs *regs)
+  | {
+  | 	if (perf_guest_state()) {
+  | 		/* TODO: We don't support guest os callchain now */
+  | 		return;
+  | 	}
+  | 
+  | 	walk_stackframe(NULL, regs, fill_callchain, entry);
+
+[compliant] arch/riscv/kernel/usercfi.c:22-22  SHSTK_ENTRY_SIZE
+  SHSTK_ENTRY_SIZE correctly uses sizeof(void *) (pointer-sized) rather than sizeof(unsigned long) (XLEN-sized). This demonstrates the correct pattern: shadow-stack entry size depends on pointer width, not XLEN. The fix for the unwinder should follow this precedent.
+  | #define SHSTK_ENTRY_SIZE sizeof(void *)
+

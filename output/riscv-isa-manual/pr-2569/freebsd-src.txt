@@ -1,0 +1,116 @@
+PR #2569  target=freebsd-src  overall=compliant
+Spec: Normative rule norm:sc_reservation_invalidate mandates SC invalidates any reservation—FreeBSD interrupt handlers executing SC/AMO can starve constrained LR/SC loops in interrupted kernel code (e.g., spinlock acquire on contended lock), breaking norm:constrained_lrsc_forward_progress and causing hart livelock
+Violation: A FreeBSD kernel trap/interrupt handler executes an SC or AMO instruction while a constrained LR/SC sequence was in progress on the same hart, silently invalidating the interrupted code's reservation and potentially breaking its forward-progress guarantee indefinitely if the interrupt fires at a high enough rate
+Consequence: denial_of_service
+Pattern: trap_handler|interrupt_handler|intr_|trap_|exception_handler.*\.S|atomic.*context|savectx|restorectx.*lr|sc\.w|sc\.d|amoswap|amoadd|amoor
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/exception.S:41-114  save_registers macro
+  The hardware trap entry sequence (via stvec→cpu_exception_handler) implicitly clears any in-progress LR/SC reservation per the RISC-V privileged spec §3.1.15. The save_registers macro itself uses only regular sd/csrr/csrw instructions — no lr/sc/amo instructions — so it does not independently affect reservations beyond what the hardware already did.
+  | save_registers 1:
+  |   addi sp, sp, -(TF_SIZE)
+  |   sd ra, (TF_RA)(sp)
+  |   ...
+  |   csrr t0, sepc
+  |   sd t0, (TF_SEPC)(sp)
+
+[compliant] sys/riscv/riscv/exception.S:219-225  cpu_exception_handler_supervisor
+  The supervisor trap handler runs with interrupts disabled (verified by KASSERT at trap.c:312). As a non-nestable trap handler, it cannot participate in a nested reservation-invalidation chain. The handler body (save_registers → do_trap_supervisor → load_registers → sret) contains no lr/sc/amo instructions.
+  | cpu_exception_handler_supervisor:
+  |   save_registers 1
+  |   mv a0, sp
+  |   call do_trap_supervisor
+  |   load_registers 1
+  |   sret
+
+[compliant] sys/riscv/riscv/exception.S:227-235  cpu_exception_handler_user
+  User-mode trap handler. Enables interrupts during exception handling (trap.c:405 intr_enable()), allowing a nested supervisor interrupt. However, the nested supervisor trap is handled by cpu_exception_handler_supervisor which does NOT re-enable interrupts, preventing unbounded nesting. Neither handler path directly issues lr/sc/amo instructions.
+  | cpu_exception_handler_user:
+  |   save_registers 0
+  |   mv a0, sp
+  |   call do_trap_user
+  |   do_ast
+  |   load_registers 0
+  |   sret
+
+[compliant] sys/riscv/riscv/trap.c:307-377  do_trap_supervisor
+  Supervisor trap dispatcher. Dispatch path: intr_irq_handler() → intc_intr() → intr_isrc_dispatch() may call device ISRs that use atomic operations via spin mutexes. However, the hardware already cleared the interrupted code's reservation on trap entry, so these AMO instructions have no additional semantic effect on the interrupted LR/SC sequence.
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  |   intr_irq_handler(frame, INTR_ROOT_IRQ);
+  |   return;
+  | }
+
+[compliant] sys/riscv/riscv/trap.c:379-460  do_trap_user
+  User trap dispatcher. Same dispatch as supervisor path for interrupts. For exceptions, enables interrupts (line 405) to prevent latency issues, but any nested interrupt enters through the non-nestable supervisor handler path. No direct lr/sc/amo usage in the handler body.
+  | exception = frame->tf_scause & SCAUSE_CODE;
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  |   intr_irq_handler(frame, INTR_ROOT_IRQ);
+  |   return;
+  | }
+  | intr_enable();
+
+[compliant] sys/riscv/include/atomic.h:391-412  atomic_cmpset_64
+  The LR/SC sequence (lr.d/sc.d) has a proper retry loop. If an interrupt fires between lr.d and sc.d, the hardware clears the reservation, sc.d fails (returns nonzero in res), the bnez at 405 jumps back to 0b retrying the lr.d. This is the architecturally correct way to handle reservation loss — it's not a silent failure because sc.d returns an explicit failure code.
+  | 0:
+  |   li   %1, 1
+  |   lr.d %0, %2
+  |   bne  %0, %z3, 1f
+  |   sc.d %1, %z4, %2
+  |   bnez %1, 0b
+  | 1:
+
+[compliant] sys/riscv/riscv/support.S:76-92  casueword
+  CAS in user-space uses lr.d/sc.d pattern. Same architectural behavior: if interrupted by a trap between lr.d and sc.d, the hardware-cleared reservation causes sc.d to fail, and the function simply returns the failure code (a5=1). The caller retries as needed. No forward-progress issue unique to RISC-V.
+  | lr.d a4, 0(a0)
+  | bne a4, a1, 1f
+  | sc.d a5, a3, 0(a0)
+  | beqz a5, 2f
+  | 1: li a5, 1
+
+[compliant] sys/riscv/riscv/swtch.S:434-457  savectx
+  savectx saves callee-saved registers and FP state to PCB. Uses only sd stores and fsd (floating-point stores). No lr/sc/amo instructions. The __fpe_state_save macro manipulates sstatus.FS but uses regular CSR access, not atomics. No impact on memory reservation state.
+  | ENTRY(savectx)
+  |   sd ra, (PCB_RA)(a0)
+  |   sd sp, (PCB_SP)(a0)
+  |   ...
+  |   __fpe_state_save a0
+  |   ret
+
+[compliant] sys/riscv/riscv/swtch.S:258-358  cpu_switch
+  Context switch (cpu_switch) saves old thread's PCB, optionally saves dirty FP state, activates new pmap, and restores new thread's PCB. Uses regular load/store instructions. No lr/sc/amo operations are issued by the context-switch code path itself. Reservation loss at this point is irrelevant since a thread being switched out cannot be holding a live reservation.
+  | sd ra, (PCB_RA)(x13)
+  | sd sp, (PCB_SP)(x13)
+  | sd s0, (PCB_S + 0 * 8)(x13)
+  | ...
+
+[compliant] sys/riscv/riscv/locore.S:64-94  _alt_start
+  Boot-time hart lottery uses amoadd.w. This executes during early boot before any other LR/SC sequences are active (no threads, no interrupts). After boot, this code is never executed again. No conflict with concurrent LR/SC reservation holders.
+  | lla t0, hart_lottery
+  | li t1, 1
+  | amoadd.w t0, t1, 0(t0)
+  | beqz t0, 1f
+  | j mpentry
+
+[compliant] sys/riscv/vmm/vmm_switch.S:41-203  vmm_switch
+  bhyve VMM context switch between host (HS-mode) and guest (VS-mode). The switch entry/exit paths use CSR swap instructions (csrrw) and regular ld/sd for register save/restore. No lr/sc/amo instructions. The sret at line 120 returns to the guest context with its own architectural state; any reservation held by the host is hardware-cleared on the trap entry that brings us to vmm_switch.
+  | csrrw t0, sstatus, t0
+  | csrrw t1, hstatus, t1
+  | ...
+  | ld a0, (HYP_G_A + 0 * 8)(a0)
+  | sret
+
+[compliant] sys/riscv/riscv/intc.c:263-289  intc_intr
+  intc_intr is the root interrupt filter. Called from intr_irq_handler under critical_enter. Dispatches via intr_isrc_dispatch to device ISRs. Any AMO instructions used by downstream ISR code (e.g., spinlocks) occur after the hardware has already cleared the interrupted context's reservation on trap entry.
+  | active_irq = frame->tf_scause & SCAUSE_CODE;
+  | src = &sc->isrcs[active_irq];
+  | if (intr_isrc_dispatch(&src->isrc, frame) != 0) {
+  |   intc_disable_intr(sc->dev, &src->isrc);
+  | }
+
+[compliant] sys/kern/subr_intr.c:330-359  intr_irq_handler
+  Main IRQ dispatch. Enters critical section, saves/restores td_intr_frame, calls root filter. The filter may trigger device ISRs that use atomic spinlocks, but these do not compound on the already-hardware-cleared reservation. The interrupt-disabled supervisor handler path prevents nested-trap reservation chaining.
+  | critical_enter();
+  | td->td_intr_frame = tf;
+  | (root->filter)(root->arg);
+  | td->td_intr_frame = oldframe;
+  | critical_exit();
+

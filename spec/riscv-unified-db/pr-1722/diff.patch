@@ -1,0 +1,2879 @@
+diff --git a/.vscode/launch.json b/.vscode/launch.json
+index 241c43fec9..5f3794602d 100644
+--- a/.vscode/launch.json
++++ b/.vscode/launch.json
+@@ -2,31 +2,24 @@
+   "version": "0.2.0",
+   "configurations": [
+     {
+-      "name": "Vector rv32 Debug Launch",
++      "name": "ISS debug Launch",
+       "type": "cppdbg",
+       "request": "launch",
+-      "program": "${workspaceFolder}/gen/cpp_hart_gen/rv32_Debug/build/iss",
+-      "args": [
+-        "-m", "rv32",
+-        "-c", "${workspaceFolder}/cfgs/rv32-vector.yaml",
+-        "${workspaceFolder}/ext/riscv-tests/isa/rv32uv-p-vsetvli"],
+-      "stopAtEntry": true,
++      "program": "${workspaceFolder}/gen/cpp_hart_gen/rv64_Debug/build/iss",
++      "args": ["-m", "rv64", "-c", "${workspaceFolder}/cfgs/rv64-riscv-tests.yaml", "--mm", "${workspaceFolder}/cfgs/memmap.json", "-g", "--halt", "${workspaceFolder}/ext/riscv-tests/isa/rv64ui-p-ld_st"],
++      "stopAtEntry": false,
+       "cwd": "${workspaceFolder}",
+       "environment": [],
+       "externalConsole": false,
+       "MIMode": "gdb",
+       "miDebuggerPath": "${workspaceFolder}/bin/gdb",
++      "logging": { "engineLogging": true },
+       "setupCommands": [
+           {
+               "description": "Enable pretty-printing for gdb",
+               "text": "-enable-pretty-printing",
+               "ignoreFailures": true
+           },
+-          {
+-              "description": "Set Disassembly Flavor to Intel",
+-              "text": "-gdb-set disassembly-flavor intel",
+-              "ignoreFailures": true
+-          },
+           {
+               "description": "Set default value display to hex",
+               "text": "-gdb-set output-radix 16",
+@@ -35,11 +28,40 @@
+       ]
+     },
+     {
+-      "name": "ISS debug Launch",
++      "name": "RISC-V Application debug Launch",
+       "type": "cppdbg",
+       "request": "launch",
+-      "program": "${workspaceFolder}/gen/cpp_hart_gen/rv64_Debug/build/iss",
+-      "args": ["-m", "rv64", "-c", "${workspaceFolder}/cfgs/rv64-riscv-tests.yaml", "--mm", "${workspaceFolder}/cfgs/memmap.json", "${workspaceFolder}/ext/riscv-tests/isa/rv64ui-p-add"],
++      "program": "${workspaceFolder}/ext/riscv-tests/isa/rv64ui-p-ld_st",
++      "miDebuggerServerAddress": "localhost:2159",
++      "stopAtEntry": true,
++      "cwd": "${workspaceFolder}",
++      "environment": [],
++      "externalConsole": false,
++      "MIMode": "gdb",
++      "miDebuggerPath": "/bin/gdb-multiarch",
++      "logging": { "engineLogging": true },
++      "setupCommands": [
++          {
++              "description": "Set RISC-V Architecture",
++              "text": "-gdb-set architecture riscv:rv64",
++              "ignoreFailures": false
++          },
++          {
++              "description": "Set debug remote logging",
++              "text": "-gdb-set debug remote 1",
++              "ignoreFailures": false
++          }
++      ]
++    },
++    {
++      "name": "Vector rv32 Debug Launch",
++      "type": "cppdbg",
++      "request": "launch",
++      "program": "${workspaceFolder}/gen/cpp_hart_gen/rv32_Debug/build/iss",
++      "args": [
++        "-m", "rv32",
++        "-c", "${workspaceFolder}/cfgs/rv32-vector.yaml",
++        "${workspaceFolder}/ext/riscv-tests/isa/rv32uv-p-vsetvli"],
+       "stopAtEntry": true,
+       "cwd": "${workspaceFolder}",
+       "environment": [],
+@@ -52,11 +74,6 @@
+               "text": "-enable-pretty-printing",
+               "ignoreFailures": true
+           },
+-          {
+-              "description": "Set Disassembly Flavor to Intel",
+-              "text": "-gdb-set disassembly-flavor intel",
+-              "ignoreFailures": true
+-          },
+           {
+               "description": "Set default value display to hex",
+               "text": "-gdb-set output-radix 16",
+diff --git a/backends/cpp_hart_gen/CMakeLists.txt b/backends/cpp_hart_gen/CMakeLists.txt
+index a322f87ac3..fe424ffb5f 100644
+--- a/backends/cpp_hart_gen/CMakeLists.txt
++++ b/backends/cpp_hart_gen/CMakeLists.txt
+@@ -133,6 +133,8 @@ target_link_libraries(hart_renode PUBLIC hart)
+ add_executable(iss
+   ${CMAKE_SOURCE_DIR}/src/iss.cpp
+   ${CMAKE_SOURCE_DIR}/src/elf_reader.cpp
++  ${CMAKE_SOURCE_DIR}/src/GDBServer.cpp
++  ${CMAKE_SOURCE_DIR}/src/NotificationHandler.cpp
+ )
+ if(IGNOREUNDEFINED STREQUAL "YES")
+ target_compile_definitions(iss PUBLIC IGNOREUNDEFINED)
+diff --git a/backends/cpp_hart_gen/cpp/include/udb/GDBServer.hpp b/backends/cpp_hart_gen/cpp/include/udb/GDBServer.hpp
+new file mode 100644
+index 0000000000..7d11517775
+--- /dev/null
++++ b/backends/cpp_hart_gen/cpp/include/udb/GDBServer.hpp
+@@ -0,0 +1,121 @@
++#pragma once
++#include <poll.h>
++#include <cstddef>
++#include <string>
++#include <stdint.h>
++
++#define GDB_PORT_DEFAULT 2159
++#define MAX_CLIENTS 1
++#define DBG_MAX_PKT_SIZE 768
++#define NUM_XREGS 32
++
++//ID's of supported features
++#define GDB_SUPPORT_HWBREAK         (1 << 0)
++#define GDB_SUPPORT_SWBREAK         (1 << 1)
++#define GDB_SUPPORT_BREAKPOINTCMDS  (1 << 2)
++#define GDB_SUPPORT_RCMD            (1 << 3)
++#define GDB_SUPPORT_VCONT           (1 << 4)
++#define GDB_SUPPORT_NOACK           (1 << 5)
++
++#define GDB_SUPPORT_BASE (GDB_SUPPORT_HWBREAK | GDB_SUPPORT_SWBREAK | \
++                          GDB_SUPPORT_BREAKPOINTCMDS | GDB_SUPPORT_RCMD |\
++                          GDB_SUPPORT_VCONT | GDB_SUPPORT_NOACK)
++
++
++
++typedef struct _REGISTERFILE
++{
++  int nXRegs;
++  uint64_t xReg[NUM_XREGS];
++} REGISTERFILE, *PREGISTERFILE;
++
++class GDBPacket
++{
++public:
++  GDBPacket();
++  GDBPacket(unsigned char* pPacket, int len, int size = 0);
++  ~GDBPacket();
++
++  bool Validate();
++  bool EndOfPacket();
++  void SetBufferSize(size_t size);
++  bool Seek(char c);
++  bool Seek(int relPos);
++  template <typename T> T Read();
++  int ReadByte(unsigned char* pValue, unsigned char* pBuffer = NULL);
++  char ReadChar();
++  int ReadData(unsigned char* pData, int len, unsigned char* pBuffer = NULL);
++  std::string ReadString();
++  size_t Length();
++  int Write(const std::string& str);
++  int Write(const unsigned char* pData , size_t len);
++  int Terminate();
++
++  operator unsigned char *();
++  unsigned char operator[](unsigned int i);
++
++private:
++  char HexCharToValue(unsigned char hexChar);
++
++  unsigned char* m_pPacket;
++  unsigned long m_len;
++  size_t m_size;
++  unsigned char* m_pNextPos;
++  int m_checksum;
++};
++
++
++class GDBServer
++{
++public:
++  enum HALTREASON
++  {
++    HALT_BREAKPOINT,
++    HALT_WATCHPOINT,
++    HALT_EXTERNAL,
++    HALT_STEP
++  };
++
++  GDBServer(uint64_t uiSupport = GDB_SUPPORT_BASE, int port = GDB_PORT_DEFAULT, bool bWait = false);
++  ~GDBServer();
++
++  int ListenForConnection(void);
++  int Poll(void);
++  int Halt(GDBServer::HALTREASON reason, uint uiCore, uint64_t uiAddress);
++
++protected:
++  int OnReceive(int socket);
++  virtual int OnExternalHalt();
++  virtual int OnContinue(uint64_t uiAddress = -1);
++  virtual int OnReadGPR(REGISTERFILE& registerFile);
++  virtual int OnWriteGPR(REGISTERFILE& registerFile);
++  virtual int OnReadMemory(uint64_t uiAddress, uint64_t& uiLen, void* pBuffer);
++  virtual int OnWriteMemory(uint64_t uiAddress, uint64_t& uiLen, void* pMemBuffer);
++  virtual int OnReadSingleRegister(int reg, uint64_t& value);
++  virtual int OnWriteSingleRegister(int reg, uint64_t& value);
++  virtual int OnSingleStep(uint64_t uiRangeBegin = 0, uint64_t uiRangeEnd = 0);
++  virtual int OnClearBreakWatchPoint(unsigned char type, uint64_t uiAddress, uint64_t uiKind);
++  virtual int OnSetBreakWatchPoint(unsigned char type, uint64_t uiAddress, uint64_t uiKind);
++
++private:
++  uint64_t m_uiSupport;
++  int m_serverSocket;
++  int m_clientSocket;
++  int m_port;
++  bool m_bWait;
++  bool m_ackMode;
++  struct pollfd m_pollFds[MAX_CLIENTS + 1];
++  int m_nPollFds;
++  unsigned char m_recvBuffer[DBG_MAX_PKT_SIZE];
++  unsigned char m_respBuffer[DBG_MAX_PKT_SIZE];
++
++  int HandleSocketEvents(int socket, short events);
++  int HandlePacket(GDBPacket& packet);
++  int SendAck(void);
++  int SendNak(void);
++  int SendResponse(void* pBuffer, unsigned int len);
++  int SendResponse(GDBPacket& packet);
++  int SendResponse(const std::string& str);
++  int SendError(int error);
++  std::string GetSupportedString();
++};
+diff --git a/backends/cpp_hart_gen/cpp/include/udb/NotificationHandler.hpp b/backends/cpp_hart_gen/cpp/include/udb/NotificationHandler.hpp
+new file mode 100644
+index 0000000000..dcc21a8102
+--- /dev/null
++++ b/backends/cpp_hart_gen/cpp/include/udb/NotificationHandler.hpp
+@@ -0,0 +1,27 @@
++#pragma once
++#include <stdint.h>
++
++class NotificationHandler;
++typedef int (*NOTIFYCALLBACK)(NotificationHandler& handler, uint64_t uiEvent, void* pData);
++
++class NotificationHandler
++{
++public:
++  NotificationHandler(NOTIFYCALLBACK notifyCallback = nullptr);
++  ~NotificationHandler();
++
++  void EnableEvent(uint64_t event);
++  void DisableEvent(uint64_t event);
++  int Notify(uint64_t uiEvent, void* pData);
++  void DisableNotifications();
++  void EnableNotifications();
++
++
++protected:
++  virtual int OnNotification(uint64_t uiEvent, void* pData) {return 0;}
++
++  uint64_t m_uiEventMask;
++  NOTIFYCALLBACK m_notifyCallback;
++  bool m_bEnable;
++
++};
+diff --git a/backends/cpp_hart_gen/cpp/include/udb/cpp_exceptions.hpp b/backends/cpp_hart_gen/cpp/include/udb/cpp_exceptions.hpp
+index 8583b67484..83251cb949 100644
+--- a/backends/cpp_hart_gen/cpp/include/udb/cpp_exceptions.hpp
++++ b/backends/cpp_hart_gen/cpp/include/udb/cpp_exceptions.hpp
+@@ -45,6 +45,10 @@ namespace udb {
+ 
+   // object that is thrown when an instruction (or fetch) encounters an
+   // exception
++  class AbortPreExecute : public std::exception {
++   public:
++    const char* what() const noexcept override { return "Instruction Abort with maintained pc"; }
++  };
+   class AbortInstruction : public std::exception {
+    public:
+     const char* what() const noexcept override { return "Instruction Abort"; }
+diff --git a/backends/cpp_hart_gen/cpp/include/udb/hart.hpp b/backends/cpp_hart_gen/cpp/include/udb/hart.hpp
+index d3544d44e2..193cff8063 100644
+--- a/backends/cpp_hart_gen/cpp/include/udb/hart.hpp
++++ b/backends/cpp_hart_gen/cpp/include/udb/hart.hpp
+@@ -17,6 +17,7 @@
+ #include "udb/soc_model.hpp"
+ #include "udb/stop_reason.h"
+ #include "udb/version.hpp"
++#include "udb/NotificationHandler.hpp"
+ 
+ #if !defined(JSON_ASSERT)
+ #define JSON_ASSERT(cond) udb_assert(cond, "JSON assert");
+@@ -43,6 +44,20 @@ namespace udb {
+ 
+   class InstBase;
+ 
++  struct TranslateResult
++  {
++    uint64_t pAddr;
++  };
++
++  enum HART_NOTIFICATION_EVENT
++  {
++    PREFETCH_EVENT = 0,
++    FETCH_EVENT,
++    DECODE_EVENT,
++    PREEXECUTE_EVENT,
++    EXECUTE_EVENT
++  };
++
+   template <SocModel SocType>
+   class HartBase {
+    public:
+@@ -51,9 +66,9 @@ namespace udb {
+           m_soc(soc),
+           m_cfg(cfg),
+           m_tracer(nullptr),
+-          m_current_priv_mode(PrivilegeMode::M),
+           m_exit_requested(false),
+-          m_num_inst_exec(0) {}
++          m_num_inst_exec(0),
++          m_pNotifier(nullptr) {}
+ 
+     virtual void reset(uint64_t reset_pc) {
+       m_exit_requested = 0;
+@@ -65,6 +80,12 @@ namespace udb {
+       m_tracer = t;
+     }
+ 
++    void attach_notifier(NotificationHandler* n) {
++      //Single sink limitation for notifications
++      //Furure applications may require list/vector of NotificationHandlers
++      m_pNotifier = n;
++    }
++
+     virtual void set_pc(uint64_t new_pc) = 0;
+     virtual void set_next_pc(uint64_t next_pc) = 0;
+     virtual uint64_t pc() const = 0;
+@@ -73,10 +94,8 @@ namespace udb {
+     // get the next instruction encoding
+     virtual uint64_t fetch() = 0;
+ 
+-    PrivilegeMode mode() const { return m_current_priv_mode; }
+-    void set_mode(const PrivilegeMode& next_mode) {
+-      m_current_priv_mode = next_mode;
+-    }
++    virtual PrivilegeMode _get_mode() = 0;
++    virtual void _set_mode(const PrivilegeMode& next_mode) = 0;
+ 
+     // access a physical address. All translations and physical checks
+     // should have already occurred
+@@ -375,12 +394,14 @@ namespace udb {
+ 
+     uint64_t num_insts_exec() const { return m_num_inst_exec; }
+ 
++    virtual TranslateResult translate_native(uint64_t vaddr, MemoryOperation op, PrivilegeMode mode, uint64_t encoding) = 0;
++
+    protected:
+     const unsigned m_hart_id;
+     SocType& m_soc;
+     const Config m_cfg;
+     AbstractTracer* m_tracer;
+-    PrivilegeMode m_current_priv_mode;
++    NotificationHandler* m_pNotifier;
+ 
+     int m_exit_code;
+     std::string m_exit_reason;
+@@ -390,6 +411,13 @@ namespace udb {
+     // the number of instruction *executed*
+     // THIS IS NOT minstret (some executed instructions do not retire)
+     uint64_t m_num_inst_exec;
++
++    inline int Notify(uint64_t uiEvent, void* pData) {
++      if(m_pNotifier) {
++        return m_pNotifier->Notify(uiEvent, pData);
++      }
++      return 0;
++    }
+   };
+ 
+ }  // namespace udb
+diff --git a/backends/cpp_hart_gen/cpp/include/udb/iss_soc_model.hpp b/backends/cpp_hart_gen/cpp/include/udb/iss_soc_model.hpp
+index e9bbfd9f01..4ad30a5cdf 100644
+--- a/backends/cpp_hart_gen/cpp/include/udb/iss_soc_model.hpp
++++ b/backends/cpp_hart_gen/cpp/include/udb/iss_soc_model.hpp
+@@ -7,19 +7,53 @@
+ #include <vector>
+ 
+ #include "udb/soc_model.hpp"
++#include "udb/NotificationHandler.hpp"
++
+ 
+ namespace udb {
++  enum MEM_NOTIFICATION_EVENT
++  {
++    MEMREAD_EVENT = 5,
++    MEMWRITE_EVENT,
++  };
++
++
++  class MemAccessRange
++  {
++  public:
++    MemAccessRange(uint64_t addr, size_t size) {m_addr = addr; m_size = size;}
++    uint64_t GetAddress() {return  m_addr;}
++    size_t GetSize() {return m_size;}
++
++    bool operator==(const MemAccessRange& mr) const {
++        return (this->m_addr == mr.m_addr && this->m_size == mr.m_size);
++    }
++
++  private:
++    uint64_t m_addr;
++    size_t m_size;
++  };
++
+   class IssSocModel {
+     class DenseMemory {
+      public:
+       DenseMemory(uint64_t size, uint64_t base_addr) : m_offset(base_addr) {
+         m_data.resize(size);
+         m_addend = &m_data[0] - base_addr;
++        m_pNotifier = nullptr;
+       }
+       ~DenseMemory() = default;
+ 
++      void attach_notifier(NotificationHandler* n) {
++        //Single sink limitation for notifications
++        //Future applications may require list/vector of NotificationHandlers
++        m_pNotifier = n;
++      }
+       // subclasses only need to override these functions:
+       virtual uint64_t read(uint64_t addr, size_t bytes) {
++        MemAccessRange memAccessData(addr, bytes);
++        this->Notify(MEMREAD_EVENT, &memAccessData);
++
+         switch (bytes) {
+           case 1:
+             return m_data[addr - m_offset];
+@@ -35,6 +69,9 @@ namespace udb {
+       }
+ 
+       void write(uint64_t addr, uint64_t data, size_t bytes) {
++        MemAccessRange memAccessData(addr, bytes);
++        this->Notify(MEMWRITE_EVENT, &memAccessData);
++
+         switch (bytes) {
+           case 1:
+             m_data[addr - m_offset] = data;
+@@ -55,16 +92,22 @@ namespace udb {
+ 
+       int memcpy_from_host(uint64_t guest_paddr, const uint8_t *host_ptr,
+                            std::size_t size) {
+-        const size_t SZ_64 = sizeof(uint64_t);
++        if(guest_paddr < m_offset || guest_paddr >= m_offset + m_data.size() ||
++            guest_paddr + size < m_offset || guest_paddr + size >= m_offset + m_data.size()) {
++          //out of bounds
++          return -1;
++        }
++
+         auto host_ptr64 = (const uint64_t *)host_ptr;  // NOLINT
+-        while (size >= SZ_64) {
+-          write((guest_paddr += SZ_64) - SZ_64, *host_ptr64++, 8);
+-          size -= SZ_64;
++        while(size >= sizeof(uint64_t)) {
++          write(guest_paddr, *host_ptr64++, sizeof(uint64_t));
++          guest_paddr += sizeof(uint64_t);
++          size -= sizeof(uint64_t);
+         }
+ 
+         auto host_ptr8 = (const uint8_t *)host_ptr64;  // NOLINT
+-        while (size > 0) {
+-          write(guest_paddr++, *host_ptr8++, 1);
++        while(size > 0) {
++          write(guest_paddr++, *host_ptr8++, sizeof(uint8_t));
+           size--;
+         }
+         return size;
+@@ -72,16 +115,21 @@ namespace udb {
+ 
+       int memcpy_to_host(uint8_t *host_ptr, uint64_t guest_paddr,
+                          std::size_t size) {
+-        const size_t SZ_64 = sizeof(uint64_t);
++        if(guest_paddr < m_offset || guest_paddr >= m_offset + m_data.size() ||
++            guest_paddr + size < m_offset || guest_paddr + size >= m_offset + m_data.size()) {
++          //out of bounds
++          return -1;
++        }
+         auto host_ptr64 = (uint64_t *)host_ptr;  // NOLINT
+-        while (size >= SZ_64) {
+-          *(host_ptr64++) = read(guest_paddr += SZ_64, 8);
+-          size -= SZ_64;
++        while(size >= sizeof(uint64_t)) {
++          *host_ptr64++ = read(guest_paddr, sizeof(uint64_t));
++          guest_paddr += sizeof(uint64_t);
++          size -= sizeof(uint64_t);
+         }
+ 
+         auto host_ptr8 = (uint8_t *)host_ptr64;  // NOLINT
+-        while (size > 0) {
+-          *(host_ptr8++) = read(guest_paddr += SZ_64, 1);
++        while(size > 0) {
++          *host_ptr8++ = read(guest_paddr++, sizeof(uint8_t));
+           size--;
+         }
+         return size;
+@@ -91,6 +139,14 @@ namespace udb {
+       std::vector<uint8_t> m_data;
+       uint64_t m_offset;
+       uint8_t *m_addend = nullptr;
++      NotificationHandler* m_pNotifier;
++
++      inline int Notify(uint64_t uiEvent, void* pData) {
++        if(m_pNotifier) {
++          return m_pNotifier->Notify(uiEvent, pData);
++        }
++        return 0;
++      }
+     };
+ 
+    public:
+@@ -99,6 +155,11 @@ namespace udb {
+     IssSocModel() = delete;
+     ~IssSocModel() = default;
+ 
++    void attach_notifier(NotificationHandler* n) {
++      //Single sink limitation for notifications
++      //Furure applications may require list/vector of NotificationHandlers
++      m_memory.attach_notifier(n);
++    }
+     uint64_t read_hpm_counter(uint64_t n) { return 0; }
+     uint64_t read_mcycle() { return 0; }
+     uint64_t read_mtime() { return 0; }
+diff --git a/backends/cpp_hart_gen/cpp/src/GDBServer.cpp b/backends/cpp_hart_gen/cpp/src/GDBServer.cpp
+new file mode 100644
+index 0000000000..1e4d060310
+--- /dev/null
++++ b/backends/cpp_hart_gen/cpp/src/GDBServer.cpp
+@@ -0,0 +1,1021 @@
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <unistd.h>
++#include <errno.h>
++#include <string>
++#include <format>
++#include <sys/param.h>
++
++#include "udb/GDBServer.hpp"
++
++
++#define GDB_CMD_PACKET_START '$'
++#define GDB_CMD_PACKET_END '#'
++#define GDB_CMD_BREAK '\3'
++#define GDB_RSP_ACK '+'
++#define GDB_RSP_NACK '-'
++
++typedef struct _GDBFEATURE
++{
++  uint64_t uiId;
++  std::string feature;
++} GDBFEATURE, *PGDBFEATURE;
++
++
++char gHexDigitTable[] = {'0', '1', '2', '3', '4', '5', '6', '7' , '8', '9',
++                         'a', 'b', 'c', 'd', 'e', 'f'};
++
++//TODO: complete table for all q/Q Features
++static const GDBFEATURE gFeatureTable[] = {{GDB_SUPPORT_HWBREAK, "hwbreak"},
++                                           {GDB_SUPPORT_SWBREAK, "swbreak"},
++                                           {GDB_SUPPORT_BREAKPOINTCMDS, "BreakpointCommands"},
++                                           {GDB_SUPPORT_VCONT, "vContSupported"},
++                                           {GDB_SUPPORT_NOACK, "QStartNoAckMode"},
++                                           {GDB_SUPPORT_RCMD, "Rcmd"}};
++
++GDBServer::GDBServer(uint64_t uiSupport, int port, bool bWait)
++{
++  m_uiSupport = uiSupport;
++  m_port = port;
++  m_bWait = bWait;
++  m_ackMode = true;
++  m_serverSocket = -1;
++  m_clientSocket = -1;
++  m_nPollFds = 0;
++}
++
++GDBServer::~GDBServer()
++{
++  if(m_clientSocket != -1)
++    close(m_clientSocket);
++
++  if(m_serverSocket != -1)
++    close(m_serverSocket);
++}
++
++int GDBServer::ListenForConnection(void)
++{
++  int result = 0;
++
++  m_serverSocket =  socket(AF_INET, SOCK_STREAM, 0);
++  if(m_serverSocket != -1)
++  {
++    sockaddr_in serverAddress;
++    serverAddress.sin_family = AF_INET;
++    serverAddress.sin_port = htons(m_port);
++    serverAddress.sin_addr.s_addr = INADDR_ANY;
++
++    if(bind(m_serverSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress)) != -1)
++    {
++      if(listen(m_serverSocket, 0) != -1)
++      {
++        m_pollFds[0].fd = m_serverSocket;
++        m_pollFds[0].events = POLLIN;
++        m_nPollFds = 1;
++      }
++      else
++      {
++        close(m_serverSocket);
++        result = m_serverSocket = -1;
++      }
++    }
++    else
++    {
++      close(m_serverSocket);
++      result = m_serverSocket = -1;
++    }
++  }
++  else
++  {
++    result = -1;
++  }
++  return result;
++}
++
++int GDBServer::Poll(void)
++{
++  int result = poll(m_pollFds, m_nPollFds, 0);
++  if(result > 0)
++  {
++    for(int i = 0 ; i < m_nPollFds ; i++)
++    {
++      if(m_pollFds[i].revents != 0)
++      {
++        result = HandleSocketEvents(m_pollFds[i].fd, m_pollFds[i].revents);
++      }
++    }
++  }
++  else if( result == -1)
++  {
++    //Error
++  }
++  return result;
++}
++
++int GDBServer::Halt(GDBServer::HALTREASON reason, uint uiCore, uint64_t uiAddress)
++{
++  int result = 0;
++  switch(reason)
++  {
++  case HALT_BREAKPOINT:
++    result = SendResponse(std::format("T05hwbreak:;core:{:02x};", (uint8_t)uiCore));
++    break;
++  case HALT_WATCHPOINT:
++    result = SendResponse(std::format("T05watch:{:x};core:{:02x};", uiAddress, (uint8_t)uiCore));
++    break;
++  case HALT_EXTERNAL:
++  default:
++    result = SendResponse("S05");
++  }
++  return result;
++}
++
++int GDBServer::HandleSocketEvents(int socket, short events)
++{
++  if(socket == m_serverSocket)
++  {
++    //server socket
++    if(events & POLLIN)
++    {
++      if(m_clientSocket < 0)
++      {
++        //accept a new client socket
++        int clientSocket;
++        sockaddr_in clientAddress;
++        socklen_t addressLen = sizeof(clientAddress);
++
++        clientSocket= accept(m_serverSocket, (struct sockaddr*)&clientAddress, &addressLen);
++        if(clientSocket >= 0)
++        {
++          m_pollFds[1].fd = clientSocket;
++          m_pollFds[1].events = POLLIN;
++          m_pollFds[1].revents = 0;
++          m_nPollFds = 2;
++          m_clientSocket = clientSocket;
++          m_ackMode = true;
++        }
++      }
++    }
++  }
++
++  if(socket == m_clientSocket)
++  {
++    if(events & POLLIN)
++    {
++      //data available to read
++      if(OnReceive(socket) == 0)
++      {
++        //0 bytes returned when remote side terminated connection
++        events |= POLLHUP;
++      }
++    }
++    if(events & (POLLHUP | POLLERR))
++    {
++      //connection closed by remote or error
++      close(m_clientSocket);
++      m_pollFds[1].fd = -1;
++      m_nPollFds = 1;
++      m_clientSocket = -1;
++    }
++  }
++  return 0;
++}
++
++int GDBServer::OnReceive(int socket)
++{
++  if(socket != m_clientSocket || socket == -1)
++    return -1;
++
++  int nBytesReceived = recv(socket, &m_recvBuffer[0], sizeof(m_recvBuffer), MSG_DONTWAIT);
++  if(nBytesReceived > 0)
++  {
++    unsigned char* pRcvd = m_recvBuffer;
++
++    while(pRcvd < &m_recvBuffer[nBytesReceived])
++    {
++      switch(*pRcvd)
++      {
++      case GDB_CMD_PACKET_START:
++        {
++          GDBPacket packet((unsigned char*)pRcvd, nBytesReceived - (pRcvd - &m_recvBuffer[0]));
++          if(packet.Validate())
++          {
++            SendAck();
++            HandlePacket(packet);
++          }
++          else
++          {
++            SendNak();
++          }
++          pRcvd += packet.Length();
++        }
++        break;
++      case GDB_RSP_NACK:
++
++        //...what did we send?
++        pRcvd++;
++        break;
++      case GDB_CMD_BREAK:
++        OnExternalHalt();
++        pRcvd++;
++        break;
++      case GDB_RSP_ACK:
++      default:
++        pRcvd++;
++        break;
++      }
++    }
++  }
++  else if(nBytesReceived < 0)
++  {
++    //Error or no data available
++    if(errno == EWOULDBLOCK || errno == EAGAIN)
++      nBytesReceived = 0;
++  }
++  return nBytesReceived;
++}
++
++int GDBServer::HandlePacket(GDBPacket& packet)
++{
++  int result;
++  uint64_t uiAddress;
++  REGISTERFILE regFile;
++  const unsigned char cmd = packet[1];
++
++  switch(cmd)
++  {
++  case '?':
++    result = SendResponse("S05");
++    if(result < 0)
++    {
++      //error response
++      result = SendError(result);
++    }
++    break;
++  // case 'c':
++  //   {
++  //     //continue with optional address
++  //     uint64_t uiAddress = (uint64_t)-1;
++  //     if(!packet.EndOfPacket())
++  //       uiAddress = packet.Read<uint64_t>();
++
++  //     result = OnContinue(uiAddress);
++  //   }
++  //   break;
++  case 'g':
++    {
++      //Read General purrpose register
++      REGISTERFILE regFile;
++      regFile.nXRegs = 32;
++      result = OnReadGPR(regFile);
++      if(result >= 0)
++      {
++        GDBPacket responsePacket(m_respBuffer, 0, sizeof(m_respBuffer));
++        result = responsePacket.Write((const unsigned char*)&regFile.xReg[0],regFile.nXRegs * sizeof(regFile.xReg[0]));
++        if(result >= 0)
++        {
++         result = SendResponse(responsePacket);
++        }
++      }
++
++      if(result < 0)
++      {
++        result = SendError(result);
++      }
++    }
++    break;
++  case 'G':
++    {
++      //Write General purpose registers
++      REGISTERFILE regFile;
++      regFile.nXRegs = 0;
++      for(int i = 0 ; i < NUM_XREGS ; i++)
++      {
++        if(packet.ReadData((unsigned char*)&regFile.xReg[i], sizeof(regFile.xReg[i])) < -1)
++          regFile.nXRegs++;
++        else
++          break;
++      }
++      if(regFile.nXRegs > 0)
++      {
++        result = OnWriteGPR(regFile);
++        if(result >= 0)
++        {
++          SendResponse("OK");
++        }
++      }
++      else
++      {
++        result = -1;
++      }
++
++      if(result < 0)
++      {
++        result = SendError(result);
++      }
++    }
++    break;
++  case 'm':
++  case 'M':
++    {
++      uint64_t uiAddress = packet.Read<uint64_t>();
++      if(packet.Seek(','))
++      {
++        uint64_t uiLen = packet.Read<uint64_t>();
++        if(uiLen > 0)
++        {
++          uint8_t* pMemBuffer = new uint8_t[uiLen];
++          if(pMemBuffer != nullptr)
++          {
++            if(cmd == 'm') //Read memory
++            {
++              //Get requested range of data from SoC
++              result = OnReadMemory(uiAddress, uiLen, pMemBuffer);
++              if(result >= 0)
++              {
++                //Create the response packet;
++                GDBPacket responsePacket(m_respBuffer, 0, sizeof(m_respBuffer));
++                result = responsePacket.Write(pMemBuffer, uiLen);
++                if(result >= 0)
++                {
++                  //Send the response
++                  result = SendResponse(responsePacket);
++                }
++              }
++            }
++            else //Write memory
++            {
++              if(packet.Seek(':'))
++              {
++                //Provide the data to the SoC
++                result = packet.ReadData(pMemBuffer, uiLen);
++                if(result >= 0)
++                {
++                  result = OnWriteMemory(uiAddress, uiLen, pMemBuffer);
++                  if(result >= 0)
++                  {
++                    SendResponse("OK");
++                  }
++                }
++              }
++              else
++              {
++                result = -1;
++              }
++            }
++            delete pMemBuffer;
++          }
++          else
++          {
++            //Out of memory
++            result = -1;
++          }
++        }
++        else
++        {
++          result = -1;
++        }
++
++        if(result < 0)
++        {
++          result = SendError(result);
++        }
++      }
++    }
++    break;
++  case 'p':
++    {
++      int iReg = packet.Read<int>();
++      uint64_t regValue = 0;
++      result = OnReadSingleRegister(iReg, regValue);
++      if(result >= 0)
++      {
++        GDBPacket responsePacket(m_respBuffer, 0, sizeof(m_respBuffer));
++        result = responsePacket.Write((unsigned char*) &regValue, sizeof(regValue));
++        if(result >= 0)
++        {
++          //Send the response
++          result = SendResponse(responsePacket);
++        }
++      }
++
++      if(result < 0)
++      {
++        result = SendResponse("xxxxxxxxxxxxxxxx");
++      }
++    }
++    break;
++  case 'P':
++    {
++      int iReg = packet.Read<int>();
++      if(packet.Seek('='))
++      {
++        uint64_t regValue;
++        result = packet.ReadData((unsigned char*)&regValue, sizeof(regValue));
++        if(result >= 0)
++        {
++          result = OnWriteSingleRegister(iReg, regValue);
++          if(result >= 0)
++            result = SendResponse("OK");
++        }
++      }
++      else
++      {
++        result = -1;
++      }
++
++      if(result < 0)
++      {
++        result = SendError(result);
++      }
++    }
++    break;
++  case 'q':
++    {
++      std::string strCmd = packet.ReadString();
++      if(strCmd == "Supported")
++      {
++        result = SendResponse(std::format("{:s};PacketSize={:02x}", GetSupportedString(), sizeof(m_recvBuffer)));
++      }
++      else if(strCmd == "Rcmd")
++      {
++        //TODO: Implement
++      }
++      else
++      {
++        result = SendResponse("");
++      }
++    }
++    break;
++  case 'Q':
++    {
++      std::string strCmd = packet.ReadString();
++      if(strCmd == "StartNoAckMode")
++      {
++        m_ackMode = false;
++        result = SendResponse("OK");
++      }
++      else
++      {
++        result = SendResponse("");
++      }
++    }
++    break;
++  // case 's':
++  //   {
++  //     //Deprecated for vCont
++  //     uint64_t uiAddress = -1;
++  //     if(!packet.EndOfPacket())
++  //       uiAddress = packet.Read<uint64_t>();
++
++  //     result = OnSingleStep(uiAddress);
++  //     if(result < 0)
++  //     {
++  //       result = SendError(result);
++  //     }
++  //   }
++  //   break;
++  case 'v':
++    {
++      std::string strCmd = packet.ReadString();
++      if(strCmd == "Cont")
++      {
++        switch(packet.ReadChar())
++        {
++        case '?':
++          result = SendResponse("c;s;t;r");
++          break;
++        case ';':
++          switch(packet.ReadChar())
++          {
++          case 'c':
++            result = OnContinue();
++            break;
++          case 's':
++            result = OnSingleStep();
++            break;
++          case 'r':
++            result = OnSingleStep();
++            break;
++          default:
++            result = -1;
++            break;
++          }
++          break;
++        default:
++          result = -1;
++          break;
++        }
++      }
++      else
++      {
++        //No other 'v' packets are supported
++        result = SendResponse("");
++      }
++    }
++    break;
++  case 'z':
++  case 'Z':
++    {
++      unsigned char type;
++
++      result = -1;
++      type = packet.Read<unsigned char>();
++      if(packet.Seek(','))
++      {
++        uint64_t uiAddress = packet.Read<uint64_t>();
++        if(packet.Seek(','))
++        {
++          uint64_t uiKind = packet.Read<uint64_t>();
++          if(cmd == 'z')
++            result = OnClearBreakWatchPoint(type, uiAddress, uiKind);
++          else
++            result = OnSetBreakWatchPoint(type, uiAddress, uiKind);
++
++          if(result >= 0)
++            result = SendResponse("OK");
++        }
++        else
++        {
++          result = -1;
++        }
++
++        if(result < 0)
++        {
++          result = SendError(result);
++        }
++      }
++    }
++    break;
++  default:
++    //unknown command
++    result = SendResponse("");
++    break;
++  }
++
++  return result;
++}
++
++
++int GDBServer::SendAck(void)
++{
++  if(m_ackMode)
++    return send(m_clientSocket, "+", 1, 0);
++  else
++    return 0;
++}
++
++int GDBServer::SendNak(void)
++{
++  if(m_ackMode)
++    return send(m_clientSocket, "-", 1, 0);
++  else
++    return 0;
++}
++
++int GDBServer::SendResponse(void* pBuffer, unsigned int len)
++{
++  return send(m_clientSocket, pBuffer, len, 0);
++}
++
++int GDBServer::SendResponse(GDBPacket& packet)
++{
++  int result;
++  result = packet.Terminate();
++  if(result >= 0)
++  {
++    result = SendResponse((unsigned char*)packet, packet.Length());
++  }
++  return result;
++}
++
++int GDBServer::SendResponse(const std::string& str)
++{
++  GDBPacket response((unsigned char*)m_respBuffer, 0, sizeof(m_respBuffer));
++  int result = response.Write(str);
++  if(result > -1 )
++  {
++    result = SendResponse(response);
++  }
++  return result;
++}
++
++int GDBServer::SendError(int error)
++{
++  GDBPacket response((unsigned char*)m_respBuffer, 0, sizeof(m_respBuffer));
++  int result = response.Write("E");
++  if(result >= 0)
++  {
++    if(error < 0)
++      error = -error;
++    result = response.Write((unsigned char*)&error, sizeof(unsigned char));
++    if(result >= 0)
++    {
++      result = SendResponse(response);
++    }
++  }
++  return result;
++}
++
++std::string GDBServer::GetSupportedString()
++{
++  std::string supported;
++  PGDBFEATURE pGdbFeature;
++
++  for(uint64_t id = 1; id != 0 && id <= m_uiSupport; id <<= 1)
++  {
++    for(pGdbFeature = (PGDBFEATURE)&gFeatureTable[0];
++      pGdbFeature < gFeatureTable + sizeof(gFeatureTable);
++      pGdbFeature++)
++    {
++      if(pGdbFeature->uiId == id)
++      {
++        if(!supported.empty())
++          supported += ';';
++        supported += pGdbFeature->feature;
++        supported += '+';
++        break;
++      }
++    }
++  }
++  return supported;
++}
++
++GDBPacket::GDBPacket()
++{
++  m_pPacket = NULL;
++  m_len = 0;
++}
++
++GDBPacket::GDBPacket(unsigned char* pPacket, int len, int size)
++{
++  m_pPacket = m_pNextPos = pPacket;
++  if(size > 0)
++  {
++    m_size = size;
++    if(len == 0)
++    {
++      //Initialize the packet
++      *m_pNextPos++ = GDB_CMD_PACKET_START;
++      m_len = 1;
++    }
++    else
++    {
++      //Partial packet passed
++      m_len = len;
++      m_pNextPos == pPacket + m_len;
++    }
++  }
++  else if(len > 0)
++  {
++    //Find terminator within the length passed
++    unsigned char* pTerminator = pPacket;
++    while(pTerminator <  pPacket + len)
++    {
++      if(*pTerminator == GDB_CMD_PACKET_END)
++        break;
++      pTerminator++;
++    }
++    if(pTerminator <  pPacket + len)
++    {
++      //Packet ends with '#' and 2 hex digits
++      m_size = m_len = MIN((pTerminator - pPacket + 3), len);
++    }
++    else
++    {
++      //Treat the whole buffer passed as a packet.
++      m_size = m_len = len;
++    }
++  }
++  else
++  {
++    //Dead packet
++    m_size = m_len = 0;
++  }
++}
++
++
++GDBPacket::~GDBPacket()
++{
++
++}
++
++bool GDBPacket::Validate()
++{
++  if(m_pPacket != NULL && m_len > 0 && m_pPacket[0] == GDB_CMD_PACKET_START)
++  {
++    unsigned char checksum;
++    int i;
++
++    for(i = 1, checksum = 0 ; i < m_len && m_pPacket[i] != GDB_CMD_PACKET_END ; i++)
++      checksum += m_pPacket[i];
++
++    if(m_pPacket[i] == GDB_CMD_PACKET_END)
++    {
++      if(i <= (m_len - 2))
++      {
++        unsigned char packetChecksum;
++        //Skip over the terminator;
++        i++;
++        if(ReadByte(&packetChecksum, &m_pPacket[i]) != -1 &&
++          packetChecksum == checksum)
++        {
++          return true;
++        }
++      }
++      else
++      {
++        //No checksum provided
++        //check packet mode flags
++      }
++    }
++  }
++  return false;
++}
++
++void GDBPacket::SetBufferSize(size_t size)
++{
++  m_size = size;
++}
++
++int GDBPacket::ReadByte(unsigned char* pValue, unsigned char* pBuffer)
++{
++  int result = -1;
++
++  if(pBuffer != NULL)
++    m_pNextPos = pBuffer;
++
++  if(m_pNextPos >= m_pPacket && m_pNextPos < (m_pPacket + m_len))
++  {
++    result = HexCharToValue(m_pNextPos[0]) << 4;
++    result |= HexCharToValue(m_pNextPos[1]);
++
++    if(result >= 0)
++    {
++      *pValue = (unsigned char)(result & 0xff);
++      m_pNextPos += 2;
++    }
++    else
++    {
++      result = -1;
++    }
++  }
++  return result;
++}
++
++char GDBPacket::ReadChar()
++{
++  char c = 0;
++
++  if(m_pNextPos >= m_pPacket && m_pNextPos < (m_pPacket + m_len))
++    c = *m_pNextPos++;
++
++  return c;
++}
++
++int GDBPacket::ReadData(unsigned char* pData, int len, unsigned char* pBuffer)
++{
++  int result = 0;
++
++  if(pBuffer != NULL)
++    m_pNextPos = pBuffer;
++
++  if(m_pNextPos >= m_pPacket && m_pNextPos < (m_pPacket + m_len - 2 * len))
++  {
++    while(result < len && ReadByte(pData++) != -1)
++      result++;
++
++    if(result == 0) //No bytes read
++      result = -1;
++  }
++  else
++  {
++    result = -1;
++  }
++  return result;
++}
++
++std::string GDBPacket::ReadString()
++{
++  std::string s;
++  while(isalpha(*m_pNextPos))
++    s += *m_pNextPos++;
++
++  return s;
++}
++
++template <typename T>
++inline T GDBPacket::Read()
++{
++  T value = 0;
++  int maxLen = sizeof(value) * 2;
++
++  while(maxLen-- && isxdigit(*m_pNextPos))
++  {
++    value <<= 4;
++    value |= HexCharToValue(*m_pNextPos++);
++  }
++
++  // for(int iShift = 0 ; iShift < sizeof(value); iShift++)
++  // {
++  //   uint8_t byteValue = 0;
++  //   if(isxdigit(*m_pNextPos) && m_pNextPos < &m_pPacket[m_len])
++  //     byteValue = HexCharToValue(*m_pNextPos++);
++  //   if(isxdigit(*m_pNextPos) && m_pNextPos < &m_pPacket[m_len])
++  //   {
++  //     byteValue <<= 4;
++  //     byteValue |= HexCharToValue(*m_pNextPos++);
++  //   }
++  //   value |= (byteValue << (iShift * 8));
++  // }
++
++  return value;
++}
++
++size_t GDBPacket::Length()
++{
++  return m_len;
++}
++
++GDBPacket::operator unsigned char*()
++{
++  return m_pPacket;
++}
++
++char GDBPacket::HexCharToValue(unsigned char hexChar)
++{
++  char result = 0;
++  if(hexChar >= '0' && hexChar <= '9')
++    result = hexChar - '0';
++  else if (hexChar >= 'a' && hexChar <= 'f')
++    result = hexChar - 'a' + 10;
++  else if (hexChar >= 'A' && hexChar <= 'F')
++    result = hexChar - 'A' + 10;
++  else
++    result = -1;
++
++  return result;
++}
++
++int GDBPacket::Write(const std::string& str)
++{
++  int len = str.length();
++  for(int i = 0 ; i < len ; i++)
++  {
++    *m_pNextPos++ = str[i];
++  }
++  m_len += len;
++
++  return len;
++}
++
++int GDBPacket::Write(const unsigned char* pData, size_t len)
++{
++  if((len * 2) > (m_pNextPos - m_pPacket + m_size))
++    return -1;
++
++  //Encode binary into hex characters
++  for(int i = 0 ; i < len ; i++)
++  {
++    *m_pNextPos++ = gHexDigitTable[pData[i] >> 4];
++    *m_pNextPos++ = gHexDigitTable[pData[i] & 0xf];
++  }
++  m_len += len * 2;
++  return len * 2;
++}
++
++int GDBPacket::Terminate()
++{
++  unsigned char* pData;
++  unsigned char checksum;
++  int result;
++
++  if(m_len + 3 > m_size)
++    return -1;
++
++  pData = &m_pPacket[1];
++  checksum = 0;
++
++  while(pData < m_pNextPos)
++  {
++    checksum += *pData++;
++  }
++  //Write terminator and checksum
++  *m_pNextPos++ = '#';
++  m_len++;
++
++  result = Write(&checksum, sizeof(checksum));
++  if(result < 0)
++  {
++    result = 1;
++  }
++  else
++  {
++    result++;
++  }
++
++  return result;
++}
++
++unsigned char GDBPacket::operator[](unsigned int i)
++{
++  if(i < m_size)
++  {
++    if(m_len < i)
++      m_len = i;
++
++    m_pNextPos = (m_pPacket + i + 1);
++    return m_pPacket[i];
++  }
++  return 0;
++}
++
++bool GDBPacket::Seek(char c)
++{
++  unsigned char* p = m_pNextPos;
++  while(p < (m_pPacket + m_len))
++  {
++    if(*p == (unsigned char)c)
++    {
++      m_pNextPos = p;
++      m_pNextPos++;
++      return true;
++    }
++    p++;
++  }
++  return false;
++}
++
++bool GDBPacket::Seek(int relPos)
++{
++  if((m_pNextPos + relPos) >= m_pPacket && (m_pNextPos + relPos) <= (m_pPacket + m_len))
++  {
++    m_pNextPos += relPos;
++    return true;
++  }
++  return false;
++}
++
++bool GDBPacket::EndOfPacket()
++{
++  if(*m_pNextPos == '#' || m_pNextPos >= m_pPacket + m_len)
++    return true;
++  else
++    return false;
++}
++//Default implementations,
++//override these in class inherited from GDBServer
++int GDBServer::OnContinue(uint64_t uiAddress)
++{
++
++  return -1;
++}
++int GDBServer::OnReadGPR(REGISTERFILE& registerFile)
++{
++  return -1;
++}
++
++int GDBServer::OnWriteGPR(REGISTERFILE& registerFile)
++{
++  return -1;
++}
++
++int GDBServer::OnReadMemory(uint64_t uiAddress, uint64_t& uiLen, void* pMemBuffer)
++{
++  return -1;
++}
++
++int GDBServer::OnWriteMemory(uint64_t uiAddress, uint64_t& uiLen, void* pMemBuffer)
++{
++  return -1;
++}
++
++int GDBServer::OnReadSingleRegister(int reg, uint64_t& value)
++{
++  return -1;
++}
++
++int GDBServer::OnWriteSingleRegister(int reg, uint64_t& value)
++{
++  return -1;
++}
++
++int GDBServer::OnSingleStep(uint64_t uiRangeBegin, uint64_t uiRangeEnd)
++{
++  return -1;
++}
++
++int GDBServer::OnSetBreakWatchPoint(unsigned char type, uint64_t uiAddress, uint64_t uiKind)
++{
++  return -1;
++}
++
++int GDBServer::OnClearBreakWatchPoint(unsigned char type, uint64_t uiAddress, uint64_t uiKind)
++{
++  return -1;
++}
++
++int GDBServer::OnExternalHalt()
++{
++  return -1;
++}
+diff --git a/backends/cpp_hart_gen/cpp/src/NotificationHandler.cpp b/backends/cpp_hart_gen/cpp/src/NotificationHandler.cpp
+new file mode 100644
+index 0000000000..03fbfcf223
+--- /dev/null
++++ b/backends/cpp_hart_gen/cpp/src/NotificationHandler.cpp
+@@ -0,0 +1,42 @@
++#include "udb/NotificationHandler.hpp"
++
++NotificationHandler::NotificationHandler(NOTIFYCALLBACK notifyCallback)
++{
++  m_notifyCallback = notifyCallback;
++  m_uiEventMask = 0;
++  m_bEnable = true;
++}
++
++NotificationHandler::~NotificationHandler()
++{
++}
++
++void NotificationHandler::EnableEvent(uint64_t event)
++{
++  m_uiEventMask |= (1 << event);
++}
++
++void NotificationHandler::DisableEvent(uint64_t event)
++{
++  m_uiEventMask &= ~(1 << event);
++}
++
++void NotificationHandler::EnableNotifications()
++{
++  m_bEnable = true;
++}
++
++void NotificationHandler::DisableNotifications()
++{
++  m_bEnable = false;
++}
++
++int NotificationHandler::Notify(uint64_t uiEvent, void* pData) {
++  if(!m_bEnable || ((1 << uiEvent) & m_uiEventMask) == 0)
++    return 0;
++
++  if(m_notifyCallback)
++    return m_notifyCallback(*this, uiEvent, pData);
++  else
++    return OnNotification(uiEvent, pData);
++}
+diff --git a/backends/cpp_hart_gen/cpp/src/iss.cpp b/backends/cpp_hart_gen/cpp/src/iss.cpp
+index 376bebcb90..0ff42c3b45 100644
+--- a/backends/cpp_hart_gen/cpp/src/iss.cpp
++++ b/backends/cpp_hart_gen/cpp/src/iss.cpp
+@@ -5,38 +5,117 @@
+ #include <string>
+ #include <fstream>
+ #include <nlohmann/json.hpp>
++#include <sys/param.h>
+ 
+ #include "udb/defines.hpp"
+ #include "udb/elf_reader.hpp"
+ #include "udb/hart_factory.hxx"
+ #include "udb/inst.hpp"
++#include "udb/csr.hpp"
+ #include "udb/iss_soc_model.hpp"
++#include "udb/GDBServer.hpp"
++#include "udb/NotificationHandler.hpp"
++
++#define RISCV_REG_GPR_FIRST 0
++#define RISCV_REG_GPR_LAST  0x1f
++#define RISCV_REG_PC        0x20
++#define RISCV_REG_FPR_FIRST 0x21
++#define RISCV_REG_FPR_LAST  0x40
++#define RISCV_REG_FPR_LAST  0x40
++#define RISCV_REG_CSR_FIRST 0x41
++#define RISCV_REG_CSR_LAST  0x1040
+ 
+ using json = nlohmann::json;
+ 
+-struct Options {
+-  std::string config_name;
+-  std::filesystem::path config_path;
+-  std::filesystem::path memory_map_path;
+-  bool show_configs;
+-  std::string elf_file_path;
++struct Options
++{
++  std::string configName;
++  std::filesystem::path configPath;
++  std::filesystem::path memoryMapPath;
++  bool showConfigs;
++  std::string elfFilePath;
++  bool halt;
++  bool gdbMode;
++  uint16_t gdbPort;
+ 
+-  Options() : show_configs(false) {}
++  Options()
++  {
++    //Default values
++    showConfigs = false;
++    halt = false;
++    gdbMode = false;
++    gdbPort = GDB_PORT_DEFAULT;
++  }
+ };
+ 
+-static const int PARSE_OK = 1234;
+-int parse_cmdline(int argc, char **argv, Options &options) {
+-  CLI::App app("Bare-bones ISS");
+-  app.add_option("-m,--model", options.config_name, "Hart model");
+-  app.add_option("-c,--cfg", options.config_path, "Hart configuration file");
+-  app.add_option("--mm, --memory-map", options.memory_map_path, "Memory map file");
+-  app.add_flag("-l,--list-configs", options.show_configs,
+-               "List available configurations");
++typedef struct _MEMORYMAP
++{
++  uint64_t base;
++  uint64_t size;
++} MEMORYMAP, *PMEMORYMAP;
++
++class InstructionSetSimulator : public GDBServer, public NotificationHandler
++{
++public:
++  InstructionSetSimulator();
++  InstructionSetSimulator(Options& opts);
++  ~InstructionSetSimulator();
++  int Run();
+ 
+-  app.add_option("elf_file", options.elf_file_path, "File to run");
++
++
++private:
++  int CreateMemoryMap(std::filesystem::path memMapPath,
++                      std::filesystem::path elfPath = "");
++  virtual int OnExternalHalt();
++  virtual int OnReadGPR(REGISTERFILE& registerFile) override;
++  virtual int OnWriteGPR(REGISTERFILE& registerFile) override;
++  virtual int OnReadMemory(uint64_t uiAddress, uint64_t& uiLen, void* pBuffer) override;
++  virtual int OnWriteMemory(uint64_t uiAddress, uint64_t& uiLen, void* pMemBuffer) override;
++  virtual int OnReadSingleRegister(int reg, uint64_t& value) override;
++  virtual int OnWriteSingleRegister(int reg, uint64_t& value) override;
++  virtual int OnSingleStep(uint64_t uiRangeBegin, uint64_t uiRangeEnd) override;
++  virtual int OnContinue(uint64_t uiAddress = -1) override;
++  virtual int OnClearBreakWatchPoint(unsigned char type, uint64_t uiAddress, uint64_t uiKind) override;
++  virtual int OnSetBreakWatchPoint(unsigned char type, uint64_t uiAddress, uint64_t uiKind) override;
++  virtual int OnNotification(uint64_t uiEvent, void* pData) override;
++
++  enum ISSSTATE
++  {
++    STATE_HALT,
++    STATE_SINGLE_STEP,
++    STATE_RUN,
++    STATE_RUN_N,
++    STATE_EXIT
++  };
++  Options m_opts;
++  MEMORYMAP m_memMap;
++  udb::IssSocModel* m_pSoC;
++  udb::HartBase<udb::IssSocModel>* m_pHart;
++  udb::AbstractTracer* m_pTracer;
++  ISSSTATE m_state;
++  std::list<uint64_t> m_breakpointList;
++  std::list<udb::MemAccessRange> m_readWatchpointList;
++  std::list<udb::MemAccessRange> m_writeWatchpointList;
++};
++
++int ParseCommandLine(int argc, char *argv[], Options &options)
++{
++  CLI::App app("UDB ISS");
++
++  app.add_option("-m,--model", options.configName, "Hart model");
++  app.add_option("-c,--cfg", options.configPath, "Hart configuration file");
++  app.add_option("--mm, --memory-map", options.memoryMapPath, "Memory map file");
++  app.add_option("-p, --gdbport", options.gdbPort, "GDB port");
++  app.add_flag("-l,--list-configs", options.showConfigs,
++               "List available configurations");
++  app.add_flag("-g,--gdb", options.gdbMode, "GDB Debugger mode");
++  app.add_flag("--halt", options.halt,
++               "Halt before execution and wait for debugger to attach");
++  app.add_option("elf_file", options.elfFilePath, "File to run");
+ 
+   CLI11_PARSE(app, argc, argv);
+-  return PARSE_OK;
++  return 0;
+ }
+ 
+ static const std::pair<uint64_t, uint64_t> get_memory_range(std::filesystem::path memmap, std::filesystem::path elf_file_path) {
+@@ -67,54 +146,504 @@ static const std::pair<uint64_t, uint64_t> get_memory_range(std::filesystem::pat
+   return std::make_pair(range.first, memsz);
+ }
+ 
+-
+-int main(int argc, char **argv) {
++int main(int argc, char *argv[])
++{
+   Options opts;
+-  int ret;
+-  if ((ret = parse_cmdline(argc, argv, opts)) != PARSE_OK) {
+-    return ret;
++  int result;
++
++  result = ParseCommandLine(argc, argv, opts);
++  if(result >= 0)
++  {
++    if (opts.showConfigs)
++    {
++      for (auto &config : udb::HartFactory::configs())
++        fmt::print("{}\n", config);
++      return 0;
++    }
++
++    if (opts.configPath.empty())
++    {
++      fmt::print("No configuration file provided\n");
++      return -1;
++    }
++
++    //Construct the ISS from the options passed and run it
++    InstructionSetSimulator iss(opts);
++    result = iss.Run();
++
+   }
++  return result;
++}
++
++InstructionSetSimulator::InstructionSetSimulator()
++{
++
++}
++
++InstructionSetSimulator::InstructionSetSimulator(Options& opts) :
++  GDBServer(GDB_SUPPORT_BASE, opts.gdbPort, opts.halt), m_opts(opts)
++{
++  CreateMemoryMap(opts.memoryMapPath, opts.elfFilePath);
++  m_pSoC = new udb::IssSocModel(m_memMap.size, m_memMap.base);
++  if(m_pSoC)
++  {
++    //Create Hart with reference to SoC model
++    m_pHart = udb::HartFactory::create<udb::IssSocModel>(opts.configName,
++      0,
++      opts.configPath,
++      *m_pSoC);
+ 
+-  if (opts.show_configs) {
+-    for (auto &config : udb::HartFactory::configs()) {
+-      fmt::print("{}\n", config);
++    if(m_pHart)
++    {
++      //Create and attach a tracer
++      m_pTracer = udb::HartFactory::create_tracer<udb::IssSocModel>("riscv-tests",
++        opts.configName,
++        m_pHart);
++      if(m_pTracer)
++      {
++        m_pHart->attach_tracer(m_pTracer);
++      }
++      //Attach notifier to hart and enable hart events we want to be notified for
++      m_pHart->attach_notifier(this);
++      //Eanble these events to trace instruction execution
++      EnableEvent(udb::PREEXECUTE_EVENT);
++      EnableEvent(udb::EXECUTE_EVENT);
+     }
+-    return 0;
++    //Attach notifier to SoC
++    m_pSoC->attach_notifier(this);
++  }
++
++  if(m_opts.gdbMode)
++  {
++    if(m_opts.halt)
++    {
++      m_state = STATE_HALT;
++    }
++    else
++    {
++      m_state = STATE_RUN;
++    }
++  }
++  else
++  {
++    m_state = STATE_RUN_N;
+   }
++}
++
++InstructionSetSimulator::~InstructionSetSimulator()
++{
++  delete m_pTracer;
++  delete m_pHart;
++  delete m_pSoC;
++}
++
++int InstructionSetSimulator::CreateMemoryMap(std::filesystem::path memMapPath,
++                                             std::filesystem::path elfPath)
++{
++  json regions;
++  uint64_t uiMemSize;
++
++  if(!memMapPath.empty())
++  {
++    std::ifstream f(memMapPath);
++    json data = json::parse(f);
++    regions = data["regions"];
+ 
+-  if (opts.config_path.empty()) {
+-    fmt::print("No configuration file provided\n");
+-    return 1;
++    for(const auto& region : regions)
++    {
++      auto type = region["type"];
++      if (type == "ram")
++      {
++        m_memMap.base = std::stoul(static_cast<std::string>(region["base"]["value"]), nullptr, 0);
++        m_memMap.size = std::stoul(static_cast<std::string>(region["size"]["value"]), nullptr, 0);
++        return 0;
++      }
++    }
+   }
+ 
+-  auto range = get_memory_range(opts.memory_map_path, opts.elf_file_path);
+-  udb::IssSocModel soc(range.second, range.first);
++  if(!elfPath.empty())
++  {
++    udb::ElfReader elfReader(elfPath.c_str());
++    auto range = elfReader.mem_range();
++    m_memMap.base = range.first;
++    m_memMap.size = range.second - range.first;
++    //Round up to whole page
++    m_memMap.size = ((range.second - range.first) + 0xffful) & ~0xffful;
++    return 0;
++  }
++
++  return -1;
++}
++
++int InstructionSetSimulator::Run()
++{
++  int result = 0;
++
++  udb::ElfReader elfReader(m_opts.elfFilePath.c_str());
++  auto entryPC = elfReader.loadLoadableSegments(*m_pSoC);
++  m_pHart->reset(entryPC);
+ 
+-  auto hart = udb::HartFactory::create<udb::IssSocModel>(opts.config_name, 0,
+-                                                         opts.config_path, soc);
+-  auto tracer = udb::HartFactory::create_tracer<udb::IssSocModel>(
+-      "riscv-tests", opts.config_name, hart);
+-  hart->attach_tracer(tracer);
++  if(m_opts.gdbMode)
++    result = ListenForConnection();
+ 
+-  udb::ElfReader elf_reader(opts.elf_file_path.c_str());
+-  auto entry_pc = elf_reader.loadLoadableSegments(soc);
+-  hart->reset(entry_pc);
++  if(m_opts.halt)
++    fmt::print("port {} - Waiting for debugger to attach...\n", m_opts.gdbPort);
+ 
+-  while (true) {
+-    auto stop_reason = hart->run_n(100);
+-    if (stop_reason != StopReason::InstLimitReached &&
+-        stop_reason != StopReason::Exception) {
+-      if (stop_reason == StopReason::ExitSuccess) {
+-        fmt::print("SUCCESS - {}\n", hart->exit_reason());
++  while (true)
++  {
++    int stopReason;
++    if(m_opts.gdbMode)
++    {
++
++      //Prevent the debugger commands from
++      //generating notifications
++      DisableNotifications();
++      result = Poll();
++      EnableNotifications();
++      if(result < 0)
+         break;
+-      } else if (stop_reason == StopReason::ExitFailure) {
+-        fmt::print(stderr, "FAIL - {}\n", hart->exit_reason());
++    }
++
++
++    switch(m_state)
++    {
++    case STATE_SINGLE_STEP:
++      stopReason = m_pHart->run_one();
++      m_state = STATE_HALT;
++      break;
++    case STATE_RUN:
++      stopReason = m_pHart->run_one();
++      break;
++    case STATE_RUN_N:
++      stopReason = m_pHart->run_n(100);
++      break;
++    case STATE_HALT:
++    default:
++        stopReason = StopReason::InstLimitReached;
++      break;
++    }
++
++    if (stopReason != StopReason::InstLimitReached &&
++        stopReason != StopReason::Exception) {
++      if (stopReason == StopReason::ExitSuccess) {
++        fmt::print("SUCCESS - {}\n", m_pHart->exit_reason());
++        break;
++      } else if (stopReason == StopReason::ExitFailure) {
++        fmt::print(stderr, "FAIL - {}\n", m_pHart->exit_reason());
+         break;
+       } else {
+-        fmt::print("EXIT - {}\n", hart->exit_reason());
++        fmt::print("EXIT - {}\n", m_pHart->exit_reason());
+         break;
+       }
+     }
+   }
+-  return hart->exit_code();
++
++  if(result == 0)
++  {
++    result = m_pHart->exit_code();
++  }
++  return result;
++}
++
++int InstructionSetSimulator::OnReadGPR(REGISTERFILE& registerFile)
++{
++  registerFile.nXRegs = MIN(registerFile.nXRegs, 32);
++  for(int i = 0 ; i < registerFile.nXRegs ; i++)
++  {
++    registerFile.xReg[i] = m_pHart->xreg(i);
++  }
++  return 0;
++}
++
++int InstructionSetSimulator::OnWriteGPR(REGISTERFILE& registerFile)
++{
++  registerFile.nXRegs = MIN(registerFile.nXRegs, 32);
++  for(int i = 0 ; i < registerFile.nXRegs ; i++)
++  {
++    m_pHart->set_xreg(i, registerFile.xReg[i]);
++  }
++  return 0;
++}
++
++int InstructionSetSimulator::OnReadMemory(uint64_t uiAddress, uint64_t& uiLen, void* pBuffer)
++{
++  try
++  {
++    auto translationResult = m_pHart->translate_native(uiAddress, udb::MemoryOperation{udb::MemoryOperation::Read},
++      m_pHart->_get_mode(), uiAddress);
++
++    if(m_pSoC->memcpy_to_host((uint8_t*)pBuffer, translationResult.pAddr, uiLen) == 0)
++      return 0;
++    else
++      return -1;
++  }
++  catch(const udb::AbortInstruction& e)
++  {
++    //memory not mapped for reading
++    return -1;
++  }
++}
++
++int InstructionSetSimulator::OnWriteMemory(uint64_t uiAddress, uint64_t& uiLen, void* pMemBuffer)
++{
++  try
++  {
++    auto translationResult = m_pHart->translate_native(uiAddress, udb::MemoryOperation{udb::MemoryOperation::Write},
++      m_pHart->_get_mode(), uiAddress);
++
++    if(m_pSoC->memcpy_from_host(translationResult.pAddr, (const uint8_t*)pMemBuffer, uiLen) == 0)
++      return 0;
++    else
++      return -1;
++  }
++  catch(const udb::AbortInstruction& e)
++  {
++    //memory not mapped for writing
++    return -1;
++  }
++}
++
++int InstructionSetSimulator::OnReadSingleRegister(int reg, uint64_t& value)
++{
++  if(reg >= RISCV_REG_GPR_FIRST && reg <= RISCV_REG_GPR_LAST)
++    value = m_pHart->xreg(reg);
++  else if (reg == RISCV_REG_PC)
++    value = m_pHart->pc();
++  else if (reg >= RISCV_REG_FPR_FIRST && reg <= RISCV_REG_FPR_LAST)
++  {
++    //no FP so far
++    return -1;
++  }
++  else if (reg >= RISCV_REG_CSR_FIRST && reg <= RISCV_REG_CSR_LAST)
++  {
++    udb::CsrBase* pCSR = m_pHart->csr(reg - RISCV_REG_CSR_FIRST);
++    if(pCSR != NULL)
++    {
++      try
++      {
++        value = pCSR->sw_read(udb::Bits<7>(64)).get();
++      }
++      catch(...)
++      {
++        //Unimplemented CRS's throw illegal instruction or
++        //instruction abort exceptions
++        return -1;
++      }
++
++    }
++    else
++      return -1;
++  }
++  else
++    return -1;
++
++  return 0;
++}
++
++int InstructionSetSimulator::OnWriteSingleRegister(int reg, uint64_t& value)
++{
++  if(reg >= RISCV_REG_GPR_FIRST && reg <= RISCV_REG_GPR_LAST)
++    m_pHart->set_xreg(reg, value);
++  else if (reg == RISCV_REG_PC)
++    m_pHart->set_next_pc(value);
++  else if (reg >= RISCV_REG_FPR_FIRST && reg <= RISCV_REG_FPR_LAST)
++  {
++    //no FP so far
++    return -1;
++  }
++  else if (reg >= RISCV_REG_CSR_FIRST && reg <= RISCV_REG_CSR_LAST)
++  {
++    udb::CsrBase* pCSR = m_pHart->csr(reg - RISCV_REG_CSR_FIRST);
++    if(pCSR == NULL)
++      return -1;
++    try
++    {
++      if(!pCSR->sw_write(udb::Bits<64>(value), udb::Bits<7>(64)))
++        return -1;
++    }
++    catch(...)
++    {
++      //Unimplemented CRS's throw illegal instruction or
++      //instruction abort exceptions
++      return -1;
++    }
++
++  }
++  else
++    return -1;
++
++  return 0;
++}
++
++int InstructionSetSimulator::OnSingleStep(uint64_t uiRangeBegin, uint64_t uiRangeEnd)
++{
++  //TODO: store the range and keep stepping if within begin -> end
++
++  m_state = STATE_SINGLE_STEP;
++  return 0;
++}
++
++int InstructionSetSimulator::OnContinue(uint64_t uiAddress)
++{
++  if(uiAddress != (uint64_t)-1)
++    m_pHart->set_next_pc(uiAddress);
++
++  m_state = STATE_RUN;
++  return 0;
++}
++
++int InstructionSetSimulator::OnClearBreakWatchPoint(unsigned char type, uint64_t uiAddress,
++                                                    uint64_t uiKind)
++{
++  int result = 0;
++  switch(type)
++  {
++  case 0:
++  case 1:
++    // All breakpoints are HW breakpoints
++    m_breakpointList.remove(uiAddress);
++    if(m_breakpointList.size() == 0)
++        DisableEvent(udb::PREFETCH_EVENT);
++    break;
++  case 2:
++    // read watch point
++    m_readWatchpointList.remove(udb::MemAccessRange(uiAddress, (size_t)uiKind));
++    if(m_readWatchpointList.size() == 0)
++        DisableEvent(udb::MEMREAD_EVENT);
++    break;
++
++  case 3:
++    // write watch point
++    m_writeWatchpointList.remove(udb::MemAccessRange(uiAddress, (size_t)uiKind));
++    if(m_writeWatchpointList.size() == 0)
++        DisableEvent(udb::MEMWRITE_EVENT);
++    break;
++  default:
++    result = -1;
++    break;
++  }
++  return result;
++}
++
++int InstructionSetSimulator::OnSetBreakWatchPoint(unsigned char type, uint64_t uiAddress,
++                                                  uint64_t uiKind)
++{
++  int result = 0;
++  switch(type)
++  {
++  case 0:
++  case 1:
++    {
++      if(m_breakpointList.size() == 0)
++        EnableEvent(udb::PREFETCH_EVENT);
++
++      // All breakpoints are HW breakpoints
++      auto it = std::find(m_breakpointList.begin(), m_breakpointList.end(), uiAddress);
++      if(it == m_breakpointList.end())
++      {
++        m_breakpointList.push_back(uiAddress);
++      }
++    }
++    break;
++  case 2:
++    // set read watch point
++    if(m_readWatchpointList.size() == 0)
++      EnableEvent(udb::MEMREAD_EVENT);
++
++    m_readWatchpointList.push_back(udb::MemAccessRange(uiAddress, (size_t)uiKind));
++    break;
++  case 3:
++    // set write watch point
++    if(m_readWatchpointList.size() == 0)
++      EnableEvent(udb::MEMREAD_EVENT);
++
++    m_writeWatchpointList.push_back(udb::MemAccessRange(uiAddress, (size_t)uiKind));
++  default:
++    result = -1;
++    break;
++  }
++  return result;
++}
++
++int InstructionSetSimulator::OnNotification(uint64_t uiEvent, void* pData)
++{
++  int result = 0;
++  switch(uiEvent)
++  {
++  case udb::PREFETCH_EVENT:
++    {
++      //look for breakpoint hit
++      auto it = std::find(m_breakpointList.begin(), m_breakpointList.end(), m_pHart->pc());
++      if(it != m_breakpointList.end())
++      {
++        m_state = STATE_HALT;
++        //Send break state to debug host
++        result = Halt(HALT_BREAKPOINT, m_pHart->hartid().get(), m_pHart->pc());
++        throw udb::AbortPreExecute();
++      }
++    }
++    break;
++  case udb::FETCH_EVENT:
++    break;
++  case udb::DECODE_EVENT:
++    break;
++  case udb::PREEXECUTE_EVENT:
++    {
++      //TODO: Trace optionally
++      udb::InstBase* pInst = (udb::InstBase*)pData;
++      fmt::print("PC {:x} {}\n", m_pHart->pc(), pInst->disassemble());
++      for(auto r : pInst->srcRegs())
++        fmt::print("R {} {:x}\n", r.to_string(), m_pHart->xreg(r.get_num()));
++    }
++    break;
++  case udb::EXECUTE_EVENT:
++    {
++      //TODO: Trace optionally
++      udb::InstBase* pInst = (udb::InstBase*)pData;
++      for (auto r : pInst->dstRegs())
++        fmt::print("R= {} {:x}\n", r.to_string(), m_pHart->xreg(r.get_num()));
++    }
++    break;
++  case udb::MEMREAD_EVENT:
++    {
++      udb::MemAccessRange* pMemRange = (udb::MemAccessRange*)pData;
++      for(udb::MemAccessRange m : m_readWatchpointList)
++      {
++        if((pMemRange->GetAddress() >= m.GetAddress() && (pMemRange->GetAddress() < (m.GetAddress() + m.GetSize()))) ||
++          ((pMemRange->GetAddress() + pMemRange->GetSize()) > m.GetAddress()))
++        {
++          m_state = STATE_HALT;
++          //Send break state to debug host
++          result = Halt(HALT_WATCHPOINT, m_pHart->hartid().get(), m.GetAddress());
++          throw udb::AbortPreExecute();
++        }
++      }
++    }
++    break;
++  case udb::MEMWRITE_EVENT:
++    {
++      udb::MemAccessRange* pMemRange =  (udb::MemAccessRange*)pData;
++      for(udb::MemAccessRange m : m_writeWatchpointList)
++      {
++        if((pMemRange->GetAddress() >= m.GetAddress() && (pMemRange->GetAddress() < (m.GetAddress() + m.GetSize()))) ||
++          ((pMemRange->GetAddress() + pMemRange->GetSize()) > m.GetAddress()))
++        {
++          m_state = STATE_HALT;
++          //Send break state to debug host
++          result = Halt(HALT_WATCHPOINT, m_pHart->hartid().get(), m.GetAddress());
++          throw udb::AbortPreExecute();
++        }
++      }
++    }
++    break;
++  default:
++    break;
++  }
++  return result;
++}
++
++int InstructionSetSimulator::OnExternalHalt()
++{
++  m_state = STATE_HALT;
++  return Halt(HALT_EXTERNAL, m_pHart->hartid().get(), m_pHart->pc());
+ }
+diff --git a/backends/cpp_hart_gen/gdb/riscv-rv64.xml b/backends/cpp_hart_gen/gdb/riscv-rv64.xml
+new file mode 100644
+index 0000000000..974f6a71d3
+--- /dev/null
++++ b/backends/cpp_hart_gen/gdb/riscv-rv64.xml
+@@ -0,0 +1,337 @@
++<?xml version="1.0"?>
++<!DOCTYPE target SYSTEM "gdb-target.dtd">
++<!--
++  GDB Target Description for RISC-V RV64 with Floating-Point and CSRs
++  =====================================================================
++  Register numbering matches the UDB ISS GDB server (iss.cpp):
++
++    x0  - x31  : regnum   0 - 31   (0x00 - 0x1F)  GPRs
++    pc         : regnum  32         (0x20)           Program Counter
++    f0  - f31  : regnum  33 - 64   (0x21 - 0x40)  FP registers
++    CSR <addr> : regnum  0x41 + <addr>              CSRs
++
++  Usage (GDB command line):
++    set tdesc filename riscv-rv64.xml
++
++  Usage (gdbopts.cfg / .gdbinit):
++    set tdesc filename /path/to/riscv-rv64.xml
++-->
++<target version="1.0">
++  <architecture>riscv:rv64</architecture>
++
++  <!-- ================================================================
++       Integer registers  -  regnum 0-31 (x0-x31) + regnum 32 (pc)
++       ================================================================ -->
++  <feature name="org.gnu.gdb.riscv.cpu">
++    <!-- x0 / zero -->
++    <reg name="zero" bitsize="64" type="int"      group="general" regnum="0"/>
++    <!-- x1 / ra -->
++    <reg name="ra"   bitsize="64" type="code_ptr" group="general"/>
++    <!-- x2 / sp -->
++    <reg name="sp"   bitsize="64" type="data_ptr" group="general"/>
++    <!-- x3 / gp -->
++    <reg name="gp"   bitsize="64" type="data_ptr" group="general"/>
++    <!-- x4 / tp -->
++    <reg name="tp"   bitsize="64" type="data_ptr" group="general"/>
++    <!-- x5 / t0 -->
++    <reg name="t0"   bitsize="64" type="int"      group="general"/>
++    <!-- x6 / t1 -->
++    <reg name="t1"   bitsize="64" type="int"      group="general"/>
++    <!-- x7 / t2 -->
++    <reg name="t2"   bitsize="64" type="int"      group="general"/>
++    <!-- x8 / s0 / fp -->
++    <reg name="fp"   bitsize="64" type="data_ptr" group="general"/>
++    <!-- x9 / s1 -->
++    <reg name="s1"   bitsize="64" type="int"      group="general"/>
++    <!-- x10 / a0 -->
++    <reg name="a0"   bitsize="64" type="int"      group="general"/>
++    <!-- x11 / a1 -->
++    <reg name="a1"   bitsize="64" type="int"      group="general"/>
++    <!-- x12 / a2 -->
++    <reg name="a2"   bitsize="64" type="int"      group="general"/>
++    <!-- x13 / a3 -->
++    <reg name="a3"   bitsize="64" type="int"      group="general"/>
++    <!-- x14 / a4 -->
++    <reg name="a4"   bitsize="64" type="int"      group="general"/>
++    <!-- x15 / a5 -->
++    <reg name="a5"   bitsize="64" type="int"      group="general"/>
++    <!-- x16 / a6 -->
++    <reg name="a6"   bitsize="64" type="int"      group="general"/>
++    <!-- x17 / a7 -->
++    <reg name="a7"   bitsize="64" type="int"      group="general"/>
++    <!-- x18 / s2 -->
++    <reg name="s2"   bitsize="64" type="int"      group="general"/>
++    <!-- x19 / s3 -->
++    <reg name="s3"   bitsize="64" type="int"      group="general"/>
++    <!-- x20 / s4 -->
++    <reg name="s4"   bitsize="64" type="int"      group="general"/>
++    <!-- x21 / s5 -->
++    <reg name="s5"   bitsize="64" type="int"      group="general"/>
++    <!-- x22 / s6 -->
++    <reg name="s6"   bitsize="64" type="int"      group="general"/>
++    <!-- x23 / s7 -->
++    <reg name="s7"   bitsize="64" type="int"      group="general"/>
++    <!-- x24 / s8 -->
++    <reg name="s8"   bitsize="64" type="int"      group="general"/>
++    <!-- x25 / s9 -->
++    <reg name="s9"   bitsize="64" type="int"      group="general"/>
++    <!-- x26 / s10 -->
++    <reg name="s10"  bitsize="64" type="int"      group="general"/>
++    <!-- x27 / s11 -->
++    <reg name="s11"  bitsize="64" type="int"      group="general"/>
++    <!-- x28 / t3 -->
++    <reg name="t3"   bitsize="64" type="int"      group="general"/>
++    <!-- x29 / t4 -->
++    <reg name="t4"   bitsize="64" type="int"      group="general"/>
++    <!-- x30 / t5 -->
++    <reg name="t5"   bitsize="64" type="int"      group="general"/>
++    <!-- x31 / t6 -->
++    <reg name="t6"   bitsize="64" type="int"      group="general"/>
++    <!-- pc  : regnum 32 (0x20) -->
++    <reg name="pc"   bitsize="64" type="code_ptr" group="general" regnum="32"/>
++  </feature>
++
++  <!-- ================================================================
++       Floating-point registers  -  regnum 33-64 (0x21-0x40)
++       FP CSRs live in the CSR address space:
++         fflags  CSR 0x001  regnum 0x41+0x001 = 0x42 = 66
++         frm     CSR 0x002  regnum 0x41+0x002 = 0x43 = 67
++         fcsr    CSR 0x003  regnum 0x41+0x003 = 0x44 = 68
++       ================================================================ -->
++  <feature name="org.gnu.gdb.riscv.fpu">
++    <!-- f0  / ft0  : regnum 33 (0x21) -->
++    <reg name="ft0"  bitsize="64" type="ieee_double" group="float" regnum="33"/>
++    <!-- f1  / ft1  : regnum 34 -->
++    <reg name="ft1"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f2  / ft2  : regnum 35 -->
++    <reg name="ft2"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f3  / ft3  : regnum 36 -->
++    <reg name="ft3"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f4  / ft4  : regnum 37 -->
++    <reg name="ft4"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f5  / ft5  : regnum 38 -->
++    <reg name="ft5"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f6  / ft6  : regnum 39 -->
++    <reg name="ft6"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f7  / ft7  : regnum 40 -->
++    <reg name="ft7"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f8  / fs0  : regnum 41 -->
++    <reg name="fs0"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f9  / fs1  : regnum 42 -->
++    <reg name="fs1"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f10 / fa0  : regnum 43 -->
++    <reg name="fa0"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f11 / fa1  : regnum 44 -->
++    <reg name="fa1"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f12 / fa2  : regnum 45 -->
++    <reg name="fa2"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f13 / fa3  : regnum 46 -->
++    <reg name="fa3"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f14 / fa4  : regnum 47 -->
++    <reg name="fa4"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f15 / fa5  : regnum 48 -->
++    <reg name="fa5"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f16 / fa6  : regnum 49 -->
++    <reg name="fa6"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f17 / fa7  : regnum 50 -->
++    <reg name="fa7"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f18 / fs2  : regnum 51 -->
++    <reg name="fs2"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f19 / fs3  : regnum 52 -->
++    <reg name="fs3"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f20 / fs4  : regnum 53 -->
++    <reg name="fs4"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f21 / fs5  : regnum 54 -->
++    <reg name="fs5"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f22 / fs6  : regnum 55 -->
++    <reg name="fs6"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f23 / fs7  : regnum 56 -->
++    <reg name="fs7"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f24 / fs8  : regnum 57 -->
++    <reg name="fs8"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f25 / fs9  : regnum 58 -->
++    <reg name="fs9"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f26 / fs10 : regnum 59 -->
++    <reg name="fs10" bitsize="64" type="ieee_double" group="float"/>
++    <!-- f27 / fs11 : regnum 60 -->
++    <reg name="fs11" bitsize="64" type="ieee_double" group="float"/>
++    <!-- f28 / ft8  : regnum 61 -->
++    <reg name="ft8"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f29 / ft9  : regnum 62 -->
++    <reg name="ft9"  bitsize="64" type="ieee_double" group="float"/>
++    <!-- f30 / ft10 : regnum 63 -->
++    <reg name="ft10" bitsize="64" type="ieee_double" group="float"/>
++    <!-- f31 / ft11 : regnum 64 (0x40) -->
++    <reg name="ft11" bitsize="64" type="ieee_double" group="float"/>
++
++    <!-- FP control/status CSRs  (regnum = 0x41 + CSR_address) -->
++    <!-- fflags  CSR 0x001  regnum 66 (0x42) -->
++    <reg name="fflags" bitsize="32" type="int" group="float" regnum="66" save-restore="no"/>
++    <!-- frm     CSR 0x002  regnum 67 (0x43) -->
++    <reg name="frm"    bitsize="32" type="int" group="float"             save-restore="no"/>
++    <!-- fcsr    CSR 0x003  regnum 68 (0x44) -->
++    <reg name="fcsr"   bitsize="32" type="int" group="float"             save-restore="no"/>
++  </feature>
++
++  <!-- ================================================================
++       CSRs  -  regnum = 0x41 + CSR_address
++       Only CSRs present in the UDB spec are listed; the GDB server
++       returns an error for any regnum that maps to an absent CSR.
++       ================================================================ -->
++  <feature name="org.gnu.gdb.riscv.csr">
++
++    <!--Zcmt: Jump Vector Table -->
++    <!--  jvt        CSR 0x017  regnum  88 (0x058) -->
++    <reg name="jvt"           bitsize="64" type="data_ptr" group="system" regnum="88"   save-restore="no"/>
++
++    <!--Supervisor trap setup -->
++    <!-- sstatus    CSR 0x100  regnum 321 (0x141) -->
++    <reg name="sstatus"       bitsize="64" type="int"      group="system" regnum="321"  save-restore="no"/>
++    <!-- sie        CSR 0x104  regnum 325 (0x145) -->
++    <reg name="sie"           bitsize="64" type="int"      group="system" regnum="325"  save-restore="no"/>
++    <!-- stvec      CSR 0x105  regnum 326 (0x146) -->
++    <reg name="stvec"         bitsize="64" type="code_ptr" group="system"               save-restore="no"/>
++    <!-- scounteren CSR 0x106  regnum 327 (0x147) -->
++    <reg name="scounteren"    bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- senvcfg    CSR 0x10A  regnum 331 (0x14B) -->
++    <reg name="senvcfg"       bitsize="64" type="int"      group="system" regnum="331"  save-restore="no"/>
++    <!-- sstateen0  CSR 0x10C  regnum 333 (0x14D) -->
++    <reg name="sstateen0"     bitsize="64" type="int"      group="system" regnum="333"  save-restore="no"/>
++    <!-- sstateen1  CSR 0x10D  regnum 334 (0x14E) -->
++    <reg name="sstateen1"     bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- sstateen2  CSR 0x10E  regnum 335 (0x14F) -->
++    <reg name="sstateen2"     bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- sstateen3  CSR 0x10F  regnum 336 (0x150) -->
++    <reg name="sstateen3"     bitsize="64" type="int"      group="system"               save-restore="no"/>
++
++    <!--Supervisor trap handling -->
++    <!-- sscratch   CSR 0x140  regnum 385 (0x181) -->
++    <reg name="sscratch"      bitsize="64" type="int"      group="system" regnum="385"  save-restore="no"/>
++    <!-- sepc       CSR 0x141  regnum 386 (0x182) -->
++    <reg name="sepc"          bitsize="64" type="code_ptr" group="system"               save-restore="no"/>
++    <!-- scause     CSR 0x142  regnum 387 (0x183) -->
++    <reg name="scause"        bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- stval      CSR 0x143  regnum 388 (0x184) -->
++    <reg name="stval"         bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- sip        CSR 0x144  regnum 389 (0x185) -->
++    <reg name="sip"           bitsize="64" type="int"      group="system"               save-restore="no"/>
++
++    <!--Supervisor address translation -->
++    <!-- satp       CSR 0x180  regnum 449 (0x1C1) -->
++    <reg name="satp"          bitsize="64" type="int"      group="system" regnum="449"  save-restore="no"/>
++
++    <!--Supervisor context register -->
++    <!-- scontext   CSR 0x5A8  regnum 1513 (0x5E9) -->
++    <reg name="scontext"      bitsize="64" type="int"      group="system" regnum="1513" save-restore="no"/>
++
++    <!--Machine trap setup -->
++    <!-- mstatus    CSR 0x300  regnum 833 (0x341) -->
++    <reg name="mstatus"       bitsize="64" type="int"      group="system" regnum="833"  save-restore="no"/>
++    <!-- misa       CSR 0x301  regnum 834 (0x342) -->
++    <reg name="misa"          bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- medeleg    CSR 0x302  regnum 835 (0x343) -->
++    <reg name="medeleg"       bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mideleg    CSR 0x303  regnum 836 (0x344) -->
++    <reg name="mideleg"       bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mie        CSR 0x304  regnum 837 (0x345) -->
++    <reg name="mie"           bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mtvec      CSR 0x305  regnum 838 (0x346) -->
++    <reg name="mtvec"         bitsize="64" type="code_ptr" group="system"               save-restore="no"/>
++    <!-- mcounteren CSR 0x306  regnum 839 (0x347) -->
++    <reg name="mcounteren"    bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- menvcfg    CSR 0x30A  regnum 843 (0x34B) -->
++    <reg name="menvcfg"       bitsize="64" type="int"      group="system" regnum="843"  save-restore="no"/>
++    <!-- mstateen0  CSR 0x30C  regnum 845 (0x34D) -->
++    <reg name="mstateen0"     bitsize="64" type="int"      group="system" regnum="845"  save-restore="no"/>
++    <!-- mstateen1  CSR 0x30D  regnum 846 (0x34E) -->
++    <reg name="mstateen1"     bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mstateen2  CSR 0x30E  regnum 847 (0x34F) -->
++    <reg name="mstateen2"     bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mstateen3  CSR 0x30F  regnum 848 (0x350) -->
++    <reg name="mstateen3"     bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mcountinhibit CSR 0x320  regnum 865 (0x361) -->
++    <reg name="mcountinhibit" bitsize="64" type="int"      group="system" regnum="865"  save-restore="no"/>
++
++    <!--Machine trap handling -->
++    <!-- mscratch   CSR 0x340  regnum 897 (0x381) -->
++    <reg name="mscratch"      bitsize="64" type="int"      group="system" regnum="897"  save-restore="no"/>
++    <!-- mepc       CSR 0x341  regnum 898 (0x382) -->
++    <reg name="mepc"          bitsize="64" type="code_ptr" group="system"               save-restore="no"/>
++    <!-- mcause     CSR 0x342  regnum 899 (0x383) -->
++    <reg name="mcause"        bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mtval      CSR 0x343  regnum 900 (0x384) -->
++    <reg name="mtval"         bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mip        CSR 0x344  regnum 901 (0x385) -->
++    <reg name="mip"           bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mtinst     CSR 0x34A  regnum 907 (0x38B) -->
++    <reg name="mtinst"        bitsize="64" type="int"      group="system" regnum="907"  save-restore="no"/>
++    <!-- mtval2     CSR 0x34B  regnum 908 (0x38C) -->
++    <reg name="mtval2"        bitsize="64" type="int"      group="system"               save-restore="no"/>
++
++    <!--Machine security configuration -->
++    <!-- mseccfg    CSR 0x747  regnum 1928 (0x788) -->
++    <reg name="mseccfg"       bitsize="64" type="int"      group="system" regnum="1928" save-restore="no"/>
++
++    <!--Machine context register -->
++    <!-- mcontext  CSR 0x7A8  regnum 2025 (0x7E9) -->
++    <reg name="mcontext"      bitsize="64" type="int"      group="system" regnum="2025" save-restore="no"/>
++
++    <!--Trigger module -->
++    <!-- tselect    CSR 0x7A0  regnum 2017 (0x7E1) -->
++    <reg name="tselect"       bitsize="64" type="int"      group="system" regnum="2017" save-restore="no"/>
++    <!-- tdata1     CSR 0x7A1  regnum 2018 (0x7E2) -->
++    <reg name="tdata1"        bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- tdata2     CSR 0x7A2  regnum 2019 (0x7E3) -->
++    <reg name="tdata2"        bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- tdata3     CSR 0x7A3  regnum 2020 (0x7E4) -->
++    <reg name="tdata3"        bitsize="64" type="int"      group="system"               save-restore="no"/>
++
++    <!--Debug mode CSRs -->
++    <!-- dcsr       CSR 0x7B0  regnum 2033 (0x7F1) -->
++    <reg name="dcsr"          bitsize="32" type="int"      group="system" regnum="2033" save-restore="no"/>
++    <!-- dpc        CSR 0x7B1  regnum 2034 (0x7F2) -->
++    <reg name="dpc"           bitsize="64" type="code_ptr" group="system"               save-restore="no"/>
++    <!-- dscratch0  CSR 0x7B2  regnum 2035 (0x7F3) -->
++    <reg name="dscratch0"     bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- dscratch1  CSR 0x7B3  regnum 2036 (0x7F4) -->
++    <reg name="dscratch1"     bitsize="64" type="int"      group="system"               save-restore="no"/>
++
++    <!--Machine counter/timer -->
++    <!-- mcycle     CSR 0xB00  regnum 2881 (0xB41) -->
++    <reg name="mcycle"        bitsize="64" type="int"      group="system" regnum="2881" save-restore="no"/>
++    <!-- minstret   CSR 0xB02  regnum 2883 (0xB43) -->
++    <reg name="minstret"      bitsize="64" type="int"      group="system" regnum="2883" save-restore="no"/>
++
++    <!--Unprivileged counter/timer -->
++    <!-- cycle      CSR 0xC00  regnum 3137 (0xC41) -->
++    <reg name="cycle"         bitsize="64" type="int"      group="system" regnum="3137" save-restore="no"/>
++    <!-- time       CSR 0xC01  regnum 3138 (0xC42) -->
++    <reg name="time"          bitsize="64" type="int"      group="system" regnum="3138" save-restore="no"/>
++    <!-- instret    CSR 0xC02  regnum 3139 (0xC43) -->
++    <reg name="instret"       bitsize="64" type="int"      group="system" regnum="3139" save-restore="no"/>
++
++    <!--Machine information registers -->
++    <!-- mvendorid  CSR 0xF11  regnum 3922 (0xF52) -->
++    <reg name="mvendorid"     bitsize="32" type="int"      group="system" regnum="3922" save-restore="no"/>
++    <!-- marchid    CSR 0xF12  regnum 3923 (0xF53) -->
++    <reg name="marchid"       bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mimpid     CSR 0xF13  regnum 3924 (0xF54) -->
++    <reg name="mimpid"        bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mhartid    CSR 0xF14  regnum 3925 (0xF55) -->
++    <reg name="mhartid"       bitsize="64" type="int"      group="system"               save-restore="no"/>
++    <!-- mconfigptr CSR 0xF15  regnum 3926 (0xF56) -->
++    <reg name="mconfigptr"    bitsize="64" type="int"      group="system"               save-restore="no"/>
++
++  </feature>
++
++  <!-- ================================================================
++       Virtual registers
++       priv: current privilege level (not a real CSR, synthesised by
++             the GDB server)  -  regnum 0x1041 = 4161
++       ================================================================ -->
++  <feature name="org.gnu.gdb.riscv.virtual">
++    <!-- priv  regnum 4161 (0x1041) -->
++    <reg name="priv" bitsize="8" type="int" group="system" regnum="4161" save-restore="no"/>
++  </feature>
++
++</target>
+diff --git a/backends/cpp_hart_gen/templates/csrs_impl.hxx.erb b/backends/cpp_hart_gen/templates/csrs_impl.hxx.erb
+index 9c85131330..1a3a264ab2 100644
+--- a/backends/cpp_hart_gen/templates/csrs_impl.hxx.erb
++++ b/backends/cpp_hart_gen/templates/csrs_impl.hxx.erb
+@@ -7,6 +7,8 @@ using namespace std::literals;
+ 
+ namespace udb {
+ 
++#define NOP_INST_ENC 0x13
++
+ <%- csrs = cfg_arch.possible_csrs -%>
+ 
+ <%- csrs.each do |csr| -%>
+@@ -90,7 +92,7 @@ void <%= name_of(:csr_field, cfg_arch, csr.name, field.name) %><SocType>::reset(
+ #define __UDB_FUNC_CALL m_parent->
+ #define __UDB_CONSTEXPR_FUNC_CALL <%= name_of(:hart, cfg_arch) %><SocType>::
+ #define __UDB_XLEN m_parent->xlen().to_defined()
+-#define __UDB_ENCODING Bits<<%= name_of(:hart, cfg_arch) %><SocType>::__MAX_INST_ENCODING_SIZE>{m_parent->m_cur_inst->encoding()}
++#define __UDB_ENCODING Bits<<%= name_of(:hart, cfg_arch) %><SocType>::__MAX_INST_ENCODING_SIZE>{m_parent->m_cur_inst ? m_parent->m_cur_inst->encoding() : NOP_INST_ENC }
+ #define __UDB_CONST_GLOBAL(global_name) <%= name_of(:hart, cfg_arch) %><SocType>::global_name
+ #define __UDB_MUTABLE_GLOBAL(global_name) m_parent->global_name
+ #define __UDB_STRUCT(struct_name) <%= cfg_arch.name.camelize %>_ ## struct_name ## _Struct
+diff --git a/backends/cpp_hart_gen/templates/hart.hxx.erb b/backends/cpp_hart_gen/templates/hart.hxx.erb
+index 26b9aed562..32fbc5d7ee 100644
+--- a/backends/cpp_hart_gen/templates/hart.hxx.erb
++++ b/backends/cpp_hart_gen/templates/hart.hxx.erb
+@@ -456,6 +456,22 @@ namespace udb {
+     //   refresh_pending_interrupts();
+     // }
+ 
++    TranslateResult translate_native(uint64_t vaddr, MemoryOperation op, PrivilegeMode mode,
++                                     uint64_t encoding) override {
++      TranslateResult result;
++      auto translateResult = translate(Bits<64>(vaddr), op, mode, Bits<64>(encoding));
++
++      result.pAddr = translateResult.paddr.get();
++      return result;
++    }
++
++    PrivilegeMode _get_mode() override {
++      return current_mode;
++    }
++    void _set_mode(const PrivilegeMode& next_mode) override {
++      current_mode = next_mode;
++    }
++
+     private:
+       XReg m_pc;
+       XReg m_next_pc;
+diff --git a/backends/cpp_hart_gen/templates/hart_impl.hxx.erb b/backends/cpp_hart_gen/templates/hart_impl.hxx.erb
+index 70a3161a3d..8a4aefdc24 100644
+--- a/backends/cpp_hart_gen/templates/hart_impl.hxx.erb
++++ b/backends/cpp_hart_gen/templates/hart_impl.hxx.erb
+@@ -74,51 +74,59 @@ namespace udb {
+   template <SocModel SocType>
+   int <%= name_of(:hart, cfg_arch) %><SocType>::_run_one()
+   {
+-    Bits<INSTR_ENC_SIZE.get()> enc;
+     try {
+-       enc = _fetch();
+-    } catch(const AbortInstruction& e) {
+-      return StopReason::Exception;
+-    }
+-    InstBase* inst = reinterpret_cast<InstBase*>(m_run_one_inst_storage.data());
+-    if (_decode(m_pc, enc, inst) == false) {
+-      try {
+-        raise(ExceptionCode{ExceptionCode::IllegalInstruction}, mode(), m_params.REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION.value() ? enc : decltype(enc){0});
+-      } catch (const AbortInstruction& e) {
+-        return StopReason::Exception;
+-     }
+-    }
+ 
+-    // set the fall-through next pc
+-    m_next_pc = m_pc + Bits<MXLEN>{inst->enc_len()};
++      Bits<INSTR_ENC_SIZE.get()> enc;
+ 
+-    try {
+-      inst->execute();
++      this->Notify(PREFETCH_EVENT, (void*)&m_pc);
++      enc = _fetch();
++
++      this->Notify(FETCH_EVENT, (void*)&enc);
++      m_cur_inst = reinterpret_cast<InstBase*>(m_run_one_inst_storage.data());
++      if (_decode(m_pc, enc, m_cur_inst) == false) {
++        try {
++          raise(ExceptionCode{ExceptionCode::IllegalInstruction}, mode(), m_params.REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION.value() ? enc : decltype(enc){0});
++        } catch (const AbortInstruction& e) {
++          return StopReason::Exception;
++        }
++      }
++      this->Notify(DECODE_EVENT, (void*)m_cur_inst);
++
++      // set the fall-through next pc
++      m_next_pc = m_pc + Bits<MXLEN>{m_cur_inst->enc_len()};
++
++      this->Notify(PREEXECUTE_EVENT, (void*)m_cur_inst);
++      m_cur_inst->execute();
++      this->Notify(EXECUTE_EVENT, (void*)m_cur_inst);
++
++      advance_pc();
++      if (this->m_exit_requested) {
++        this->m_exit_requested = false; // reset the request
++      }
++    } catch (const AbortPreExecute& e) {
++      return StopReason::Exception;
++    } catch (const AbortInstruction& e) {
++      advance_pc();
++      return StopReason::Exception;
+     } catch (const udb::WfiException& e) {
+-      std::destroy_at(inst);
+       advance_pc();
+       return StopReason::Wfi;
+     } catch (const udb::PauseException& e) {
+-      std::destroy_at(inst);
+       advance_pc();
+       return StopReason::Pause;
+     } catch (const udb::UnpredictableBehaviorException& e) {
+-      std::destroy_at(inst);
+       advance_pc();
+       return StopReason::UnpredictableBehavior;
+     } catch (const udb::ExitEvent& e) {
++      advance_pc();
+       this->m_exit_code = e.code();
+       this->m_exit_reason = e.what();
+-      advance_pc();
+-      std::destroy_at(inst);
+       if (e.code() == 0) {
+         return StopReason::ExitSuccess;
+       } else {
+         return StopReason::ExitFailure;
+       }
+     }
+-    advance_pc();
+-
+     return StopReason::InstLimitReached;
+   }
+ 
+@@ -126,8 +134,6 @@ namespace udb {
+   int <%= name_of(:hart, cfg_arch) %><SocType>::_run_bb()
+   {
+     auto current_bb = m_bb_cache.get(m_pc.get());
+-    InstBase* inst;
+-
+     try {
+       if (current_bb->start_pc() == m_pc.get()) {
+         current_bb->reset(); // hit, reset to the top of the basic block
+@@ -136,21 +142,14 @@ namespace udb {
+         const auto bb_size = current_bb->size();
+ 
+         for (unsigned b = 0; b < bb_size; b++) {
+-          inst = current_bb->pop();
+-
+-          fmt::print("PC {:x} {}\n", m_pc, inst->disassemble());
+-          for (auto r : inst->srcRegs()) {
+-            fmt::print("R {} {:x}\n", r.to_string(), _xreg(r.get_num()));
+-          }
++          m_cur_inst = current_bb->pop();
+ 
+           // set the fall-through next pc
+-          m_next_pc = m_pc + Bits<MXLEN>{inst->enc_len()};
++          m_next_pc = m_pc + Bits<MXLEN>{m_cur_inst->enc_len()};
+ 
+-          inst->execute();
+-
+-          for (auto r : inst->dstRegs()) {
+-            fmt::print("R= {} {:x}\n", r.to_string(), _xreg(r.get_num()));
+-          }
++          this->Notify(PREEXECUTE_EVENT, (void*)m_cur_inst);
++          m_cur_inst->execute();
++          this->Notify(EXECUTE_EVENT, (void*)m_cur_inst);
+ 
+           advance_pc();
+           if (this->m_exit_requested) {
+@@ -163,34 +162,37 @@ namespace udb {
+         current_bb->recycle(m_pc.get());
+         do {
+           Bits<INSTR_ENC_SIZE.get()> enc;
+-          enc = _fetch();
+-
+-          inst = current_bb->alloc_inst();
+-          if (_decode(m_pc, enc, inst) == false) {
+-            raise(ExceptionCode{ExceptionCode::IllegalInstruction}, mode(), m_params.REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION.value() ? enc : decltype(enc){0});
+-          }
+ 
+-          fmt::print("PC {:x} {}\n", m_pc, inst->disassemble());
+-          for (auto r : inst->srcRegs()) {
+-            fmt::print("R {} {:x}\n", r.to_string(), _xreg(r.get_num()));
++          this->Notify(PREFETCH_EVENT, (void*)&m_pc);
++          enc = _fetch();
++          this->Notify(FETCH_EVENT, (void*)&enc);
++
++          m_cur_inst = current_bb->alloc_inst();
++          if (_decode(m_pc, enc, m_cur_inst) == false) {
++            try {
++              raise(ExceptionCode{ExceptionCode::IllegalInstruction}, mode(), m_params.REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION.value() ? enc : decltype(enc){0});
++            } catch (const AbortInstruction& e) {
++              return StopReason::Exception;
++            }
+           }
++          this->Notify(DECODE_EVENT, (void*)m_cur_inst);
+ 
+           // set the fall-through next pc
+-          m_next_pc = m_pc + Bits<MXLEN>{inst->enc_len()};
++          m_next_pc = m_pc + Bits<MXLEN>{m_cur_inst->enc_len()};
+ 
+-          inst->execute();
+-
+-          for (auto r : inst->dstRegs()) {
+-            fmt::print("R= {} {:x}\n", r.to_string(), _xreg(r.get_num()));
+-          }
++          this->Notify(PREEXECUTE_EVENT, (void*)m_cur_inst);
++          m_cur_inst->execute();
++          this->Notify(EXECUTE_EVENT, (void*)m_cur_inst);
+ 
+           advance_pc();
+           if (this->m_exit_requested) {
+             this->m_exit_requested = false; // reset the request
+             break;
+           }
+-        } while (!(current_bb->full() || inst->control_flow()));
++        } while (!(current_bb->full() || m_cur_inst->control_flow()));
+       }
++    } catch (const AbortPreExecute& e) {
++      return StopReason::Exception;
+     } catch (const AbortInstruction& e) {
+       current_bb->invalidate();
+       advance_pc();
+diff --git a/spec/std/isa/csr/instret.yaml b/spec/std/isa/csr/instret.yaml
+index ba3aab2d37..e63c2c405b 100644
+--- a/spec/std/isa/csr/instret.yaml
++++ b/spec/std/isa/csr/instret.yaml
+@@ -74,4 +74,4 @@ sw_read(): |
+     }
+   }
+ 
+-  return CSR[minstret].COUNT;
++  return $bits(CSR[minstret]);
+diff --git a/spec/std/isa/csr/jvt.yaml b/spec/std/isa/csr/jvt.yaml
+index 27812daf2d..35469a5e01 100644
+--- a/spec/std/isa/csr/jvt.yaml
++++ b/spec/std/isa/csr/jvt.yaml
+@@ -86,5 +86,4 @@ fields:
+       return 0;
+ sw_read(): |
+   check_zcmt_enabled($encoding);
+-
+   return $bits(CSR[jvt]);

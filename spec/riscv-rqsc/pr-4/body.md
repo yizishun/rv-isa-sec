@@ -1,0 +1,2 @@
+- Addded Clarification to RCID Count and MCID Count fields of QoS Controller structure/table
+- Uprev to 0.9.0 for final internal and peer review.

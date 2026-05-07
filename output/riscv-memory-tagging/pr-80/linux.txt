@@ -1,0 +1,49 @@
+PR #80  target=linux  overall=compliant
+Spec: Removal of MT_ASYNC bit reclassifies those CSR bit positions as WPRI: kernel context-switch and KVM code that explicitly clears or rewrites these bits (rather than preserving read-back values) corrupts implementation-defined state, risking undefined hardware behavior on implementations that repurpose the reclaimed bits.
+Violation: Kernel explicitly clears or modifies bit 36 (former MT_ASYNC) in senvcfg/henvcfg/menvcfg, or the corresponding bit in mseccfg, during context-switch save/restore or KVM vcpu load/put, instead of preserving the value read from hardware. Since these bits are now WPRI, writes must preserve original values; writing a hardcoded 0 (or any value different from what was read) violates the spec.
+Consequence: data_corruption
+Pattern: envcfg.*MT_ASYNC|MT_ASYNC.*envcfg|BIT.*36.*envcfg|sencfg.*36|hencfg.*36|__enable_mte|__disable_mte|csr_write.*senvcfg.*mask|csr_write.*henvcfg.*mask
+------------------------------------------------------------
+[compliant] arch/riscv/include/asm/csr.h:214-231  (global defs)
+  No MT_ASYNC bit 36 is defined for any ENVCFG CSR. Smtt/Smtte3 MTE extensions are absent from all ISA extension lists (cpufeature.c, kvm infrastructure). The kernel has zero awareness of RISC-V MTE, so it cannot explicitly clear or modify a bit it doesn't know about.
+  | #define ENVCFG_STCE  (_AC(1, ULL) << 63)
+  | #define ENVCFG_PBMTE (_AC(1, ULL) << 62)
+  | #define ENVCFG_ADUE  (_AC(1, ULL) << 61)
+  | #define ENVCFG_PMM   (_AC(0x3, ULL) << 32)
+  | /* bits 36:33, 60:59, 31:8 — undefined, no macros */
+
+[compliant] arch/riscv/kvm/vcpu.c:543-562  kvm_riscv_vcpu_setup_config
+  cfg->henvcfg is constructed from zero (VCPU allocated via kzalloc in KVM core) by OR-ing only known feature bits (PBMTE|STCE|CBIE|CBCFE|CBZE|ADUE). Bit 36 is implicitly 0 because no MT_ASYNC macro exists and no read-modify-write from hardware CSR is performed. Since bit 36 is WPRI, hardware ignores the written value; no data corruption occurs.
+  | if (riscv_isa_extension_available(isa, SVPBMT))
+  |     cfg->henvcfg |= ENVCFG_PBMTE;  // bit 62
+  | if (riscv_isa_extension_available(isa, SSTC))
+  |     cfg->henvcfg |= ENVCFG_STCE;   // bit 63
+  | // ... no bit 36 manipulation whatsoever
+
+[compliant] arch/riscv/kvm/vcpu.c:596-617  kvm_arch_vcpu_load
+  Writing cfg->henvcfg to CSR_HENVCFG on VCPU load. The value has bit 36 = 0 (implicit from zero-initialization). This is NOT a read-modify-write — the kernel never reads the hardware CSR and clears bit 36. The value is synthesized from known ISA extensions only. Since bit 36 is WPRI per RISC-V spec, hardware ignores the written value for this bit. No active clearing of MTE async mode.
+  | nacl_csr_write(nsh, CSR_HENVCFG, cfg->henvcfg);  // line 596
+  | csr_write(CSR_HENVCFG, cfg->henvcfg);              // line 615
+
+[compliant] arch/riscv/kvm/vcpu.c:749-761  kvm_riscv_vcpu_swap_in_guest_state
+  Uses csr_swap() for CSR_SENVCFG, which atomically reads hardware → saves as host_senvcfg, and writes guest's csr->senvcfg. The host's original value (including WPRI bit 36 state) is captured and later restored in kvm_riscv_vcpu_swap_in_host_state() at line 770. This correctly preserves hardware state across VM-enter/exit.
+  | vcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);  // line 756
+  | // restore at line 770:
+  | csr->senvcfg = csr_swap(CSR_SENVCFG, vcpu->arch.host_senvcfg);
+
+[compliant] arch/riscv/kvm/vcpu.c:763-775  kvm_riscv_vcpu_swap_in_host_state
+  Restores host SENVCFG from the value captured at line 756 via csr_swap. The guest senvcfg is saved into csr->senvcfg. This is a correct bidirectional swap preserving both host and guest contexts, including WPRI bit 36.
+  | csr->senvcfg = csr_swap(CSR_SENVCFG, vcpu->arch.host_senvcfg);  // line 770
+
+[compliant] arch/riscv/kvm/vcpu_sbi_fwft.c:181-190  kvm_sbi_fwft_set_pointer_masking_pmlen
+  Modifies henvcfg PMM field (bits 33:32) via &= ~ENVCFG_PMM and |= pmm. This is a targeted field update using read-modify-write on the in-memory cfg->henvcfg value. Bit 36 is untouched by these operations. PMM field manipulation does not overlap with the former MT_ASYNC bit position.
+  | vcpu->arch.cfg.henvcfg &= ~ENVCFG_PMM;  // only touches bits 33:32
+  | vcpu->arch.cfg.henvcfg |= pmm;
+  | csr_write(CSR_HENVCFG, vcpu->arch.cfg.henvcfg);
+
+[compliant] arch/riscv/kvm/vcpu.c:643-683  kvm_arch_vcpu_put
+  VCPU put saves guest VS CSRs back to in-memory state but does NOT read/save HENVCFG or SENVCFG. The host SENVCFG was already restored during the swap_in_host_state inline at VM-exit (line 770). No stale guest envcfg state leaks to the host.
+  | csr->vsstatus = nacl_csr_read(nsh, CSR_VSSTATUS);
+  | // ... saves VS CSRs only (VSSTATUS through VSATP)
+  | // No HENVCFG or SENVCFG read — host restored at VM-exit already
+

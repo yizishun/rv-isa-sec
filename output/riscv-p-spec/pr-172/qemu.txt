@@ -1,0 +1,30 @@
+PR #172  target=qemu  overall=compliant
+Spec: Double-wide register-pair P-add instructions encode register-pair selectors as 4-bit fields but require even-numbered registers; failing to validate this in QEMU's decode/translate causes aliased register-pair writes that silently corrupt guest register state
+Violation: QEMU TCG decoder for PADD.DB/DH/DW/DBS/DHS/DWS (OP-IMM-32 major opcode 0x1b, funct3=0x6) does not enforce that the register-pair operands rd_p, rs1_p, rs2_p (encoded as 4-bit fields) specify even-numbered registers. An odd value in these fields causes register aliasing where X[odd*2] and X[odd*2+1] overlap with adjacent pairs — e.g., rd_p=1 writes to X[2] and X[3], but X[2] is also the high half of rd_p=0's pair, producing silent cross-instruction data corruption.
+Consequence: data_corruption
+Pattern: trans_ppair | gen_helper_padd_db | OP_IMM_32.*0x6 | ext4.*rd_p | register_pair.*align | GEN_HANDLER.*PADD\.DW | decodetree.*OP-IMM-32.*funct3=6
+------------------------------------------------------------
+[compliant] target/riscv/insn32.decode:0-0  <none — P-ext not decoded>
+  PADD.DB/DH/DW/DBS/DHS/DWS are not decoded in QEMU's decodetree. OP-IMM-32 (0x1b) funct3=0x6 is unpopulated. Any attempt to execute these instructions raises an illegal-instruction exception. The register-pair aliasing vulnerability described in the security spec cannot manifest because the instruction dispatch path does not exist.
+  | (no code — instruction not implemented)
+
+[compliant] target/riscv/insn_trans/:0-0  <none — no trans_ppair exists>
+  No translation functions (trans_ppair, etc.) exist for P-extension packed add. The register-pair operand encoding vulnerability (rd_p/rs1_p/rs2_p aliasing on odd values) requires a translation function that extracts 4-bit pair fields without alignment checking. Since no such translation function exists, there is no code path to exploit.
+  | (no code — translation function not implemented)
+
+[compliant] target/riscv/:0-0  <none — no gen_helper_padd_* exists>
+  No TCG helper functions (gen_helper_padd_db, gen_helper_padd_dh, gen_helper_padd_dw, etc.) are generated or called. The vulnerability requires helpers that operate on register pairs without validating even-register alignment. No such helpers exist.
+  | (no code — helpers not generated)
+
+[compliant] target/riscv/cpu.c:0-0  cpu_reset / vmstate_riscv_cpu
+  No P-extension CPU state fields (e.g., uABI register-pair state, P-extension CSRs) exist in RISCVCPU or vmstate_riscv_cpu. The vulnerability scenario of silent corruption during live-migration due to missing P-extension state serialization is inapplicable since there is no P-extension state to serialize.
+  | (no code — P-extension CPU state not defined)
+
+[compliant] target/riscv/kvm/kvm-cpu.c:0-0  kvm_riscv_get_regs / kvm_riscv_put_regs
+  No KVM synchronization code exists for P-extension CSRs. No divergence between QEMU's view and KVM kernel state can occur for non-existent P-extension registers.
+  | (no code — KVM P-ext sync not implemented)
+
+[potential_risk] target/riscv/insn32.decode:0-0  <decodetree — OP-IMM-32 opcode 0x1b>
+  If P-extension support is added in the future, the decoder for OP-IMM-32 (0x1b) funct3=0x6 must validate that the 4-bit register-pair fields (rd_p, rs1_p, rs2_p) encode even-numbered registers. Without this check, odd values cause X[odd*2] and X[odd*2+1] to alias adjacent pairs, producing cross-instruction data corruption. This is a forward-looking note — the risk is NOT present today because the instruction is unimplemented.
+  | (no code — forward-looking risk for future P-ext implementation)
+

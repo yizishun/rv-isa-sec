@@ -1,0 +1,141 @@
+{
+  "pr_number": 1434,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 1434,
+    "violation_condition": "Kernel code in M-mode (or S/U-mode via PMP) executes a misaligned store, an XLEN-wider store (e.g., FSD on RV32D), or a Zicboz CBO.ZERO whose decomposed memory-operations span a PMP region boundary — one memory operation writes into a PMP-allowed region and becomes architecturally visible, while another memory operation in a disallowed region triggers an access-fault. The kernel cannot assume the store is atomic with respect to PMP checking; partial writes commit in allowed regions before the fault fires",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "store instruction (SD/FSD/CBO.ZERO or memcpy/copy_to_user/__put_user) whose byte range [addr, addr+len) crosses a PMP region boundary defined by pmpaddr[] registers; search M-mode trap handlers, context-switch save/restore, KVM vCPU world-switch paths, and any code writing near PMP-configured guard pages",
+    "affected_entities": [
+      "pmpcfg",
+      "pmpaddr",
+      "CBO.ZERO (Zicboz)",
+      "FSD (RV32D)",
+      "SD (misaligned)"
+    ],
+    "summary": "PMP explicitly decomposes wide/misaligned stores into per-memory-operation checks — partial writes become visible across PMP boundaries before the fault, violating any kernel invariant that treats PMP store-checks as all-or-nothing"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/head.S",
+        "function_name": "_start_kernel",
+        "line_start": 217,
+        "line_end": 253,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PMP setup is confined to CONFIG_RISCV_M_MODE boot path, configuring a single 'allow all' NAPOT region covering the full address space. This is the only PMP touch in the entire kernel. No runtime PMP management, no per-CPU PMP context switching. The kernel runs in S-mode (or HS-mode for KVM) where PMP is owned by M-mode firmware. This is architecturally correct: PMP virtualization/protection is M-mode firmware territory.",
+      "snippet": "li a0, -1\ncsrw CSR_PMPADDR0, a0\nli a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)\ncsrw CSR_PMPCFG0, a0"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 421,
+        "line_end": 471,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Context-switch saves/restores callee-saved GPRs (ra, sp, s0-s11) and the SUM bit from CSR_STATUS. PMP registers (CSR_PMPCFG*, CSR_PMPADDR*) are M-mode CSRs inaccessible from S-mode; the kernel cannot touch them. Context-switch of PMP state is the responsibility of M-mode firmware. The kernel correctly delegates this.",
+      "snippet": "REG_S ra,  TASK_THREAD_RA_RA(a3)\nREG_S sp,  TASK_THREAD_SP_RA(a3)\n[...]\ncsrr  s0, CSR_STATUS\nREG_S s0, TASK_THREAD_SUM_RA(a3)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/switch_to.h",
+        "function_name": "switch_to",
+        "line_start": 113,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The switch_to macro chains FPU save/restore, vector save/restore, icache flush, and ENVCFG CSR write. No PMP CSR handling is present, but this is correct: PMP CSRs are M-mode-only and are inaccessible from S-mode. M-mode firmware (e.g., OpenSBI) handles PMP context on trap entry/exit.",
+      "snippet": "if (has_fpu())\n    __switch_to_fpu(__prev, __next);\nif (has_vector() || has_xtheadvector())\n    __switch_to_vector(__prev, __next);\n__switch_to_envcfg(__next);\n((last) = __switch_to(__prev, __next));"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 578,
+        "line_end": 641,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vCPU load writes guest VS-mode CSRs (VSSTATUS, VSIE, VSTVEC, etc.) and HGATP, restores FP/vector state. No PMP CSRs are touched. This is architecturally correct: RISC-V H-extension does not virtualize PMP; PMP is an M-mode construct. Guest accesses to PMP CSRs in VS-mode would trap as illegal instructions. M-mode firmware handles any PMP context on world-switch.",
+      "snippet": "csr_write(CSR_VSSTATUS, csr->vsstatus);\ncsr_write(CSR_VSIE, csr->vsie);\ncsr_write(CSR_VSTVEC, csr->vstvec);\n[...]\nkvm_riscv_mmu_update_hgatp(vcpu);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_enter_exit",
+        "line_start": 784,
+        "line_end": 862,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Guest entry/exit swaps SCOUNTEREN, SENVCFG, SSTATEEN0, and HSTATUS. The assembly switch_to in vcpu_switch.S saves/restores SSTATUS, STVEC, SSCRATCH, SEPC, and GPRs. No PMP CSRs (0x3a0-0x3ef) are referenced in either the C or assembly world-switch paths. This is correct per the RISC-V privileged architecture: PMPs are not part of the supervisor-level context.",
+      "snippet": "kvm_riscv_vcpu_swap_in_guest_state(vcpu);\nguest_state_enter_irqoff();\n[...]\n__kvm_riscv_switch_to(&vcpu->arch);\n[...]\nguest_state_exit_irqoff();\nkvm_riscv_vcpu_swap_in_host_state(vcpu);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "__kvm_riscv_switch_to",
+        "line_start": 198,
+        "line_end": 219,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Assembly world-switch: SAVE_HOST_AND_RESTORE_GUEST_CSRS saves host SSTATUS/STVEC/SSCRATCH and restores guest versions; SAVE_GUEST_AND_RESTORE_HOST_CSRS does the reverse plus saves guest SEPC. The CSR swap set is narrow and correct. No PMP CSRs (0x3a0-0x3ef) appear in any macro (SAVE_HOST_GPRS, SAVE_HOST_AND_RESTORE_GUEST_CSRS, etc.).",
+      "snippet": "SAVE_HOST_GPRS\nSAVE_HOST_AND_RESTORE_GUEST_CSRS .Lkvm_switch_return\nRESTORE_GUEST_GPRS\nsret"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps_misaligned.c",
+        "function_name": "handle_misaligned_store",
+        "line_start": 446,
+        "line_end": 452,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Misaligned store emulation by the kernel decomposes a single architectural store into multiple byte/word writes via the scalar misaligned handler. If the original misaligned store spans a PMP region boundary (configured by M-mode firmware), the kernel's software emulation could cause partial writes: some bytes land in an allowed PMP region while others trigger a fault. The kernel has no visibility into M-mode PMP configuration and cannot detect or prevent this. However, this risk is fundamentally M-mode firmware's concern -- the kernel correctly emulates the misaligned access at the virtual address level and relies on M-mode to enforce PMP at the physical level.",
+      "snippet": "int handle_misaligned_store(struct pt_regs *regs)\n{\n    if (IS_ENABLED(CONFIG_RISCV_SCALAR_MISALIGNED))\n        return handle_scalar_misaligned_store(regs);\n    return -1;\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/lib/clear_page.S",
+        "function_name": "clear_page",
+        "line_start": 20,
+        "line_end": 73,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CBO.ZERO on a page whose underlying physical memory spans a PMP region boundary: each CBO.ZERO instruction is decomposed by hardware into per-byte (or per-sub-block) memory operations. If the cache block straddles a PMP boundary (e.g., a 64-byte CBO block where bytes [0,32) are allowed but bytes [32,64) are disallowed), the allowed portion becomes architecturally visible while the disallowed portion triggers an access-fault. In practice, clear_page operates on kernel buddy-allocated pages that are page-aligned, and PMP regions are unlikely to be configured at sub-page granularity within kernel heap. The risk is theoretical unless M-mode firmware configures PMP guard pages within kernel-allocated pages.",
+      "snippet": ".Lzero_loop:\n    CBO_ZERO(a0)\n    add  a0, a0, a1\n    CBOZ_ALT(11, \"bltu a0, a2, .Lzero_loop; ret\", \"nop; nop\")"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "setup_sigcontext",
+        "line_start": 353,
+        "line_end": 388,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Signal frame delivery uses __copy_to_user/__put_user to write the sigcontext (GPRs, FP state, vector state, Zicfiss state) to the user stack. These are standard uaccess operations with fixup exception handling. PMP checks are done transparently by M-mode hardware; S-mode sees any PMP violation as a regular store access fault routed through do_page_fault -> handle_page_fault. The kernel correctly handles this via the existing fixup mechanism.",
+      "snippet": "err = __copy_to_user(&sc->sc_regs, regs, sizeof(sc->sc_regs));\nif (has_fpu())\n    err |= save_fp_state(regs, &sc->sc_fpregs);\n[...]\nerr |= __put_user(END_MAGIC, &sc_ext_ptr->magic);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/lib/uaccess.S",
+        "function_name": "__asm_copy_to_user",
+        "line_start": 15,
+        "line_end": 55,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "User copy routines use SR_SUM to enable supervisor access to user memory, with _asm_extable fixup entries for exception handling. Any PMP violation during the copy would manifest as a store access fault at the physical level and be caught by the fixup handler, which returns the number of uncopied bytes. The kernel correctly treats PMP faults as ordinary access faults at its privilege level.",
+      "snippet": "SYM_FUNC_START(__asm_copy_to_user)\n    ALTERNATIVE(\"j fallback_scalar_usercopy\", \"nop\", ...)\n    tail __asm_copy_to_user_sum_enabled\nSYM_FUNC_END(__asm_copy_to_user)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

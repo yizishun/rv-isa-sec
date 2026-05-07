@@ -1,0 +1,161 @@
+{
+  "pr_number": 2997,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2997,
+    "violation_condition": "FreeBSD kernel context-switch path (cpu_switch, savectx, set_mcontext, sendsig) saves/restores vector registers via vsetvl/vsext but does not save/restore the matrix tile state (up to 16*TE*TE bytes of architectural state per hart) or the mtype CSR (0xC23), causing tile data from the switched-out process to be readable by the switched-in process",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "cpu_switch|savectx|restorectx|set_mcontext|get_mcontext|sendsig|sigreturn.*mtype|tile|mstatus.*MS|vtdiscard|vtmv\\.t\\.v|vtzero",
+    "affected_entities": [
+      "mtype CSR (0xC23)",
+      "mstatus.MS",
+      "sstatus.MS",
+      "vsstatus.MS",
+      "mt0-mt15 tile state",
+      "vtdiscard",
+      "vtmv.t.v",
+      "vtmv.v.t",
+      "vtle32",
+      "vtse32",
+      "vtzero",
+      "msetmtype",
+      "msettn"
+    ],
+    "summary": "Zvt adds multi-kilobyte matrix tile state per hart that must be context-switched; FreeBSD's riscv cpu_switch/sendsig paths lack tile save/restore, leaking prior process's matrix computation results across context switches"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "PCB has no fields for matrix tile state (Zvt extension): no save area for tile registers (up to 16*TE*TE bytes), no slot for mtype CSR (0xC23), no XS-dirty tracking. Only FP state (pcb_x, pcb_fcsr, pcb_fpflags) is stored. If Zvt-capable hardware appears, tile state has no place to be saved across context switches.",
+      "snippet": "struct pcb {\n  uint64_t pcb_ra; uint64_t pcb_sp; uint64_t pcb_gp; uint64_t pcb_tp;\n  uint64_t pcb_s[12]; uint64_t pcb_x[32][2]; /* Floating point registers */\n  uint64_t pcb_fcsr; uint64_t pcb_fpflags;\n  vm_offset_t pcb_onfault;\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/ucontext.h",
+        "function_name": "struct __mcontext",
+        "line_start": 57,
+        "line_end": 64,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "mcontext_t has no fields for matrix tile state. mc_fpregs covers only FP registers, and mc_spare[8] (64 bytes) is far too small for matrix tile architectural state. Signal delivery/receive paths use this struct — Zvt tile state would be silently dropped across signal boundaries.",
+      "snippet": "struct __mcontext {\n  struct gpregs mc_gpregs; struct fpregs mc_fpregs;\n  int mc_flags; int mc_pad;\n  __uint64_t mc_spare[8]; /* Space for expansion */\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 286,
+        "line_end": 305,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "cpu_switch checks only SSTATUS_FS (floating-point) dirty state to decide whether to save FP registers. It does not check SSTATUS_XS (extension state) or mstatus.XS, which tracks user-mode extension dirty state including vector/tile. When hardware supports Zvt, tile-dirty state would be silently lost on context switch, leaking data from the old process to the new process.",
+      "snippet": "ld t0, TD_FRAME(a0)\nld t1, (TF_SSTATUS)(t0)\nli t2, SSTATUS_FS_MASK\nand t3, t1, t2\nli t2, SSTATUS_FS_DIRTY\nbne t3, t2, 1f  /* No, skip. */\nli t2, ~SSTATUS_FS_MASK\nand t3, t1, t2\nli t2, SSTATUS_FS_CLEAN\nor t3, t3, t2\nsd t3, (TF_SSTATUS)(t0)\n__fpe_state_save x13"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "savectx saves GP registers and calls __fpe_state_save to capture FP state, but does not save matrix tile state or mtype CSR. This path is used for crash dumps and debugger entry — Zvt tile state would be unrecoverable.",
+      "snippet": "ENTRY(savectx)\n  sd ra, (PCB_RA)(a0)\n  ... sd s0-s11 ...\n  __fpe_state_save a0\n  ret\nEND(savectx)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_mcontext",
+        "line_start": 245,
+        "line_end": 249,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "set_mcontext explicitly masks SSTATUS_XS_MASK in the sstatus validation check, meaning the kernel deliberately ignores the XS (extension status) field across signal delivery. This prevents any mechanism for tracking tile/matrix dirty state across signal boundaries. Comment at line 242 says 'Ignore writes to read-only bits (SD, XS)' which is incorrect for S-mode XS — sstatus.XS is writable in S-mode (the RISC-V spec says XS is a read-only view of the summary of all extension states, but individual extension CSRs control the underlying state).",
+      "snippet": "if (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &\n    ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_UPIE |\n    SSTATUS_UIE)) != 0)\n    return (EINVAL);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sendsig",
+        "line_start": 377,
+        "line_end": 377,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sendsig calls get_mcontext to build the signal frame, which only captures FP state. No tile/matrix state is included in the signal frame. A user process that uses Zvt tile operations, then receives a signal, would find its tile state missing from the signal context.",
+      "snippet": "get_mcontext(td, &frame.sf_uc.uc_mcontext, 0);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sys_sigreturn",
+        "line_start": 317,
+        "line_end": 334,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sigreturn restores context via set_mcontext, which only restores FP state. Any tile state saved (hypothetically) in the signal frame would not be restored. Current code cannot round-trip Zvt tile state through signal delivery.",
+      "snippet": "if (copyin(uap->sigcntxp, &uc, sizeof(uc)))\n  return (EFAULT);\nerror = set_mcontext(td, &uc.uc_mcontext);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "exec_setregs",
+        "line_start": 172,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "exec_setregs clears PCB_FP_STARTED but does not clear or discard any tile/matrix state. After execve(), the new process image could inherit stale tile data from the previous process. RISC-V Zvt specification requires tile state be invalidated on context change (e.g., via vtdiscard instruction or tile-disabling CSR write).",
+      "snippet": "memset(tf, 0, sizeof(struct trapframe));\ntf->tf_a[0] = stack;\n...\npcb->pcb_fpflags &= ~PCB_FP_STARTED;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fpe_state_clear",
+        "line_start": 154,
+        "line_end": 201,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fpe_state_clear zeros only FP registers (f0-f31). When a thread exits or its FP state is being cleaned, Zvt tile registers are not cleared. This leaves tile data in hardware registers that could be observed by the next thread scheduled on this hart.",
+      "snippet": "ENTRY(fpe_state_clear)\n  li t0, SSTATUS_FS_INITIAL\n  csrs sstatus, t0\n  fscsr zero\n  fcvt.d.l f0, zero\n  ... fcvt.d.l f31, zero\n  li t0, SSTATUS_FS_MASK\n  csrc sstatus, t0\n  ret\nEND(fpe_state_clear)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 41,
+        "line_end": 204,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "bhyve VMM switch path saves/restores GPRs and CSR state (sstatus, hstatus, scounteren, stvec, sscratch) but does not save/restore any tile/matrix state. When virtualizing guests that use Zvt extensions, guest tile state would be lost on VM exit or leaked between VCPUs.",
+      "snippet": "ENTRY(vmm_switch)\n  sd ra, (HYP_H_RA)(a0)\n  ... sd s0-s11 ...\n  csrrw t0, sstatus, t0\n  csrrw t1, hstatus, t1\n  /* No tile state save/restore */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/fpe.c",
+        "function_name": "fpe_enable",
+        "line_start": 44,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fpe_enable sets only SSTATUS_FS_INITIAL, enabling FPU access. There is no corresponding function to enable tile/matrix extension access, and no tracking of which extensions are in use per-thread. The kernel has no mechanism to lazily context-switch extension state (no extension-state-dirty trap handler).",
+      "snippet": "void fpe_enable(void)\n{\n  uint64_t reg;\n  reg = SSTATUS_FS_INITIAL;\n  csr_set(sstatus, reg);\n}"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

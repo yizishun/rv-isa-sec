@@ -1,0 +1,153 @@
+{
+  "pr_number": 775,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 775,
+    "violation_condition": "Linux kernel APLIC driver writes to sourcecfg[0] or target[0] (bits in acliciprio[0]) expecting configuration to take effect, but the hardware silently ignores those writes because these fields are read-only zero",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "writel|writeq|iowrite32|iowrite64.*(sourcecfg\\[0\\]|target\\[0\\]|acliciprio\\[0\\]|0x1000|interrupt.*0.*config)",
+    "affected_entities": [
+      "aclicsourcecfg[0]",
+      "sourcecfg[0]",
+      "target[0]",
+      "acliciprio[0] (target[0] bits)",
+      "xiselect=0x1000 (xireg2, formerly aclicsourcecfg0)"
+    ],
+    "summary": "sourcecfg[0] and target[0] are hardwired read-only zero: the kernel must skip interrupt 0 during APLIC initialization or writes are silently dropped, leaving interrupt 0 permanently disabled and unrouted"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-main.c",
+        "function_name": "aplic_init_hw_irqs",
+        "line_start": 296,
+        "line_end": 300,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Init loop starts at i=1 and uses (i-1) indexing, which maps interrupt source 1 to sourcecfg[1] at offset 0x0004 — correct per AIA offset formula 0x0004 + 4×(i−1). No write targets the nonexistent source 0.",
+      "snippet": "for (i = 1; i <= priv->nr_irqs; i++) {\n\twritel(0, priv->regs + APLIC_SOURCECFG_BASE + (i - 1) * sizeof(u32));\n\twritel(APLIC_DEFAULT_PRIORITY,\n\t       priv->regs + APLIC_TARGET_BASE + (i - 1) * sizeof(u32));\n}"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-main.c",
+        "function_name": "aplic_irq_set_type",
+        "line_start": 228,
+        "line_end": 232,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Uses (d->hwirq - 1)*4 offset from SOURCECFG_BASE (0x0004). For hwirq=1, resolves to offset 0x0004 = sourcecfg[1], correct per AIA spec. hwirq is guaranteed non-zero by aplic_irqdomain_translate() validation.",
+      "snippet": "sourcecfg = priv->regs + APLIC_SOURCECFG_BASE;\nsourcecfg += (d->hwirq - 1) * sizeof(u32);\nwritel(val, sourcecfg);\n\npriv->saved_hw_regs.srcs[d->hwirq - 1].sourcecfg = val;"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-main.c",
+        "function_name": "aplic_restore_states",
+        "line_start": 44,
+        "line_end": 49,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Restore loop uses i*4 offset from SOURCECFG_BASE (0x0004) and TARGET_BASE (0x3004). For i=0, writes to sourcecfg[1] and target[1] — the first hardware registers for interrupt source 1. The comment explicitly documents the AIA rule that inactive sources have ROZ target/IE/pending bits.",
+      "snippet": "for (i = 0; i < nr_irqs; i++) {\n\tsrcs = &priv->saved_hw_regs.srcs[i];\n\twritel(srcs->sourcecfg, regs + APLIC_SOURCECFG_BASE + i * sizeof(u32));\n\twritel(srcs->target, regs + APLIC_TARGET_BASE + i * sizeof(u32));\n}"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-main.c",
+        "function_name": "aplic_save_states",
+        "line_start": 75,
+        "line_end": 83,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Save loop reads target[i+1] at offset TARGET_BASE + i*4 and stores to srcs[i], then reads IE word at bit-array boundary. The internal srcs[n] stores state for interrupt source (n+1), consistent with the restore path.",
+      "snippet": "for (i = 0; i < nr_irqs; i++) {\n\tsrcs = &priv->saved_hw_regs.srcs[i];\n\tsrcs->target = readl(regs + APLIC_TARGET_BASE + i * sizeof(u32));\n\t...\n\tsrcs->ie = readl(regs + APLIC_SETIE_BASE + (i / 32) * sizeof(u32));\n}"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-direct.c",
+        "function_name": "aplic_direct_set_affinity",
+        "line_start": 69,
+        "line_end": 73,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Target register write uses TARGET_BASE + (hwirq-1)*4. For hwirq=1, offset 0x3004 = target[1], correct. Val is constructed with HART_IDX and IPRIO fields matching AIA target register layout.",
+      "snippet": "target = priv->regs + APLIC_TARGET_BASE + (d->hwirq - 1) * sizeof(u32);\nval = FIELD_PREP(APLIC_TARGET_HART_IDX, idc->hart_index);\nval |= FIELD_PREP(APLIC_TARGET_IPRIO, APLIC_DEFAULT_PRIORITY);\nwritel(val, target);"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-direct.c",
+        "function_name": "aplic_direct_setup",
+        "line_start": 292,
+        "line_end": 296,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Boot CPU hart_index correction loop updates all target[j] using TARGET_BASE + (j-1)*4. For j=1, writes to target[1] at offset 0x3004 — correct.",
+      "snippet": "if (cpu == current_cpu && idc->hart_index) {\n\tv = FIELD_PREP(APLIC_TARGET_HART_IDX, idc->hart_index);\n\tv |= FIELD_PREP(APLIC_TARGET_IPRIO, APLIC_DEFAULT_PRIORITY);\n\tfor (j = 1; j <= priv->nr_irqs; j++)\n\t\twritel(v, priv->regs + APLIC_TARGET_BASE + (j - 1) * sizeof(u32));\n}"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-msi.c",
+        "function_name": "aplic_msi_write_msg",
+        "line_start": 88,
+        "line_end": 93,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Zeroed MSI path writes 0 to target register at TARGET_BASE + (hwirq-1)*4. For hwirq=1, offset 0x3004 = target[1], correct. This is the MSI teardown/deactivation path.",
+      "snippet": "if (!msg->address_hi && !msg->address_lo && !msg->data) {\n\ttarget = priv->regs + APLIC_TARGET_BASE;\n\ttarget += (d->hwirq - 1) * sizeof(u32);\n\twritel(0, target);\n\treturn;\n}"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-msi.c",
+        "function_name": "aplic_msi_write_msg",
+        "line_start": 122,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MSI configuration path writes EIID|GUEST_IDX|HART_IDX to target register at TARGET_BASE + (hwirq-1)*4. For hwirq=1, offset 0x3004 = target[1], correctly mapped.",
+      "snippet": "target = priv->regs + APLIC_TARGET_BASE;\ntarget += (d->hwirq - 1) * sizeof(u32);\nval = FIELD_PREP(APLIC_TARGET_HART_IDX, hart_index);\nval |= FIELD_PREP(APLIC_TARGET_GUEST_IDX, guest_index);\nval |= FIELD_PREP(APLIC_TARGET_EIID, msg->data);\nwritel(val, target);"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-aplic-main.c",
+        "function_name": "aplic_irqdomain_translate",
+        "line_start": 240,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Validates !fwspec->param[0] before computing hwirq, ensuring hwirq is never 0. This guarantees all subsequent (hwirq-1) index computations are non-negative and map to valid hardware register slots.",
+      "snippet": "if (WARN_ON(!fwspec->param[0]))\n\treturn -EINVAL;\n...\n*hwirq = fwspec->param[0] - gsi_base;\n*type = fwspec->param[1] & IRQ_TYPE_SENSE_MASK;\n\nWARN_ON(*type == IRQ_TYPE_NONE);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_aplic.c",
+        "function_name": "aplic_mmio_write_offset",
+        "line_start": 465,
+        "line_end": 468,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM emulation bounds-checks MMIO write offset against SOURCECFG_BASE + (nr_irqs-1)*4, and computes i = (off - SOURCECFG_BASE)/4 + 1 to get hardware source number. aplic_write_sourcecfg() rejects irq==0, mirroring the hardware ROZ behavior for nonexistent source 0.",
+      "snippet": "} else if ((off >= APLIC_SOURCECFG_BASE) &&\n\t (off < (APLIC_SOURCECFG_BASE + (aplic->nr_irqs - 1) * 4))) {\n\ti = ((off - APLIC_SOURCECFG_BASE) >> 2) + 1;\n\taplic_write_sourcecfg(aplic, i, val32);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_aplic.c",
+        "function_name": "aplic_mmio_write_offset",
+        "line_start": 503,
+        "line_end": 506,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM emulation bounds-checks target MMIO write against TARGET_BASE + (nr_irqs-1)*4, and computes i = (off - TARGET_BASE)/4 + 1. aplic_write_target() rejects irq==0, preventing writes to nonexistent target[0].",
+      "snippet": "} else if ((off >= APLIC_TARGET_BASE) &&\n\t (off < (APLIC_TARGET_BASE + (aplic->nr_irqs - 1) * 4))) {\n\ti = ((off - APLIC_TARGET_BASE) >> 2) + 1;\n\taplic_write_target(aplic, i, val32);"
+    }
+  ],
+  "overall_severity": "compliant"
+}

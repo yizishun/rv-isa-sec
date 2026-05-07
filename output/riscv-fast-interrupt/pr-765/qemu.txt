@@ -1,0 +1,39 @@
+PR #765  target=qemu  overall=compliant
+Spec: Inverted mithreshold comparison in QEMU CLIC/CLINT emulation would mask higher-priority interrupts instead of lower-priority ones, causing guest OS to miss critical interrupts
+Violation: QEMU's CLIC/CLINT emulation inverts the mithreshold comparison direction — masking interrupts with priority number LESS than the threshold value instead of masking interrupts with priority number GREATER than the threshold value (or vice versa, depending on interpretation of 'lower-priority'). Specifically, if QEMU implements `irq_enabled = (irq_priority >= mithreshold)` when the spec requires `irq_enabled = (irq_priority <= mithreshold)`, the threshold masks the wrong set of interrupts.
+Consequence: denial_of_service
+Pattern: mithreshold.*>=|<=\s*priority|threshold.*comparison|clic_threshold_filter|plic.*threshold|interrupt.*threshold.*check
+------------------------------------------------------------
+[compliant] hw/intc/riscv_aplic.c:499-500  riscv_aplic_idc_topi
+  APLIC ithreshold comparison uses `iprio >= ithres` to filter out interrupts. Per RISC-V AIA spec, lower integer = higher priority, so this correctly masks interrupts whose priority value is >= threshold (i.e., lower-or-equal priority interrupts). The pass condition is effectively `iprio < ithres`, which is the correct semantic: only interrupts with strictly higher priority than the threshold are considered.
+  | iprio = aplic->target[irq] & aplic->iprio_mask;
+  | if (ithres && iprio >= ithres) {
+  |     continue;
+  | }
+
+[compliant] hw/intc/sifive_plic.c:105-108  sifive_plic_claimed
+  PLIC threshold comparison uses `prio > max_prio` (strict greater-than). Per SiFive PLIC spec, higher integer = higher priority, so this correctly requires interrupt source priority to be strictly above the threshold. The threshold register semantics (interrupts with priority > threshold are forwarded; priority <= threshold are masked) match the spec.
+  | if (enabled && prio > max_prio) {
+  |     max_irq = irq;
+  |     max_prio = prio;
+  | }
+
+[compliant] hw/intc/riscv_imsic.c:54-57  riscv_imsic_topei
+  IMSIC eithreshold filtering is bounds-checked (`eithreshold <= num_irqs`) and used as a scan-range cap (`for i < max_irq`). There is no direct priority-value-vs-threshold comparison here, so the vulnerability pattern (inverted <= vs >= on priority) does not apply. The semantic (mask interrupts with ID >= threshold) is conceptually consistent with AIA threshold behavior.
+  | max_irq = (imsic->eithreshold[page] &&
+  |            (imsic->eithreshold[page] <= imsic->num_irqs)) ?
+  |            imsic->eithreshold[page] : imsic->num_irqs;
+  | for (i = 1; i < max_irq; i++) {
+
+[compliant] hw/intc/riscv_aclint.c:74-74  riscv_aclint_mtimer_write_timecmp
+  CLINT `mtimecmp <= rtc` is a timer comparator (raise timer IRQ if mtimecmp is in the past), not an interrupt priority threshold comparison. No mithreshold or priority-based interrupt masking exists in CLINT. The vulnerability pattern does not apply.
+  | if (mtimer->timecmp[hartid] <= rtc) {
+
+[compliant] target/riscv/cpu_helper.c:461-461  riscv_cpu_pending_to_irq
+  The CPU core interrupt prioritization uses `prio <= best_prio` purely for best-interrupt selection (smallest priority value = highest priority). There is no threshold filtering at this level — the function only picks the highest-priority pending interrupt to present. The comparison direction is correct for priority ordering.
+  | if ((pending & 0x1) && (prio <= best_prio)) {
+
+[compliant] (not in codebase):0-0  N/A
+  CLIC/Smip/Smnip (mithreshold) is NOT implemented in this QEMU tree. No CLIC source files exist, and the string 'mithreshold' has zero occurrences. The security spec vulnerability (CLIC mithreshold comparison direction inversion masking wrong set of interrupts) is not applicable because the CLIC extension has not been implemented.
+  | N/A — CLIC not implemented
+

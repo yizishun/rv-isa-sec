@@ -1,0 +1,95 @@
+PR #933  target=freebsd-src  overall=compliant
+Spec: 4-bit RVY PTE field replaces single CRW bit; residual stale bits in pmap-constructed PTEs cause silent capability tag corruption or spurious CLCR faults when Svyrg is enabled, and SYRG/UYRG context-switch omission leaks revocation-generation state across processes
+Violation: FreeBSD kernel context-switch path (cpu_switch/cpu_throw in sys/riscv/riscv/swtch.S) saves and restores sstatus without preserving the new per-thread SYRG and UYRG fields, or the pmap PTE constructor (pmap_enter/pv_to_pte in sys/riscv/riscv/pmap.c) writes the legacy single-bit CRW into the now-4-bit RVY PTE field, leaving bits [2:0] carrying stale state from a previously freed page table page. When sstatus.RGE is subsequently set, the hardware interprets the residual bits as YRG/YW/YD — producing spurious CHERI Load Capability Faults (denial_of_service) or silently clearing capability tags on loads from pages believed to be capability-enabled (data_corruption).
+Consequence: data_corruption
+Pattern: sstatus.*(SYRG|UYRG|RGE)|pte.*(RVY|YR|YW|YD|YRG)|crw.*pte|PTE_CAP|PTE_CHERI
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/swtch.S:258-358  cpu_switch
+  cpu_switch saves/restores only callee-saved GPRs and the PCB RA/SP; sstatus is NOT saved/restored here because it is already saved in the trapframe's TF_SSTATUS by save_registers in exception.S during exception/trap entry. The FPE-state path reads TF_SSTATUS and modifies only FS bits (lines 290-302). No SYRG/UYRG/RGE fields exist in this codebase, so there is nothing to lose.
+  | ENTRY(cpu_switch)
+  |   sd a1, PC_CURTHREAD(tp)
+  |   ...
+  |   ld t1, (TF_SSTATUS)(t0)
+  |   li t2, SSTATUS_FS_MASK
+  |   and t3, t1, t2
+
+[compliant] sys/riscv/riscv/swtch.S:206-248  cpu_throw
+  cpu_throw does not touch sstatus at all; it activates the new pmap, loads callee-saved GPRs, and conditionally restores FPE state. sstatus was already set during fork_trampoline or will be restored via the trap-return path (load_registers in exception.S). No CHERI capability fields are present in this implementation.
+  | ENTRY(cpu_throw)
+  |   call _C_LABEL(pmap_activate_sw)
+  |   ld ra, (PCB_RA)(x13)
+  |   ld sp, (PCB_SP)(x13)
+
+[compliant] sys/riscv/riscv/swtch.S:365-432  fork_trampoline
+  fork_trampoline restores sstatus from the trapframe with only SIE masked off (lines 371-376). This is correct: the full sstatus value was saved during the initial exception that created the thread, and fork_trampoline just ensures interrupts are disabled before the final sret. No SYRG/UYRG/RGE fields exist to lose.
+  | ENTRY(fork_trampoline)
+  |   call _C_LABEL(fork_exit)
+  |   ld t0, (TF_SSTATUS)(sp)
+  |   li t1, ~SSTATUS_SIE
+  |   and t0, t0, t1
+  |   csrw sstatus, t0
+
+[compliant] sys/riscv/riscv/exception.S:41-114  save_registers
+  save_registers saves the full sstatus CSR value (line 103-104) via csrr into TF_SSTATUS without masking. This captures all sstatus bits including any reserved/extension bits that may exist in the hardware. On a standard RISC-V core, this is compliant.
+  | csrr t0, sstatus
+  | sd t0, (TF_SSTATUS)(sp)
+
+[compliant] sys/riscv/riscv/exception.S:116-150  load_registers
+  load_registers restores sstatus from TF_SSTATUS, setting SPIE for user-mode returns (line 120-121) and clearing SIE for supervisor-mode returns (lines 128-129). No SYRG/UYRG/RGE fields are referenced because none exist in this standard RISC-V implementation.
+  | ld t0, (TF_SSTATUS)(sp)
+  | .if \mode == 0
+  |   li t1, SSTATUS_SPIE
+  |   or t0, t0, t1
+  | .else
+  |   li t1, ~SSTATUS_SIE
+  |   and t0, t0, t1
+  | .endif
+  | csrw sstatus, t0
+
+[compliant] sys/riscv/riscv/pmap.c:3256-3300  pmap_enter
+  pmap_enter constructs the leaf PTE using only standard RISC-V PTE bits: PTE_V, PTE_R, PTE_A, PTE_X, PTE_D, PTE_W, PTE_U, PTE_SW_WIRED, PTE_SW_MANAGED, plus Svpbmt memory attributes (lines 3276-3289). No CHERI capability bits (PTE_CAP, CRW, RVY, YRG, YW, YD) are defined or used. The PTE format is the standard Sv39/48/57 64-bit layout.
+  | new_l3 = PTE_V | PTE_R | PTE_A;
+  | if (prot & VM_PROT_EXECUTE)
+  |   new_l3 |= PTE_X;
+  | if (flags & VM_PROT_WRITE)
+  |   new_l3 |= PTE_D;
+  | if (prot & VM_PROT_WRITE)
+  |   new_l3 |= PTE_W;
+  | if (va < VM_MAX_USER_ADDRESS)
+  |   new_l3 |= PTE_U;
+
+[compliant] sys/riscv/include/pte.h:69-84  
+  The PTE bit definitions cover only standard RISC-V leaf PTE bits (V=0, R=1, W=2, X=3, U=4, G=5, A=6, D=7) plus two software bits (SW_WIRED=8, SW_MANAGED=9) and Svpbmt MA bits [62:61]. Bits [63:54] are declared reserved. There are no CHERI/Morello capability PTE field definitions. The legacy single-bit CRW and 4-bit RVY/YRG/YW/YD fields described in the spec do not exist.
+  | #define PTE_D  (1 << 7)
+  | #define PTE_A  (1 << 6)
+  | #define PTE_G  (1 << 5)
+  | #define PTE_U  (1 << 4)
+  | #define PTE_X  (1 << 3)
+  | #define PTE_W  (1 << 2)
+  | #define PTE_R  (1 << 1)
+  | #define PTE_V  (1 << 0)
+
+[compliant] sys/riscv/include/riscvreg.h:60-79  
+  SSTATUS register definitions cover only standard RISC-V privileged spec fields: SIE (bit 1), SPIE (bit 5), SPP (bit 8), FS [14:13], XS [16:15], SUM (bit 18), SD (bit 63/31). No SYRG, UYRG, or RGE bit definitions exist. The implementation operates correctly for the standard RISC-V ISA it targets.
+  | #define SSTATUS_SIE        (1 << 1)
+  | #define SSTATUS_SPIE       (1 << 5)
+  | #define SSTATUS_SPP        (1 << 8)
+  | #define SSTATUS_FS_MASK    (0x3 << SSTATUS_FS_SHIFT)
+  | #define SSTATUS_XS_MASK    (0x3 << SSTATUS_XS_SHIFT)
+  | #define SSTATUS_SUM        (1 << 18)
+
+[compliant] sys/riscv/vmm/vmm_switch.S:41-204  vmm_switch
+  vmm_switch uses csrrw to atomically swap host and guest sstatus (lines 73, 169), which preserves all sstatus bits including any extension fields. The full sstatus values are saved to/loaded from the hypctx structure's HYP_H_SSTATUS and HYP_G_SSTATUS fields (genassym.c lines 111, 125). The hypervisor correctly virtualizes sstatus for guests within the standard RISC-V H-extension model.
+  | csrrw t0, sstatus, t0   // swap host<->guest sstatus atomically
+  | ...
+  | sd t0, (HYP_H_SSTATUS)(a0)
+  | ...
+  | csrrw t5, sstatus, t5   // restore on guest exit
+  | sd t5, (HYP_G_SSTATUS)(a0)
+
+[compliant] sys/riscv/riscv/pmap.c:390-392  L3_PTE
+  The L3_PTE/L2_PTE/L1_PTE macros construct PTE values by shifting the physical address into the PPN field and ORing in permission bits. The PTE_HI_MASK (0xFFC0000000000000) masks off bits [63:54] when extracting physical addresses (PTE_TO_PHYS line 375-376). Only standard RISC-V PTE bits are combined — no CRW single-bit writes and no CHERI RVY 4-bit field operations exist.
+  | #define L3_PTE(pa, bits) ((((pa) >> L3_SHIFT) << PTE_PPN0_S) | (bits))
+  | #define PTE_TO_PHYS(pte) ((((pte) & ~PTE_HI_MASK) >> PTE_PPN0_S) * PAGE_SIZE)
+  | #define PTE_HI_MASK 0xFFC0000000000000ULL
+

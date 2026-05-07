@@ -1,0 +1,67 @@
+PR #80  target=qemu  overall=compliant
+Spec: Removal of MT_ASYNC from *envcfg bit 36 and mseccfg: if QEMU fails to convert the bit to WPRI (writes ignored, reads return 0), previously-written values leak across VM reset/context-switch boundaries, and stale asynchronous tag-check paths may create a covert side-channel observable by the guest kernel.
+Violation: QEMU still emulates the MT_ASYNC bit (bit 36 in menvcfg/senvcfg/henvcfg; or the removed MT_ASYNC field in mseccfg) as a readable/writable field after the spec removed it. If QEMU's CSR emulation allows the guest to set bit 36 of *envcfg to 1, or reads back a previously-written value instead of returning 0 (WPRI), the emulation violates the updated spec. Additionally, if QEMU previously implemented deferred/asynchronous tag-check reporting for stores and that code path still exists, a guest setting the now-WPRI bit could trigger stale asynchronous behavior that the spec no longer permits.
+Consequence: info_leak
+Pattern: menvcfg.*MT_ASYNC|senvcfg.*MT_ASYNC|henvcfg.*MT_ASYNC|mseccfg.*MT_ASYNC|envcfg.*bit.*36|WPRI.*36|MTE_ASYNC|mt_async|tag_check.*async
+------------------------------------------------------------
+[compliant] target/riscv/cpu_bits.h:854-899  (menvcfg/senvcfg/henvcfg bit definitions)
+  No MT_ASYNC bit (bit 36) is defined for any envcfg CSR. The menvcfg bit layout uses bits 0-7, 32-33, 59-63 with no assignment at bit 36. The only bit 36 usage in the entire cpu_bits.h is XCTRCTL_NTBREN (line 962), which is an unrelated counter-control field. No WPRI redefinition is needed because the bit was never defined in the first place.
+  | #define MENVCFG_FIOM   BIT(0)
+  | #define MENVCFG_LPE    BIT(2) /* zicfilp */
+  | #define MENVCFG_SSE    BIT(3) /* zicfiss */
+  | #define MENVCFG_PMM    (3ULL << 32)
+  | #define MENVCFG_DTE    (1ULL << 59)
+  | ... /* bits 62-63; no bit 36 */
+
+[compliant] target/riscv/csr.c:3173-3218  write_menvcfg
+  The write mask constructs the writable field set from only the defined bits (FIOM, CBIE, CBCFE, CBZE, CDE, PBMTE, STCE, ADUE, DTE, LPE, SSE, PMM). No MT_ASYNC bit exists in the mask, so any write to bit 36 is correctly masked out (write-ignored). Reserved bits default to read-as-zero, write-ignored because the mask simply doesn't include them.
+  | uint64_t mask = MENVCFG_FIOM | MENVCFG_CBIE | MENVCFG_CBCFE | MENVCFG_CBZE | MENVCFG_CDE;
+  | ...
+  | mask |= (cfg->ext_svpbmt ? MENVCFG_PBMTE : 0) | ...
+  | env->menvcfg = (env->menvcfg & ~mask) | (val & mask);
+
+[compliant] target/riscv/csr.c:3273-3307  write_senvcfg
+  senvcfg write path uses a mask of only defined fields (FIOM, CBIE, CBCFE, CBZE, PMM, LPE, SSE, UKTE). No MT_ASYNC bit. Reserved bits including bit 36 are correctly write-ignored.
+  | uint64_t mask = SENVCFG_FIOM | SENVCFG_CBIE | SENVCFG_CBCFE | SENVCFG_CBZE;
+  | ...
+  | env->senvcfg = (env->senvcfg & ~mask) | (val & mask);
+
+[compliant] target/riscv/csr.c:3330-3387  write_henvcfg
+  henvcfg write path has a mask of defined fields plus conditional menvcfg-gated bits (PBMTE, STCE, ADUE, DTE, LPE, SSE, PMM). No MT_ASYNC bit. The code correctly ensures bits not in the mask are not writable. Reserved bits remain 0.
+  | uint64_t mask = HENVCFG_FIOM | HENVCFG_CBIE | HENVCFG_CBCFE | HENVCFG_CBZE;
+  | ...
+  | mask |= env->menvcfg & (HENVCFG_PBMTE | HENVCFG_STCE | HENVCFG_ADUE | HENVCFG_DTE);
+  | env->henvcfg = val & mask;
+
+[compliant] target/riscv/pmp.c:662-703  mseccfg_csr_write
+  mseccfg write path only handles MSECCFG_MMWP (bit 1), MSECCFG_MML (bit 0), optional MSECCFG_PMM (bits 32-33), MSECCFG_RLB (bit 2), and MSECCFG_MLPE (bit 10). No MT_ASYNC field was ever defined in the mseccfg enum (pmp.h:44-50). No bit-36 field exists.
+  | uint64_t mask = MSECCFG_MMWP | MSECCFG_MML;
+  | ...
+  | if (riscv_cpu_cfg(env)->ext_smmpm && ...) { mask |= MSECCFG_PMM; }
+  | ...
+  | env->mseccfg = val;
+
+[compliant] target/riscv/cpu.c:729-732  riscv_cpu_reset_hold
+  Reset values: menvcfg is initialized to PBMTE and/or ADUE based on config. henvcfg is reset to 0. No MT_ASYNC bit is set at reset. Correct per spec.
+  | env->menvcfg = (cpu->cfg.ext_svpbmt ? MENVCFG_PBMTE : 0) |
+  |                (!cpu->cfg.ext_svade && cpu->cfg.ext_svadu ? MENVCFG_ADUE : 0);
+  | env->henvcfg = 0;
+
+[compliant] target/riscv/machine.c:298-300  (vmstate_riscv_cpu)
+  menvcfg, senvcfg, henvcfg are all included in VMState. Since no MT_ASYNC bit exists, there is no stale-field risk on migration. Migration state is correct.
+  | VMSTATE_UINT64(env.menvcfg, RISCVCPU),
+  | VMSTATE_UINT64(env.senvcfg, RISCVCPU),
+  | VMSTATE_UINT64(env.henvcfg, RISCVCPU),
+
+[compliant] target/riscv/cpu_helper.c:2218-2535  (interrupt/trap delivery)
+  The entire trap delivery path uses 'async' only in the traditional RISC-V sense (async = interrupt, sync = exception). There is no MTE deferred-tag-check pathway, no pending-tag-mismatch buffer, and no stval2/htval2/mtval3 tag-fault write logic. The only CSR registers written during trap delivery are standard *cause, *tval, *epc, *status. No async MTE reporting pipeline exists at all.
+  | bool async = !!(cs->exception_index & RISCV_EXCP_INT_FLAG);
+  | uint64_t deleg = async ? env->mideleg : env->medeleg;
+  | // No MTE deferred-check logic anywhere in this function
+
+[compliant] target/riscv/kvm/kvm-cpu.c:256-256  (KVM CSR sync)
+  KVM path only synchronizes senvcfg (via KVM_CSR_CFG). No MT_ASYNC bit involved. Reset sets senvcfg=0. No KVM-capable RISC-V MTE feature exists.
+  | KVM_CSR_CFG("senvcfg",    senvcfg,    RISCV_CSR_REG(senvcfg)),
+  | ...
+  | env->senvcfg = 0;
+

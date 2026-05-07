@@ -1,0 +1,2 @@
+Per the defined criteria for reserving relocation numbers ahead of standardization, we would like to reserve 10 relocation numbers for the RISCV Y base ISA. Our current best estimate (based on existing CHERI ABI implementations and outstanding Y specification work items) is that the Y ISA will require 7 relocations. We prefer to round that up to 10 relocations for this reservation to reduce the risk of conflicts, with the intention of releasing any reserved relocation numbers that are unused once the Y base ABI is standardized.
+

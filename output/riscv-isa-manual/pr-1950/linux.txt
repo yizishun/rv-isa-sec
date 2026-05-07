@@ -1,0 +1,89 @@
+PR #1950  target=linux  overall=potential_risk
+Spec: vkeccak.vi only uses 25 of 32 elements per EGU64x32; upper 7 elements follow tail policy and the spec explicitly considers leaving them implementation-defined, creating a 448-bit cross-process covert channel through kernel context-switch save/restore of uninitialized-but-persisted vector register slots
+Violation: The kernel performs a vector context save/restore across a security boundary while vkeccak.vi has been executed with tail-agnostic policy (vta=1), and the hardware implementation writes microarchitecturally-sensitive remnant data into the upper 7 elements (indices 25-31) of each 32-element EGU64x32 group that the spec marks as tail-policy-dependent and not part of the Keccak state
+Consequence: info_leak
+Pattern: vstate_save|vstate_restore|riscv_vr_save|riscv_vr_restore|__arch_vstate_save|vcontext.*save|kvm_riscv_vcpu.*vector
+------------------------------------------------------------
+[potential_risk] arch/riscv/include/asm/vector.h:196-231  __riscv_v_vstate_save
+  Vector context save uses vsetvli with tail-agnostic policy (ta) at line 219, which stores ALL architecturally-visible vector register bytes to the task's datap buffer. If the hardware implementation of Zvknhk vkeccak.vi writes microarchitecturally-sensitive remnant data into tail elements (indices 25-31 of EGU64x32 groups) as the security spec describes, the kernel blindly captures this data. There is no scrubbing or masking of tail elements after cryptographic operations.
+  | asm volatile (
+  |   ".option push\n\t"
+  |   ".option arch, +zve32x\n\t"
+  |   "vsetvli %0, x0, e8, m8, ta, ma\n\t"  // ta = tail-agnostic
+  |   "vse8.v v0, (%1)\n\t"
+
+[potential_risk] arch/riscv/include/asm/vector.h:233-268  __riscv_v_vstate_restore
+  Vector context restore uses vsetvli with tail-agnostic policy (ta) at line 255, faithfully reloading all vector register bytes from the saved datap buffer. If the saved buffer contains sensitive tail element data from a prior vkeccak.vi execution, it is restored into the vector registers where it becomes readable by the owning task. The kernel has no logic to determine which bytes are legitimate Keccak state vs microarchitecturally-sensitive remnant data.
+  | asm volatile (
+  |   ".option push\n\t"
+  |   ".option arch, +zve32x\n\t"
+  |   "vsetvli %0, x0, e8, m8, ta, ma\n\t"  // ta = tail-agnostic
+  |   "vle8.v v0, (%1)\n\t"
+
+[compliant] arch/riscv/include/asm/vector.h:369-400  __switch_to_vector
+  Context-switch path correctly saves the previous task's vector state to its own thread.vstate.datap and sets deferred restore for the next task's state from its own datap. Each task has an independently allocated datap buffer, so there is no cross-task contamination of vector register state. The save/restore operates at byte granularity over the full register file, which is architecturally correct.
+  | regs = task_pt_regs(prev);
+  | riscv_v_vstate_save(&prev->thread.vstate, regs);  // saves to prev's own datap
+  | ...
+  | riscv_v_vstate_set_restore(next, task_pt_regs(next));  // restores from next's own datap
+
+[potential_risk] arch/riscv/kvm/vcpu.c:632-634  kvm_arch_vcpu_load
+  On VCPU load, the host vector context is saved and the guest vector context is restored via __kvm_riscv_vector_save/restore, which directly delegates to __riscv_v_vstate_save/restore. If the guest executed vkeccak.vi with vta=1 on a prior run and the hardware wrote sensitive remnant data into tail elements, those bytes are preserved in the guest_context.vector.datap buffer and reloaded on next VCPU load. The host userspace (QEMU) could read this buffer via KVM_GET_ONE_REG for vector registers, potentially exposing internal Keccak state across the VM boundary.
+  | kvm_riscv_vcpu_host_vector_save(&vcpu->arch.host_context);
+  | kvm_riscv_vcpu_guest_vector_restore(&vcpu->arch.guest_context,
+  |                                     vcpu->arch.isa);
+
+[potential_risk] arch/riscv/kvm/vcpu.c:656-659  kvm_arch_vcpu_put
+  On VCPU put, guest vector state (including any tail elements polluted by vkeccak.vi hardware remnant data) is saved to guest_context.vector.datap and host vector state is restored. The saved guest state persists in kernel memory accessible via the KVM VCPU fd, creating a channel where sensitive cryptographic microarchitectural state could be extracted by host userspace through the KVM register interface.
+  | kvm_riscv_vcpu_guest_vector_save(&vcpu->arch.guest_context,
+  |                                  vcpu->arch.isa);
+  | kvm_riscv_vcpu_host_vector_restore(&vcpu->arch.host_context);
+
+[potential_risk] arch/riscv/kernel/signal.c:73-108  save_v_state
+  Signal delivery saves the full vector state (riscv_v_vsize bytes) to a user-space signal frame on the task's stack via get_cpu_vector_context()/riscv_v_vstate_save()/put_cpu_vector_context(). The saved data includes any tail element data from vkeccak.vi remnant state. While this is the task's own data, it creates a persistence channel: the sensitive remnant data is now written to user-space memory where it could be inspected by the task itself or (in case of signal handler vulnerabilities) by an attacker who gains read access to the signal frame.
+  | get_cpu_vector_context();
+  | riscv_v_vstate_save(&current->thread.vstate, regs);
+  | put_cpu_vector_context();
+  | ...
+  | err |= __copy_to_user(datap, current->thread.vstate.datap, riscv_v_vsize);
+
+[compliant] arch/riscv/kernel/signal.c:115-143  __restore_v_state
+  Vector state restore from signal frame uses copy_from_user() at line 142 to prevent information leak from kernel to userspace during the restore operation. The restored data goes into the task's own vstate.datap, which is architecturally correct for self-restoration.
+  | return copy_from_user(current->thread.vstate.datap, datap, riscv_v_vsize);
+
+[compliant] arch/riscv/include/asm/vector.h:270-296  __riscv_v_vstate_discard
+  Discard function correctly overwrites all vector register groups (v0, v8, v16, v24) with -1 (all-ones) using vmv.v.i, then sets vtype to an invalid value to make vector registers architecturally inaccessible. This is the correct sanitization primitive that could be used to scrub tail elements after cryptographic operations, but it is currently only called from the traps.c error path and not integrated into the normal save/restore or VCPU load/put paths.
+  | "vmv.v.i v0, -1\n\t"
+  | "vmv.v.i v8, -1\n\t"
+  | "vmv.v.i v16, -1\n\t"
+  | "vmv.v.i v24, -1\n\t"
+  | "vsetvl %0, x0, %1\n\t"  // invalidates vtype
+
+[compliant] arch/riscv/include/asm/vector.h:129-165  __vstate_csr_save
+  CSR save correctly captures vstart, vtype, vl, and vcsr/vlenb state. These CSRs are properly saved to the ext_state structure. No additional Zvknhk-specific CSR state exists to save.
+  | "csrr %0, " __stringify(CSR_VSTART) "\n\t"
+  | "csrr %1, " __stringify(CSR_VTYPE) "\n\t"
+  | "csrr %2, " __stringify(CSR_VL) "\n\t"
+
+[compliant] arch/riscv/kvm/vcpu_vector.c:19-35  kvm_riscv_vcpu_vector_reset
+  VCPU vector reset correctly zeroes the guest vector context datap via memset(..., 0, riscv_v_vsize) when the VCPU has the 'v' extension. This ensures a fresh VCPU starts with clean vector state, preventing any stale data from prior allocations from leaking into the guest.
+  | cntx->vector.vlenb = riscv_v_vsize / 32;
+  | if (riscv_isa_extension_available(isa, v)) {
+  |   cntx->sstatus |= SR_VS_INITIAL;
+  |   WARN_ON(!cntx->vector.datap);
+  |   memset(cntx->vector.datap, 0, riscv_v_vsize);
+
+[compliant] arch/riscv/include/asm/entry-common.h:10-21  arch_exit_to_user_mode_prepare
+  Deferred vector restore path is correctly invoked on return to userspace when TIF_RISCV_V_DEFER_RESTORE is set. This is the lazy-restore optimization that avoids restoring vector state until the task actually returns to userspace.
+  | if (ti_work & _TIF_RISCV_V_DEFER_RESTORE) {
+  |   clear_thread_flag(TIF_RISCV_V_DEFER_RESTORE);
+  |   riscv_v_vstate_restore(&current->thread.vstate, regs);
+  | }
+
+[potential_risk] arch/riscv/kernel/kernel_mode_vector.c:169-188  riscv_v_context_nesting_end
+  In the preemptive vector context nesting end path, when the nesting depth reaches zero and a restore is pending (riscv_preempt_v_restore), the kernel restores vector state via __riscv_v_vstate_restore. If the kernel_vstate.datap contains saved tail element data from a prior kernel-mode vkeccak.vi usage, this data is restored into live vector registers. There is no scrubbing of sensitive cryptographic tail elements between the kernel-mode vector usage and the restore to userspace.
+  | if (depth == 0) {
+  |   if (riscv_preempt_v_restore(current)) {
+  |     __riscv_v_vstate_restore(vstate, vstate->datap);
+  |     __riscv_v_vstate_clean(regs);
+

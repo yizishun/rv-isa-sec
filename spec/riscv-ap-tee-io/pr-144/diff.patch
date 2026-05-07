@@ -1,0 +1,246 @@
+diff --git a/src/07-theory_operations.adoc b/src/07-theory_operations.adoc
+index 0f39c84..f18cc83 100644
+--- a/src/07-theory_operations.adoc
++++ b/src/07-theory_operations.adoc
+@@ -62,19 +62,9 @@ I/O rules apply:
+   and the RP.
+ * A TDI must not be bound to a TVM if the TSM managing the TVM does not own the
+   IDE keys for the TDI's physical device.
+-* The TSM that owns the IDE keys for an IDE stream established between a physical
+-  device and its RP also configures the corresponding RP PCIe IDE extended
+-  capability.
+-
+-As the TSM is responsible for setting both the RP IDE keys and PCI IDE
+-capabilities, it must be the IDE operations owner for any downstream device for
+-a given RP. As the overall platform resources owner, the hosting Supervisor Domain
+-software stack must register a RP for TEE I/O and IDE ownership with the TSM, by
+-calling the `sbi_covh_register_rp()` `COVH` function. This function associates a
+-RP id to its MMIO space (for the IDE capability configurations) and all the MMIO
+-ranges that are routed through it. The TSM must compare these 2 arguments with
+-the information it received from the platform ROT through the TEE I/O manifest.
+-If both match, it can proceed into establishing an SPDM session with the RP.
++* As the owner of the PCIe configuration space for all RPs on the platform, the
++  RDSM configures all IDE streams extended capability on behalf of Supervisor
++  Domain Managers (host and TSMs).
+ 
+ ===== PCIe Root Port IDE Key Programming
+ 
+@@ -87,6 +77,21 @@ Protocol (IDE_KM), provisioning the Root Port is a platform-specific operation.
+ This operation is delegated to the Root Domain Security Manager (RDSM), which
+ the TSM accesses via the `COVT` SBI's PCIe Root Port IDE management functions.
+ 
++===== PCIe Root Port IDE Extended Capability
++
++Since the PCIe configuration space occupies exactly one 4KB page and MPT access
++controls operate at page granularity, the RDSM (as the platform security
++enforcer) must retain exclusive ownership of the entire configuration space for
++all RPs. Consequently, it enforces that Supervisor Domain Managers configure the
++IDE Extended Capability for their owned streams via the `COVT`
++SBI `sbi_covt_program_rp_ide_stream` function.
++
++When requested to establish a xref:device-connection[connection] with a TEE-IO
++capable device, the TSM receives the IDE Extended Capability configuration for
++the allocated IDE stream from the Host Supervisor Domain. After successfully
++establishing the connection, it configures the IDE stream capabilities via the
++`sbi_covt_program_rp_ide_cap` SBI function.
++
+ === Device Initialization
+ 
+ A device may require special initialization before it can act correctly in
+@@ -268,9 +273,7 @@ and for binding or unbinding TDIs to or from a TVM.
+ 
+ The hosting Supervisor Domain manager requires the TSM to establish a secured
+ SPDM session with the physical device by calling the `sbi_covh_connect_device()`
+-COVH function. Before proceeding into actually establishing the session, the TSM
+-must check that the physical device is a downstream endpoint of a root port that
+-the hosting Supervisor Domain manager has previously registered with the TSM.
++COVH function.
+ 
+ The TSM establishes a secured SPDM session with the physical device DSM by going
+ through the steps described in the Secured SPDM Session section.
+diff --git a/src/09-coveio_abi.adoc b/src/09-coveio_abi.adoc
+index ed627c2..7e2eff4 100644
+--- a/src/09-coveio_abi.adoc
++++ b/src/09-coveio_abi.adoc
+@@ -9,56 +9,48 @@ must be in the `[1024:1087]` range.
+ 
+ === CoVE IO Host Extension (EID #0x434F5648 "COVH")
+ 
+-==== PCIe Root Port Management
+-
+-[#sbi_covh_register_rp]
+-===== Function: CoVE Host Register PCIe Root Port (FID #1024)
+-[source, C]
+------
+-struct sbiret sbi_covh_register_rp(unsigned long rp_id,
+-                                   unsigned long mmio_ranges);
+------
+-
+-Registers a PCIe Root Port (RP) for TEE I/O and IDE ownership with the TSM.
+-
+-This function associates a RP id to its MMIO space (for configuring the RP IDE
+-capability) and all the MMIO ranges that are routed through it.
+-
+-The TSM must compare these 2 arguments with the information it received from
+-the platform ROT through the TEE I/O manifest. If both match, it can proceed
+-into establishing an SPDM session with the RP.
+-
+-The possible error codes returned in `sbiret.error` are shown below.
+-
+-[#table_sbi_covh_register_rp]
+-.CoVE Host Register PCIe Root Port
+-[cols="2,3", width=90%, align="center", options="header"]
+-|===
+-| Error code              | Description
+-| SBI_SUCCESS             | The operation completed successfully.
+-| SBI_ERR_INVALID_PARAMS  | The `rp_id` index is invalid.
+-| SBI_ERR_FAILED          | The operation failed for unknown reasons.
+-|===
+-
+ ==== Physical Device Management
+ 
+ [#sbi_covh_connect_device]
+-===== Function: CoVE Host Connect Device (FID #1025)
++===== Function: CoVE Host Connect Device (FID #1024)
+ [source, C]
+ -----
+-struct sbiret sbi_covh_connect_device()(unsigned long device_id,
+-                                        unsigned long stream_id,
+-                                        unsigned long connection_data_addr_out,
+-                                        unsigned long connection_data_size);
++struct sbiret sbi_covh_connect_device(unsigned long device_id,
++                                      unsigned long ide_stream_desc,
++                                      unsigned long connection_data_addr_out,
++                                      unsigned long connection_data_size);
+ -----
+ 
+ Establishes a secure SPDM session between the TSM and a device identified by
+ `device_id`, and configure the PCIe IDE link between that device and its
+-upstream Root Port. The configured IDE link must use the selective IDE stream
+-identified by `stream_id`.
++upstream Root Port. The TSM must configure the IDE link according to the IDE
++stream description in `ide_stream_desc`.
+ 
+-The TSM returns the device connection transcript data to the host Supervisor Domain
+-manager at `connection_data_addr_out`, structured as follows:
++The `ide_stream_desc` IDE stream descriptor must be structured as follows:
++
++[#table_sbi_covt_rp_ide_stream_desc]
++.CoVE IDE Stream Descriptor
++[options=header]
++|===
++| *Byte Offset*         | *Field*          | *Size (bytes)* | *Description*
++| 00h                   | Stream_ID        | 1              | IDE selective stream ID
++| 01h                   | Num_Addr_Assoc   | 1              | Number of IDE Address Association Register blocks.
++                                                              `Num_Addr_Assoc` must not be greater than the corresponding
++                                                              value programmed in the `device_id` PCIe Selective IDE Stream Capability Register.
++| 02h                   | Reserved         | 2              | Must be 0
++| 04h                   | RID_Assoc_1      | 4              | RID Association Register 1 (See <<PCIE>>)
++| 08h                   | RID_Assoc_2      | 4              | RID Association Register 2 (See <<PCIE>>)
++| 0Ch                   | ADDR_0_Assoc_1   | 4              | Address Association Register 1 for block 0 (See <<PCIE>>)
++| 10h                   | ADDR_0_Assoc_2   | 4              | Address Association Register 2 for block 0 (See <<PCIE>>)
++| 14h                   | ADDR_0_Assoc_3   | 4              | Address Association Register 3 for block 0 (See <<PCIE>>)
++| ...                   | ...              | 4              | ...
++| 0Ch + ((N - 1) * 0Ch) | ADDR_N-1_Assoc_1 | 4              | Address Association Register 1 for block Num_Addr_Assoc - 1 (See <<PCIE>>)
++| 10h + ((N - 1) * 0Ch) | ADDR_N-1_Assoc_2 | 4              | Address Association Register 2 for block Num_Addr_Assoc - 1 (See <<PCIE>>)
++| 14h + ((N - 1) * 0Ch) | ADDR_N-1_Assoc_3 | 4              | Address Association Register 3 for block Num_Addr_Assoc - 1 (See <<PCIE>>)
++|===
++
++The TSM returns the device connection transcript data to the host Supervisor
++Domain manager at `connection_data_addr_out`, structured as follows:
+ 
+ [#table_sbi_covh_connection_transcript]
+ .CoVE Device Connection Transcript
+@@ -86,10 +78,10 @@ The possible error codes returned in `sbiret.error` are shown below.
+ |===
+ 
+ [#sbi_covh_disconnect_device]
+-===== Function: CoVE Host Disconnect Device (FID #1026)
++===== Function: CoVE Host Disconnect Device (FID #1025)
+ [source, C]
+ -----
+-struct sbiret sbi_covh_disconnect_device()(unsigned long device_id);
++struct sbiret sbi_covh_disconnect_device(unsigned long device_id);
+ -----
+ 
+ Disconnects the TSM from the device identified by `device_id`.
+@@ -113,7 +105,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ ==== TVM Memory Management
+ 
+ [#sbi_covh_add_tvm_interface_region]
+-===== Function: CoVE Host Add TVM Interface Region (FID #1027)
++===== Function: CoVE Host Add TVM Interface Region (FID #1026)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_add_tvm_interface_region(unsigned long tvm_id,
+@@ -147,7 +139,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ | SBI_ERR_FAILED          | The operation failed for unknown reasons.
+ |===
+ 
+-===== Function: CoVE Host Reclaim TVM Interface Region (FID #1028)
++===== Function: CoVE Host Reclaim TVM Interface Region (FID #1027)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_reclaim_tvm_interface_region(unsigned long tvm_id,
+@@ -183,7 +175,7 @@ The possible error codes returned in `sbiret.error` are shown below.
+ ==== Device Interface Management
+ 
+ [#sbi_covh_bind_interface]
+-===== Function: CoVE Host Bind Interface (FID #1029)
++===== Function: CoVE Host Bind Interface (FID #1028)
+ [source, C]
+ -----
+ struct sbiret sbi_covh_bind_interface()(unsigned long tvm_id,
+@@ -308,7 +300,7 @@ struct sbiret sbi_covh_get_device_connection_transcript(unsigned long device_id,
+ 
+ Pass the device connection transcript data back to the TSM for a given connected
+ device. The data is formatted according to the
+-[Device Connection Transcript](#function-cove-host-connect-device-fid-1027)
++[Device Connection Transcript](#function-cove-host-connect-device-fid-1026)
+ structure.
+ 
+ `transcript_data_addr_out` must be 4KB-aligned and points to a memory region
+@@ -849,7 +841,6 @@ A key status must be one of the following values:
+ 
+ [source, C]
+ -------
+-
+ enum sbi_covt_ide_key_status {
+      /* The key is not programmed in the Root Port */
+      Cleared,
+@@ -860,7 +851,6 @@ enum sbi_covt_ide_key_status {
+      /* The key is programmed and enabled */
+      Enabled,
+ };
+-
+ -------
+ 
+ When a selective IDE Stream State Machine transitions to the `Insecure` state
+@@ -893,3 +883,27 @@ The possible error codes returned in `sbiret.error` are shown below.
+ | SBI_ERR_INVALID_PARAM   | `key_desc` or `rp_id` is invalid.
+ | SBI_ERR_FAILED          | The operation failed for unknown reasons.
+ |===
++
++[#sbi_covt_program_rp_ide_stream]
++===== Function: CoVE TSM Program PCIe Root Port IDE Stream Extended Capability (FID #1029)
++[source, C]
++-----
++struct sbiret sbi_covt_program_rp_ide_stream(unsigned long rp_id,
++                                             unsigned long ide_stream_desc);
++-----
++
++Programs the IDE Extended Capability of PCIe Root Port `rp_id` for the IDE
++stream described in `ide_stream_desc`.
++
++[#table_sbi_covt_program_rp_ide_stream]
++.CoVE TSM Program PCIe Root Port IDE Stream
++[cols="2,3", width=90%, align="center", options="header"]
++|===
++| Error code              | Description
++| SBI_SUCCESS             | The operation completed successfully.
++| SBI_ERR_INVALID_PARAM   | `ide_stream_desc` is invalid.
++                            The IDE stream descriptor can be invalid if the
++                            stream ID is unknown or if the descriptor data is
++                            inconsistent.
++| SBI_ERR_FAILED          | The operation failed for unknown reasons.
++|===

@@ -1,0 +1,14 @@
+PR #2517  target=xiangshan  overall=compliant
+Spec: WFI in U-mode must trap as illegal instruction unconditionally (independent of mstatus.TW); the TW bit gates WFI trapping only for S-mode, while U-mode and VU-mode WFI must always trap via isModeHU or virtualInst respectively
+Violation: If the unconditional isModeHU (non-virtualized U-mode) term is removed or bypassed in the WFI trap logic, or if the trap decision depends solely on mstatus.TW without the unconditional U-mode check. In NewCSR.scala:1499 and CSR.scala:1116, the WFI illegal-instruction condition currently includes an explicit isModeHU term that unconditionally traps WFI in U-mode. If this term were lost during refactoring, WFI in U-mode with TW=0 would succeed without trapping, violating the privilege isolation model where U-mode must never execute WFI directly.
+Consequence: privilege_escape
+Pattern: wfi.*trap|illegalInst.*wfi.*:=|illegalWFI|!isModeM.*TW(?!.*isModeHU)|TW.*wfi(?!.*isModeHU)
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1499-1499  WFI illegal-instruction decode logic
+  WFI is unconditionally illegal in non-virtualized U-mode via the isModeHU term (isModeHU || !isModeM && mstatus.regOut.TW). isModeHU = !isVirtual && PrvmIsU(), so WFI always traps in U-mode regardless of mstatus.TW. The TW term only gates trapping in S-mode and other less-privileged modes. This correctly implements the RISC-V privilege spec requirement that U-mode must never execute WFI directly.
+  | io.toDecode.illegalInst.wfi        := isModeHU || !isModeM && mstatus.regOut.TW
+
+[compliant] src/main/scala/xiangshan/backend/fu/CSR.scala:1116-1116  WFI illegal-instruction decode (legacy path)
+  The legacy CSR path equivalently makes WFI unconditionally illegal in non-virtualized U-mode via privilegeMode === ModeU && !virtMode. The !virtMode negation correctly scopes this to host U-mode, while guest VU-mode WFI trapping is handled separately via illegalVWFI (line 1117). No bypass exists.
+  | val illegalWFI = valid && isWFI && (privilegeMode < ModeM && mstatusStruct.tw === 1.U ||  privilegeMode === ModeU && !virtMode)
+

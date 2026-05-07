@@ -1,0 +1,265 @@
+diff --git a/iopmp_ref_model/include/iopmp.h b/iopmp_ref_model/include/iopmp.h
+index 81ab8b0..e78ac99 100644
+--- a/iopmp_ref_model/include/iopmp.h
++++ b/iopmp_ref_model/include/iopmp.h
+@@ -69,6 +69,7 @@ typedef struct iopmp_dev_t {
+     bool imp_err_reqid_eid;             // IOPMP implements ERR_REQID.eid
+     bool imp_rridscp;                   // IOPMP implements RRIDSCP-related features
+     bool imp_msi;                       // IOPMP implements message-signaled interrupts (MSI)
++    bool imp_stall_buffer;              // IOPMP implements buffer to record and store stalled transactions
+ } iopmp_dev_t;
+ 
+ // Configurations of IOPMP when reset
+@@ -105,6 +106,7 @@ typedef struct iopmp_cfg_t {
+     bool imp_err_reqid_eid;             // IOPMP implements ERR_REQID.eid
+     bool imp_rridscp;                   // IOPMP implements RRIDSCP-related features
+     bool imp_msi;                       // IOPMP implements message-signaled interrupts (MSI)
++    bool imp_stall_buffer;              // IOPMP implements buffer to record and store stalled transactions
+ } iopmp_cfg_t;
+ 
+ // Enumerates specific match statuses for transactions
+diff --git a/iopmp_ref_model/include/iopmp_req_rsp.h b/iopmp_ref_model/include/iopmp_req_rsp.h
+index 959ec69..e40008b 100644
+--- a/iopmp_ref_model/include/iopmp_req_rsp.h
++++ b/iopmp_ref_model/include/iopmp_req_rsp.h
+@@ -49,6 +49,7 @@ typedef struct __attribute__((__packed__)) {
+     uint32_t rrid;          // Requester ID
+     uint8_t  user;          // User mode indicator
+     uint8_t  rrid_stalled;  // Requester ID stall status
++    uint8_t  rrid_stalled_no_available_buffer;  // Requester ID stall status due to no available stall buffer
+     uint16_t rrid_transl;   // The RRID tagged to outgoing transactions
+     status_e status;        // Transaction status (success or error)
+ } iopmp_trans_rsp_t;
+diff --git a/iopmp_ref_model/src/iopmp_reg.c b/iopmp_ref_model/src/iopmp_reg.c
+index 99c82d3..107a1f1 100644
+--- a/iopmp_ref_model/src/iopmp_reg.c
++++ b/iopmp_ref_model/src/iopmp_reg.c
+@@ -87,6 +87,9 @@ int reset_iopmp(iopmp_dev_t *iopmp, iopmp_cfg_t *cfg)
+     // ENTRYOFFSET must beyond SRCMD table
+     if (cfg->entryoffset < (SRCMD_TABLE_BASE_OFFSET + cfg->rrid_num * SRCMD_REG_STRIDE))
+         return -1;
++    // Stall buffer is only needed when stall features are implemented
++    if (cfg->imp_stall_buffer && !cfg->stall_en)
++        return -1;
+ 
+     // Zeroize all states
+     memset(iopmp, 0, sizeof(*iopmp));
+@@ -148,6 +151,7 @@ int reset_iopmp(iopmp_dev_t *iopmp, iopmp_cfg_t *cfg)
+     iopmp->imp_err_reqid_eid                = cfg->imp_err_reqid_eid;
+     iopmp->imp_rridscp                      = cfg->imp_rridscp;
+     iopmp->imp_msi                          = cfg->imp_msi;
++    iopmp->imp_stall_buffer                 = cfg->imp_stall_buffer;
+ 
+     return 0;
+ }
+@@ -496,7 +500,13 @@ void write_register(iopmp_dev_t *iopmp, uint64_t offset, reg_intf_dw data, uint8
+             iopmp->reg_file.mdstall.md     = mdstall_temp.md;
+             rrid_stall_update(iopmp, iopmp->reg_file.mdstall.exempt);
+             if ((mdstall_temp.raw == 0) && (iopmp->reg_file.mdstall.raw == 0)) {
+-                iopmp->stall_cntr = 0;
++                // The stalled transactions are resumed. If IOPMP implements a
++                // stall buffer, IOPMP flushes all the stalled transactions in
++                // the buffer. The reference model just zerorize the counter to
++                // simulate this behavior.
++                if (iopmp->imp_stall_buffer) {
++                    iopmp->stall_cntr = 0;
++                }
+             }
+         }
+         if (num_bytes == 4) break;
+@@ -572,7 +582,9 @@ void write_register(iopmp_dev_t *iopmp, uint64_t offset, reg_intf_dw data, uint8
+                 iopmp->reg_file.err_cfg.msi_en         = err_cfg_temp.msi_en;
+                 iopmp->reg_file.err_cfg.msidata        = err_cfg_temp.msidata;
+             }
+-            iopmp->reg_file.err_cfg.stall_violation_en = err_cfg_temp.stall_violation_en;
++            if (iopmp->reg_file.hwcfg2.stall_en) {
++                iopmp->reg_file.err_cfg.stall_violation_en = err_cfg_temp.stall_violation_en;
++            }
+             iopmp->reg_file.err_cfg.rsv1               = 0;
+             iopmp->reg_file.err_cfg.rsv2               = 0;
+         }
+diff --git a/iopmp_ref_model/src/iopmp_validate.c b/iopmp_ref_model/src/iopmp_validate.c
+index a0fb9be..427a8aa 100644
+--- a/iopmp_ref_model/src/iopmp_validate.c
++++ b/iopmp_ref_model/src/iopmp_validate.c
+@@ -103,17 +103,34 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+         goto stop_and_report_fault;
+     }
+ 
+-    if (iopmp->rrid_stall[rrid]) {
+-        if (iopmp->stall_cntr != STALL_BUF_DEPTH){
++    // Check rrid_stall[s] bit array if IOPMP implements stall-related feature.
++    // rrid_stall[s] are signals indicating that transactions with corresponding
++    // RRID s must be stalled (rrid_stall[s] = 1) or not (rrid_stall[s] = 0).
++    if (iopmp->reg_file.hwcfg2.stall_en && iopmp->rrid_stall[rrid]) {
++        // IOPMP can implement a stall buffer to queue stalled transactions.
++        // If there is any space in the buffer, IOPMP queues the transactions
++        // until the buffer is full. The reference model just returns a flag to
++        // indicate that the input transaction is stalled in this case.
++        if (iopmp->imp_stall_buffer && iopmp->stall_cntr != STALL_BUF_DEPTH) {
+             iopmp_trans_rsp->rrid_stalled = 1;
+             iopmp->stall_cntr++;
+-            return ;
++            return;
+         }
+-        else if (iopmp->reg_file.err_cfg.stall_violation_en) {
++        // If IOPMP doesn't implement any stall buffer or the stall buffer is
++        // full, IOPMP cannot queue the transactions.
++        // IOPMP can fault the stalled transactions in this case and record the
++        // error due to the stalled transactions.
++        if (iopmp->reg_file.err_cfg.stall_violation_en) {
+             iopmp->error_suppress = iopmp->reg_file.err_cfg.rs;
+             error_type = STALLED_TRANSACTION;
+             goto stop_and_report_fault;
+         }
++
++        // There is no available stall buffer and IOPMP doesn't fault stalled
++        // transactions. The transactions are truly stalled. The reference model
++        // just return a special flag to simulate this behavior.
++        iopmp_trans_rsp->rrid_stalled_no_available_buffer = 1;
++        return;
+     }
+ 
+     // When no_w is set to 1, the IOPMP denies all write transactions regardless
+@@ -166,7 +183,7 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+     rule_analyzer_i.rrid         = rrid;
+     rule_analyzer_i.trans_start  = trans_req->addr;
+     rule_analyzer_i.trans_end    = trans_req->addr +
+-                          ((int)pow(2, trans_req->size) * (trans_req->length + 1));
++                                   ((int)pow(2, trans_req->size) * (trans_req->length + 1));
+     rule_analyzer_i.perm         = trans_perm;
+     rule_analyzer_i.is_amo       = trans_req->is_amo;
+     rule_analyzer_o.match_status = ENTRY_NOTMATCH;
+@@ -190,9 +207,9 @@ void iopmp_validate_access(iopmp_dev_t *iopmp, iopmp_trans_req_t *trans_req, iop
+             /* Assign necessary input information */
+             rule_analyzer_i.prev_iopmpaddr =
+                 (cur_entry == 0) ? 0 : CONCAT32(iopmp->iopmp_entries.entry_table[cur_entry - 1].entry_addrh.addrh,
+-                                            iopmp->iopmp_entries.entry_table[cur_entry - 1].entry_addr.addr);
++                                                iopmp->iopmp_entries.entry_table[cur_entry - 1].entry_addr.addr);
+             rule_analyzer_i.iopmpaddr = CONCAT32(iopmp->iopmp_entries.entry_table[cur_entry].entry_addrh.addrh,
+-                                            iopmp->iopmp_entries.entry_table[cur_entry].entry_addr.addr);
++                                                 iopmp->iopmp_entries.entry_table[cur_entry].entry_addr.addr);
+             rule_analyzer_i.iopmpcfg = iopmp->iopmp_entries.entry_table[cur_entry].entry_cfg;
+             rule_analyzer_i.md       = cur_md;
+             /* Reset output information */
+diff --git a/iopmp_ref_model/verif/tests/compactmodel.c b/iopmp_ref_model/verif/tests/compactmodel.c
+index 8ea1d42..0f63a50 100644
+--- a/iopmp_ref_model/verif/tests/compactmodel.c
++++ b/iopmp_ref_model/verif/tests/compactmodel.c
+@@ -65,6 +65,7 @@ int main()
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
+ 
+ #if (SRC_ENFORCEMENT_EN == 0)
+ 
+diff --git a/iopmp_ref_model/verif/tests/dynamicmodel.c b/iopmp_ref_model/verif/tests/dynamicmodel.c
+index fc17571..a25e9fd 100644
+--- a/iopmp_ref_model/verif/tests/dynamicmodel.c
++++ b/iopmp_ref_model/verif/tests/dynamicmodel.c
+@@ -69,6 +69,7 @@ int main()
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
+ 
+ #if (SRC_ENFORCEMENT_EN == 0)
+     START_TEST("Test OFF - Read Access permissions");
+diff --git a/iopmp_ref_model/verif/tests/fullmodel.c b/iopmp_ref_model/verif/tests/fullmodel.c
+index b9c3600..091873e 100644
+--- a/iopmp_ref_model/verif/tests/fullmodel.c
++++ b/iopmp_ref_model/verif/tests/fullmodel.c
+@@ -61,6 +61,7 @@ int main()
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
+ 
+ #if (SRC_ENFORCEMENT_EN == 0)
+     START_TEST("Test OFF - Read Access permissions");
+diff --git a/iopmp_ref_model/verif/tests/isolationmodel.c b/iopmp_ref_model/verif/tests/isolationmodel.c
+index d58c130..555eed8 100644
+--- a/iopmp_ref_model/verif/tests/isolationmodel.c
++++ b/iopmp_ref_model/verif/tests/isolationmodel.c
+@@ -64,6 +64,7 @@ int main()
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
+ 
+ #if (SRC_ENFORCEMENT_EN == 0)
+ 
+diff --git a/iopmp_ref_model/verif/tests/libiopmp_INFO.c b/iopmp_ref_model/verif/tests/libiopmp_INFO.c
+index d7ef2b3..5c2f8b7 100644
+--- a/iopmp_ref_model/verif/tests/libiopmp_INFO.c
++++ b/iopmp_ref_model/verif/tests/libiopmp_INFO.c
+@@ -63,6 +63,8 @@ int main(void)
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
++
+     reset_iopmp(&iopmp_dev, &cfg);
+ 
+     // Read the registers
+diff --git a/iopmp_ref_model/verif/tests/rapidmodel.c b/iopmp_ref_model/verif/tests/rapidmodel.c
+index 4b88414..86a707a 100644
+--- a/iopmp_ref_model/verif/tests/rapidmodel.c
++++ b/iopmp_ref_model/verif/tests/rapidmodel.c
+@@ -69,6 +69,7 @@ int main()
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
+ 
+ #if (SRC_ENFORCEMENT_EN == 0)
+ 
+diff --git a/iopmp_ref_model/verif/tests/unnamed_model_1.c b/iopmp_ref_model/verif/tests/unnamed_model_1.c
+index c3eef47..848fa32 100644
+--- a/iopmp_ref_model/verif/tests/unnamed_model_1.c
++++ b/iopmp_ref_model/verif/tests/unnamed_model_1.c
+@@ -65,6 +65,7 @@ int main()
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
+ 
+ #if (SRC_ENFORCEMENT_EN == 0)
+ 
+diff --git a/iopmp_ref_model/verif/tests/unnamed_model_2.c b/iopmp_ref_model/verif/tests/unnamed_model_2.c
+index 25c423a..d9daf14 100644
+--- a/iopmp_ref_model/verif/tests/unnamed_model_2.c
++++ b/iopmp_ref_model/verif/tests/unnamed_model_2.c
+@@ -66,6 +66,7 @@ int main()
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
+ 
+ #if (SRC_ENFORCEMENT_EN == 0)
+     START_TEST("Test OFF - Read Access permissions");
+diff --git a/iopmp_ref_model/verif/tests/unnamed_model_3.c b/iopmp_ref_model/verif/tests/unnamed_model_3.c
+index 6110f9e..3aecd09 100644
+--- a/iopmp_ref_model/verif/tests/unnamed_model_3.c
++++ b/iopmp_ref_model/verif/tests/unnamed_model_3.c
+@@ -65,6 +65,7 @@ int main()
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
+ 
+ #if (SRC_ENFORCEMENT_EN == 0)
+     START_TEST("Test OFF - Read Access permissions");
+diff --git a/iopmp_ref_model/verif/tests/unnamed_model_4.c b/iopmp_ref_model/verif/tests/unnamed_model_4.c
+index 3828a45..b37589a 100644
+--- a/iopmp_ref_model/verif/tests/unnamed_model_4.c
++++ b/iopmp_ref_model/verif/tests/unnamed_model_4.c
+@@ -60,6 +60,7 @@ int main()
+     cfg.imp_err_reqid_eid = true;
+     cfg.imp_rridscp = true;
+     cfg.imp_msi = true;
++    cfg.imp_stall_buffer = true;
+ 
+ #if (SRC_ENFORCEMENT_EN == 0)
+     START_TEST("Test OFF - Read Access permissions");

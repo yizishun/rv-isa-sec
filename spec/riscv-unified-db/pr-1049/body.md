@@ -1,0 +1,1 @@
+I have successfully created a clean branch add-zvfofp8min-extension-clean with only the necessary Zvfofp8min extension file added, addressing the maintainer's concern about extra changes in PR #1030, and pushed it to the repository.

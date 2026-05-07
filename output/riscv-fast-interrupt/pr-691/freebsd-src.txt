@@ -1,0 +1,39 @@
+PR #691  target=freebsd-src  overall=compliant
+Spec: FreeBSD currently has no Smip implementation, but any future port must not assume hardware stack isolation — the new spec leaves the interrupted context's stack exposed to handler save/restore, so the handler's ABI frame must be compatible with whatever stack the interrupted code was using
+Violation: A FreeBSD Smip interrupt handler implementation that assumes the hardware performs automatic stack pointer swapping (cspspush/cspspop per the old spec) and therefore does not reserve frame space on the interrupted context's stack, or relies on automatic stack isolation to protect the interrupted context's stack from handler spill. Under the new spec, the handler unconditionally saves x10-x15 directly onto the interrupted context's stack without any swap, so any gap between the interrupted frame and the handler's assumed save area results in silent register corruption on the victim stack.
+Consequence: data_corruption
+Pattern: riscv_cspspush|riscv_cspspop|sstatus\.sxsp|sstatus\.mxsp|SP_SWAP|stackptr_swap|smip_stack_switch|condition.*stack.*swap
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/exception.S:41-114  save_registers (macro)
+  The generic register save macro unconditionally does 'addi sp, sp, -(TF_SIZE)' to reserve frame space on the current stack before saving all registers including x10-x15 (a0-a5). No Smip-specific stack swap logic exists; no cspspush/cspspop instructions are used; no assumption about hardware-mediated stack isolation is present.
+  | addi	sp, sp, -(TF_SIZE)
+  | 	sd	ra, (TF_RA)(sp)
+  | 	...
+  | 	sd	a0, (TF_A + 0 * 8)(sp)  /* x10 */
+  | 	sd	a1, (TF_A + 1 * 8)(sp)  /* x11 */
+  | 	...
+
+[compliant] sys/riscv/riscv/trap.c:307-323  do_trap_supervisor
+  Trap dispatch uses the generic intr_irq_handler() path for all interrupts including supervisor software interrupts. No Smip-specific handler exists; SIP_SSIP is handled through the standard sbi_ipi driver, not through any conditional stack-swap mechanism.
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  | 		intr_irq_handler(frame, INTR_ROOT_IRQ);
+  | 		return;
+  | }
+
+[compliant] sys/riscv/include/riscvreg.h:60-174  (CSR definitions)
+  Only standard RISC-V privileged spec CSR bit definitions present (SSTATUS_SIE, SIP_SSIP, SIP_STIP, etc.). No Smip-specific definitions such as sstatus.sxsp, sstatus.mxsp, or any SP_SWAP-related macros exist.
+  | #define	SIP_SSIP	(1 << 1)
+  | #define	SIP_STIP	(1 << 5)
+
+[compliant] sys/riscv/riscv/sbi_ipi.c:96-126  sbi_ipi_intr
+  The SBI IPI handler only clears SIP_SSIP and dispatches IPIs via intr_ipi_dispatch(). No Smip-specific handler logic, no conditional stack swap, no reliance on hardware stack isolation. Standard FreeBSD IPI dispatch model.
+  | csr_clear(sip, SIP_SSIP);
+  | 	...
+  | 	intr_ipi_dispatch(ipi);
+
+[compliant] sys/riscv/riscv/intc.c:262-289  intc_intr
+  The local interrupt controller handler uses the trapframe's scause field to identify the interrupt source and dispatches via intr_isrc_dispatch(). No Smip-specific logic or stack manipulation.
+  | active_irq = frame->tf_scause & SCAUSE_CODE;
+  | 	src = &sc->isrcs[active_irq];
+  | 	intr_isrc_dispatch(&src->isrc, frame);
+

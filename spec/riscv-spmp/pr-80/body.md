@@ -1,0 +1,4 @@
+- the lock feature of SPMP is required 
+- a flush should be actioned after writing to sspmpswitch
+- the M-mode should store and clear affected configuration bits before reconfiguration of pmpnum
+- explain what happens if spmpaddr is narrower than the number of supported physical address range

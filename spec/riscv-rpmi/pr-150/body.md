@@ -1,0 +1,1 @@
+Add a new SYSTEM_IRQ service group which allows application processors to receive external interrupts from platform microcontroller. The platform microcontroller can use this service group to forward platform interrupts or inject software generated interrupts.

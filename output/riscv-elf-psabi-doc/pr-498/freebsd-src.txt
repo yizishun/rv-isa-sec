@@ -1,0 +1,54 @@
+PR #498  target=freebsd-src  overall=potential_risk
+Spec: FreeBSD's ELF loader has zero e_flags validation; RVY capability binaries load silently on non-CHERI kernels, SIGILL on first capability instruction because no gate rejects ISA-mismatched binaries
+Violation: In sys/kern/imgact_elf.c, exec_elfN_imgact() loads a RISC-V ELF binary with EF_RISCV_RVY (0x00000040) set in e_flags on a non-CHERI FreeBSD kernel without any e_flags validation — check_header() ignores e_flags entirely, ELF_MACHINE_OK() checks only e_machine, and the flag flows unvalidated into p_elf_flags and userspace AT_EHDRFLAGS
+Consequence: denial_of_service
+Pattern: p_elf_flags|AT_EHDRFLAGS|hdr->e_flags
+------------------------------------------------------------
+[potential_risk] sys/kern/imgact_elf.c:493-519  __elfN(check_header)
+  check_header() validates EI_CLASS, EI_DATA, EI_VERSION, e_phentsize, e_version, and e_machine, but performs zero validation of hdr->e_flags. Any unknown RISC-V e_flags bit (including a future EF_RISCV_RVY = 0x40) passes through unchecked. No ELF_MACHINE_OK() macro exists in this file. This is a structural gap: the kernel has no mechanism to reject ELF binaries whose e_flags advertise ISA extensions the running kernel does not support.
+  | static int
+  | __elfN(check_header)(const Elf_Ehdr *hdr)
+  | {
+  | 	const Elf_Brandinfo *bi;
+  | 	int i;
+  | 
+  | 	if (!IS_ELF(*hdr) ||
+  | 	    hdr->e_ident[EI_CLASS] != ELF_TARG_CLASS ||
+  | 	    hdr->e_ident[EI_DATA] != ELF_TARG_DATA ||
+  | 	    hdr->e_ident[EI_VERSION] != EV_CURRENT ||
+  | 	    hdr->e_phentsize != sizeof(Elf_Phdr) ||
+  | 	    hdr->e_version != ELF_TARG_VER)
+  | 		return (ENOEXEC);
+  | 	/* ... e_machine check only, no e_flags check ... */
+  | 	return (0);
+  | }
+
+[potential_risk] sys/kern/imgact_elf.c:1428-1435  exec_elfN_imgact
+  Raw hdr->e_flags is copied unvalidated into two persistent locations: (1) elf_auxargs->hdr_eflags at line 1428, which later flows to userspace via AT_EHDRFLAGS at line 1470; (2) imgp->proc->p_elf_flags at line 1435, which persists for the process lifetime and is written into core dumps at line 1948. An attacker who controls a RISC-V ELF binary can inject arbitrary flag bits into both the auxiliary vector (visible to rtld and the process itself) and the per-process struct proc.
+  | elf_auxargs->hdr_eflags = hdr->e_flags;
+  | /* ... */
+  | imgp->proc->p_elf_flags = hdr->e_flags;
+
+[potential_risk] sys/kern/imgact_elf.c:1470-1470  __elfN(freebsd_copyout_auxargs)
+  AT_EHDRFLAGS is copied to the userspace auxiliary vector from args->hdr_eflags (which is the raw, unvalidated hdr->e_flags). Userspace consumers (rtld, the process itself via /proc/self/auxv) see whatever e_flags bits were in the ELF header, with no kernel-side masking of unsupported flags. While the current rtld only prints AT_EHDRFLAGS at rtld.c:6615, future userspace could make security-relevant decisions based on these flags.
+  | AUXARGS_ENTRY(pos, AT_EHDRFLAGS, args->hdr_eflags);
+
+[potential_risk] sys/kern/imgact_elf.c:1948-1948  __elfN(puthdr)
+  Core dump path round-trips p_elf_flags (which originated from the unvalidated hdr->e_flags) back into the core ELF header e_flags field. An attacker-set flag bit persists across the entire process lifecycle and into forensic artifacts, potentially confusing analysis tools that assume kernel-validated e_flags.
+  | ehdr->e_flags = td->td_proc->p_elf_flags;
+
+[compliant] sys/sys/elf_common.h:396-403  (RISC-V e_flags definitions)
+  Current EF_RISCV_* definitions cover only bits 0x00-0x1F (RVC, FLOAT_ABI_SOFT/SINGLE/DOUBLE/QUAD, RVE, TSO). Bit 0x40 (EF_RISCV_RVY) is not yet defined anywhere in the codebase. The PR proposes adding this definition. If added without corresponding kernel-side e_flags validation in check_header(), the structural gap described above becomes triggerable.
+  | #define	EF_RISCV_RVC		0x00000001
+  | #define	EF_RISCV_FLOAT_ABI_MASK	0x00000006
+  | #define	EF_RISCV_FLOAT_ABI_SOFT	0x00000000
+  | #define	EF_RISCV_FLOAT_ABI_SINGLE 0x000002
+  | #define	EF_RISCV_FLOAT_ABI_DOUBLE 0x000004
+  | #define	EF_RISCV_FLOAT_ABI_QUAD	0x00000006
+  | #define	EF_RISCV_RVE		0x00000008
+  | #define	EF_RISCV_TSO		0x00000010
+
+[potential_risk] sys/sys/elf_common.h:396-403  (missing EF_RISCV capability mask)
+  There is no EF_RISCV_ALLOWED_MASK or equivalent kernel-internal mask defining which e_flags bits the running kernel understands and supports. Without such a mask, check_header() has no declarative way to distinguish known-safe flags from unknown/dangerous ones. This is a prerequisite for adding validation. Compare: Linux's arch/riscv/kernel/elf_kexec.c validates e_flags before kexec, and the Linux kernel proper rejects EF_RISCV_RVE on non-RVE harts.
+  | /* No EF_RISCV_ALLOWED_MASK or kernel-internal flag whitelist exists */
+

@@ -1,0 +1,109 @@
+PR #865  target=freebsd-src  overall=compliant
+Spec: FreeBSD pmap must correctly program PTE tag-clearing bits for shared pages and user-kernel boundary mappings; this PR makes platform-defined load-tag-clearing explicitly normative, so any kernel assumption that loaded tags always equal stored tags is a security violation at every cross-domain capability transfer point
+Violation: FreeBSD kernel code loads a capability through an MMU mapping or PMA region where platform-defined tag-clearing is active (e.g., a PTE configured to strip tags for cross-address-space data sharing, an MMIO PMA that cannot store tags, or a CHERIoT-style load filter), but the kernel does not account for the cleared tag and either dereferences the now-untagged capability without checking, or relies on its authority to enforce a security boundary. Concretely: (1) pmap enters a PTE with tag-clearing semantics intended to deanthropomorphize capabilities on shared pages between VMs, but the PTE bits are misprogrammed, allowing full tagged capabilities to transit; (2) copyin/copyout paths depend on tag-clearing mappings to strip authority from user capabilities entering kernel space, but the underlying pmap entry incorrectly preserves tags; (3) sigreturn restores capability register frames from user-controlled memory through a mapping that unexpectedly preserves tags, giving userspace the ability to inject tagged capabilities into the kernel or a different privilege context; (4) bhyve capability load/store emulation virtualizes tag-clearing behavior inconsistently with hardware, causing guest kernels to load tagged capabilities they should not possess.
+Consequence: privilege_escape
+Pattern: LOAD_CAP or capability load through PTE where HW tag-clearing is assumed by kernel security policy but not enforced in page table entry or PMA configuration
+------------------------------------------------------------
+[compliant] sys/riscv/include/pte.h:40-103  (PTE definitions)
+  No CHERI capability tag-clearing PTE bits exist. pt_entry_t is hardcoded to uint64_t. Only standard Sv39/Sv48 PTE bits (V/R/W/X/U/G/A/D) plus two software bits (PTE_SW_MANAGED at bit 9, PTE_SW_WIRED at bit 8) and Svpbmt MA bits [62:61] are defined. PTE_HI_MASK at line 132 reserves bits 63-54 as 'reserved for future use' but no tag-clearing or CHERI enforcement bits are programmed. Since no CHERI PTE semantics are claimed, there is no violation — the pmap cannot misprogram tag-clearing bits that don't exist.
+  | typedef uint64_t pt_entry_t;  /* page table entry */
+  | #define PTE_SW_MANAGED (1 << 9)
+  | #define PTE_SW_WIRED   (1 << 8)
+  | #define PTE_HI_MASK    0xFFC0000000000000ULL
+
+[compliant] sys/riscv/riscv/copyinout.S:60-108  copyin/copyout (copycommon macro)
+  copyin/copyout uses integer ld/sd (lines 88-90, 99-100), not capability load/store instructions (CL[BHWD]/SC[BHWD]). On CHERI RISC-V hardware, integer loads do not propagate capability tags or metadata — they load only the 64-bit data payload. This means copyin from userspace cannot inject tagged capabilities into the kernel through these paths regardless of PTE configuration. The copycommon macro is correct for its stated purpose: copying raw data between address spaces without propagating capability authority.
+  | 2:  ld  a4, 0(a0)    /* Load word from src */
+  |     addi a0, a0, XLEN_BYTES
+  |     sd  a4, 0(a1)    /* Store word in dest */
+  |     addi a1, a1, XLEN_BYTES
+
+[compliant] sys/riscv/riscv/support.S:145-225  fueword/fueword64 (line 145), suword/suword64 (line 212)
+  fueword/fueword64 and suword/suword64 similarly use integer ld/sd (lines 152, 219), not capability load/stores. No capability tags can transit through these primitives. The lr.d/sc.d in casueword (lines 82-84) are also integer operations. Again correct: these are data-transfer primitives that should not propagate capability authority across privilege boundaries.
+  | ld  a0, 0(a0)    /* Try loading the data */  // fueword
+  | sd  a1, 0(a0)    /* Try storing the data */  // suword
+
+[potential_risk] sys/riscv/riscv/exec_machdep.c:231-262  set_mcontext
+  set_mcontext() performs raw memcpy of user-provided mcontext_t register values into the kernel trapframe (lines 250-258) with only a limited sstatus field validation (lines 245-248). The only check prevents writes to read-only sstatus bits (SD, XS) and the FS field; there is no capability tag validation, no sealing check, and no bounds/permission restriction. On a CHERI build where __register_t resolves to __intcap_t (128-bit capability), this function would blindly copy full capability-bearing registers from a user-controlled ucontext_t back into the kernel trapframe via sys_sigreturn (line 326). However, struct trapframe uses hardcoded uint64_t (not __register_t), and CTASSERTs at lines 192-203 verify the array sizes match. In practice this mismatch between capability-width gpregs and integer-width trapframe would cause a compile-time assertion failure, preventing the unsafe code from being built — which is the defense mechanism.
+  | /* Only sstatus bits validated, then blind memcpy: */
+  | memcpy(tf->tf_t, mcp->mc_gpregs.gp_t, sizeof(tf->tf_t));
+  | memcpy(tf->tf_s, mcp->mc_gpregs.gp_s, sizeof(tf->tf_s));
+  | memcpy(tf->tf_a, mcp->mc_gpregs.gp_a, sizeof(tf->tf_a));
+  | tf->tf_ra = mcp->mc_gpregs.gp_ra;
+  | tf->tf_sp = mcp->mc_gpregs.gp_sp;
+  | tf->tf_sepc = mcp->mc_gpregs.gp_sepc;
+
+[potential_risk] sys/riscv/riscv/exec_machdep.c:317-334  sys_sigreturn
+  sys_sigreturn() copies in a full ucontext_t from user-controlled memory via copyin() (line 323), then passes it to set_mcontext() (line 326) with no additional sanitization. If __CHERI__ were active and copyin() used capability-aware loads, the user could forge a ucontext_t containing valid tagged capabilities in gpregs fields. However, as noted above, copyin() uses integer ld (not capability loads), so tags are stripped at the hardware level during the copyin itself. The CTASSERT mismatch between capability-width gpregs and uint64_t trapframe would also block compilation.
+  | if (copyin(uap->sigcntxp, &uc, sizeof(uc)))
+  |     return (EFAULT);
+  | error = set_mcontext(td, &uc.uc_mcontext);
+  | if (error != 0)
+  |     return (error);
+  | kern_sigprocmask(td, SIG_SETMASK, &uc.uc_sigmask, NULL, 0);
+  | return (EJUSTRETURN);
+
+[compliant] sys/riscv/include/frame.h:46-58  (struct trapframe definition)
+  struct trapframe uses hardcoded uint64_t fields for all registers (ra, sp, gp, tp, t[7], s[12], a[8], sepc, sstatus, stval, scause). It does NOT use __register_t. This means even on a CHERI build, the trapframe is strictly 64-bit integer and cannot hold capability-width (128-bit) registers. This hardcoding provides a type-level defense against capability register injection: CTASSERTs in exec_machdep.c (lines 192-203) would fire if gpregs (which uses __register_t) were wider than the trapframe. The downside is that a CHERI kernel cannot save/restore actual capability registers through the trapframe — it would need a separate capability-aware frame structure.
+  | struct trapframe {
+  |     uint64_t tf_ra;
+  |     uint64_t tf_sp;
+  |     uint64_t tf_gp;
+  |     uint64_t tf_tp;
+  |     uint64_t tf_t[7];
+  |     uint64_t tf_s[12];
+  |     uint64_t tf_a[8];
+  |     uint64_t tf_sepc;
+  |     uint64_t tf_sstatus;
+  |     uint64_t tf_stval;
+  |     uint64_t tf_scause;
+  | };
+
+[potential_risk] sys/riscv/include/ucontext.h:38-48  (struct gpregs definition)
+  struct gpregs uses __register_t for all fields (lines 39-47). On non-CHERI this resolves to __int64_t (64-bit). On CHERI (__CHERI__ defined), __register_t would resolve through __intptr_t → __intcap_t (128-bit capability). This means the mcontext_t layout silently changes size based on the CHERI preprocessor flag. The _Static_assert at exec_machdep.c:74 locks in mcontext_t at 864 bytes — on a CHERI build this would fail, which is the safety net. But the type-level duality (gpregs is CHERI-aware but trapframe is not) creates a fragile split that could lead to errors if someone makes trapframe CHERI-aware without adding corresponding validation logic to set_mcontext().
+  | struct gpregs {
+  |     __register_t gp_ra;   /* 8 bytes non-CHERI, 16 bytes CHERI */
+  |     __register_t gp_sp;
+  |     __register_t gp_gp;
+  |     __register_t gp_tp;
+  |     __register_t gp_t[7];
+  |     __register_t gp_s[12];
+  |     __register_t gp_a[8];
+  |     __register_t gp_sepc;
+  |     __register_t gp_sstatus;
+  | };
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:460-524  riscv_handle_exception
+  The bhyve VMM hypervisor exception handler deals with standard RISC-V trap causes (SCAUSE_ILLEGAL_INSTRUCTION, SCAUSE_VIRTUAL_SUPERVISOR_ECALL, SCAUSE_VIRTUAL_INSTRUCTION, etc.) and uses standard integer register loads/stores. There is no CHERI capability load/store emulation, no capability register virtualization, and no tag-clearing logic. SCAUSE_ILLEGAL_INSTRUCTION at line 489 is handled as a BOGUS exit — CHERI instructions would fall into this unhandled path. Since no CHERI guest support is claimed, this is compliant. Adding CHERI guest support would require: capability register save/restore in hypctx, CHERI instruction emulation, and tag-clearing virtualization in hgatp page walks.
+  | case SCAUSE_ILLEGAL_INSTRUCTION:
+  |     /* TODO: handle illegal instruction properly. */
+  |     printf("%s: Illegal instruction at %lx ...", ...);
+  |     vmm_stat_incr(hypctx->vcpu, VMEXIT_UNHANDLED, 1);
+  |     vme->exitcode = VM_EXITCODE_BOGUS;
+  |     handled = false;
+  |     break;
+
+[compliant] sys/riscv/vmm/vmm.c:442-460  vm_get_capability/vm_set_capability
+  vm_get_capability() and vm_set_capability() are generic VM capability query/control interface (VM_CAP_MAX bounds checking), NOT CHERI hardware capability register emulation. The naming collision between 'VM capability' (bhyve VM feature flags) and 'CHERI capability' (hardware capability registers) is unfortunate but not a security issue. No CHERI capability load/store virtualization exists — guest CHERI instructions would trap as illegal instructions and be rejected by the hypervisor.
+  | vm_get_capability(struct vcpu *vcpu, int type, int *retval) {
+  |     if (type < 0 || type >= VM_CAP_MAX)
+  |         return (EINVAL);
+  |     return (vmmops_getcap(vcpu->cookie, type, retval));
+  | }
+
+[potential_risk] sys/sys/_types.h:70-76  (CHERI type infrastructure)
+  Lines 70-76 gated on #ifdef __CHERI__ define __intptr_t/__uintptr_t as __intcap_t/__uintcap_t (128-bit capabilities), with a non-CHERI fallback at lines 164-173 that aliases __intcap_t to __intptr_t for 'hybrid-C code which needs to be explicitly aware of capabilities.' This type-level infrastructure implies CHERI readiness, but no kernel enforcement code exists (no pmap tag-clearing, no copyin capability stripping, no sigreturn capability sanitization). The PROT_CHERI0/PROT_CHERI1 flags in sys/sys/mman.h (lines 56-57) are defined but never referenced. This creates a false sense of CHERI readiness — the types are there but the security mechanisms are not.
+  | #ifdef __CHERI__
+  | typedef __intcap_t  __intptr_t;
+  | typedef __intcap_t  __intfptr_t;
+  | typedef __uintcap_t __uintptr_t;
+  | typedef __uintcap_t __uintfptr_t;
+  | #endif
+
+[compliant] sys/riscv/riscv/pmap.c:565-965  pmap_bootstrap / pmap_enter
+  The pmap bootstrap and page table creation functions use only standard PTE flags (PTE_V, PTE_R, PTE_W, PTE_X, PTE_U, PTE_G, PTE_A, PTE_D, PTE_SW_MANAGED, PTE_SW_WIRED) plus memory attribute bits via memattr_bits (line 553). No CHERI tag-clearing bits are programmed into any page table entry. The satp CSR is written with the bare Sv39/Sv48 mode encoding — no CHERI translation mode (Sv39c/Sv48c) is configured, so the hardware would never interpret PTEs as having capability tag-clearing semantics even if such bits existed.
+  | static __read_frequently pt_entry_t memattr_bits[VM_MEMATTR_TOTAL];
+  | static __read_frequently pt_entry_t memattr_mask;
+  | /* No CHERI tag-clearing or capability-enforcement bits present */
+  | csr_write(satp, pmap->pm_satp);  /* Sv39/Sv48 only */
+

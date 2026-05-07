@@ -1,0 +1,106 @@
+{
+  "pr_number": 2922,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2922,
+    "violation_condition": "When the kernel enables qspinlocks based on Ziccrse detection (RISCV_QUEUED_SPINLOCKS or RISCV_COMBO_SPINLOCKS with ziccrse available) and schedules a spinlock holder onto a hart whose coherent cacheable main memory PMA region lacks RsrvEventual support, the LR/SC in cmpxchg may never make forward progress, causing the unlock path to livelock indefinitely.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "riscv_isa_extension_available(NULL, ZICCRSE) && (IS_ENABLED(CONFIG_RISCV_QUEUED_SPINLOCKS) || static_branch_likely(&qspinlock_key))",
+    "affected_entities": [
+      "LR.W",
+      "LR.D",
+      "SC.W",
+      "SC.D",
+      "qspinlock",
+      "Ziccrse"
+    ],
+    "summary": "Ziccrse now formally requires RsrvEventual on coherent cacheable main memory; kernel qspinlocks implicitly depend on this guarantee but do not verify per-PMA-region reservability at runtime, so a firmware/hardware PMA misconfiguration could cause silent hart-level livelock."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/setup.c",
+        "function_name": "riscv_spinlock_init",
+        "line_start": 282,
+        "line_end": 312,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The kernel enables queued spinlocks solely based on ZICCRSE ISA string presence (line 297), without verifying the RsrvEventual PMA property that Ziccrse requires for its forward-progress guarantee. On a platform where M-mode firmware configures main memory without RsrvEventual, the LR/SC-based cmpxchg in qspinlock fast/slow paths can livelock indefinitely because lr.w reservation may never succeed. The kernel has no SBI mechanism to query PMA properties, so this gap is architectural — but it means the Ziccrse check alone is insufficient to guarantee correctness.",
+      "snippet": "} else if (riscv_isa_extension_available(NULL, ZICCRSE)) {\n    using_ext = \"using Ziccrse\";\n}\n#if defined(CONFIG_RISCV_COMBO_SPINLOCKS)\n    else {\n        static_branch_disable(&qspinlock_key);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/cmpxchg.h",
+        "function_name": "__arch_cmpxchg",
+        "line_start": 196,
+        "line_end": 211,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When Zacas is unavailable (no amocas), cmpxchg on RISC-V falls back to a plain lr.w/sc.w retry loop (lines 199-207). On a hart whose PMA region lacks RsrvEventual, this loop may spin forever. When qspinlocks are enabled based on Ziccrse detection, the fast-path lock acquisition (queued_spin_lock → atomic_try_cmpxchg_acquire → arch_cmpxchg_acquire) and slow-path queue transitions (atomic_try_cmpxchg_relaxed in xchg_tail when _Q_PENDING_BITS != 8) both execute this same LR/SC retry loop. With Ziccrse but no RsrvEventual, Ziccrse's forward-progress guarantee is voided.",
+      "snippet": "} else {\n    register unsigned int __rc;\n    __asm__ __volatile__ (\n        \"0:    lr\" lr_sfx \" %0, %2\\n\"\n        \"      bne  %0, %z3, 1f\\n\"\n        \"      sc\" sc_sfx \" %1, %z4, %2\\n\"\n        \"      bnez %1, 0b\\n\""
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/spinlock.h",
+        "function_name": "SPINLOCK_BASE_DECLARE",
+        "line_start": 23,
+        "line_end": 29,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The combo-spinlock dispatch (arch_spin_lock/unlock at line 26) resolves at runtime via static_branch_unlikely(&qspinlock_key). There is no per-hart check: if qspinlock_key is enabled because CPU0 detected Ziccrse, all harts use qspinlocks even if a hotplugged CPU's PMA regions lack RsrvEventual. The queued_spin_unlock path (include/asm-generic/qspinlock.h:128) uses smp_store_release on lock->locked — a plain store, no LR/SC — so unlock itself won't livelock. But the holder of a lock queued behind a stuck LR/SC on another hart may never get the lock.",
+      "snippet": "if (static_branch_unlikely(&qspinlock_key))\n    return queued_spin_##op(lock);\nreturn ticket_spin_##op(lock);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/Kconfig",
+        "function_name": "RISCV_QUEUED_SPINLOCKS",
+        "line_start": 516,
+        "line_end": 527,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "RISCV_QUEUED_SPINLOCKS depends on NONPORTABLE (line 518). Its help text states that LR/SC with Ziccrse provides the forward-progress guarantee (line 522-523), but there is no Kconfig dependency on Ziccrse, no runtime ISA check (it unconditionally uses qspinlocks), and no mention of the RsrvEventual PMA dependency. A user building a NONPORTABLE kernel with this option on Ziccrse-but-no-RsrvEventual hardware gets a silently broken spinlock implementation.",
+      "snippet": "config RISCV_QUEUED_SPINLOCKS\n    bool \"Using queued spinlock\"\n    depends on SMP && MMU && NONPORTABLE\n    select ARCH_USE_QUEUED_SPINLOCKS\n    help\n      The queued spinlock implementation requires the forward progress\n      guarantee of cmpxchg()/xchg() atomic operations: CAS with Zabha or\n      LR/SC with Ziccrse provide such guarantee."
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/setup.c",
+        "function_name": "riscv_spinlock_init",
+        "line_start": 286,
+        "line_end": 289,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "When CONFIG_RISCV_TICKET_SPINLOCKS is selected, the function returns early and never enables qspinlocks. Ticket spinlocks on RISC-V use AMO-based fetch-and-add (amoadd.w) for lock acquisition and plain stores for unlock — no LR/SC dependency, therefore no RsrvEventual requirement. This path is safe.",
+      "snippet": "if (IS_ENABLED(CONFIG_RISCV_TICKET_SPINLOCKS)) {\n    pr_info(\"Ticket spinlock: enabled\\n\");\n    return;\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/setup.c",
+        "function_name": "",
+        "line_start": 277,
+        "line_end": 280,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "qspinlock_key defaults to true (DEFINE_STATIC_KEY_TRUE) under CONFIG_RISCV_COMBO_SPINLOCKS only. The key is disabled in riscv_spinlock_init when neither Zabha+Zacas nor Ziccrse is available (line 302). The default-true design is safe because the disable path runs before any spinlock user — riscv_spinlock_init is called from setup_arch at line 343, before SMP bringup.",
+      "snippet": "#if defined(CONFIG_RISCV_COMBO_SPINLOCKS)\nDEFINE_STATIC_KEY_TRUE(qspinlock_key);\nEXPORT_SYMBOL(qspinlock_key);\n#endif"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "riscv_isa_ext",
+        "line_start": 505,
+        "line_end": 505,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Ziccrse is registered with __RISCV_ISA_EXT_DATA (no validation callback), matching the design that Ziccrse is a pure ISA-string property with no enable/disable side effects in S-mode. The extension detection is correct; the gap is in the consumer (riscv_spinlock_init) which doesn't account for the PMA dependency.",
+      "snippet": "__RISCV_ISA_EXT_DATA(ziccrse, RISCV_ISA_EXT_ZICCRSE),"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

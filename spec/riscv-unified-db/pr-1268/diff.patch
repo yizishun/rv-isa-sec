@@ -1,0 +1,2129 @@
+diff --git a/.vscode/launch.json b/.vscode/launch.json
+index 402aa3d664..ce009172de 100644
+--- a/.vscode/launch.json
++++ b/.vscode/launch.json
+@@ -1,6 +1,39 @@
+ {
+   "version": "0.2.0",
+   "configurations": [
++    {
++      "name": "Vector rv32 Debug Launch",
++      "type": "cppdbg",
++      "request": "launch",
++      "program": "${workspaceFolder}/gen/cpp_hart_gen/rv32_Debug/build/iss",
++      "args": [
++        "-m", "rv32",
++        "-c", "${workspaceFolder}/cfgs/rv32-vector.yaml",
++        "${workspaceFolder}/ext/riscv-tests/isa/rv32uv-p-vsetvli"],
++      "stopAtEntry": true,
++      "cwd": "${workspaceFolder}",
++      "environment": [],
++      "externalConsole": false,
++      "MIMode": "gdb",
++      "miDebuggerPath": "${workspaceFolder}/bin/gdb",
++      "setupCommands": [
++          {
++              "description": "Enable pretty-printing for gdb",
++              "text": "-enable-pretty-printing",
++              "ignoreFailures": true
++          },
++          {
++              "description": "Set Disassembly Flavor to Intel",
++              "text": "-gdb-set disassembly-flavor intel",
++              "ignoreFailures": true
++          },
++          {
++              "description": "Set default value display to hex",
++              "text": "-gdb-set output-radix 16",
++              "ignoreFailures": true
++          }
++      ]
++    },
+     {
+       "name": "ISS debug Launch",
+       "type": "cppdbg",
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+index a868065a70..d6d9632c5a 100644
+--- a/.vscode/settings.json
++++ b/.vscode/settings.json
+@@ -150,6 +150,7 @@
+     "typeindex": "cpp",
+     "typeinfo": "cpp",
+     "valarray": "cpp",
+-    "variant": "cpp"
++    "variant": "cpp",
++    "format": "cpp"
+   }
+ }
+diff --git a/Gemfile.lock b/Gemfile.lock
+index d2fb8f5f8c..1ef04b0c38 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -322,6 +322,7 @@ GEM
+       ffi (~> 1.17)
+ 
+ PLATFORMS
++  aarch64-linux-gnu
+   x86_64-linux-gnu
+ 
+ DEPENDENCIES
+diff --git a/backends/cpp_hart_gen/tasks.rake b/backends/cpp_hart_gen/tasks.rake
+index ae1cc7c194..2ceca92889 100644
+--- a/backends/cpp_hart_gen/tasks.rake
++++ b/backends/cpp_hart_gen/tasks.rake
+@@ -349,7 +349,7 @@ namespace :build do
+ 
+     Rake::Task["#{CPP_HART_GEN_DST}/#{build_name}/build/Makefile"].invoke
+     Dir.chdir("#{CPP_HART_GEN_DST}/#{build_name}/build") do
+-      sh "make -j #{$jobs}"
++      sh "make -j #{$jobs} iss"
+     end
+   end
+ 
+@@ -385,8 +385,8 @@ end
+ task checkout_riscv_tests: "#{$root}/ext/riscv-tests/env/LICENSE"
+ 
+ task build_riscv_tests: "checkout_riscv_tests" do
+-  Dir.chdir "#{$root}/ext/riscv-tests/isa" do
+-    sh "make RISCV_GCC_OPTS='-static -mcmodel=medany -fvisibility=hidden -nostdlib -nostartfiles -I/usr/include/newlib'"
++  Dir.chdir "#{$root}/tests/isa" do
++    sh "make"
+   end
+ end
+ 
+@@ -479,4 +479,14 @@ namespace :test do
+       sh "#{CPP_HART_GEN_DST}/#{build_name}/build/iss -m #{configs_name[0]} -c #{$root}/cfgs/#{configs_name[0]}-riscv-tests.yaml ext/riscv-tests/isa/#{configs_name[0]}si-p-#{t}"
+     end
+   end
++
++  task riscv_vector_tests: ["build_riscv_tests", "build:iss"] do
++    _, build_name = configs_build_name
++
++    # These extensions to the riscv-tests suite have binaries under a different diretcory
++    rv32uvTests = ["vsetivli", "vsetvl", "vsetvli_rs1_eq_zero", "vsetvli_vl_lt_vlmax"]
++    rv32uvTests.each do |t|
++      sh "#{CPP_HART_GEN_DST}/#{build_name}/build/iss -m rv32 -c #{$root}/cfgs/rv32-vector.yaml tests/isa/rv32uv-p-#{t}"
++    end
++  end
+ end
+diff --git a/backends/cpp_hart_gen/templates/csrs.hxx.erb b/backends/cpp_hart_gen/templates/csrs.hxx.erb
+index c9c6d2536f..ef773954ea 100644
+--- a/backends/cpp_hart_gen/templates/csrs.hxx.erb
++++ b/backends/cpp_hart_gen/templates/csrs.hxx.erb
+@@ -22,7 +22,7 @@ namespace udb {
+ 
+   <%- csrs.each do |csr| -%>
+   <%- next unless cfg_arch.possible_xlens.any? { |xlen| csr.defined_in_base?(xlen) } -%>
+-  <%- fields = cfg_arch.fully_configured? ? csr.possible_fields(cfg_arch) : csr.fields.select { |field| field.exists_in_cfg?(cfg_arch) } -%>
++  <%- fields = cfg_arch.fully_configured? ? csr.possible_fields : csr.fields.select { |field| field.exists_in_cfg?(cfg_arch) } -%>
+ 
+   // Field classes for <%= csr.name %>
+ 
+diff --git a/backends/cpp_hart_gen/templates/csrs_impl.hxx.erb b/backends/cpp_hart_gen/templates/csrs_impl.hxx.erb
+index 00d6fc43fb..9c85131330 100644
+--- a/backends/cpp_hart_gen/templates/csrs_impl.hxx.erb
++++ b/backends/cpp_hart_gen/templates/csrs_impl.hxx.erb
+@@ -10,7 +10,7 @@ namespace udb {
+ <%- csrs = cfg_arch.possible_csrs -%>
+ 
+ <%- csrs.each do |csr| -%>
+-<%- fields = cfg_arch.fully_configured? ? csr.possible_fields(cfg_arch) : csr.fields.select { |field| field.exists_in_cfg?(cfg_arch) } -%>
++<%- fields = cfg_arch.fully_configured? ? csr.possible_fields : csr.fields.select { |field| field.exists_in_cfg?(cfg_arch) } -%>
+ 
+ #define __UDB_RUNTIME_PARAM(param_name) m_hart->m_params.param_name.value()
+ #define __UDB_STATIC_PARAM(param_name) <%= name_of(:params, cfg_arch) %>::param_name.value()
+@@ -187,7 +187,7 @@ void <%= name_of(:csr, cfg_arch, csr.name) %><SocType>::_hw_write(const Possibly
+ <%- if cfg_arch.multi_xlen? && csr.format_changes_with_xlen? -%>
+ template <SocModel SocType>
+ bool <%= name_of(:csr, cfg_arch, csr.name) %><SocType>::_sw_write(const PossiblyUnknownBits<<%= csr.max_length %>>& value, const Bits<8>& xlen) {
+-  <%- fields = cfg_arch.fully_configured? ? csr.possible_fields(cfg_arch) : csr.fields.select { |field| field.exists_in_cfg?(cfg_arch) } -%>
++  <%- fields = cfg_arch.fully_configured? ? csr.possible_fields : csr.fields.select { |field| field.exists_in_cfg?(cfg_arch) } -%>
+   <%- fields.each do |field| -%>
+   <%- next unless cfg_arch.possible_xlens.any? { |xlen| field.defined_in_base?(xlen) } -%>
+   <%- cfg_arch.possible_xlens.each do |xlen| -%>
+@@ -229,7 +229,7 @@ template <SocModel SocType>
+ bool <%= name_of(:csr, cfg_arch, csr.name) %><SocType>::_sw_write(const PossiblyUnknownBits<<%= csr.max_length %>>& value) {
+   View<<%= cfg_arch.possible_xlens[0] %>> csr_value(value);
+ 
+-  <%- fields = cfg_arch.fully_configured? ? csr.possible_fields(cfg_arch) : csr.fields.select { |field| field.exists_in_cfg?(cfg_arch) } -%>
++  <%- fields = cfg_arch.fully_configured? ? csr.possible_fields : csr.fields.select { |field| field.exists_in_cfg?(cfg_arch) } -%>
+   <%- fields.each do |field| -%>
+   <%- next unless cfg_arch.possible_xlens.any? { |xlen| field.defined_in_base?(xlen) } -%>
+   <%- if field.has_custom_sw_write? -%>
+diff --git a/backends/cpp_hart_gen/templates/db_data.cxx.erb b/backends/cpp_hart_gen/templates/db_data.cxx.erb
+index 82e8f055e8..2dc133d93a 100644
+--- a/backends/cpp_hart_gen/templates/db_data.cxx.erb
++++ b/backends/cpp_hart_gen/templates/db_data.cxx.erb
+@@ -22,27 +22,6 @@ std::map<std::string, std::string> udb::DbData::SCHEMAS = {
+       <%- end.join(", ") -%>
+     };
+ 
+-namespace udb {
+-template <unsigned N, bool Signed>
+-void to_json(const nlohmann::json& j, _Bits<N, Signed>& b) {
+-  j = nlohmann::json { b.get() };
+-}
+-
+-template <unsigned N, bool Signed>
+-void to_json(const nlohmann::json& j, _PossiblyUnknownBits<N, Signed>& b) {
+-  j = nlohmann::json { b.get() };
+-}
+-
+-template <unsigned N, bool Signed>
+-void from_json(const nlohmann::json& j, _Bits<N, Signed>& b) {
+-  b = _Bits<N, Signed>{j.get<typename _Bits<N, Signed>::StorageType>()};
+-}
+-
+-template <unsigned N, bool Signed>
+-void from_json(const nlohmann::json& j, _PossiblyUnknownBits<N, Signed>& b) {
+-  b = _PossiblyUnknownBits<N, Signed>{_Bits<N, Signed>{j.get<typename _Bits<N, Signed>::StorageType>()}, 0_b};
+-}
+-}
+ 
+ static ExtensionName str_to_ext_name(const std::string& ext_name) {
+   <%- i = 0 -%>
+@@ -88,17 +67,6 @@ SatisfiedResult Config::ext_req_is_met(const ExtensionName& ext_name, const Vers
+ }
+ 
+ <%- cfg_arch.params.each do |param| -%>
+-constexpr <%= name_of(:param, cfg_arch, param) %>::<%= name_of(:param, cfg_arch, param) %>(const nlohmann::json& value)
+-  : Parameter("<%= param.name %>")
+-    <%- unless cfg_arch.param_values.key?(param.name) -%>
+-    , m_value(std::in_place, value.get<<%= param.idl_type.to_cxx_no_qualifiers %>>())
+-    <%- end -%>
+-{
+-  <%- if cfg_arch.param_values.key?(param.name) -%>
+-  bool same = value.get<<%= param.idl_type.to_cxx_no_qualifiers %>>() == m_value;
+-  udb_assert(same, "Runtime parameter value must match compile-time value");
+-  <%- end -%>
+-}
+ 
+ SatisfiedResult <%= name_of(:param, cfg_arch, param) %>::defined(const Config& cfg) const {
+   return <%=
+@@ -132,7 +100,7 @@ SatisfiedResult <%= name_of(:param, cfg_arch, param) %>::defined(const Config& c
+         "cfg.ext_req_is_met(ExtensionName::#{term.name}, VersionRequirement(\"#{term.comparison.serialize}#{term.version}\"))"
+       elsif term.is_a?(Udb::ParameterTerm)
+         cxx_val =
+-          "std::any_cast<#{cfg_arch.param(term.name).idl_type.to_cxx_no_qualifiers}>(cfg.param_value(\"#{term.name}\"))"
++          "std::any_cast<const #{cfg_arch.param(term.name).idl_type.to_cxx_no_qualifiers}&>(cfg.param_value(\"#{term.name}\"))"
+         res =
+           if term.array_comparison?
+             if term.size
+diff --git a/backends/cpp_hart_gen/templates/db_data.hxx.erb b/backends/cpp_hart_gen/templates/db_data.hxx.erb
+index 8d4952377d..2be5de7493 100644
+--- a/backends/cpp_hart_gen/templates/db_data.hxx.erb
++++ b/backends/cpp_hart_gen/templates/db_data.hxx.erb
+@@ -18,6 +18,28 @@
+ 
+ using namespace std::literals;
+ 
++namespace udb {
++template <unsigned N, bool Signed>
++void to_json(const nlohmann::json& j, _Bits<N, Signed>& b) {
++  j = nlohmann::json { b.get() };
++}
++
++template <unsigned N, bool Signed>
++void to_json(const nlohmann::json& j, _PossiblyUnknownBits<N, Signed>& b) {
++  j = nlohmann::json { b.get() };
++}
++
++template <unsigned N, bool Signed>
++void from_json(const nlohmann::json& j, _Bits<N, Signed>& b) {
++  b = _Bits<N, Signed>{j.get<typename _Bits<N, Signed>::StorageType>()};
++}
++
++template <unsigned N, bool Signed>
++void from_json(const nlohmann::json& j, _PossiblyUnknownBits<N, Signed>& b) {
++  b = _PossiblyUnknownBits<N, Signed>{_Bits<N, Signed>{j.get<typename _Bits<N, Signed>::StorageType>()}, 0_b};
++}
++}
++
+ namespace udb {
+   class SatisfiedResult {
+     public:
+@@ -121,7 +143,7 @@ namespace udb {
+     const ExtensionVersion& implemented_ext(const ExtensionName& name) const { return m_implemented_exts_hash.at(name); }
+ 
+     bool has_param_value(const std::string& name) const { return m_param_values.contains(name); }
+-    std::any param_value(const std::string& name) const { return m_param_values.at(name); }
++    const std::any& param_value(const std::string& name) const { return m_param_values.at(name); }
+ 
+ 
+     private:
+@@ -141,7 +163,17 @@ namespace udb {
+     {}
+ 
+     // constructor with value
+-    constexpr <%= name_of(:param, cfg_arch, param) %>(const nlohmann::json& value);
++      constexpr <%= name_of(:param, cfg_arch, param) %>(const nlohmann::json& value)
++      : Parameter("<%= param.name %>")
++        <%- unless cfg_arch.param_values.key?(param.name) -%>
++        , m_value(std::in_place, value.get<<%= param.idl_type.to_cxx_no_qualifiers %>>())
++        <%- end -%>
++    {
++      <%- if cfg_arch.param_values.key?(param.name) -%>
++      bool same = value.get<<%= param.idl_type.to_cxx_no_qualifiers %>>() == m_value;
++      udb_assert(same, "Runtime parameter value must match compile-time value");
++      <%- end -%>
++    }
+ 
+     SatisfiedResult defined(const Config& cfg) const override;
+ 
+diff --git a/cfgs/rv32-vector.yaml b/cfgs/rv32-vector.yaml
+new file mode 100644
+index 0000000000..3ef9b6c67e
+--- /dev/null
++++ b/cfgs/rv32-vector.yaml
+@@ -0,0 +1,209 @@
++# yaml-language-server: $schema=../schemas/config_schema.json
++---
++$schema: https://riscv.org/udb/schemas/config_schema-0.1.0.json
++kind: architecture configuration
++type: fully configured
++name: rv32-vector
++description: A compliant full config for rv32 riscv-tests with the V extension
++implemented_extensions:
++  - [Sm, "1.11.0"]
++  - ["Smstateen", "1.0.0"]
++  - [I, "2.1"]
++  - [C, "2.0"]
++  - [Zca, "1.0.0"]
++  - [M, "2.0"]
++  - [Zicsr, "2.0"]
++  - [Zicntr, "2.0"]
++  - [Smrnmi, "1.0"]
++  - [S, "1.11.0"]
++  - [Smpmp, "1.11.0"]
++  - [U, "1.0.0"]
++  - [Zifencei, "2.0.0"]
++  - [Sv32, "1.11.0"]
++  - [V, "1.0.0"]
++
++params:
++  MXLEN: 32
++  MARCHID_IMPLEMENTED: true
++  ARCH_ID_VALUE: 1
++  MIMPID_IMPLEMENTED: true
++  IMP_ID_VALUE: 0
++  VENDOR_ID_BANK: 1
++  VENDOR_ID_OFFSET: 1
++  MISALIGNED_LDST: true
++  MISALIGNED_LDST_EXCEPTION_PRIORITY: low
++  MISALIGNED_MAX_ATOMICITY_GRANULE_SIZE: 4
++  MISALIGNED_SPLIT_STRATEGY: sequential_bytes
++  PRECISE_SYNCHRONOUS_EXCEPTIONS: true
++  TRAP_ON_ECALL_FROM_M: true
++  TRAP_ON_EBREAK: true
++  M_MODE_ENDIANNESS: little
++  TRAP_ON_ILLEGAL_WLRL: true
++  TRAP_ON_UNIMPLEMENTED_INSTRUCTION: true
++  TRAP_ON_RESERVED_INSTRUCTION: true
++  TRAP_ON_UNIMPLEMENTED_CSR: true
++  REPORT_VA_IN_MTVAL_ON_BREAKPOINT: true
++  REPORT_VA_IN_MTVAL_ON_LOAD_MISALIGNED: true
++  REPORT_VA_IN_MTVAL_ON_STORE_AMO_MISALIGNED: true
++  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_MISALIGNED: true
++  REPORT_VA_IN_MTVAL_ON_LOAD_ACCESS_FAULT: true
++  REPORT_VA_IN_MTVAL_ON_STORE_AMO_ACCESS_FAULT: true
++  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_ACCESS_FAULT: true
++  REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION: true
++  MTVAL_WIDTH: 32
++  PMA_GRANULARITY: 12
++  PHYS_ADDR_WIDTH: 34
++  MISA_CSR_IMPLEMENTED: true
++  MTVEC_ACCESS: rw
++  MTVEC_MODES: [0, 1]
++  MTVEC_BASE_ALIGNMENT_DIRECT: 4
++  MTVEC_BASE_ALIGNMENT_VECTORED: 4
++  MTVEC_ILLEGAL_WRITE_BEHAVIOR: retain
++  MUTABLE_MISA_C: false
++  MUTABLE_MISA_M: false
++  TIME_CSR_IMPLEMENTED: false
++  MUTABLE_MISA_S: false
++  ASID_WIDTH: 5
++  S_MODE_ENDIANNESS: little
++  SXLEN: [32]
++  REPORT_VA_IN_MTVAL_ON_LOAD_PAGE_FAULT: true
++  REPORT_VA_IN_MTVAL_ON_STORE_AMO_PAGE_FAULT: true
++  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_PAGE_FAULT: true
++  REPORT_VA_IN_STVAL_ON_BREAKPOINT: true
++  REPORT_VA_IN_STVAL_ON_LOAD_MISALIGNED: true
++  REPORT_VA_IN_STVAL_ON_STORE_AMO_MISALIGNED: true
++  REPORT_VA_IN_STVAL_ON_INSTRUCTION_MISALIGNED: true
++  REPORT_VA_IN_STVAL_ON_LOAD_ACCESS_FAULT: true
++  REPORT_VA_IN_STVAL_ON_STORE_AMO_ACCESS_FAULT: true
++  REPORT_VA_IN_STVAL_ON_INSTRUCTION_ACCESS_FAULT: true
++  REPORT_VA_IN_STVAL_ON_LOAD_PAGE_FAULT: true
++  REPORT_VA_IN_STVAL_ON_STORE_AMO_PAGE_FAULT: true
++  REPORT_VA_IN_STVAL_ON_INSTRUCTION_PAGE_FAULT: true
++  REPORT_ENCODING_IN_STVAL_ON_ILLEGAL_INSTRUCTION: true
++  STVAL_WIDTH: 32
++  COUNTINHIBIT_EN:
++    [
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++    ]
++  MCOUNTENABLE_EN:
++    [
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++    ]
++  SCOUNTENABLE_EN:
++    [
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++    ]
++  STVEC_MODE_DIRECT: true
++  STVEC_MODE_VECTORED: true
++  SATP_MODE_BARE: true
++  TRAP_ON_ECALL_FROM_S: true
++  TRAP_ON_ECALL_FROM_U: true
++  TRAP_ON_SFENCE_VMA_WHEN_SATP_MODE_IS_READ_ONLY: false
++  MSTATUS_VS_LEGAL_VALUES: [0, 1, 2, 3]
++  MSTATUS_FS_LEGAL_VALUES: [0]
++  MSTATUS_TVM_IMPLEMENTED: false
++  NUM_PMP_ENTRIES: 16
++  PMP_GRANULARITY: 12
++  MUTABLE_MISA_U: false
++  U_MODE_ENDIANNESS: little
++  UXLEN: [32]
++  MSTATEEN_ENVCFG_TYPE: rw
++  MUTABLE_MISA_V: false
++  HW_MSTATUS_VS_DIRTY_UPDATE: never
++  RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX: "VLMAX"
++  FOLLOW_VTYPE_RESET_RECOMMENDATION: true
++  VLEN: 128
++  ELEN: 64
+diff --git a/cfgs/rv64-vector.yaml b/cfgs/rv64-vector.yaml
+new file mode 100644
+index 0000000000..a3b6185bc0
+--- /dev/null
++++ b/cfgs/rv64-vector.yaml
+@@ -0,0 +1,212 @@
++# yaml-language-server: $schema=../schemas/config_schema.json
++---
++$schema: https://riscv.org/udb/schemas/config_schema-0.1.0.json
++kind: architecture configuration
++type: fully configured
++name: rv64-vector
++description: A compliant full config for rv64 riscv-tests with the V extension
++implemented_extensions:
++  - [Sm, "1.11.0"]
++  - [Smstateen, "1.0.0"]
++  - [I, "2.1"]
++  - [C, "2.0"]
++  - [Zca, "1.0.0"]
++  - [M, "2.0"]
++  - [Zicsr, "2.0"]
++  - [Zicntr, "2.0"]
++  - [Smrnmi, "1.0"]
++  - [S, "1.11.0"]
++  - [Smpmp, "1.11.0"]
++  - [U, "1.0.0"]
++  - [Zifencei, "2.0.0"]
++  - [Sv39, "1.11.0"]
++  - [V, "1.0.0"]
++
++params:
++  MXLEN: 64
++  MARCHID_IMPLEMENTED: true
++  ARCH_ID_VALUE: 1
++  MIMPID_IMPLEMENTED: true
++  IMP_ID_VALUE: 0
++  VENDOR_ID_BANK: 1
++  VENDOR_ID_OFFSET: 1
++  MISALIGNED_LDST: true
++  MISALIGNED_LDST_EXCEPTION_PRIORITY: low
++  MISALIGNED_MAX_ATOMICITY_GRANULE_SIZE: 4
++  MISALIGNED_SPLIT_STRATEGY: by_byte
++  PRECISE_SYNCHRONOUS_EXCEPTIONS: true
++  TRAP_ON_ECALL_FROM_M: true
++  TRAP_ON_EBREAK: true
++  M_MODE_ENDIANNESS: little
++  TRAP_ON_ILLEGAL_WLRL: true
++  TRAP_ON_UNIMPLEMENTED_INSTRUCTION: true
++  TRAP_ON_RESERVED_INSTRUCTION: true
++  TRAP_ON_UNIMPLEMENTED_CSR: true
++  REPORT_VA_IN_MTVAL_ON_BREAKPOINT: true
++  REPORT_VA_IN_MTVAL_ON_LOAD_MISALIGNED: true
++  REPORT_VA_IN_MTVAL_ON_STORE_AMO_MISALIGNED: true
++  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_MISALIGNED: true
++  REPORT_VA_IN_MTVAL_ON_LOAD_ACCESS_FAULT: true
++  REPORT_VA_IN_MTVAL_ON_STORE_AMO_ACCESS_FAULT: true
++  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_ACCESS_FAULT: true
++  REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION: true
++  MTVAL_WIDTH: 64
++  PMA_GRANULARITY: 12
++  PHYS_ADDR_WIDTH: 57
++  MISA_CSR_IMPLEMENTED: true
++  MTVEC_ACCESS: read-write
++  MTVEC_MODES: [0, 1]
++  MTVEC_BASE_ALIGNMENT_DIRECT: 4
++  MTVEC_BASE_ALIGNMENT_VECTORED: 4
++  MTVEC_ILLEGAL_WRITE_BEHAVIOR: retain
++  MUTABLE_MISA_C: false
++  MUTABLE_MISA_M: false
++  TIME_CSR_IMPLEMENTED: false
++  MUTABLE_MISA_S: false
++  ASID_WIDTH: 5
++  S_MODE_ENDIANNESS: little
++  SXLEN: [64]
++  REPORT_VA_IN_MTVAL_ON_LOAD_PAGE_FAULT: true
++  REPORT_VA_IN_MTVAL_ON_STORE_AMO_PAGE_FAULT: true
++  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_PAGE_FAULT: true
++  REPORT_VA_IN_STVAL_ON_BREAKPOINT: true
++  REPORT_VA_IN_STVAL_ON_LOAD_MISALIGNED: true
++  REPORT_VA_IN_STVAL_ON_STORE_AMO_MISALIGNED: true
++  REPORT_VA_IN_STVAL_ON_INSTRUCTION_MISALIGNED: true
++  REPORT_VA_IN_STVAL_ON_LOAD_ACCESS_FAULT: true
++  REPORT_VA_IN_STVAL_ON_STORE_AMO_ACCESS_FAULT: true
++  REPORT_VA_IN_STVAL_ON_INSTRUCTION_ACCESS_FAULT: true
++  REPORT_VA_IN_STVAL_ON_LOAD_PAGE_FAULT: true
++  REPORT_VA_IN_STVAL_ON_STORE_AMO_PAGE_FAULT: true
++  REPORT_VA_IN_STVAL_ON_INSTRUCTION_PAGE_FAULT: true
++  REPORT_ENCODING_IN_STVAL_ON_ILLEGAL_INSTRUCTION: true
++  STVAL_WIDTH: 64
++  COUNTINHIBIT_EN:
++    [
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++    ]
++  MCOUNTENABLE_EN:
++    [
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++    ]
++  SCOUNTENABLE_EN:
++    [
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++      false,
++    ]
++  STVEC_MODE_DIRECT: true
++  STVEC_MODE_VECTORED: true
++  SATP_MODE_BARE: true
++  TRAP_ON_ECALL_FROM_S: true
++  TRAP_ON_ECALL_FROM_U: true
++  TRAP_ON_SFENCE_VMA_WHEN_SATP_MODE_IS_READ_ONLY: false
++  MSTATUS_FS_WRITABLE: false
++  MSTATUS_VS_WRITABLE: false
++  MSTATUS_VS_LEGAL_VALUES: [0]
++  MSTATUS_FS_LEGAL_VALUES: [0]
++  MSTATUS_TVM_IMPLEMENTED: false
++  NUM_PMP_ENTRIES: 16
++  PMP_GRANULARITY: 12
++  MUTABLE_MISA_U: false
++  U_MODE_ENDIANNESS: little
++  UXLEN: [64]
++  MSTATEEN_ENVCFG_TYPE: rw
++  # HSTATEEN_ENVCFG_TYPE: rw
++  MUTABLE_MISA_V: false
++  HW_MSTATUS_VS_DIRTY_UPDATE: never
++  RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX: "VLMAX"
++  FOLLOW_VTYPE_RESET_RECOMMENDATION: true
++  VLEN: 128
++  ELEN: 64
+diff --git a/spec/std/isa/csr/V/vcsr.yaml b/spec/std/isa/csr/V/vcsr.yaml
+new file mode 100644
+index 0000000000..ca44808a50
+--- /dev/null
++++ b/spec/std/isa/csr/V/vcsr.yaml
+@@ -0,0 +1,36 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../schemas/csr_schema.json
++
++$schema: "csr_schema.json#"
++kind: csr
++name: vcsr
++long_name: Vector Control and Status Register
++address: 0x00F
++writable: true
++priv_mode: U
++length: MXLEN
++description: Contains aliases to vxrm and vxsat CSRs
++definedBy:
++  extension:
++    name: V
++fields:
++  VXRM:
++    location: 2-1
++    description: See vxrm.
++    type: RW-RH
++    alias: vxrm.VALUE[1:0]
++    sw_write(csr_value): |
++      CSR[vxrm].VALUE = csr_value.VXRM;
++      return csr_value.VXRM;
++    reset_value: UNDEFINED_LEGAL
++  VXSAT:
++    location: 0
++    description: See vxsat.
++    type: RW-RH
++    alias: vxsat.VALUE[0]
++    sw_write(csr_value): |
++      CSR[vxsat].VALUE = csr_value.VXSAT;
++      return csr_value.VXSAT;
++    reset_value: UNDEFINED_LEGAL
+diff --git a/spec/std/isa/csr/V/vl.yaml b/spec/std/isa/csr/V/vl.yaml
+new file mode 100644
+index 0000000000..3dcff0d06c
+--- /dev/null
++++ b/spec/std/isa/csr/V/vl.yaml
+@@ -0,0 +1,33 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../schemas/csr_schema.json
++
++$schema: "csr_schema.json#"
++kind: csr
++name: vl
++long_name: Vector Length
++address: 0xC20
++writable: false
++priv_mode: U
++length: MXLEN
++description: Holds an unsigned integer specifying number of elements to be updated with results from a vector instruction.
++definedBy:
++  extension:
++    name: V
++fields:
++  VALUE:
++    location_rv32: 31-0
++    location_rv64: 63-0
++    description: |
++      The vl register holds an unsigned integer specifying the number of elements to be updated with
++      results from a vector instruction, as further detailed in Section Section 31.5.4.
++
++      [NOTE]
++      The number of bits implemented in vl depends on the implementation's maximum vector
++      length of the smallest supported type. The smallest vector implementation with VLEN=32
++      and supporting SEW=8 would need at least six bits in vl to hold the values 0-32
++      (VLEN=32, with LMUL=8 and SEW=8, yields VLMAX=32).
++    type: RO-H
++    reset_value(): |
++      return (FOLLOW_VTYPE_RESET_RECOMMENDATION)? 0 : UNDEFINED_LEGAL;
+diff --git a/spec/std/isa/csr/V/vlenb.yaml b/spec/std/isa/csr/V/vlenb.yaml
+new file mode 100644
+index 0000000000..631e6a9a61
+--- /dev/null
++++ b/spec/std/isa/csr/V/vlenb.yaml
+@@ -0,0 +1,27 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../schemas/csr_schema.json
++
++$schema: "csr_schema.json#"
++kind: csr
++name: vlenb
++long_name: Vector Byte Length
++address: 0xC22
++writable: false
++priv_mode: U
++length: MXLEN
++description: Holds the value VLEN/8, the vector register length in bytes.
++definedBy:
++  extension:
++    name: V
++fields:
++  VALUE:
++    location_rv32: 31-0
++    location_rv64: 63-0
++    description: |
++      The value in vlenb is a design-time constant in any implementation.
++      Without this CSR, several instructions are needed to calculate VLEN in bytes, and the code
++      has to disturb current vl and vtype settings which require them to be saved and restored.
++    type: RO
++    reset_value(): return VLEN / 8;
+diff --git a/spec/std/isa/csr/V/vstart.yaml b/spec/std/isa/csr/V/vstart.yaml
+new file mode 100644
+index 0000000000..0341010551
+--- /dev/null
++++ b/spec/std/isa/csr/V/vstart.yaml
+@@ -0,0 +1,81 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../schemas/csr_schema.json
++
++$schema: "csr_schema.json#"
++kind: csr
++name: vstart
++long_name: Vector Start Index
++address: 0x008
++writable: true
++priv_mode: U
++length: MXLEN
++description: Specifies the index of the first element to be executed by a vector instruction.
++definedBy:
++  extension:
++    name: V
++fields:
++  VALUE:
++    location_rv32: 31-0
++    location_rv64: 63-0
++    description: |
++      Normally, vstart is only written by hardware on a trap on a vector instruction, with the vstart value
++      representing the element on which the trap was taken (either a synchronous exception or an
++      asynchronous interrupt), and at which execution should resume after a resumable trap is handled.
++      All vector instructions are defined to begin execution with the element number given in the vstart
++      CSR, leaving earlier elements in the destination vector undisturbed, and to reset the vstart CSR to
++      zero at the end of execution.
++
++      [NOTE]
++      All vector instructions, including vset{i}vl{i}, reset the vstart CSR to zero.
++      vstart is not modified by vector instructions that raise illegal-instruction exceptions.
++      The vstart CSR is defined to have only enough writable bits to hold the largest element index (one
++      less than the maximum VLMAX).
++
++      [NOTE]
++      The maximum vector length is obtained with the largest LMUL setting (8) and the smallest
++      SEW setting (8), so VLMAX_max = 8*VLEN/8 = VLEN. For example, for VLEN=256,
++      vstart would have 8 bits to represent indices from 0 through 255.
++
++      The use of vstart values greater than the largest element index for the current vtype setting is
++      reserved.
++
++      [NOTE]
++      It is recommended that implementations trap if vstart is out of bounds. It is not required
++      to trap, as a possible future use of upper vstart bits is to store imprecise trap
++      information.
++
++      The vstart CSR is writable by unprivileged code, but non-zero vstart values may cause vector
++      instructions to run substantially slower on some implementations, so vstart should not be used by
++      application programmers. A few vector instructions cannot be executed with a non-zero vstart value
++      and will raise an illegal instruction exception as defined below.
++
++      [NOTE]
++      Making vstart visible to unprivileged code supports user-level threading libraries.
++
++      Implementations are permitted to raise illegal instruction exceptions when attempting to execute a
++      vector instruction with a value of vstart that the implementation can never produce when executing
++      that same instruction with the same vtype setting.
++
++      [NOTE]
++      For example, some implementations will never take interrupts during execution of a vector
++      arithmetic instruction, instead waiting until the instruction completes to take the
++      interrupt. Such implementations are permitted to raise an illegal instruction exception
++      when attempting to execute a vector arithmetic instruction when vstart is nonzero.
++
++      [NOTE]
++      When migrating a software thread between two harts with different microarchitectures,
++      the vstart value might not be supported by the new hart microarchitecture. The runtime
++      on the receiving hart might then have to emulate instruction execution up to the next
++      supported vstart element position. Alternatively, migration events can be constrained to
++      only occur at mutually supported vstart locations.
++    sw_write(csr_value): |
++      XReg newval = csr_value.VALUE & (VLEN - 1);
++      if (newval != csr_value.VALUE) {
++        return UNDEFINED_LEGAL;
++      } else {
++        return newval;
++      }
++    type: RW-RH
++    reset_value: UNDEFINED_LEGAL
+diff --git a/spec/std/isa/csr/V/vtype.yaml b/spec/std/isa/csr/V/vtype.yaml
+new file mode 100644
+index 0000000000..ab015d5ac0
+--- /dev/null
++++ b/spec/std/isa/csr/V/vtype.yaml
+@@ -0,0 +1,125 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../schemas/csr_schema.json
++
++$schema: "csr_schema.json#"
++kind: csr
++name: vtype
++long_name: Vector Type
++address: 0xC21
++writable: false
++priv_mode: U
++length: MXLEN
++description: Provides the default type used to interpret the contents of the vector register file.
++definedBy:
++  extension:
++    name: V
++fields:
++  VILL:
++    location_rv32: 31
++    location_rv64: 63
++    description: |
++      The vill bit is used to encode that a previous vset{i}vl{i} instruction attempted to write an
++      unsupported value to vtype.
++
++      [NOTE]
++      The vill bit is held in bit XLEN-1 of the CSR to support checking for illegal values with a
++      branch on the sign bit.
++
++      If the vill bit is set, then any attempt to execute a vector instruction that depends upon vtype will
++      raise an illegal-instruction exception.
++
++      When the vill bit is set, the other XLEN-1 bits in vtype shall be zero.
++
++      It is recommended that at reset, vill is set.
++    type: RO-H
++    reset_value(): |
++      return (FOLLOW_VTYPE_RESET_RECOMMENDATION)? 1 : UNDEFINED_LEGAL;
++  VMA:
++    location: 7
++    description: |
++      Vector mask agnostic bit. Modifies the behavior of destination inactive masked-off elements during the
++      execution of vector instructions.
++
++      A value of 0 means inactive elements are undisturbed, meaning the corresponding set of destination elements
++      in a vector register group retain the value they previously held.
++
++      A value of 1 means inactive elements are agnostic, meaning the corresponding set of destination elements
++      in any vector destination operand can either retain the value they previously held, or are overwritten with 1s.
++      Within a single vector instruction, each destination element can be either left undisturbed or overwritten
++      with 1s, in any combination, and the pattern of undisturbed or overwritten with 1s is not required to be
++      deterministic when the instruction is executed with the same inputs.
++
++      It is recommended that at reset, vill is set, and the remaining bits in vtype are zero.
++    type: RO-H
++    reset_value(): |
++      return (FOLLOW_VTYPE_RESET_RECOMMENDATION)? 0 : UNDEFINED_LEGAL;
++  VTA:
++    location: 6
++    description: |
++      Vector tail agnostic bit. Modifies the bahavior of destination tail elements during the execution of vector
++      instructions.
++
++      A value of 0 means tail elements are undisturbed, meaning the corresponding set of destination elements
++      in a vector register group retain the value they previously held.
++
++      A value of 1 means tail elements are agnostic, meaning the corresponding set of destination elements
++      in any vector destination operand can either retain the value they previously held, or are overwritten with 1s.
++      Within a single vector instruction, each destination element can be either left undisturbed or overwritten
++      with 1s, in any combination, and the pattern of undisturbed or overwritten with 1s is not required to be
++      deterministic when the instruction is executed with the same inputs.
++
++      It is recommended that at reset, vill is set, and the remaining bits in vtype are zero.
++    type: RO-H
++    reset_value(): |
++      return (FOLLOW_VTYPE_RESET_RECOMMENDATION)? 0 : UNDEFINED_LEGAL;
++  VSEW:
++    location: 5-3
++    description: |
++      The value in vsew sets the dynamic selected element width (SEW).
++
++      [separator="!"]
++      !===
++      ! vsew[2:0] ! SEW ! Elements per vector register
++      ! 000 ! 8 ! 16
++      ! 001 ! 16 ! 8
++      ! 010 ! 32 ! 4
++      ! 011 ! 64 ! 2
++      ! 1XX ! Reserved ! Reserved
++      !===
++
++      It is recommended that at reset, vill is set, and the remaining bits in vtype are zero.
++    type: RO-H
++    reset_value(): |
++      return (FOLLOW_VTYPE_RESET_RECOMMENDATION)? 0 : UNDEFINED_LEGAL;
++  VLMUL:
++    location: 2-0
++    description: |
++      Vector register group multiplier.
++
++      Multiple vector registers can be grouped together, so that a single vector instruction can operate on
++      multiple vector registers. The term vector register group is used herein to refer to one or more vector
++      registers used as a single operand to a vector instruction. Vector register groups can be used to provide
++      greater execution efficiency for longer application vectors, but the main reason for their inclusion is to
++      allow double-width or larger elements to be operated on with the same vector length as single-width
++      elements. The vector length multiplier, LMUL, when greater than 1, represents the default number of
++      vector registers that are combined to form a vector register group. Implementations must support
++      LMUL integer values of 1, 2, 4, and 8.
++
++      [NOTE]
++      The vector architecture includes instructions that take multiple source and destination
++      vector operands with different element widths, but the same number of elements. The
++      effective LMUL (EMUL) of each vector operand is determined by the number of registers
++      required to hold the elements. For example, for a widening add operation, such as add 32-
++      bit values to produce 64-bit results, a double-width result requires twice the LMUL of the
++      single-width inputs.
++
++      LMUL can also be a fractional value, reducing the number of bits used in a single vector register.
++      Fractional LMUL is used to increase the number of effective usable vector register groups when
++      operating on mixed-width values.
++
++      It is recommended that at reset, vill is set, and the remaining bits in vtype are zero.
++    type: RO-H
++    reset_value(): |
++      return (FOLLOW_VTYPE_RESET_RECOMMENDATION)? 0 : UNDEFINED_LEGAL;
+diff --git a/spec/std/isa/csr/V/vxrm.yaml b/spec/std/isa/csr/V/vxrm.yaml
+new file mode 100644
+index 0000000000..af9ae47207
+--- /dev/null
++++ b/spec/std/isa/csr/V/vxrm.yaml
+@@ -0,0 +1,48 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../schemas/csr_schema.json
++
++$schema: "csr_schema.json#"
++kind: csr
++name: vxrm
++long_name: Vector Fixed-Point Rounding Mode
++address: 0x00A
++writable: true
++priv_mode: U
++length: MXLEN
++description: Holds a 2-bit read-write rounding-mode field in the least-significant bits
++definedBy:
++  extension:
++    name: V
++sw_read(): |
++  return CSR[vcsr].VXRM;
++fields:
++  VALUE:
++    location_rv32: 31-0
++    location_rv64: 63-0
++    description: |
++      The vector fixed-point rounding-mode register holds a two-bit read-write rounding-mode field in the
++      least-significant bits (vxrm[1:0]). The upper bits, vxrm[XLEN-1:2], should be written as zeros.
++      The vector fixed-point rounding-mode is given a separate CSR address to allow independent access,
++      but is also reflected as a field in vcsr.
++
++      [NOTE]
++      A new rounding mode can be set while saving the original rounding mode using a single csrwi instruction.
++
++      The fixed-point rounding algorithm is specified as follows. Suppose the pre-rounding result is v, and d
++      bits of that result are to be rounded off. Then the rounded result is (v >> d) + r, where r depends on
++      the rounding mode as specified in the following table of vxrm[1:0] values.
++
++      [separator="!"]
++      !===
++      ! vxrm[1:0] ! Abbreviation ! Rounding Mode ! Rounding increment, r
++      ! 00 ! rnu ! round-to-nearest-up (add +0.5 LSB) ! v[d-1]
++      ! 01 ! rne ! round-to-nearest-even ! v[d-1] & (v[d-2:0]\!=0 | v[d])
++      ! 10 ! rdn ! round-down (truncate) ! 0
++      ! 11 ! rod ! round-to-odd (OR bits into LSB, aka "jam") ! \!v[d] & v[d-1:0]\!=0
++
++    sw_write(csr_value): |
++      return csr_value.VALUE & 3;
++    type: RW-H
++    reset_value: UNDEFINED_LEGAL
+diff --git a/spec/std/isa/csr/V/vxsat.yaml b/spec/std/isa/csr/V/vxsat.yaml
+new file mode 100644
+index 0000000000..41175a183b
+--- /dev/null
++++ b/spec/std/isa/csr/V/vxsat.yaml
+@@ -0,0 +1,33 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../schemas/csr_schema.json
++
++$schema: "csr_schema.json#"
++kind: csr
++name: vxsat
++long_name: Vector Fixed-Point Saturate Flag
++address: 0x009
++writable: true
++priv_mode: U
++length: MXLEN
++description: Indicates if a fixed-point instruction has had to saturate an output value to fit into a destination format
++definedBy:
++  extension:
++    name: V
++sw_read(): |
++  return CSR[vcsr].VXSAT;
++fields:
++  VALUE:
++    location_rv32: 31-0
++    location_rv64: 63-0
++    description: |
++      The vxsat CSR has a single read-write least-significant bit (vxsat[0]) that indicates if a fixed-point
++      instruction has had to saturate an output value to fit into a destination format. Bits vxsat[XLEN-1:1]
++      should be written as zeros.
++
++      The vxsat bit is mirrored in vcsr.
++    sw_write(csr_value): |
++      return csr_value.VALUE & 1;
++    type: RW-H
++    reset_value: UNDEFINED_LEGAL
+diff --git a/spec/std/isa/inst/V/vadd.vv.yaml b/spec/std/isa/inst/V/vadd.vv.yaml
+index 019816829d..addc9cb9bb 100644
+--- a/spec/std/isa/inst/V/vadd.vv.yaml
++++ b/spec/std/isa/inst/V/vadd.vv.yaml
+@@ -1,4 +1,5 @@
+ # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+ 
+ # yaml-language-server: $schema=../../../../schemas/inst_schema.json
+@@ -6,9 +7,9 @@
+ $schema: "inst_schema.json#"
+ kind: instruction
+ name: vadd.vv
+-long_name: No synopsis available
++long_name: Vector-vector integer addition
+ description: |
+-  No description available.
++  Add source vector register groups from vs1 and vs2 according to mask vm and store results in vd.
+ definedBy:
+   extension:
+     name: V
+@@ -31,6 +32,29 @@ access:
+   vu: always
+ data_independent_timing: true
+ operation(): |
++  VectorState state = vector_state();
++  VectorLmulType lmul_type = state.lmul_type;
++
++  XReg vlen = VLEN;
++  XReg vlmax;
++  if (lmul_type == VectorLmulType::Multiply) {
++    vlmax = (vlen << state.log2_lmul) >> state.log2_sew;
++  } else {
++    # (lmul_type == VectorLmulType::Divide)
++    vlmax = (vlen >> state.log2_lmul) >> state.log2_sew;
++  }
++
++  for (U32 i = CSR[vstart].VALUE; i < vlmax; i++) {
++    U32 start_bit_pos = i * state.sew;
++    U32 end_bit_pos = start_bit_pos + state.sew - 1;
++    v[vd] = {
++      v[vd][VLEN-1:end_bit_pos + 1],
++      (v[vs2])[end_bit_pos:start_bit_pos] + (v[vs1])[end_bit_pos:start_bit_pos],
++      v[vd][start_bit_pos-1:0]
++      };
++  }
++
++  CSR[vstart].VALUE = 0;
+ 
+ # SPDX-SnippetBegin
+ # SPDX-FileCopyrightText: 2017-2025 Contributors to the RISCV Sail Model <https://github.com/riscv/sail-riscv/blob/master/LICENCE>
+diff --git a/spec/std/isa/inst/V/vsetivli.yaml b/spec/std/isa/inst/V/vsetivli.yaml
+index 6bd744ee4a..6471d88e81 100644
+--- a/spec/std/isa/inst/V/vsetivli.yaml
++++ b/spec/std/isa/inst/V/vsetivli.yaml
+@@ -6,9 +6,8 @@
+ $schema: "inst_schema.json#"
+ kind: instruction
+ name: vsetivli
+-long_name: No synopsis available
+-description: |
+-  No description available.
++long_name: Vector Set Vector Type Immediate and Vector Length Immediate
++description: Set the vtype and vl CSRs, and write the new value of vl into rd.
+ definedBy:
+   extension:
+     name: V
+@@ -29,6 +28,48 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  XReg new_vtype = vtypei;
++  if ((new_vtype[xlen() - 1] == 1'b1) # software is setting the illegal bit
++      || ((new_vtype & 8'd0) != 0)    # reserved bits
++      || (new_vtype[5] == 1)          # reserved vsew encoding
++      || (new_vtype[2:0] == 3'b100)   # reserved vlmul encoding
++      || (xlen() == 32 && new_vtype[2:0] == 3'b101)) # reserved LMUL in RV32
++  {
++    CSR[vtype].VILL = 1;
++    CSR[vtype].VMA = 0;
++    CSR[vtype].VTA = 0;
++    CSR[vtype].VSEW = 0;
++    CSR[vtype].VLMUL = 0;
++  } else {
++    # valid, do the write
++    CSR[vtype].VILL = 0;
++    CSR[vtype].VMA = new_vtype[7];
++    CSR[vtype].VTA = new_vtype[6];
++    CSR[vtype].VSEW = new_vtype[5:3];
++    CSR[vtype].VLMUL = new_vtype[2:0];
++  }
++
++  VectorState state = vector_state();
++  XReg vlen = VLEN;
++  XReg vlmax = (vlen << state.log2_lmul) >> state.log2_sew;
++  XReg AVL = uimm;
++  XReg CEIL_AVL_OVER_TWO = (AVL + 1) / 2;
++  if (AVL < vlmax) {
++    CSR[vl].VALUE = AVL;
++  } else if (AVL < 2*vlmax) {
++    if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "ceil(AVL/2)") {
++      CSR[vl].VALUE = CEIL_AVL_OVER_TWO;
++    } else if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "VLMAX") {
++      CSR[vl].VALUE = vlmax;
++    } else {
++      unpredictable("Implementations may choose a custom value for vl in the case AVL < (2*VLMAX), so long as ceil(AVL/2) <= vl <= VLMAX");
++    }
++  } else {
++    CSR[vl].VALUE = vlmax;
++  }
++
++  X[xd] = CSR[vl].VALUE;
++  CSR[vstart].VALUE = 0;
+ 
+ # SPDX-SnippetBegin
+ # SPDX-FileCopyrightText: 2017-2025 Contributors to the RISCV Sail Model <https://github.com/riscv/sail-riscv/blob/master/LICENCE>
+diff --git a/spec/std/isa/inst/V/vsetvl.yaml b/spec/std/isa/inst/V/vsetvl.yaml
+index c153b0f80d..aea633f9c2 100644
+--- a/spec/std/isa/inst/V/vsetvl.yaml
++++ b/spec/std/isa/inst/V/vsetvl.yaml
+@@ -6,9 +6,8 @@
+ $schema: "inst_schema.json#"
+ kind: instruction
+ name: vsetvl
+-long_name: No synopsis available
+-description: |
+-  No description available.
++long_name: Vector Set Vector Type and Vector Length
++description: Set the vtype and vl CSRs, and write the new value of vl into rd.
+ definedBy:
+   extension:
+     name: V
+@@ -29,3 +28,120 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  XReg new_vtype = X[xs2];
++  if ((new_vtype[xlen() - 1] == 1'b1) # software is setting the illegal bit
++      || ((new_vtype & 8'd0) != 0)    # reserved bits
++      || (new_vtype[5] == 1)          # reserved vsew encoding
++      || (new_vtype[2:0] == 3'b100)   # reserved vlmul encoding
++      || (xlen() == 32 && new_vtype[2:0] == 3'b101)) # reserved LMUL in RV32
++  {
++    CSR[vtype].VILL = 1;
++    CSR[vtype].VMA = 0;
++    CSR[vtype].VTA = 0;
++    CSR[vtype].VSEW = 0;
++    CSR[vtype].VLMUL = 0;
++  } else {
++    # valid, do the write
++    CSR[vtype].VILL = 0;
++    CSR[vtype].VMA = new_vtype[7];
++    CSR[vtype].VTA = new_vtype[6];
++    CSR[vtype].VSEW = new_vtype[5:3];
++    CSR[vtype].VLMUL = new_vtype[2:0];
++  }
++
++  VectorState state = vector_state();
++  XReg vlen = VLEN;
++  XReg vlmax = (vlen << state.log2_lmul) >> state.log2_sew;
++  XReg avl = X[xs1];
++  XReg ceil_avl_over_two = (avl + 1) / 2;
++  if (avl < vlmax) {
++    CSR[vl].VALUE = avl;
++  } else if (avl < 2*vlmax) {
++    if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "ceil(AVL/2)") {
++      CSR[vl].VALUE = ceil_avl_over_two;
++    } else if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "VLMAX") {
++      CSR[vl].VALUE = vlmax;
++    } else {
++      unpredictable("Implementations may choose a custom value for vl in the case AVL < (2*VLMAX), so long as ceil(AVL/2) <= vl <= VLMAX");
++    }
++  } else {
++    CSR[vl].VALUE = vlmax;
++  }
++
++  X[xd] = CSR[vl].VALUE;
++  CSR[vstart].VALUE = 0;
++
++# SPDX-SnippetBegin
++# SPDX-FileCopyrightText: 2017-2025 Contributors to the RISCV Sail Model <https://github.com/riscv/sail-riscv/blob/master/LICENCE>
++# SPDX-License-Identifier: BSD-2-Clause
++sail(): |
++  {
++    let VLEN_pow      = get_vlen_pow();
++    let ELEN_pow      = get_elen_pow();
++    let LMUL_pow_ori  = get_lmul_pow();
++    let SEW_pow_ori   = get_sew_pow();
++    let ratio_pow_ori = SEW_pow_ori - LMUL_pow_ori;
++
++    /* set vtype */
++    match op {
++      VSETVLI => {
++        vtype->bits() = 0b0 @ zeros(sizeof(xlen) - 9) @ ma @ ta @ sew @ lmul
++      },
++      VSETVL  => {
++        let rs2 : regidx = sew[1 .. 0] @ lmul;
++        vtype->bits() = X(rs2)
++      }
++    };
++
++    /* check legal SEW and LMUL and calculate VLMAX */
++    let LMUL_pow_new = get_lmul_pow();
++    let SEW_pow_new  = get_sew_pow();
++    if SEW_pow_new > LMUL_pow_new + ELEN_pow then {
++      /* Note: Implementations can set vill or trap if the vtype setting is not supported.
++       * TODO: configuration support for both solutions
++       */
++      vtype->bits() = 0b1 @ zeros(sizeof(xlen) - 1); /* set vtype.vill */
++      vl = zeros();
++      print_reg("CSR vtype <- " ^ BitStr(vtype.bits()));
++      print_reg("CSR vl <- " ^ BitStr(vl));
++      return RETIRE_SUCCESS
++    };
++    let VLMAX = int_power(2, VLEN_pow + LMUL_pow_new - SEW_pow_new);
++
++    /* set vl according to VLMAX and AVL */
++    if (rs1 != 0b00000) then { /* normal stripmining */
++      let rs1_val = X(rs1);
++      let AVL = unsigned(rs1_val);
++      vl = if AVL <= VLMAX then to_bits(sizeof(xlen), AVL)
++           else if AVL < 2 * VLMAX then to_bits(sizeof(xlen), (AVL + 1) / 2)
++           else to_bits(sizeof(xlen), VLMAX);
++      /* Note: ceil(AVL / 2) <= vl <= VLMAX when VLMAX < AVL < (2 * VLMAX)
++       * TODO: configuration support for either using ceil(AVL / 2) or VLMAX
++       */
++      X(rd) = vl;
++    } else if (rd != 0b00000) then { /* set vl to VLMAX */
++      let AVL = unsigned(ones(sizeof(xlen)));
++      vl = to_bits(sizeof(xlen), VLMAX);
++      X(rd) = vl;
++    } else { /* keep existing vl */
++      let AVL = unsigned(vl);
++      let ratio_pow_new = SEW_pow_new - LMUL_pow_new;
++      if (ratio_pow_new != ratio_pow_ori) then {
++        /* Note: Implementations can set vill or trap if the vtype setting is not supported.
++         * TODO: configuration support for both solutions
++         */
++        vtype->bits() = 0b1 @ zeros(sizeof(xlen) - 1); /* set vtype.vill */
++        vl = zeros();
++      }
++    };
++    print_reg("CSR vtype <- " ^ BitStr(vtype.bits()));
++    print_reg("CSR vl <- " ^ BitStr(vl));
++
++    /* reset vstart to 0 */
++    vstart = zeros();
++    print_reg("CSR vstart <- " ^ BitStr(vstart));
++
++    RETIRE_SUCCESS
++  }
++
++# SPDX-SnippetEnd
+diff --git a/spec/std/isa/inst/V/vsetvli.yaml b/spec/std/isa/inst/V/vsetvli.yaml
+index 123408517f..6953678b05 100644
+--- a/spec/std/isa/inst/V/vsetvli.yaml
++++ b/spec/std/isa/inst/V/vsetvli.yaml
+@@ -6,9 +6,8 @@
+ $schema: "inst_schema.json#"
+ kind: instruction
+ name: vsetvli
+-long_name: No synopsis available
+-description: |
+-  No description available.
++long_name: Vector Set Vector Type and Vector Length Immediate
++description: Set the vtype and vl CSRs, and write the new value of vl into rd.
+ definedBy:
+   extension:
+     name: V
+@@ -16,7 +15,7 @@ assembly: xd, xs1, vtypei
+ encoding:
+   match: 0----------------111-----1010111
+   variables:
+-    - name: zimm
++    - name: vtypei
+       location: 30-20
+     - name: xs1
+       location: 19-15
+@@ -29,6 +28,51 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  XReg new_vtype = vtypei;
++  if ((new_vtype[xlen() - 1] == 1'b1) # software is setting the illegal bit
++      || ((new_vtype & 8'd0) != 0)    # reserved bits
++      || (new_vtype[5] == 1)          # reserved vsew encoding
++      || (new_vtype[2:0] == 3'b100)   # reserved vlmul encoding
++      || (xlen() == 32 && new_vtype[2:0] == 3'b101)) # reserved LMUL in RV32
++  {
++    CSR[vtype].VILL = 1;
++    CSR[vtype].VMA = 0;
++    CSR[vtype].VTA = 0;
++    CSR[vtype].VSEW = 0;
++    CSR[vtype].VLMUL = 0;
++  } else {
++    # valid, do the write
++    CSR[vtype].VILL = 0;
++    CSR[vtype].VMA = new_vtype[7];
++    CSR[vtype].VTA = new_vtype[6];
++    CSR[vtype].VSEW = new_vtype[5:3];
++    CSR[vtype].VLMUL = new_vtype[2:0];
++  }
++
++  VectorState state = vector_state();
++  XReg vlen = VLEN;
++  XReg vlmax = (vlen << state.log2_lmul) >> state.log2_sew;
++  XReg avl = X[xs1];
++  XReg ceil_avl_over_two = (avl + 1) / 2;
++
++  if (xs1 == 0) {
++    CSR[vl].VALUE = vlmax;
++  } else if (avl < vlmax) {
++      CSR[vl].VALUE = avl;
++  } else if (avl < 2*vlmax) {
++      if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "ceil(AVL/2)") {
++        CSR[vl].VALUE = ceil_avl_over_two;
++      } else if (RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX == "VLMAX") {
++          CSR[vl].VALUE = vlmax;
++      } else {
++          unpredictable("Implementations may choose a custom value for vl in the case AVL < (2*VLMAX), so long as ceil(AVL/2) <= vl <= VLMAX");
++      }
++  } else {
++      CSR[vl].VALUE = vlmax;
++  }
++
++  X[xd] = CSR[vl].VALUE;
++  CSR[vstart].VALUE = 0;
+ 
+ # SPDX-SnippetBegin
+ # SPDX-FileCopyrightText: 2017-2025 Contributors to the RISCV Sail Model <https://github.com/riscv/sail-riscv/blob/master/LICENCE>
+diff --git a/spec/std/isa/isa/globals.isa b/spec/std/isa/isa/globals.isa
+index 8e11467661..24574f62a3 100644
+--- a/spec/std/isa/isa/globals.isa
++++ b/spec/std/isa/isa/globals.isa
+@@ -8,6 +8,7 @@ include "interrupts.idl"
+ include "fetch.idl"
+ include "util.idl"
+ include "fp.idl"
++include "vec.idl"
+ 
+ # global state
+ 
+diff --git a/spec/std/isa/isa/vec.idl b/spec/std/isa/isa/vec.idl
+new file mode 100644
+index 0000000000..995d6de4d9
+--- /dev/null
++++ b/spec/std/isa/isa/vec.idl
+@@ -0,0 +1,55 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++%version: 1.0
++
++# - test suite?
++# - Vector params (there will be many)
++# - Vector state
++# - Order (might be dictated somewhat by test suite)
++#   - vset*
++#   - integer arith (vadd/vsub/vrsub(.vv,.vx,.vi), compare, min, max)
++#   - integer widening arith ()
++
++# the vector register file
++Bits<128> v[32];
++
++enum VectorLmulType {
++  Divide
++  Multiply
++}
++
++struct VectorState {
++  Bits<7> sew;
++  Bits<3> log2_sew;
++  VectorLmulType lmul_type;
++  Bits<2> log2_lmul;
++}
++
++function vector_state {
++  returns VectorState
++  description {
++    Get the current vector state from CSRs
++  }
++  body {
++    VectorState state;
++
++    state.log2_sew = 3 + CSR[vtype].VSEW;
++    state.sew = 7'b1 << state.log2_sew;
++
++    Bits<3> vlmul = CSR[vtype].VLMUL;
++    state.lmul_type = CSR[vtype].VLMUL[2] == 1'b1 ? VectorLmulType::Divide : VectorLmulType::Multiply;
++    state.log2_lmul = CSR[vtype].VLMUL[1:0];
++    if (vlmul == 3'b101) {
++      state.log2_lmul = 3;
++    } else if (vlmul == 3'b110) {
++      state.log2_lmul = 2;
++    } else if (vlmul == 3'b111) {
++      state.log2_lmul = 1;
++    } else if (vlmul == 3'b100) {
++      unpredictable("VLMUL value 0b100 is reserved");
++    }
++
++    return state;
++  }
++}
+diff --git a/spec/std/isa/param/ELEN.yaml b/spec/std/isa/param/ELEN.yaml
+new file mode 100644
+index 0000000000..78eb1c6ae6
+--- /dev/null
++++ b/spec/std/isa/param/ELEN.yaml
+@@ -0,0 +1,20 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../../schemas/param_schema.json
++
++$schema: param_schema.json#
++kind: parameter
++name: ELEN
++description: |
++  The maximum size in bits of a vector element that any operation can produce or consume.
++long_name: TODO
++schema:
++  type: integer
++#    requirements:
++#      idl(): |
++#        -> (ELEN >='h8) && (popcount(ELEN) == 1);
++#      reason: ELEN >= 8, which must be a power of 2.
++definedBy:
++  extension:
++    name: V
+diff --git a/spec/std/isa/param/FOLLOW_VTYPE_RESET_RECOMMENDATION.yaml b/spec/std/isa/param/FOLLOW_VTYPE_RESET_RECOMMENDATION.yaml
+new file mode 100644
+index 0000000000..482c12845a
+--- /dev/null
++++ b/spec/std/isa/param/FOLLOW_VTYPE_RESET_RECOMMENDATION.yaml
+@@ -0,0 +1,18 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../../schemas/param_schema.json
++
++$schema: param_schema.json#
++kind: parameter
++name: FOLLOW_VTYPE_RESET_RECOMMENDATION
++description: |
++  It is recommended that at reset, vtype.vill is set, the remaining bits in vtype are zero, and vl is set to zero.
++  If this parameter is set to true, this recommendation is followed. If it is false, at reset the respective fields
++  will be UNDEFINED_LEGAL.
++long_name: TODO
++schema:
++  type: boolean
++definedBy:
++  extension:
++    name: V
+diff --git a/spec/std/isa/param/RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX.yaml b/spec/std/isa/param/RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX.yaml
+new file mode 100644
+index 0000000000..98a51778f3
+--- /dev/null
++++ b/spec/std/isa/param/RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX.yaml
+@@ -0,0 +1,17 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../../schemas/param_schema.json
++
++$schema: param_schema.json#
++kind: parameter
++name: RVV_VL_WHEN_AVL_LT_DOUBLE_VLMAX
++description: |
++  The value assigned to VL when AVL < 2*VLMAX.
++long_name: TODO
++schema:
++  type: string
++  enum: ["ceil(AVL/2)", "VLMAX", "custom"]
++definedBy:
++  extension:
++    name: V
+diff --git a/spec/std/isa/param/VLEN.yaml b/spec/std/isa/param/VLEN.yaml
+new file mode 100644
+index 0000000000..b82d2c23ce
+--- /dev/null
++++ b/spec/std/isa/param/VLEN.yaml
+@@ -0,0 +1,20 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../../schemas/param_schema.json
++
++$schema: param_schema.json#
++kind: parameter
++name: VLEN
++description: |
++  The number of bits in a single vector register.
++long_name: TODO
++schema:
++  type: integer
++#    requirements:
++#      idl(): |
++#        -> (VLEN >= ELEN) && (VLEN <='h10000) && (popcount(VLEN) == 1);
++#      reason: VLEN >= ELEN, which must be a power of 2, and must be no greater than 2^16.
++definedBy:
++  extension:
++    name: V
+diff --git a/tests/isa/.gitignore b/tests/isa/.gitignore
+new file mode 100644
+index 0000000000..a3186f6ba6
+--- /dev/null
++++ b/tests/isa/.gitignore
+@@ -0,0 +1,5 @@
++#SPDX-FileCopyrightText = "Qualcomm Technologies, Inc. and/or its subsidiaries."
++#SPDX-License-Identifier = "CC0-1.0"
++
++# Ignore all compiled tests and dump files
++rv??uv-?-*
+diff --git a/tests/isa/Makefile b/tests/isa/Makefile
+new file mode 100644
+index 0000000000..e81905276b
+--- /dev/null
++++ b/tests/isa/Makefile
+@@ -0,0 +1,85 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++#=======================================================================
++# Makefile for riscv-tests/isa
++#-----------------------------------------------------------------------
++
++XLEN ?= 64
++
++src_dir := .
++riscv_tests_dir := $(src_dir)/../../ext/riscv-tests
++
++ifeq ($(XLEN),64)
++include $(src_dir)/rv64uv/Makefrag
++endif
++include $(src_dir)/rv32uv/Makefrag
++
++default: all
++
++#--------------------------------------------------------------------
++# Build rules
++#--------------------------------------------------------------------
++
++RISCV_PREFIX ?= riscv$(XLEN)-unknown-elf-
++RISCV_GCC ?= $(RISCV_PREFIX)gcc
++RISCV_GCC_OPTS ?= -static -mcmodel=medany -fvisibility=hidden -nostdlib -nostartfiles -I/usr/include/newlib
++RISCV_OBJDUMP ?= $(RISCV_PREFIX)objdump --disassemble-all --disassemble-zeroes --section=.text --section=.text.startup --section=.text.init --section=.data
++
++
++vpath %.S $(src_dir)
++
++#------------------------------------------------------------
++# Build assembly tests
++
++%.dump: %
++	$(RISCV_OBJDUMP) $< > $@
++
++define compile_template
++
++$$($(1)_p_tests): $(1)-p-%: $(1)/%.S
++	$$(RISCV_GCC) $(2) $$(RISCV_GCC_OPTS) -I$(riscv_tests_dir)/env/p -I$(riscv_tests_dir)/isa/macros/scalar -T$(riscv_tests_dir)/env/p/link.ld $$< -o $$@
++$(1)_tests += $$($(1)_p_tests)
++
++$$($(1)_v_tests): $(1)-v-%: $(1)/%.S
++	$$(RISCV_GCC) $(2) $$(RISCV_GCC_OPTS) -DENTROPY=0x$$(shell echo \$$@ | md5sum | cut -c 1-7) -std=gnu99 -O2 -I$(riscv_tests_dir)/env/v -I$(riscv_tests_dir)/isa/macros/scalar -T$(riscv_tests_dir)/env/v/link.ld $(riscv_tests_dir)/env/v/entry.S $(riscv_tests_dir)/env/v/*.c $$< -o $$@
++$(1)_tests += $$($(1)_v_tests)
++
++$(1)_tests_dump = $$(addsuffix .dump, $$($(1)_tests))
++
++$(1): $$($(1)_tests_dump)
++
++.PHONY: $(1)
++
++COMPILER_SUPPORTS_$(1) := $$(shell $$(RISCV_GCC) $(2) -c -x c /dev/null -o /dev/null 2> /dev/null; echo $$$$?)
++
++ifeq ($$(COMPILER_SUPPORTS_$(1)),0)
++tests += $$($(1)_tests)
++endif
++
++endef
++
++$(eval $(call compile_template,rv32uv,-march=rv32gv -mabi=ilp32))
++ifeq ($(XLEN),64)
++$(eval $(call compile_template,rv64uv,-march=rv64gv -mabi=lp64))
++endif
++
++tests_dump = $(addsuffix .dump, $(tests))
++
++junk += $(tests) $(tests_dump)
++
++#------------------------------------------------------------
++# Default
++
++all: $(tests_dump) riscv_tests
++
++#------------------------------------------------------------
++# riscv-tests targets
++riscv_tests:
++	$(MAKE) -C $(riscv_tests_dir)/isa RISCV_GCC_OPTS='$(RISCV_GCC_OPTS)'
++
++#------------------------------------------------------------
++# Clean up
++
++clean:
++	$(MAKE) -C $(riscv_tests_dir)/isa clean
++	rm -rf $(junk)
+diff --git a/tests/isa/REUSE.toml b/tests/isa/REUSE.toml
+new file mode 100644
+index 0000000000..8a87185ad1
+--- /dev/null
++++ b/tests/isa/REUSE.toml
+@@ -0,0 +1,8 @@
++version = 1
++
++[[annotations]]
++path = ["**/.gitattributes", "**.gitignore", "**.gitreview"]
++comment = "version control system. Infrastructure"
++precedence = "closest"
++SPDX-FileCopyrightText = "Qualcomm Technologies, Inc. and/or its subsidiaries."
++SPDX-License-Identifier = "CC0-1.0"
+diff --git a/tests/isa/rv32uv/Makefrag b/tests/isa/rv32uv/Makefrag
+new file mode 100644
+index 0000000000..5d70f75fd1
+--- /dev/null
++++ b/tests/isa/rv32uv/Makefrag
+@@ -0,0 +1,12 @@
++#=======================================================================
++# Makefrag for rv32uv tests
++#-----------------------------------------------------------------------
++
++rv32uv_sc_tests = \
++    vsetivli \
++    vsetvl \
++    vsetvli_vl_lt_vlmax \
++    vsetvli_rs1_eq_zero
++
++rv32uv_p_tests = $(addprefix rv32uv-p-, $(rv32uv_sc_tests))
++rv32uv_v_tests = $(addprefix rv32uv-v-, $(rv32uv_sc_tests))
+diff --git a/tests/isa/rv32uv/REUSE.toml b/tests/isa/rv32uv/REUSE.toml
+new file mode 100644
+index 0000000000..932e43e98a
+--- /dev/null
++++ b/tests/isa/rv32uv/REUSE.toml
+@@ -0,0 +1,7 @@
++version = 1
++
++[[annotations]]
++path = "**"
++precedence = "closest"
++SPDX-FileCopyrightText = "Qualcomm Technologies, Inc. and/or its subsidiaries."
++SPDX-License-Identifier = "CC0-1.0"
+diff --git a/tests/isa/rv32uv/vsetivli.S b/tests/isa/rv32uv/vsetivli.S
+new file mode 100644
+index 0000000000..e698d285fb
+--- /dev/null
++++ b/tests/isa/rv32uv/vsetivli.S
+@@ -0,0 +1,9 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++# See LICENSE for license details
++
++#include "riscv_test.h"
++#undef RVTEST_RV64U
++#define RVTEST_RV64U RVTEST_RV32U
++
++#include "../rv64uv/vsetivli.S"
+diff --git a/tests/isa/rv32uv/vsetvl.S b/tests/isa/rv32uv/vsetvl.S
+new file mode 100644
+index 0000000000..2871bf5c8c
+--- /dev/null
++++ b/tests/isa/rv32uv/vsetvl.S
+@@ -0,0 +1,9 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++# See LICENSE for license details
++
++#include "riscv_test.h"
++#undef RVTEST_RV64U
++#define RVTEST_RV64U RVTEST_RV32U
++
++#include "../rv64uv/vsetvl.S"
+diff --git a/tests/isa/rv32uv/vsetvli_rs1_eq_zero.S b/tests/isa/rv32uv/vsetvli_rs1_eq_zero.S
+new file mode 100644
+index 0000000000..806d6b8d0e
+--- /dev/null
++++ b/tests/isa/rv32uv/vsetvli_rs1_eq_zero.S
+@@ -0,0 +1,7 @@
++# See LICENSE for license details
++
++#include "riscv_test.h"
++#undef RVTEST_RV64U
++#define RVTEST_RV64U RVTEST_RV32U
++
++#include "../rv64uv/vsetvli_rs1_eq_zero.S"
+diff --git a/tests/isa/rv32uv/vsetvli_vl_lt_vlmax.S b/tests/isa/rv32uv/vsetvli_vl_lt_vlmax.S
+new file mode 100644
+index 0000000000..404141b704
+--- /dev/null
++++ b/tests/isa/rv32uv/vsetvli_vl_lt_vlmax.S
+@@ -0,0 +1,7 @@
++# See LICENSE for license details
++
++#include "riscv_test.h"
++#undef RVTEST_RV64U
++#define RVTEST_RV64U RVTEST_RV32U
++
++#include "../rv64uv/vsetvli_vl_lt_vlmax.S"
+diff --git a/tests/isa/rv64uv/Makefrag b/tests/isa/rv64uv/Makefrag
+new file mode 100644
+index 0000000000..70cadd2bdb
+--- /dev/null
++++ b/tests/isa/rv64uv/Makefrag
+@@ -0,0 +1,12 @@
++#=======================================================================
++# Makefrag for rv64uv tests
++#-----------------------------------------------------------------------
++
++rv64uv_sc_tests = \
++    vsetivli \
++    vsetvl \
++    vsetvli_vl_lt_vlmax \
++    vsetvli_rs1_eq_zero
++
++rv64uv_p_tests = $(addprefix rv64uv-p-, $(rv64uv_sc_tests))
++rv64uv_v_tests = $(addprefix rv64uv-v-, $(rv64uv_sc_tests))
+diff --git a/tests/isa/rv64uv/REUSE.toml b/tests/isa/rv64uv/REUSE.toml
+new file mode 100644
+index 0000000000..932e43e98a
+--- /dev/null
++++ b/tests/isa/rv64uv/REUSE.toml
+@@ -0,0 +1,7 @@
++version = 1
++
++[[annotations]]
++path = "**"
++precedence = "closest"
++SPDX-FileCopyrightText = "Qualcomm Technologies, Inc. and/or its subsidiaries."
++SPDX-License-Identifier = "CC0-1.0"
+diff --git a/tests/isa/rv64uv/vsetivli.S b/tests/isa/rv64uv/vsetivli.S
+new file mode 100644
+index 0000000000..9437d6a3ab
+--- /dev/null
++++ b/tests/isa/rv64uv/vsetivli.S
+@@ -0,0 +1,42 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++# See LICENSE for license details
++
++#*****************************************************************************
++# vsetivli.S
++#-----------------------------------------------------------------------------
++#
++# Test vsetivli instruction.
++#
++# vsetivli xd, uimm, vtypei
++# vtypei[7:0] = VLMUL[2:0], VSEW[5:3], VTA[6], VMA[7]
++# uimm[4:0] = AVL
++
++#include "riscv_test.h"
++#include "test_macros.h"
++
++RVTEST_RV64U
++RVTEST_CODE_BEGIN
++
++# tests for VLEN=128bits, AVL < VLMAX
++
++  TEST_CASE(2, x2, 0x2, \
++    vsetivli x2, 0x2, 3; \
++  )
++
++  TEST_CASE(3, x2, 0x2, \
++    vsetivli x2, 0x2, 0x23; \
++  )
++
++  TEST_CASE(4, x2, 0x2, \
++    vsetivli x2, 0x2, 0xeb; \
++  )
++
++  TEST_PASSFAIL
++
++RVTEST_CODE_END
++
++  .data
++RVTEST_DATA_BEGIN
++
++RVTEST_DATA_END
+diff --git a/tests/isa/rv64uv/vsetvl.S b/tests/isa/rv64uv/vsetvl.S
+new file mode 100644
+index 0000000000..df9e73fc1f
+--- /dev/null
++++ b/tests/isa/rv64uv/vsetvl.S
+@@ -0,0 +1,51 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++# See LICENSE for license details
++
++#*****************************************************************************
++# vsetvl.S
++#-----------------------------------------------------------------------------
++#
++# Test vsetvl instruction.
++#
++# vsetvl xd, xs1, xs2
++# xs2[7:0] = VLMUL[2:0], VSEW[5:3], VTA[6], VMA[7]
++# xs1[4:0] = AVL
++
++#include "riscv_test.h"
++#include "test_macros.h"
++
++RVTEST_RV64U
++RVTEST_CODE_BEGIN
++
++# tests for VLEN=128bits, AVL < VLMAX
++
++  # SEW=8, LMUL=1, VLMAX=16
++  TEST_CASE(2, x5, 0x2, \
++    li x2, 0x2; \
++    li x4, 0x2; \
++    vsetvl x5, x2, x4; \
++  )
++
++  # SEW=8, LMUL=2, VLMAX=32
++  TEST_CASE(3, x5, 0x2, \
++    li x2, 0x2; \
++    li x4, 0x23; \
++    vsetvl x5, x2, x4; \
++  )
++
++  # SEW=8, LMUL=1/2, VLMAX=8
++  TEST_CASE(4, x5, 0x2, \
++    li x2, 0x2; \
++    li x4, 0xeb; \
++    vsetvl x5, x2, x4; \
++  )
++
++  TEST_PASSFAIL
++
++RVTEST_CODE_END
++
++  .data
++RVTEST_DATA_BEGIN
++
++RVTEST_DATA_END
+diff --git a/tests/isa/rv64uv/vsetvli_rs1_eq_zero.S b/tests/isa/rv64uv/vsetvli_rs1_eq_zero.S
+new file mode 100644
+index 0000000000..d67fa4bc8f
+--- /dev/null
++++ b/tests/isa/rv64uv/vsetvli_rs1_eq_zero.S
+@@ -0,0 +1,54 @@
++# See LICENSE for license details
++
++#*****************************************************************************
++# vsetvli.S
++#-----------------------------------------------------------------------------
++#
++# Test vsetvli instruction when source register rs1 is equal to zero
++#
++# vsetvli xd, x0, vtypei
++# vtypei[7:0] = VLMUL[2:0], VSEW[5:3], VTA[6], VMA[7]
++# AVL is taken to be ~0 (the maximum unsigned integer) and VL is set to VLMAX
++
++#include "riscv_test.h"
++#include "test_macros.h"
++
++RVTEST_RV64U
++RVTEST_CODE_BEGIN
++
++# tests for VLEN=128bits, AVL = ~0 (rs1 = x0)
++  # vtypei = 0x03 -> VMA_VTA_VSEW_VLMUL == 0_0_000_011 -> SEW=8, LMUL=8
++  # VLMAX=LMUL*VLEN/SEW = 8*128/8 = 128
++  TEST_CASE(1, x5, 0x80, \
++    vsetvli x5, x0, 0x03; \
++  )
++
++  # vtypei = 0x0b -> VMA_VTA_VSEW_VLMUL == 0_0_001_011 -> SEW=16, LMUL=8
++  # VLMAX=LMUL*VLEN/SEW = 8*128/16 = 64
++  TEST_CASE(2, x5, 0x40, \
++    vsetvli x5, x0, 0x0b; \
++  )
++  # vtypei = 0x23 -> VMA_VTA_VSEW_VLMUL == 0_0_100_011 -> SEW=RESERVED, LMUL=8
++  # Change to
++  # vtypei = 0x13 -> VMA_VTA_VSEW_VLMUL == 0_0_010_011 -> SEW=32, LMUL=8
++  # VLMAX=LMUL*VLEN/SEW = 8*128/32 = 32
++  TEST_CASE(3, x5, 0x20, \
++    vsetvli x5, x0, 0x13; \
++  )
++
++  # vtypei = 0xeb-> VMA_VTA_VSEW_VLMUL == 1_1_101_011 -> SEW=RESERVED, LMUL=8
++  # Change to
++  # vtypei = 0xdb -> VMA_VTA_VSEW_VLMUL == 1_1_011_011 -> SEW=64, LMUL=8
++  # VLMAX=LMUL*VLEN/SEW = 8*128/64 = 16
++  TEST_CASE(4, x5, 0x10, \
++    vsetvli x5, x0, 0xdb; \
++  )
++
++  TEST_PASSFAIL
++
++RVTEST_CODE_END
++
++  .data
++RVTEST_DATA_BEGIN
++
++RVTEST_DATA_END
+diff --git a/tests/isa/rv64uv/vsetvli_vl_lt_vlmax.S b/tests/isa/rv64uv/vsetvli_vl_lt_vlmax.S
+new file mode 100644
+index 0000000000..4a87ad09f5
+--- /dev/null
++++ b/tests/isa/rv64uv/vsetvli_vl_lt_vlmax.S
+@@ -0,0 +1,43 @@
++# See LICENSE for license details
++
++#*****************************************************************************
++# vsetvli.S
++#-----------------------------------------------------------------------------
++#
++# Test vsetvli instruction.
++#
++# vsetvli xd, xs1, vtypei
++# vtypei[7:0] = VLMUL[2:0], VSEW[5:3], VTA[6], VMA[7]
++# xs1[4:0] = AVL
++
++#include "riscv_test.h"
++#include "test_macros.h"
++
++RVTEST_RV64U
++RVTEST_CODE_BEGIN
++
++# tests for VLEN=128bits, AVL < VLMAX
++
++  TEST_CASE(2, x5, 0x2, \
++    li x4, 0x2; \
++    vsetvli x5, x4, 0x3; \
++  )
++
++  TEST_CASE(3, x5, 0x2, \
++    li x4, 0x2; \
++    vsetvli x5, x4, 0x23; \
++  )
++
++  TEST_CASE(4, x5, 0x2, \
++    li x4, 0x2; \
++    vsetvli x5, x4, 0xeb; \
++  )
++
++  TEST_PASSFAIL
++
++RVTEST_CODE_END
++
++  .data
++RVTEST_DATA_BEGIN
++
++RVTEST_DATA_END
+diff --git a/tools/scripts/run-rvtest b/tools/scripts/run-rvtest
+new file mode 100755
+index 0000000000..7624253843
+--- /dev/null
++++ b/tools/scripts/run-rvtest
+@@ -0,0 +1,42 @@
++#!/bin/bash
++# SPDX-FileCopyrightText: Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++if [ -n "$1" ]; then
++	ARCH_TYPE=$1
++	shift
++fi
++
++if [ -n "$1" ]; then
++	BUILD_TYPE=$1
++	shift
++fi
++
++if [ -n "$1" ]; then
++	config=$1
++	shift
++fi
++
++if [ -n "$1" ]; then
++	test_prefix=$1
++	shift
++fi
++
++if [ -n "$1" ]; then
++	tests=$@
++fi
++
++echo ARCH_TYPE: $ARCH_TYPE
++echo BUILD_TYPE: $BUILD_TYPE
++echo config: $config
++echo test_prefix: $test_prefix
++echo tests: $tests
++
++for rvtest in $tests
++do
++    echo $rvtest
++    ./gen/cpp_hart_gen/${ARCH_TYPE}_${BUILD_TYPE}/build/iss \
++		-m ${ARCH_TYPE} \
++		-c ./cfgs/${config}.yaml \
++		./tests/isa/${test_prefix}-$rvtest
++done

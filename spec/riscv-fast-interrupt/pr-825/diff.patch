@@ -1,0 +1,740 @@
+diff --git a/src/aclic.adoc b/src/aclic.adoc
+index 8ee354a..82eec5b 100644
+--- a/src/aclic.adoc
++++ b/src/aclic.adoc
+@@ -69,8 +69,8 @@ Graphics used are either explicitly available for free, are the property of RISC
+ :cause: pass:q[``**__x__**cause``]
+ :tval: pass:q[``**__x__**tval``]
+ :ip: pass:q[``**__x__**ip``]
+-:pistatus: pass:q[``**__x__**pistatus``]
+-:xpistatus: pass:q[``xpistatus``]
++:istatus: pass:q[``**__x__**istatus``]
++:xistatus: pass:q[``xistatus``]
+ :pithreshold: pass:q[``pithreshold``]
+ :mithreshold: pass:q[``mithreshold``]
+ :sithreshold: pass:q[``sithreshold``]
+@@ -91,10 +91,12 @@ Graphics used are either explicitly available for free, are the property of RISC
+ :xtopi: pass:q[``xtopi``]
+ :xtopei: pass:q[``xtopei``]
+ :claimi: pass:q[``claimi``]
++:IPRIO: pass:q[``IPRIO``]
+ 
+ :mstatus: pass:q[``mstatus``]
+ :mideleg: pass:q[``mideleg``]
+ :mie: pass:q[``mie``]
++:xie: pass:q[``xie``]
+ :mtvec: pass:q[``mtvec``]
+ :mivt: pass:q[``mivt``]
+ :meivt: pass:q[``meivt``]
+@@ -105,13 +107,25 @@ Graphics used are either explicitly available for free, are the property of RISC
+ :mcause: pass:q[``mcause``]
+ :mtval: pass:q[``mtval``]
+ :mip: pass:q[``mip``]
+-:mpistatus: pass:q[``mpistatus``]
++:mistatus: pass:q[``mistatus``]
+ :mpnipprio: pass:q[``mpnipprio``]
+ :mistatus: pass:q[``mistatus``]
+ :mipreemptcfg: pass:q[``mipreemptcfg``]
++:sipreemptcfg: pass:q[``sipreemptcfg``]
+ :preemptmsk: pass:q[``preemptmsk``]
++:spreempten: pass:q[``spreempten``]
++:mpreempten: pass:q[``mpreempten``]
++:mfie: pass:q[``mfie``]
++:sfie: pass:q[``sfie``]
++:xfie: pass:q[``xfie``]
++:mpfie: pass:q[``mpfie``]
++:spfie: pass:q[``spfie``]
++:xpfie: pass:q[``xpfie``]
++:fithresh: pass:q[``fithresh``]
+ :mintthresh: pass:q[``mintthresh``]
+ :mtopi: pass:q[``mtopi``]
++:mtopei: pass:q[``mtopei``]
++:stopei: pass:q[``stopei``]
+ :mclaimi: pass:q[``mclaimi``]
+ 
+ :sstatus: pass:q[``sstatus``]
+@@ -126,7 +140,7 @@ Graphics used are either explicitly available for free, are the property of RISC
+ :scause: pass:q[``scause``]
+ :stval: pass:q[``stval``]
+ :sip: pass:q[``sip``]
+-:spistatus: pass:q[``spistatus``]
++:sistatus: pass:q[``sistatus``]
+ :spnipprio: pass:q[``spnipprio``]
+ :snipprio: pass:q[``snipprio``]
+ :sintthresh: pass:q[``sintthresh``]
+@@ -676,7 +690,7 @@ It provides additional state to resume execution of the previous handler after a
+ [source]
+ ----
+        Number  Name         Description
+- (NEW) 0x346   mpistatus    Previous interrupt context
++ (NEW) 0x346   mistatus     Interrupt status
+  (NEW) 0x347   mithreshold  Interrupt enable threshold
+  (NEW) 0x348   mipreemptcfg Interrupt preemption configuration
+ ----
+@@ -687,13 +701,28 @@ It provides additional state to resume execution of the previous handler after a
+ ----
+ mipreemptcfg fields
+  bits        description
+- XLEN-1:4    (reserved)
+- 3:0         preemptmsk
++ XLEN-1:12   (reserved)
++ 11:8        preemptmsk
++ 7:4         fithresh
++ 3           spreempten (if Ssnip is implemented)
++ 2           mpreempten
++ 1           sfie (if Ssnip is implemented)
++ 0           mfie
+ ----
+ 
+ {mipreemptcfg} is a WARL register used to configure the behavior of preemption.
+-The highest legal value of {mipreemptcfg}.{preemptmsk} is IPRIOLEN.
+ 
++The fields {mpreempten} and {spreempten} enable this extension at M-mode and S-mode, respectively.
++Enablement of the extension refers to activating the modified operative behavior specified in <<op-threshold>>.
++
++If Ssnip is not implemented, then {spreempten} is read-only 0.
++
++The bit {xfie} (Fast Interrupt Enable) controls if fast interrupts can trap when the corresponding {xie} bit is zero.
++
++When {xie} is one, {xfie} has no effect.
++When the {xfie} bit is set to 0 by an explicit CSR write, the {xie} bit is cleared to 0.
++
++The highest legal value of {mipreemptcfg}.{preemptmsk} is IPRIOLEN.
+ A mask for filtering out the bits of a priority number that will participate in the selection for nested interrupt preemption is:
+ 
+ [source,subs="attributes"]
+@@ -701,6 +730,32 @@ A mask for filtering out the bits of a priority number that will participate in
+ NIPPRIO_MASK = ~(2^(mipreemptcfg.preemptmsk) - 1)
+ ----
+ 
++Which subset of the interrupts is considered fast interrupts is controlled by {fithresh}.
++The highest legal value of {mipreemptcfg}.{fithresh} is IPRIOLEN.
++
++NOTE: In the intended use-case, {fithresh} will be configured to values smaller than {preemptmsk}.
++This selects a subset of preemption groups as fast-interrupts.
++
++[source,subs="attributes"]
++----
++FITHRESHOLD = 2^mipreemptcfg.fithresh
++----
++
++An interrupt source is considered a fast interrupt source depending on its IPRIO value, if the following condition holds:
++
++[source]
++----
++IPRIO < FITHRESHOLD
++
++which is equivalent to
++
++IPRIO & FITHRESHOLD == 0
++----
++
++NOTE: The fast interrupt threshold is defined this way to simplify the logic to determine,
++if an interrupt is considered a fast interrupt.
++No comparator is needed this way, and the determination can be done through a bitwise and-operation.
++
+ ===== New Interrupt enable threshold ({mithreshold}) CSR
+ 
+ A new WLRL M-mode CSR, {mithreshold},
+@@ -717,21 +772,28 @@ It is needed in an efficient implementation of synchronization protocols like
+ Priority Ceiling Protocol (PCP) that are used with preemptive interrupt schemes.
+ ====
+ 
+-===== New Previous Interrupt Status ({mpistatus}) CSR
++When reading from {mtopi} or {mtopei}, and no interrupt is pending and enabled at machine level,
++the {IPRIO} field returns {mithreshold}.
++
++NOTE: Returning mithreshold as {IPRIO} field allows software to use this priority as threshold for spurious interrupts handlers.
++If it would return zero, software would need special handling of spurious interrupts to prevent writing 0 to the threshold register.
+ 
+-A new M-mode CSR, {mpistatus}, holds consolidated state of preempted context.
++===== New Interrupt Status ({mistatus}) CSR
++
++A new M-mode CSR, {mistatus}, holds consolidated state related to interrupts.
+ 
+ [source]
+ ----
+-mpistatus 
++mistatus
+  Bits       Field            Description
+  XLEN-1:30  (reserved)
+  29:28      mpp[1:0]         Previous privilege mode, mirror of mstatus.mpp
+  27         mpie             Previous interrupt enable, mirror of mstatus.mpie
+- 26:20      (reserved)
++ 26         pmfie            Previous fast interrupts enable
++ 25:20      (reserved)
+  19:18      VS[1:0]          Vector extension status, mirror of mstatus.VS
+  17:16      FS[1:0]          Floating-point extension status, mirror of mstatus.FS
+- 16:9       (reserved)
++ 15:9       (reserved) 
+  8          psppush          Previous stack pointer push, mirror of mspcs.ppush, if Smcsps is implemented
+  7:0        pithreshold[7:0] Previous interrupt-enable threshold
+ ----
+@@ -741,23 +803,47 @@ mpistatus
+ [source]
+ ----
+        Number  Name         Description
+- (NEW) 0x146   spistatus    Previous interrupt context
++ (NEW) 0x146   sistatus     Interrupt status
+  (NEW) 0x147   sithreshold  Interrupt enable threshold
++ (NEW) 0x148   sipreemptcfg Interrupt preemption configuration
++----
++
++===== New Interrupt Preemption Configuration ({sipreemptcfg}) CSR
++
++[source]
+ ----
++sipreemptcfg fields
++ bits        description
++ XLEN-1:4    (reserved)
++ 3           spreempten
++ 2           (reserved)
++ 1           sfie
++ 0           (reserved)
++----
++
++{sipreemptcfg} is a WARL register used to configure the behavior of preemption at S-mode.
++
++The field {spreempten} enables this extension at S-mode.
++
++The field {sfie} controls if fast interrupts can trap when the corresponding {sie} bit is zero.
++
++When {sie} is one, {sfie} has no effect.
++When the {sfie} bit is set to 0 by an explicit CSR write, the {sie} bit is cleared to 0.
+ 
+-===== New Previous Interrupt Status ({spistatus}) CSR
++===== New Interrupt Status ({sistatus}) CSR
+ 
+ [source]
+ ----
+-spistatus
++sistatus
+  Bits       Field            Description
+  XLEN-1:29  (reserved)
+  28         spp              Previous privilege mode, mirror of sstatus.spp
+  27         spie             Previous interrupt enable, mirror of sstatus.spie
+- 26:20      (reserved)
+- 19:18      VS[1:0]          Vector extension status, mirror of mstatus.VS
+- 17:16      FS[1:0]          Floating-point extension status, mirror of mstatus.FS
+- 16:9       (reserved)
++ 26         psfie            Previous fast interrupts enable
++ 25:20      (reserved)
++ 19:18      VS[1:0]          Vector extension status, mirror of sstatus.VS
++ 17:16      FS[1:0]          Floating-point extension status, mirror of sstatus.FS
++ 15:9       (reserved)
+  8          psppush          Previous stack pointer push, mirror of sspcs.ppush, if Sscsps is implemented
+  7:0        pithreshold[7:0] Previous interrupt-enable threshold
+ ----
+@@ -773,6 +859,9 @@ for an interrupt to be considered enabled at the hart.
+ 
+ Register {sithreshold} implements exactly IPRIOLEN bits.
+ 
++When reading from {stopi} or {stopei}, and no interrupt is pending and enabled at machine level,
++the {IPRIO} field returns {sithreshold}.
++
+ ==== Reset Behavior
+ 
+ In general, in RISC-V, mandatory reset state is minimized but platform
+@@ -782,7 +871,7 @@ mstatus.mie is reset to zero, interrupts will not be enabled coming
+ out of reset.
+ 
+ NOTE: For an S-mode execution environment, the EEI should specify
+-that {sstatus}.`sie` is also reset on entry. It is then responsibility of
++that {sstatus}.{sie} is also reset on entry. It is then responsibility of
+ the execution environment to ensure that is true before beginning execution
+ in S-mode.
+ 
+@@ -817,19 +906,32 @@ according to the rules defined in AIA.
+ When {xithreshold} is zero,
+ all enabled interrupt sources can contribute to signaling interrupts to the hart.
+ 
++If {xfie} is one, interrupts are enabled and can cause a trap irrespective of {xie},
++if the following holds:
++
++[source]
++----
++IPRIO < FITHRESHOLD
++
++which is equivalent to
++
++IPRIO & FITHRESHOLD == 0
++----
++
+ ===== Trap behavior
+ 
+ The existing trap behavior is modified as follows:
+ 
+ When a trap is taken into level `x`,
+-the current value of {xithreshold} is written to {xpistatus}.{pithreshold}.
++the current value of {xithreshold} is written to {xistatus}.{pithreshold}.
++Also, the current value of {xistatus}.{xfie} is written into {xistatus}.{xpfie}, and then {xistatus}.{xfie} is set to zero.
+ 
+ Additionally, if the trap was taken on an interrupt,
+ {xithreshold} is set to `IPRIO`.
+ This automatically raises the interrupt-enable threshold.
+ 
+ If a double trap occurs while in M-mode,
+-{xpistatus}.{pithreshold} is unchanged.
++{xistatus}.{pithreshold} is unchanged.
+ 
+ NOTE: Synchronous exceptions do not modify the value of {xithreshold}.
+ 
+@@ -837,18 +939,334 @@ NOTE: Synchronous exceptions do not modify the value of {xithreshold}.
+ 
+ The behavior of an {xret} instruction is modified as follows:
+ 
+-{xret} sets {xithreshold} to {xpistatus}.{pithreshold}.
++{xret} sets {xithreshold} to {xistatus}.{pithreshold}.
++{xret} sets {xistatus}.{xfie} to {xistatus}.{xpfie}.
+ 
+ This automatically restores the interrupt-enable threshold to the level of the previous context.
+ 
++[[smnip-handler]]
++==== Example: Handler code for nested preemption
++
++This section introduces several pseudo-code examples for handling interrupts in the presence of Smnip.
++Ssnip examples can be constructed analogously by using the equivalent S-mode CSRs.
++
++===== Direct mode SW dispatcher
++
++The first example modifies the example handler from AIA by adding support for nested preemption.
++This handler assumes `mtvec.mode` = Direct (0).
++In this mode, all traps have a common entry point, and thus all interrupts use a common SW dispatcher.
++
++[,c]
++----
++save processor registers
++i = read CSR mcause
++if (i >= 0) {
++    handle synchronous exception i
++    restore mstatus if necessary
++}
++if (mstatus.MPIE == 1) {
++    save mistatus
++    loop {
++        i = read CSR mtopi
++        IPRIO = (i & 0xFF)
++        write IPRIO to mithreshold  /* raise threshold */
++        id = i>>16
++        enable interrupts
++        call the interrupt handler for major interrupt id
++        disable interrupts
++        restore mistatus
++        write mistatus.pithreshold to mithreshold /* restore threshold */
++    }
++}
++restore processor registers
++return from trap
++----
++(This example can be further optimized, but with an increase in complexity.)
++
++The most important difference compared to not using Smnip is that interrupts are enabled before calling the interrupt handler.
++While the interrupt is handled, a pending-and-enabled higher-priority interrupt can preempt the currently running interrupt handler.
++
++It is necessary to raise the threshold after reading {mtopi},
++because a higher priority interrupt could have become pending after the trap was taken.
++
++Restoring the threshold after the handler call returns
++allows lower priority interrupts to be handled
++without restoring and saving the processor registers.
++
++In case an interrupt an interrupt ceases to be pending before {mtopi} is read,
++this is a spurious interrupt.
++It can occur for level-sensitive interrupts.
++To handle those, a spurious interrupt handler needs to be installed for interrupt id 0.
++
++===== Direct mode SW dispatcher including external interrupts
++
++The handler needs to be extended for efficient handling of external interrupts,
++if external interrupts are prioritized among each other.
++The example below assumes that the top external interrupt can be read and claimed via {mtopei}.
++
++[,c]
++----
++save processor registers
++i = read CSR mcause
++if (i >= 0) {
++    handle synchronous exception i
++    restore mstatus if necessary
++}
++if (mstatus.MPIE == 1) {
++    save mistatus
++    loop {
++        i = read CSR mtopi
++        id = i>>16
++        if (id == MEI) {
++          i = read CSR mtopei
++          eid = i>>16
++          handler_addr = ei_handlers[eid]
++        } else {
++          handler_addr = i_handlers[id]
++        }
++        IPRIO = (i & 0xFF)
++        write IPRIO to mithreshold  /* raise threshold */
++        enable interrupts
++        call the interrupt handler at handler_addr
++        disable interrupts
++        restore mistatus
++        write mistatus.pithreshold to mithreshold /* restore threshold */
++    }
++}
++restore processor registers
++return from trap
++----
++
++===== Vectored mode SW dispatcher
++
++This example further modifies the example handler by considering `mtvec.mode` = Vectored (1).
++In this mode, some interrupts may share a common SW dispatcher,
++while others (higher priority interrupts) are handled in dedicated handlers (referred to as fast interrupt handlers here).
++
++In a system based on this example, fast interrupts must be able to preempt other interrupts.
++Because the fast interrupt handlers are not guaranteed to comply with the psABI,
++it must also be guaranteed that the common SW dispatcher does not dispatch fast interrupt handlers.
++
++Any fast interrupt handler must be configured to a nested interrupt priority that is higher than interrupt using the common SW dispatcher.
++
++In this example, it is assumed that exceptions have an entry point on traps that is different from interrupts.
++
++[,c]
++----
++save mepc, mistatus
++enable fast interrupts (mfie = 1)
++save processor registers
++
++loop {
++    i = read CSR mtopi
++    IPRIO = (i & 0xFF)
++    write IPRIO to mithreshold  /* raise threshold */
++    id = i>>16
++    enable interrupts (mie = 1)
++    call the interrupt handler for major interrupt id
++    disable all interrupts (mie = 0 -> mfie = 0)
++    restore mistatus
++    write mistatus.pithreshold to mithreshold /* restore threshold */
++    enable fast interrupts (mfie = 1)
++}
++
++restore processor registers
++disable fast interrupts (mfie = 0)
++restore mepc, mistatus
++return from trap
++----
++(This example can be further optimized, but with an increase in complexity.)
++
++In this example, fast interrupts are enabled for an extended period.
++After saving the minimal state needed to resume after preemption,
++fast interrupts are being enabled.
++Enabling fast interrupts has the highest urgency.
++
++This allows fast interrupts to preempt the dispatcher.
++Because of that, {mtopi} can never report a fast interrupt.
++
++Interrupts can still be globally enabled before calling the interrupt handler,
++to ensure that other interrupts, that are not fast interrupts, 
++but have a higher nested interrupt preemption priority can preempt the currently executing handler.
++
++While restoring the threshold before the next loop iteration,
++all interrupts have to be disabled.
++As writing zero to {mie} also clears {mfie},
++fast interrupts need to be enabled afterwards.
++
++[[smnip-handler-vectored-external]]
++===== Vectored SW dispatcher including external interrupts
++
++This section builds upon the two handler examples introduced previously.
++
++[,c]
++----
++save mepc, mistatus
++enable fast interrupts (mfie = 1)
++save processor registers
++
++loop {
++    i = read CSR mtopi
++    id = i>>16
++    if (id == MEI) {
++      i = read CSR mtopei
++      eid = i>>16
++      handler_addr = ei_handlers[eid]
++    } else {
++      handler_addr = i_handlers[id]
++    }
++    IPRIO = (i & 0xFF)
++    write IPRIO to mithreshold  /* raise threshold */
++    enable all interrupts (mie = 1)
++    call the interrupt handler at handler_addr
++    disable all interrupts (mie = 0 -> mfie = 0)
++    restore mistatus
++    write mistatus.pithreshold to mithreshold  /* restore threshold */
++    enable fast interrupts (mfie = 1)
++}
++
++restore processor registers
++disable fast interrupts (mfie = 0)
++restore mepc, mistatus
++return from trap
++----
++(This example can be further optimized, but with an increase in complexity.)
++
++
++Assembly version:
++
++[source,asm]
++----
++    .if XLEN == 64
++        .equ REGSZ, 8
++        .macro sr reg, off, base
++            sd \reg, \off(\base)
++        .endm
++        .macro lr reg, off, base
++            ld \reg, \off(\base)
++        .endm
++        .macro shxadd dst, idx, base
++            sh3add \dst, \idx, \base
++        .endm
++    .else
++        .equ REGSZ, 4
++        .macro sr reg, off, base
++            sw \reg, \off(\base)
++        .endm
++        .macro lr reg, off, base
++            lw \reg, \off(\base)
++        .endm
++        .macro shxadd dst, idx, base
++            sh2add \dst, \idx, \base
++        .endm
++    .endif
++
++.equ MEI_ID,           11
++.equ CSR_MISTATUS,     0x346
++.equ CSR_MITHRESHOLD,  0x347
++.equ CSR_MIPREEMPTCFG, 0x348
++.equ MSTATUS_MIE,      8
++
++interrupt_dispatcher:
++    addi    sp, sp, -(2*REGSZ)
++    sr      s0, 0*REGSZ, sp
++    sr      s1, 1*REGSZ, sp
++
++    csrr    s0, mepc
++    csrr    s1, CSR_MISTATUS
++    csrsi   CSR_MIPREEMPTCFG, 1  /* enable fast interrupts */
++
++    call    __riscv_save
++
++dispatch_loop:
++    csrr    t0, mtopi
++    srli    t1, t0, 16
++    li      t2, MEI_ID
++    bne     t1, t2, int_irq
++
++ext_irq:
++    csrr    t0, mtopei
++    srli    t1, t0, 16
++    la      t3, ei_handlers
++    shxadd  t3, t1, t3
++    lr      t3, 0, t3
++
++have_handler:
++    csrw    CSR_MITHRESHOLD, t0  /* raise threshold */
++
++    csrsi   mstatus, MSTATUS_MIE
++    jalr    t3
++    csrci   mstatus, MSTATUS_MIE
++
++    csrw    CSR_MITHRESHOLD, s1  /* restore threshold */
++
++    j       dispatch_loop
++
++int_irq:
++    la      t3, i_handlers
++    shxadd  t3, t1, t3
++    lr      t3, 0, t3
++    j       have_handler
++
++dispatch_exit:
++    call    __riscv_restore
++    csrci   CSR_MIPREEMPTCFG, 1  /* disable fast interrupts */
++    csrw    mepc, s0
++    csrw    CSR_MISTATUS, s1
++
++    lr      s0, 0*REGSZ, sp
++    lr      s1, 1*REGSZ, sp
++    addi    sp, sp, (2*REGSZ)
++    mret
++----
++
++
++[[smnip-fast-handler]]
++===== Preemptible Fast Interrupt Handler
++
++An example of a preemptible fast interrupt handler is
++
++[,C]
++----
++fast_interrupt_handler:
++  save mepc, mistatus
++  enable interrupts
++
++  /* interrupt handling */
++
++  disable interrupts
++  restore mepc, mistatus
++  return from trap
++----
++
++As part of the interrupt handling, the pending bit needs to be cleared by software.
++
++It is expected that GNU toolchains will preemptible C-handlers like
++
++[,C]
++----
++void fast_interrupt_handler() __attribute__((interrupt("preemptible")))
++{
++
++  /* interrupt handling */
++
++  return;
++}
++----
++
++Context needed to return after preemption is saved before enabling interrupts.
++Interrupts are enabled before executing the first statement of the function.
++Before returning, interrupts are disabled, and context is restored.
++
++
+ [[ex-threshold-nested]]
+ ==== Example: Threshold behavior under nested traps and interrupts
+ 
+ This example illustrates heavy nesting with explicit threshold management,
+ under the following assumptions:
+ 
+-* Any handler must save xpistatus before enabling interrupts
+-* Any handler that had interrupts enabled at any time must restore xpistatus with interrupts disabled before executing xret
++* Any handler must save xistatus before enabling interrupts
++* Any handler that had interrupts enabled at any time must restore xistatus with interrupts disabled before executing xret
+ 
+ .Preconditions
+ * Thread **T** starts with `xithreshold = 128`.
+@@ -856,24 +1274,24 @@ under the following assumptions:
+ 
+ [cols="3,2,3,3,3,6", options="header"]
+ |===
+-| Step | Context | Event | xithreshold | xpistatus.pithreshold | Notes
++| Step | Context | Event | xithreshold | xistatus.pithreshold | Notes
+ 
+ | 0  | T (thread) | —                         | 128 | X   | Baseline: thread running with cutoff 128.
+ | 1  | A          | trap (interrupt A)        | 32  | 128 | Trap writes `pithreshold=128`; interrupt entry sets `xithreshold=32`.
+-| 1  | A          | save context; IE=1        | 32  | 128 | Save xpistatus and enable interrupts afterwards.
++| 1  | A          | save context; IE=1        | 32  | 128 | Save xistatus and enable interrupts afterwards.
+ | 2  | A          | raise threshold           | 2   | 128 | Short critical section in A; `pithreshold` unchanged.
+ | 3  | A          | lower threshold           | 32  | 128 | End of A's critical section; restore handler threshold to 32.
+ | 4  | B          | trap (interrupt B)        | 4   | 32  | Trap writes `pithreshold=32`; interrupt entry sets `xithreshold=4`.
+-| 1  | B          | save context; IE=1        | 4   | 32  | Save xpistatus and enable interrupts afterwards.
++| 1  | B          | save context; IE=1        | 4   | 32  | Save xistatus and enable interrupts afterwards.
+ | 5  | E          | trap (exception E)        | 4   | 4   | Exception trap captures current threshold into `pithreshold=4`.
+-| 1  | E          | save context; IE=1        | 4   | 32  | Save xpistatus and enable interrupts afterwards.
++| 1  | E          | save context; IE=1        | 4   | 32  | Save xistatus and enable interrupts afterwards.
+ | 7  | C          | trap (interrupt C)        | 2   | 4   | Trap writes `pithreshold=4`; interrupt entry sets `xithreshold=2`.
+ | 9  | C→E        | return (xRET)             | 4   | 4   | On C's return, `xithreshold` restored from `pithreshold=4`; resume E.
+-| 1  | E          | IE=0; restore context     | 4   | 4   | Disable interrupts and restore xpistatus afterwards.
++| 1  | E          | IE=0; restore context     | 4   | 4   | Disable interrupts and restore xistatus afterwards.
+ | 10 | E→B        | return (xRET)             | 4   | 4   | E returns; `xithreshold` restored from `pithreshold=4`; resume B.
+-| 1  | B          | IE=0; restore context     | 4   | 32  | Disable interrupts and restore xpistatus afterwards.
++| 1  | B          | IE=0; restore context     | 4   | 32  | Disable interrupts and restore xistatus afterwards.
+ | 11 | B→A        | return (xRET)             | 32  | 32  | On B's return, `xithreshold=32` from `pithreshold=32`; resume A.
+-| 1  | A          | IE=0; restore context     | 32  | 128 | Disable interrupts and restore xpistatus afterwards.
++| 1  | A          | IE=0; restore context     | 32  | 128 | Disable interrupts and restore xistatus afterwards.
+ | 12 | A→T        | return (xRET)             | 128 | 128 | On A's return, `xithreshold=128` from `pithreshold=128`; resume T.
+ |===
+ 
+@@ -885,7 +1303,7 @@ The threshold lineage is preserved across nested preemptions, which can include
+ If the Smstateen extension is implemented,
+ then the bit 53 (ACLIC) in mstateen0 is implemented.
+ If bit 53 (ACLIC) of a controlling mstateen0 CSR is zero,
+-then access to the new CSRs {spistatus} and {sithreshold} by S-mode or a lower-privilege mode
++then access to the new CSRs {sistatus} and {sithreshold} by S-mode or a lower-privilege mode
+ results in an illegal instruction exception.
+ 
+ == Fast Interrupt Extensions for Microcontrollers
+@@ -1302,17 +1720,18 @@ After executing the required side-effects as required with the existing behavior
+ the hart then fetches an XLEN-bit handler address with permissions corresponding to the handler's mode
+ from the in-memory table whose base address (VTBASE).
+ The trap handler function address is fetched from `VTBASE+XLEN/8*vtoffset`.
+-If the fetch is successful, the hart clears the low bit(s) (depending on IALIGN) of the handler address,
+-clears the corresponding interrupt-pending bit if possible,
++If the fetch is successful, the hart clears the low bit(s) (depending on IALIGN) of the handler address
+ and sets the PC to this handler address.
+-The masked vector table entry bit(s) are reserved and should be zero.
++
++If the LSB of the vector table entry is 1, and the fetch is successful,
++the hart clears the corresponding interrupt-pending bit if possible.
+ 
+ NOTE: The original vectored mode simply jumps to an address in
+ the trap vector table, while the interrupt vector table mode reads a
+ handler function address from the table, and jumps to it in hardware.
+ 
+ NOTE: In case of a level-sensitive interrupt,
+-it might not be possible to clear the interurpt-pending bit.
++it might not be possible to clear the interrupt-pending bit.
+ 
+ For permissions-checking purposes, the memory access to retrieve the
+ function pointer for hardware vectoring is an _implicit_ fetch at the
+@@ -1363,6 +1782,18 @@ In case a higher priority interrupt became pending and enabled, this will trap f
+ As long as synchronous exceptions can occur during the interrupt vector table fetch,
+ side-effects of the trap may only be executed if they allow resuming of operation after the handling of the synchronous exception.
+ 
++==== Handler support
++
++The extension is expected to be used in conjunction with the <<smnip>> extensions.
++In this case, the handlers introduced in Sections <<smnip-handler-vectored-external>> and <<smnip-fast-handler>> are applicable.
++
++For the SW dispatcher, an additional configuration assumption is
++that interrupts trapping to the SW dispatcher have the LSB of their interrupt vector table entry zero.
++
++If the interrupt vector table associated with a fast interrupt has its LSB set to one,
++the handler does not have to clear the pending bit at the hart level.
++It may nevertheless need to clear the pending bit at the peripheral, typically in case of a level-sensitive interrupt.
++
+ ==== State Enable
+ 
+ If the Smstateen extension is implemented,
+@@ -1511,17 +1942,26 @@ It is however an implementation choice to perform tail-chaining to the next high
+ 
+ ==== C interrupt handlers
+ 
+-When this extension is implemented, a compiler may assume for any interrupt handler defined with the interrupt attribute like
++When this extension is implemented, a GNU compiler may assume for any interrupt handler defined with the interrupt attribute like
+ 
+ [source,c]
+ ----
+-void interrupt_handler() __attribute__((interrupt));
++void interrupt_handler() __attribute__((interrupt("push-pop")));
+ ----
+ 
+ that the registers x10-x15 have been saved.
+ Additionally, the compiler does not need to restore these registers.
+ Finally, it should generate an {xipopret} instruction at the end of the function instead of an {xret}.
+ 
++The attribute can be combined with other attributes, e.g. like
++
++[source,c]
++----
++void interrupt_handler() __attribute__((interrupt("preemptible", "push-pop")));
++----
++
++To indicate that the nested preemption is used in addition.
++
+ ==== Late Preemption of the interrupt handler
+ 
+ While executing the trap side effects of an interrupt, it is allowed for an implementation to optionally check for higher priority pending and enabled interrupts at the current privilege mode, and switch to fetching this interrupt handler instead.
+@@ -1537,7 +1977,7 @@ If such an interrupt exists, the hart may abort executing the xipopret instructi
+   - Perform the interrupt handler fetch.
+   - Start executing the interrupt handler, while skipping the portions of context restore that have not yet been executed by the aborted xipopret.
+ 
+-Explicitly, {xepc}, {xpistatus} remain unchanged.
++Explicitly, {xepc}, {xistatus} remain unchanged.
+ 
+ NOTE: In the typical case of tail chaining, the check for another pending enabled interrupt is at the start of the xipopret instruction.
+ In this case, the entire context save and restore sequence can be skipped.

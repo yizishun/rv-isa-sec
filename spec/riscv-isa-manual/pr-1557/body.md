@@ -1,0 +1,1 @@
+We are supporting zama16b in QEMU. A comment from QEMU commnunity that we should clarify that it applies to compressed encodings(https://mail.gnu.org/archive/html/qemu-riscv/2024-07/msg00411.html). Current specification is a little confusing. 

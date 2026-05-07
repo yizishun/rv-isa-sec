@@ -1,0 +1,334 @@
+This PR contains the following updates:
+
+| Package | Change | [Age](https://docs.renovatebot.com/merge-confidence/) | [Confidence](https://docs.renovatebot.com/merge-confidence/) |
+|---|---|---|---|
+| [org.codehaus.mojo:exec-maven-plugin](https://www.mojohaus.org/exec-maven-plugin) ([source](https://redirect.github.com/mojohaus/exec-maven-plugin)) | `3.0.0` → `3.6.3` | ![age](https://developer.mend.io/api/mc/badges/age/maven/org.codehaus.mojo:exec-maven-plugin/3.6.3?slim=true) | ![confidence](https://developer.mend.io/api/mc/badges/confidence/maven/org.codehaus.mojo:exec-maven-plugin/3.0.0/3.6.3?slim=true) |
+
+---
+
+### Release Notes
+
+<details>
+<summary>mojohaus/exec-maven-plugin (org.codehaus.mojo:exec-maven-plugin)</summary>
+
+### [`v3.6.3`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.6.3)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.6.2...3.6.3)
+
+<!-- Optional: add a release summary here -->
+
+#### 📝 Documentation updates
+
+- Document thread group isolation limitation in java goal ([#&#8203;503](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/503)) @&#8203;[copilot-swe-agent\[bot\]](https://redirect.github.com/apps/copilot-swe-agent)
+
+#### 👻 Maintenance
+
+- JUnit 5 best practices ([#&#8203;505](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/505)) [@&#8203;slachiewicz](https://redirect.github.com/slachiewicz)
+- Move ExecJavaMojoTest, ExecMojoTest to JUnit 5 ([#&#8203;502](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/502)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Add support for JEP 512 for for package-private static main method ([#&#8203;499](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/499)) [@&#8203;anuragagarwal561994](https://redirect.github.com/anuragagarwal561994)
+- Move to JUnit 5 ([#&#8203;501](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/501)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+#### 📦 Dependency updates
+
+- Bump asm.version from 9.9 to 9.9.1 ([#&#8203;509](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/509)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump org.apache.commons:commons-exec from 1.5.0 to 1.6.0 ([#&#8203;508](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/508)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+
+### [`v3.6.2`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.6.2)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.6.1...3.6.2)
+
+<!-- Optional: add a release summary here -->
+
+#### 🚀 New features and improvements
+
+- Add JPMS ServiceLoader Support with Multi-Release JAR ([#&#8203;500](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/500)) [@&#8203;ascheman](https://redirect.github.com/ascheman)
+
+#### 📦 Dependency updates
+
+- Bump asm.version from 9.8 to 9.9 ([#&#8203;498](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/498)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+
+### [`v3.6.1`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.6.1)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.6.0...3.6.1)
+
+<!-- Optional: add a release summary here -->
+
+#### 🐛 Bug Fixes
+
+- Revert change from [#&#8203;480](https://redirect.github.com/mojohaus/exec-maven-plugin/issues/480) - plugin dependencies must be resolved from plugin repositories ([#&#8203;496](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/496)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+#### 📦 Dependency updates
+
+- Bump org.codehaus.mojo:mojo-parent from 93 to 94 ([#&#8203;495](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/495)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+
+### [`v3.6.0`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.6.0)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.5.1...3.6.0)
+
+<!-- Optional: add a release summary here -->
+
+#### 🚀 New features and improvements
+
+- \[ExecMojo]Add `getShebang` method to correctly set the command line executable name ([#&#8203;487](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/487)) [@&#8203;uchenily](https://redirect.github.com/uchenily)
+- JEP 512 Support ([#&#8203;484](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/484)) [@&#8203;cayhorstmann](https://redirect.github.com/cayhorstmann)
+
+#### 🐛 Bug Fixes
+
+- fix inheritIo option ([#&#8203;488](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/488)) [@&#8203;dernasherbrezon](https://redirect.github.com/dernasherbrezon)
+- Fix for [#&#8203;479](https://redirect.github.com/mojohaus/exec-maven-plugin/issues/479) - Wrong repositories used to collect deps ([#&#8203;480](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/480)) [@&#8203;cstamas](https://redirect.github.com/cstamas)
+
+#### 👻 Maintenance
+
+- Use JSR-330 for component injection ([#&#8203;493](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/493)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Re-run failed tests ([#&#8203;491](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/491)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Restore default matrix build ([#&#8203;486](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/486)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+#### 📦 Dependency updates
+
+- Use Maven 3.9.11 in dependencies, still requires 3.6.3 as minimum ([#&#8203;492](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/492)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Bump org.codehaus.mojo:mojo-parent from 92 to 93 ([#&#8203;483](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/483)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump org.codehaus.mojo:mojo-parent from 91 to 92 ([#&#8203;478](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/478)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump org.codehaus.mojo:mojo-parent from 90 to 91 ([#&#8203;477](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/477)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump org.codehaus.mojo:mojo-parent from 89 to 90 ([#&#8203;476](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/476)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+
+### [`v3.5.1`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.5.1)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.5.0...3.5.1)
+
+<!-- Optional: add a release summary here -->
+
+#### 🐛 Bug Fixes
+
+- Add ClassLoader support for ASM ClassWriter ([#&#8203;472](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/472)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+#### 📦 Dependency updates
+
+- Bump org.codehaus.mojo:mojo-parent from 88 to 89 ([#&#8203;475](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/475)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump org.codehaus.mojo:mojo-parent from 87 to 88 ([#&#8203;474](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/474)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump org.apache.commons:commons-exec from 1.4.0 to 1.5.0 ([#&#8203;473](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/473)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump commons-io:commons-io from 2.7 to 2.14.0 in /src/test/projects/project6/project5lib ([#&#8203;470](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/470)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump commons-io:commons-io from 2.7 to 2.14.0 in /src/test/projects/project1 ([#&#8203;468](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/468)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump asm.version from 9.7.1 to 9.8 ([#&#8203;467](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/467)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump commons-io:commons-io from 2.7 to 2.14.0 in /src/test/projects/project2 ([#&#8203;465](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/465)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump commons-io:commons-io from 2.7 to 2.14.0 in /src/test/projects/project14 ([#&#8203;464](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/464)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump commons-io:commons-io from 2.7 to 2.14.0 in /src/test/projects/project3 ([#&#8203;463](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/463)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+- Bump org.codehaus.mojo:mojo-parent from 86 to 87 ([#&#8203;460](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/460)) @&#8203;[dependabot\[bot\]](https://redirect.github.com/apps/dependabot)
+
+#### 👻 Maintenance
+
+- Fix ITs for Maven 4 rc-3 ([#&#8203;462](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/462)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Document how to use env vars in commandlineArgs ([#&#8203;459](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/459)) [@&#8203;cpfeiffer](https://redirect.github.com/cpfeiffer)
+
+### [`v3.5.0`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.5.0)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.4.1...3.5.0)
+
+<!-- Optional: add a release summary here -->
+
+#### 🚀 New features and improvements
+
+- Add toolchain java path to environment variables in ExecMojo ([#&#8203;455](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/455)) [@&#8203;michalm2000](https://redirect.github.com/michalm2000)
+
+#### 🐛 Bug Fixes
+
+- [#&#8203;322](https://redirect.github.com/mojohaus/exec-maven-plugin/issues/322), enable to control the exec:java interaction with JVM classloader more finely ([#&#8203;337](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/337)) [@&#8203;rmannibucau](https://redirect.github.com/rmannibucau)
+
+#### 📦 Dependency updates
+
+- Bump org.codehaus.mojo:mojo-parent from 85 to 86 ([#&#8203;445](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/445)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump commons-io:commons-io from 2.7 to 2.14.0 in /src/it/projects/project6/project5lib ([#&#8203;451](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/451)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump asm.version from 9.7 to 9.7.1 ([#&#8203;452](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/452)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump commons-io:commons-io from 2.7 to 2.14.0 in /src/it/projects/setup-parent ([#&#8203;450](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/450)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump commons-io:commons-io from 2.7 to 2.14.0 in /src/test/projects/project13 ([#&#8203;449](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/449)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-utils from 4.0.1 to 4.0.2 ([#&#8203;447](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/447)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+
+#### 👻 Maintenance
+
+- Update site descriptor to 2.0.0 ([#&#8203;457](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/457)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Toolchains manual improvements ([#&#8203;456](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/456)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Manage version of maven-toolchains-plugin ([#&#8203;454](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/454)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+### [`v3.4.1`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.4.1)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.4.0...3.4.1)
+
+<!-- Optional: add a release summary here -->
+
+##### 🐛 Bug Fixes
+
+- Environment variable Path should be used as case-insensitive ([#&#8203;442](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/442)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- fix: NPE because declared MavenSession field hides field of superclass ([#&#8203;439](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/439)) [@&#8203;sebthom](https://redirect.github.com/sebthom)
+
+##### 📦 Dependency updates
+
+- Bump org.codehaus.mojo:mojo-parent from 84 to 85 ([#&#8203;441](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/441)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+
+##### 👻 Maintenance
+
+- Remove redundant spotless configuration ([#&#8203;440](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/440)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+##### 🔧 Build
+
+- Use Maven4 enabled with GH Action ([#&#8203;443](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/443)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Use shared release drafter GH Action ([#&#8203;444](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/444)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+### [`v3.4.0`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.4.0)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.3.0...3.4.0)
+
+<!-- Optional: add a release summary here -->
+
+##### 🚀 New features and improvements
+
+- Allow `<includePluginDependencies>` to be specified for the exec:exec goal ([#&#8203;432](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/432)) [@&#8203;sebthom](https://redirect.github.com/sebthom)
+
+##### 🐛 Bug Fixes
+
+- Do not get UPPERCASE env vars ([#&#8203;427](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/427)) [@&#8203;wheezil](https://redirect.github.com/wheezil)
+
+##### 📦 Dependency updates
+
+- Bump org.codehaus.mojo:mojo-parent from 82 to 84 ([#&#8203;434](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/434)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-xml from 3.0.0 to 3.0.1 ([#&#8203;431](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/431)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+
+##### 👻 Maintenance
+
+- Remove Log4j 1.2.x from ITs ([#&#8203;437](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/437)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+##### 🔧 Build
+
+- Use Maven 3.9.7 and 4.0.0-beta-3 ([#&#8203;433](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/433)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+### [`v3.3.0`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.3.0)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.2.0...3.3.0)
+
+<!-- Optional: add a release summary here -->
+
+##### 🚀 New features and improvements
+
+- Add option to include runtime and provided ([#&#8203;61](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/61)) [@&#8203;rehevkor5](https://redirect.github.com/rehevkor5)
+
+##### 📦 Dependency updates
+
+- Bump org.codehaus.mojo:mojo-parent from 80 to 82 ([#&#8203;429](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/429)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-utils from 4.0.0 to 4.0.1 ([#&#8203;424](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/424)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump asm.version from 9.6 to 9.7 ([#&#8203;422](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/422)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump apache/maven-gh-actions-shared from 3 to 4 ([#&#8203;420](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/420)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+
+### [`v3.2.0`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.2.0)
+
+[Compare Source](https://redirect.github.com/mojohaus/exec-maven-plugin/compare/3.1.1...3.2.0)
+
+<!-- Optional: add a release summary here -->
+
+##### 🚀 New features and improvements
+
+- Enable to exec:java runnables and not only mains with loosely coupled injections ([#&#8203;408](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/408)) [@&#8203;rmannibucau](https://redirect.github.com/rmannibucau)
+- Try to get rid of legacy API which can break starting with java 17 ([#&#8203;409](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/409)) [@&#8203;rmannibucau](https://redirect.github.com/rmannibucau)
+
+##### 🐛 Bug Fixes
+
+- Fix [#&#8203;401](https://redirect.github.com/mojohaus/exec-maven-plugin/issues/401) - Maven v4 compatibility ([#&#8203;414](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/414)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+##### 📦 Dependency updates
+
+- Bump org.codehaus.mojo:mojo-parent from 78 to 80 ([#&#8203;419](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/419)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump commons-io:commons-io from 1.1 to 2.7 in /src/it/projects/setup-parent ([#&#8203;416](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/416)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.apache.commons:commons-exec from 1.3 to 1.4.0 ([#&#8203;405](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/405)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.mojo:mojo-parent from 77 to 78 ([#&#8203;406](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/406)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-component-metadata from 2.1.1 to 2.2.0 ([#&#8203;403](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/403)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-component-annotations from 2.1.1 to 2.2.0 ([#&#8203;404](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/404)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+
+##### 👻 Maintenance
+
+- ITs improvement ([#&#8203;415](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/415)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Fix documentation formatting, add menu items for new examples ([#&#8203;412](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/412)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Execute mexec-137 also on unix family ([#&#8203;413](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/413)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Remove unused test ([#&#8203;410](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/410)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+##### 🔧 Build
+
+- Bump release-drafter/release-drafter from 5 to 6 ([#&#8203;417](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/417)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+
+### [`v3.1.1`](https://redirect.github.com/mojohaus/exec-maven-plugin/releases/tag/3.1.1)
+
+<!-- Optional: add a release summary here -->
+
+#### 🚀 New features and improvements
+
+- Remove unused killAfter options ([#&#8203;394](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/394)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- \[[#&#8203;391](https://redirect.github.com/mojohaus/exec-maven-plugin/issues/391)] Cope with Thread::stop being unavailable in JDK 20+ ([#&#8203;393](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/393)) [@&#8203;kriegaex](https://redirect.github.com/kriegaex)
+- Only prefix program output with thread name when running with multiple threads ([#&#8203;157](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/157)) [@&#8203;hankolerd](https://redirect.github.com/hankolerd)
+- \[[#&#8203;389](https://redirect.github.com/mojohaus/exec-maven-plugin/issues/389)] Add option 'blockSystemExit' to 'java' mojo ([#&#8203;390](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/390)) [@&#8203;kriegaex](https://redirect.github.com/kriegaex)
+- Require Maven 3.6.3+ ([#&#8203;385](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/385)) [@&#8203;slachiewicz](https://redirect.github.com/slachiewicz)
+- Ensure maven.properties can be forwarded to system properties for exec:java ([#&#8203;346](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/346)) [@&#8203;rmannibucau](https://redirect.github.com/rmannibucau)
+
+#### 🐛 Bug Fixes
+
+- Fix [#&#8203;158](https://redirect.github.com/mojohaus/exec-maven-plugin/issues/158) - Fix non ascii character handling ([#&#8203;372](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/372)) [@&#8203;jebeaudet](https://redirect.github.com/jebeaudet)
+- \[[#&#8203;323](https://redirect.github.com/mojohaus/exec-maven-plugin/issues/323)] exec arguments missing ([#&#8203;324](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/324)) [@&#8203;bmarwell](https://redirect.github.com/bmarwell)
+
+#### 📦 Dependency updates
+
+- Bump org.codehaus.plexus:plexus-utils from 3.0.16 to 3.0.24 in /src/it/projects/java\_module-module+mainclass ([#&#8203;382](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/382)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-utils from 3.0.16 to 3.0.24 in /src/it/projects/java\_module-mainclass ([#&#8203;380](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/380)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-utils from 3.0.16 to 3.0.24 in /src/it/projects/java\_module-export ([#&#8203;379](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/379)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-utils from 3.0.16 to 3.0.24 in /src/it/projects/longModulepath with spaces ([#&#8203;383](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/383)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-utils from 3.0.16 to 3.0.24 in /src/it/projects/jigsaw ([#&#8203;381](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/381)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.plexus:plexus-utils from 3.0.16 to 3.0.24 in /src/it/mrm/java\_module ([#&#8203;378](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/378)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump org.codehaus.mojo:mojo-parent from 76 to 77 ([#&#8203;384](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/384)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Require Maven 3.6.3+ ([#&#8203;385](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/385)) [@&#8203;slachiewicz](https://redirect.github.com/slachiewicz)
+- Bump plexus-utils from 3.5.1 to 4.0.0 ([#&#8203;368](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/368)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump parent from 70 to 76 ([#&#8203;375](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/375)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Bump groovy from 3.0.17 to 3.0.18 ([#&#8203;371](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/371)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump groovy from 3.0.16 to 3.0.17 ([#&#8203;365](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/365)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump groovy from 3.0.15 to 3.0.16 ([#&#8203;363](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/363)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump plexus-utils from 3.5.0 to 3.5.1 ([#&#8203;362](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/362)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump groovy from 3.0.14 to 3.0.15 ([#&#8203;361](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/361)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump groovy from 3.0.13 to 3.0.14 ([#&#8203;354](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/354)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump mockito-core from 4.9.0 to 4.11.0 ([#&#8203;355](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/355)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump mockito-core from 4.8.1 to 4.9.0 ([#&#8203;347](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/347)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump groovy from 3.0.12 to 3.0.13 ([#&#8203;340](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/340)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump plexus-utils from 3.4.2 to 3.5.0 ([#&#8203;343](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/343)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump mockito-core from 4.7.0 to 4.8.1 ([#&#8203;344](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/344)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump mojo-parent from 69 to 70 ([#&#8203;329](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/329)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump mockito-core from 4.6.1 to 4.7.0 ([#&#8203;330](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/330)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+- Bump groovy from 3.0.11 to 3.0.12 ([#&#8203;325](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/325)) [@&#8203;dependabot](https://redirect.github.com/dependabot)
+
+#### 👻 Maintenance
+
+- Code cleanups - use newer JDK features ([#&#8203;396](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/396)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Enable spotless for code formatting ([#&#8203;395](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/395)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Require Maven 3.6.3+ ([#&#8203;385](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/385)) [@&#8203;slachiewicz](https://redirect.github.com/slachiewicz)
+- ITs cleanups ([#&#8203;374](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/374)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Use Resolver Api for dependency resolving ([#&#8203;349](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/349)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+#### 🔧 Build
+
+- Workaround for concurrent access to local repository on Windows by ITs ([#&#8203;392](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/392)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+- Use Maven 3.9.4, 3.8.8 in GitHub build ([#&#8203;377](https://redirect.github.com/mojohaus/exec-maven-plugin/pull/377)) [@&#8203;slawekjaranowski](https://redirect.github.com/slawekjaranowski)
+
+</details>
+
+---
+
+### Configuration
+
+📅 **Schedule**: Branch creation - At 12:00 AM through 04:59 AM and 10:00 PM through 11:59 PM, Monday through Friday ( * 0-4,22-23 * * 1-5 ), Only on Sunday and Saturday ( * * * * 0,6 ) in timezone America/Los_Angeles, Automerge - At any time (no schedule defined).
+
+🚦 **Automerge**: Enabled.
+
+♻ **Rebasing**: Whenever PR is behind base branch, or you tick the rebase/retry checkbox.
+
+🔕 **Ignore**: Close this PR and you won't be reminded about this update again.
+
+---
+
+ - [ ] <!-- rebase-check -->If you want to rebase/retry this PR, check this box
+
+---
+
+This PR was generated by [Mend Renovate](https://mend.io/renovate/). View the [repository job log](https://developer.mend.io/github/riscv/riscv-unified-db).
+<!--renovate-debug:eyJjcmVhdGVkSW5WZXIiOiI0Mi45Mi4xIiwidXBkYXRlZEluVmVyIjoiNDIuOTIuMSIsInRhcmdldEJyYW5jaCI6Im1haW4iLCJsYWJlbHMiOlsiZGVwZW5kZW5jaWVzIl19-->
+

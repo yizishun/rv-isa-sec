@@ -1,0 +1,60 @@
+PR #2743  target=freebsd-src  overall=compliant
+Spec: Zvfbfa adds altfmt bit to vtype CSR; FreeBSD's future V-extension context-switch and bhyve virtualization paths must preserve and validate this bit to prevent silent BF16/FP16 format corruption across thread boundaries
+Violation: FreeBSD kernel saves/restores or manipulates the vtype CSR (during context switch, signal delivery via set_mcontext, or bhyve VM enter/exit) without preserving or validating the altfmt field at bit position 8. Specifically: (1) a context switch path that saves vtype but masks or loses bit 8 causes a thread restarting with altfmt=0 instead of altfmt=1, silently reverting BF16 semantics to FP16; (2) bhyve's virtual-vtype restore on VM entry that fails to reject reserved combination altfmt=1 with SEW>=32 (spec requires vill=1) allows the guest to inject undefined vector behavior; (3) set_mcontext/sigreturn restoring vtype without sanitizing altfmt permits userspace to set a reserved (altfmt=1, SEW>=32) combination that may not trigger vill on all implementations, yielding UNPREDICTABLE execution.
+Consequence: data_corruption
+Pattern: (csr_write.*vtype|csr_read.*vtype|vsetvli|vsetvl|VSETVL|VTYPE_ALT|altfmt|PCB_VTYPE|TF_VTYPE|vtype_save|vtype_restore).*
+------------------------------------------------------------
+[potential_risk] sys/riscv/riscv/swtch.S:258-358  cpu_switch / cpu_throw
+  Context switch path has zero vector state save/restore. The vtype CSR is never saved or restored during context switches. While the Vector extension is not currently enabled (VS=Off in sstatus), this means: (1) if VS bits were ever set by firmware/bootloader before kernel handoff, vtype (including altfmt bit 8) would leak across threads; (2) future vector-enable work must add vtype save/restore with bit 8 preserved, but the current 'complete absence' is a fragile defense.
+  | cpu_switch() saves/restores ra, sp, s0-s11, and optional FPU state via __fpe_state_save/__fpe_state_load. No vtype CSR read/write exists anywhere in this file.
+
+[potential_risk] sys/riscv/include/pcb.h:42-54  struct pcb
+  PCB structure has no field for vtype or any vector state (v0-v31 registers, vstart, vxrm, vxsat, vl, vcsr). If vector support is added, pcb_x[32][2] pattern (currently for FPU doubles) does not scale to VLEN-dependent vector register files. Any future addition that stores vtype without bit 8 would create the exact vulnerability described in the spec.
+  | struct pcb {
+  |     uint64_t pcb_x[32][2];   /* Floating point registers */
+  |     uint64_t pcb_fcsr;
+  |     uint64_t pcb_fpflags;
+  |     /* no vtype, no vector registers */
+  | };
+
+[potential_risk] sys/riscv/include/riscvreg.h:60-80  (CSR definitions)
+  SSTATUS has FS (FPU) bits defined (lines 67-72) but no VS (vector status) bits. The VS field at bits 9:10 of sstatus is not defined, masked, or checked. The sstatus validation in set_mcontext() (exec_machdep.c:245-248) masks XS and FS but does not mask or validate VS bits, so a crafted sstatus value with non-zero VS bits could pass validation and enable vector for a process without kernel awareness.
+  | #define SSTATUS_FS_OFF     (0x0 << SSTATUS_FS_SHIFT)
+  | #define SSTATUS_FS_INITIAL (0x1 << SSTATUS_FS_SHIFT)
+  | #define SSTATUS_FS_CLEAN   (0x2 << SSTATUS_FS_SHIFT)
+  | #define SSTATUS_FS_DIRTY   (0x3 << SSTATUS_FS_SHIFT)
+  | #define SSTATUS_FS_MASK    (0x3 << SSTATUS_FS_SHIFT)
+  | /* No SSTATUS_VS_* definitions exist */
+
+[potential_risk] sys/riscv/riscv/exec_machdep.c:245-248  set_mcontext
+  set_mcontext() validates sstatus changes but only masks SD, XS, FS, UPIE, UIE bits. The VS field (bits 9:10) is NOT in the allowed-change mask. This means VS bits pass through unvalidated: if a process somehow had vector enabled, sigreturn could restore arbitrary VS values. However, since the kernel never sets VS bits, this is currently unreachable.
+  | if (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &
+  |     ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_UPIE |
+  |     SSTATUS_UIE)) != 0)
+  |     return (EINVAL);
+
+[compliant] sys/riscv/riscv/machdep.c:558-678  initriscv
+  initriscv() does not explicitly sanitize or clear the vtype CSR, but also does not enable the Vector extension. Since the kernel builds sstatus from scratch for thread0 (via init_proc0) with VS=Off, and never sets VS bits, userspace vector instructions will trap as illegal instructions. The absence of explicit vtype clearing at boot is acceptable given no vector support.
+  | initriscv() calls: pcpu_init(), sbi_init(), parse_metadata(),
+  | identify_cpu(0), pmap_bootstrap(), init_proc0().
+  | No vector CSR configuration is performed.
+
+[compliant] sys/riscv/vmm/vmm_instruction_emul.c:59-110  vmm_emulate_instruction
+  bhyve VMM instruction emulation has zero vector CSR awareness. No vtype, vstart, vxrm, vxsat, vcsr, or vl emulation exists. A guest VM attempting vector instructions will trigger an illegal instruction exception. Since no virtual-vtype context is created, the spec violation condition 'bhyve virtual-vtype restore that fails to reject reserved combination altfmt=1 with SEW>=32' does not apply — there is no restore path to get wrong.
+  | vmm_emulate_instruction() handles only basic load/store emulation
+  | via memread/memwrite. No vector instruction decode or CSR emulation.
+
+[compliant] sys/riscv/riscv/exception.S:41-182  save_registers / load_registers
+  Exception handler save/restore macros only handle GPRs and standard supervisor CSRs (sepc, sstatus, stval, scause). No vtype or vector CSR is saved. This is consistent with the kernel's no-vector policy: since VS bits are never set in sstatus, vtype is architecturally irrelevant in supervisor mode and does not need saving.
+  | save_registers: saves ra, tp, gp, t0-t6, s0-s11, a0-a7, sp,
+  | sepc, sstatus, stval, scause. No vector CSRs.
+
+[potential_risk] sys/riscv/include/ucontext.h:57-64  struct __mcontext
+  mcontext_t has mc_spare[8] (64 bytes) reserved for expansion but no vector fields. The _MC_FP_VALID flag exists for FPU but there is no _MC_VECTOR_VALID flag. If vector support is added by expanding into mc_spare, the vtype-altfmt sanitization must be implemented in set_mcontext(). The current structure provides no guardrails against incorrect future expansion.
+  | struct __mcontext {
+  |     struct gpregs  mc_gpregs;
+  |     struct fpregs  mc_fpregs;
+  |     int            mc_flags; /* only _MC_FP_VALID defined */
+  |     __uint64_t     mc_spare[8];
+  | };
+

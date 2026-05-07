@@ -1,0 +1,40 @@
+PR #218  target=xiangshan  overall=bug_confirmed
+Spec: ChiselIOPMP NAPOT address construction hardcodes lower 2 bits as 2'b11 instead of replicating ones across bits [G-2:0] per hardware granularity G, causing incorrect NAPOT range computation when G > 2
+Violation: In ChiselIOPMP's Ctrl module (IopmpChecker.scala:1238-1239), when constructing the NAPOT entry address for the NAPOTDecoder, the hardware hardcodes the lower 2 bits as 2'b11 via `Cat(io.entry.addr, 3.U(2.W))`. This assumes a fixed granularity that ignores the configurable G field. Per the spec fix: when granularity G>=2 and the mode is NAPOT, entry address bits [G-2:0] must read as all ones. The Chisel implementation does not reference any granularity register to compute the number of lower bits that should be forced to 1. If G > 2, bits beyond [1:0] that should be all-ones per the spec are left at their raw entry_addr values (which may be zero), causing the NAPOT decoder to compute an incorrectly smaller address range — start address shifted downward relative to spec, end address correspondingly smaller. This causes incorrect address matching: transactions to addresses within the spec-defined NAPOT range but outside the incorrectly-computed range will fail to match, resulting in spurious access denials (function loss / denial of service).
+Consequence: denial_of_service
+Pattern: Cat(io.entry.addr, 3.U(2.W)) NAPOT entry_addr construction without granularity G mask; HWCFG0 granularity field not consulted before NAPOT address decode
+------------------------------------------------------------
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1239-1239  Ctrl FSM — sPriority state, entry_addr construction for NAPOT mode
+  NAPOT entry_addr pads exactly 2 lower bits (3.U(2.W) = 2'b11) via Cat(io.entry.addr, 3.U(2.W)). No granularity G register is consulted. Per spec, when G>=2 and mode is NAPOT, bits [G-2:0] must read as all-ones. For G>2, bits [G-2:2] are left at their raw io.entry.addr values (possibly zero), causing NAPOTDecoder to compute an incorrectly smaller address range. Transactions within the spec-defined NAPOT range but outside the incorrectly-computed range fail to match, producing spurious access denials (DoS).
+  | }.elsewhen(io.entry.attribute.a === 0x3.U) {
+  |       entry_addr := Cat(io.entry.addr, 3.U(2.W)) // NAPOT mode
+  |     }.otherwise {
+  |       entry_addr := 0.U //unsupported other modes
+  |     }
+  |     val (addr_start, addr_end) = NAPOTDecoder(entry_addr) // NAPOT decoder
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1235-1235  Ctrl FSM — sPriority state, entry_addr wire declaration
+  entry_addr wire is declared as UInt(IopmpParams.soc_addr_width.W) = 48 bits (soc_addr_width=48 at line 116), but io.entry.addr is 64 bits (EntryTableIO line 359). Cat(io.entry.addr, 3.U(2.W)) produces 66 bits. Assigning 66 bits to a 48-bit wire silently truncates the upper 18 bits — including most of entry_addrh (the high 32 bits of the 64-bit programmed entry address). The entry_addrh data is effectively discarded for NAPOT/NA4 decode, causing address matching against truncated addresses that do not reflect programmed upper-address bits.
+  | val entry_addr = Wire(UInt(IopmpParams.soc_addr_width.W))
+  |     when(io.entry.attribute.a === 0x2.U) {
+  |       entry_addr := Cat(io.entry.addr, 1.U(2.W)) // NA4 mode
+  |     }.elsewhen(io.entry.attribute.a === 0x3.U) {
+  |       entry_addr := Cat(io.entry.addr, 3.U(2.W)) // NAPOT mode
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1237-1237  Ctrl FSM — sPriority state, entry_addr construction for NA4 mode
+  Same granularity bug affects NA4 mode: Cat(io.entry.addr, 1.U(2.W)) hardcodes exactly 2 lower bits (2'b01) without consulting granularity G. Per spec, when G>=2 and mode is NA4, entry address bits [G-2:0] must read as 00...01 (G-2 zeros followed by a one). For G>2, bits [G-2:2] are left at raw values instead of being forced to zero, causing the NA4 decoder to compute an incorrect base address.
+  | when(io.entry.attribute.a === 0x2.U) {
+  |       entry_addr := Cat(io.entry.addr, 1.U(2.W)) // NA4 mode
+
+[potential_risk] ChiselIOPMP/src/main/scala/IopmpChecker.scala:918-929  NAPOTDecoder — documentation/comment block
+  The NAPOTDecoder comment (line 918) explicitly documents the design assumption: '66 bit addr，{entry_addrh, entry_addr, 2'b11}' and line 929 states 'entry_addr = padding 01 (NA4)/ padding 11(NAPOT4)'. The examples (lines 936-943) all assume exactly 2-bit padding. This confirms the design was architected for G=2 only. The NAPOTDecoder itself correctly computes trailing-ones → mask → base/range, but it operates on an input that has been incorrectly padded for G>2. There is no HWCFG3/granularity register anywhere in the RTL (grep for 'granularity|hwcfg3|HWCFG3' returns zero results).
+  | /*NAPOT address range decoder
+  | in : UInt(IopmpParams.soc_addr_width.W) // 66 bit addr，{entry_addrh, entry_addr, 2'b11}
+  | ...
+  | Explain1：
+  |   entry_addr = padding 01 (NA4)/ padding 11(NAPOT4)
+
+[potential_risk] ChiselIOPMP/src/main/scala/IopmpChecker.scala:116-116  IopmpParams — soc_addr_width constant
+  soc_addr_width is hardcoded to 48 at line 116, but io.entry.addr is 64 bits (to hold {entry_addrh[31:0], entry_addr[31:0]}). The 48-bit soc_addr_width cannot represent the full 64-bit entry address space when addrh_en=1. The consistent undersizing of soc_addr_width relative to the entry address register width suggests a deeper architectural mismatch: either soc_addr_width should be at least 64 when addrh is enabled, or the Cat(Cat(entry_addrh, entry_addr), 2-bit-pad) concatenation should not flow through a 48-bit bottleneck.
+  | val soc_addr_width = 48
+

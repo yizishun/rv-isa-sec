@@ -1,0 +1,454 @@
+diff --git a/spec/schemas/inst_schema.json b/spec/schemas/inst_schema.json
+index f1a8aa206a..e46b6649f7 100644
+--- a/spec/schemas/inst_schema.json
++++ b/spec/schemas/inst_schema.json
+@@ -337,17 +337,47 @@
+         "hints": {
+           "type": "array",
+           "items": {
+-            "type": "object",
+-            "properties": {
+-              "$ref": {
+-                "type": "string",
+-                "format": "uri-reference",
+-                "pattern": "^inst/.+\\.yaml#.*$",
+-                "description": "Ref to an instruction that is using a HINT codepoint(s) of this instruction"
++            "oneOf": [
++              {
++                "type": "object",
++                "properties": {
++                  "$ref": {
++                    "type": "string",
++                    "format": "uri-reference",
++                    "pattern": "^inst/.+\\.yaml#.*$",
++                    "description": "Ref to an instruction that is using a HINT codepoint(s) of this instruction"
++                  }
++                },
++                "required": ["$ref"],
++                "additionalProperties": false
++              },
++              {
++                "type": "object",
++                "properties": {
++                  "when": {
++                    "type": "string",
++                    "description": "Condition under which the following refs apply"
++                  },
++                  "refs": {
++                    "type": "array",
++                    "items": {
++                      "type": "object",
++                      "properties": {
++                        "$ref": {
++                          "type": "string",
++                          "format": "uri-reference",
++                          "pattern": "^inst/.+\\.yaml#.*$"
++                        }
++                      },
++                      "required": ["$ref"],
++                      "additionalProperties": false
++                    }
++                  }
++                },
++                "required": ["when", "refs"],
++                "additionalProperties": false
+               }
+-            },
+-            "required": ["$ref"],
+-            "additionalProperties": false
++            ]
+           },
+           "description": "List of HINTs that use this instruction's codepoints"
+         },
+diff --git a/spec/std/isa/inst/Zcmop/c.mop.n.yaml b/spec/std/isa/inst/Zcmop/c.mop.n.yaml
+index 3ccdb34795..9ed0199833 100644
+--- a/spec/std/isa/inst/Zcmop/c.mop.n.yaml
++++ b/spec/std/isa/inst/Zcmop/c.mop.n.yaml
+@@ -21,6 +21,13 @@ access:
+   vs: always
+   vu: always
+ data_independent_timing: false
++hints:
++  - when: (n == 0)
++    refs:
++      - { $ref: inst/Zicfiss/c.sspush.yaml# }
++  - when: (n == 2)
++    refs:
++      - { $ref: inst/Zicfiss/c.sspopchk.yaml# }
+ pseudoinstructions:
+   - when: (n == 0)
+     to: c.mop.1
+diff --git a/spec/std/isa/inst/Zicfiss/c.sspopchk.x5.yaml b/spec/std/isa/inst/Zicfiss/c.sspopchk.x5.yaml
+new file mode 100644
+index 0000000000..ae26f3e284
+--- /dev/null
++++ b/spec/std/isa/inst/Zicfiss/c.sspopchk.x5.yaml
+@@ -0,0 +1,45 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../../../schemas/inst_schema.json
++
++$schema: inst_schema.json#
++kind: instruction
++name: c.sspopchk.x5
++long_name: Pop from the Shadow Stack, 16 bit version of sspopchk
++description: |
++  The c.sspopchk x5 expands to sspopchk x5, which is defined for an XLEN wide read from
++  the current top of the shadow stack followed by an increment of the ssp by XLEN/8.
++definedBy: Zicfiss
++assembly: c.sspopchk_x5
++encoding:
++  match: "0110001010000001"
++  variables: []
++access:
++  s: always
++  u: always
++  vs: always
++  vu: always
++data_independent_timing: false
++operation(): |
++  Bits<12> ssp_addr = 0x011;
++  Csr csr_handle = direct_csr_lookup(ssp_addr);
++
++  if (csr_handle.valid == false) {
++    unimplemented_csr($encoding);
++  } else if ((mode() < PrivilegeMode::M && CSR[menvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::U && CSR[senvcfg].SSE == 0)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::VU && (CSR[henvcfg].SSE == 0 || CSR[senvcfg].SSE == 0))) {
++    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++  }
++
++  if ((CSR[menvcfg].SSE == 1'b1) || (CSR[henvcfg].SSE == 1'b1) || (CSR[senvcfg].SSE == 1'b1)) {
++    Bits<XLEN> ssp = csr_sw_read(csr_handle);
++    XReg temp = read_memory<XLEN>(ssp, $encoding);
++    if (temp != X[5]) {
++      raise(ExceptionCode::SoftwareCheck, mode(), $encoding);
++    }
++    csr_sw_write(csr_handle, (ssp + (XLEN/8)));
++  }
+diff --git a/spec/std/isa/inst/Zicfiss/c.sspush.x1.yaml b/spec/std/isa/inst/Zicfiss/c.sspush.x1.yaml
+new file mode 100644
+index 0000000000..b44160feed
+--- /dev/null
++++ b/spec/std/isa/inst/Zicfiss/c.sspush.x1.yaml
+@@ -0,0 +1,43 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# yaml-language-server: $schema=../../../../schemas/inst_schema.json
++
++$schema: inst_schema.json#
++kind: instruction
++name: c.sspush.x1
++long_name: Push to the Shadow Stack from register x1, 16 bit version of sspush
++description: |
++  The c.sspush x1 expands to sspush x1, which is defined for decrement of the ssp by XLEN/8
++  followed by a store of the value in the link register x1 to memory at the new top of the
++  shadow stack.
++definedBy: Zicfiss
++assembly: c.sspush_x1
++encoding:
++  match: "0110000010000001"
++  variables: []
++access:
++  s: always
++  u: always
++  vs: always
++  vu: always
++data_independent_timing: false
++operation(): |
++  Bits<12> ssp_addr = 0x011;
++  Csr csr_handle = direct_csr_lookup(ssp_addr);
++
++  if (csr_handle.valid == false) {
++    unimplemented_csr($encoding);
++  } else if ((mode() < PrivilegeMode::M && CSR[menvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::U && CSR[senvcfg].SSE == 0)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::VU && (CSR[henvcfg].SSE == 0 || CSR[senvcfg].SSE == 0))) {
++    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++  }
++
++  if ((CSR[menvcfg].SSE == 1'b1) || (CSR[henvcfg].SSE == 1'b1) || (CSR[senvcfg].SSE == 1'b1)) {
++    Bits<XLEN> ssp = csr_sw_read(csr_handle) - (XLEN/8);
++    write_memory<XLEN>(ssp, X[1], $encoding);
++    csr_sw_write(csr_handle, ssp);
++  }
+diff --git a/spec/std/isa/inst/Zicfiss/ssamoswap.d.yaml b/spec/std/isa/inst/Zicfiss/ssamoswap.d.yaml
+index 99b3ab3c94..7d0fd86d82 100644
+--- a/spec/std/isa/inst/Zicfiss/ssamoswap.d.yaml
++++ b/spec/std/isa/inst/Zicfiss/ssamoswap.d.yaml
+@@ -6,11 +6,14 @@
+ $schema: inst_schema.json#
+ kind: instruction
+ name: ssamoswap.d
+-long_name: No synopsis available
++long_name: Atomic Swap Doubleword from a Shadow Stack Location
+ description: |
+-  No description available.
++  The `ssamoswap.w` atomically loads a 64-bit data value from address of a shadow
++  stack location in xs1, puts the loaded value into register xd, and stores the
++  64-bit value held in xs2 to the original address in xs1.
+ definedBy: Zicfiss
+ assembly: xd, xs2, xs1
++base: 64
+ encoding:
+   match: 01001------------011-----0101111
+   variables:
+@@ -31,3 +34,17 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  if (!implemented?(ExtensionName::S)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() < PrivilegeMode::M && CSR[menvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::U && CSR[senvcfg].SSE == 0)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::VU && (CSR[henvcfg].SSE == 0 || CSR[senvcfg].SSE == 0))) {
++    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++  }
++
++  if ((CSR[menvcfg].SSE == 1'b1) || (CSR[henvcfg].SSE == 1'b1) || (CSR[senvcfg].SSE == 1'b1)) {
++    XReg addr_in_ssp = X[xs1];
++    X[xd] = amo<64>(addr_in_ssp, X[xs2], AmoOperation::Swap, aq, rl, $encoding);
++  }
+diff --git a/spec/std/isa/inst/Zicfiss/ssamoswap.w.yaml b/spec/std/isa/inst/Zicfiss/ssamoswap.w.yaml
+index 0c21c13d09..3fdc94a7e8 100644
+--- a/spec/std/isa/inst/Zicfiss/ssamoswap.w.yaml
++++ b/spec/std/isa/inst/Zicfiss/ssamoswap.w.yaml
+@@ -6,9 +6,11 @@
+ $schema: inst_schema.json#
+ kind: instruction
+ name: ssamoswap.w
+-long_name: No synopsis available
++long_name: Atomic Swap Word from a Shadow Stack Location
+ description: |
+-  No description available.
++  The `ssamoswap.w` atomically loads a 32-bit data value from address of a shadow
++  stack location in xs1, puts the loaded value into register xd, and stores the
++  32-bit value held in xs2 to the original address in xs1.
+ definedBy: Zicfiss
+ assembly: xd, xs2, xs1
+ encoding:
+@@ -31,3 +33,17 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  if (!implemented?(ExtensionName::S)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() < PrivilegeMode::M && CSR[menvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::U && CSR[senvcfg].SSE == 0)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::VU && (CSR[henvcfg].SSE == 0 || CSR[senvcfg].SSE == 0))) {
++    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++  }
++
++  if ((CSR[menvcfg].SSE == 1'b1) || (CSR[henvcfg].SSE == 1'b1) || (CSR[senvcfg].SSE == 1'b1)) {
++    XReg addr_in_ssp = X[xs1];
++    X[xd] = amo<32>(addr_in_ssp, X[xs2][31:0], AmoOperation::Swap, aq, rl, $encoding);
++  }
+diff --git a/spec/std/isa/inst/Zicfiss/sspopchk.x1.yaml b/spec/std/isa/inst/Zicfiss/sspopchk.x1.yaml
+index 685ca04ad1..312ba33bfd 100644
+--- a/spec/std/isa/inst/Zicfiss/sspopchk.x1.yaml
++++ b/spec/std/isa/inst/Zicfiss/sspopchk.x1.yaml
+@@ -6,9 +6,10 @@
+ $schema: inst_schema.json#
+ kind: instruction
+ name: sspopchk.x1
+-long_name: No synopsis available
++long_name: Pop from the Shadow Stack
+ description: |
+-  No description available.
++  A shadow stack pop operation is defined as an XLEN wide read from the current top
++  of the shadow stack followed by an increment of the ssp by XLEN/8.
+ definedBy: Zicfiss
+ assembly: sspopchk_x1
+ encoding:
+@@ -21,3 +22,24 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  Bits<12> ssp_addr = 0x011;
++  Csr csr_handle = direct_csr_lookup(ssp_addr);
++
++  if (csr_handle.valid == false) {
++    unimplemented_csr($encoding);
++  } else if ((mode() < PrivilegeMode::M && CSR[menvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::U && CSR[senvcfg].SSE == 0)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::VU && (CSR[henvcfg].SSE == 0 || CSR[senvcfg].SSE == 0))) {
++    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++  }
++
++  if ((CSR[menvcfg].SSE == 1) || (CSR[henvcfg].SSE == 1) || (CSR[senvcfg].SSE == 1)) {
++    Bits<XLEN> ssp = csr_sw_read(csr_handle);
++    XReg temp = read_memory<XLEN>(ssp, $encoding);
++    if (temp != X[1]) {
++      raise(ExceptionCode::SoftwareCheck, mode(), $encoding);
++    }
++    csr_sw_write(csr_handle, (ssp + (XLEN/8)));
++  }
+diff --git a/spec/std/isa/inst/Zicfiss/sspopchk.x5.yaml b/spec/std/isa/inst/Zicfiss/sspopchk.x5.yaml
+index c660552ba4..c2bc4b2d3d 100644
+--- a/spec/std/isa/inst/Zicfiss/sspopchk.x5.yaml
++++ b/spec/std/isa/inst/Zicfiss/sspopchk.x5.yaml
+@@ -6,9 +6,10 @@
+ $schema: inst_schema.json#
+ kind: instruction
+ name: sspopchk.x5
+-long_name: No synopsis available
++long_name: Pop from the Shadow Stack
+ description: |
+-  No description available.
++  A shadow stack pop operation is defined as an XLEN wide read from the current top
++  of the shadow stack followed by an increment of the ssp by XLEN/8.
+ definedBy: Zicfiss
+ assembly: sspopchk_x5
+ encoding:
+@@ -21,3 +22,24 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  Bits<12> ssp_addr = 0x011;
++  Csr csr_handle = direct_csr_lookup(ssp_addr);
++
++  if (csr_handle.valid == false) {
++    unimplemented_csr($encoding);
++  } else if ((mode() < PrivilegeMode::M && CSR[menvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::U && CSR[senvcfg].SSE == 0)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::VU && (CSR[henvcfg].SSE == 0 || CSR[senvcfg].SSE == 0))) {
++    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++  }
++
++  if ((CSR[menvcfg].SSE == 1) || (CSR[henvcfg].SSE == 1) || (CSR[senvcfg].SSE == 1)) {
++    Bits<XLEN> ssp = csr_sw_read(csr_handle);
++    XReg temp = read_memory<XLEN>(ssp, $encoding);
++    if (temp != X[5]) {
++      raise(ExceptionCode::SoftwareCheck, mode(), $encoding);
++    }
++    csr_sw_write(csr_handle, (ssp + (XLEN/8)));
++  }
+diff --git a/spec/std/isa/inst/Zicfiss/sspush.x1.yaml b/spec/std/isa/inst/Zicfiss/sspush.x1.yaml
+index aa94160293..887316cbf5 100644
+--- a/spec/std/isa/inst/Zicfiss/sspush.x1.yaml
++++ b/spec/std/isa/inst/Zicfiss/sspush.x1.yaml
+@@ -6,9 +6,11 @@
+ $schema: inst_schema.json#
+ kind: instruction
+ name: sspush.x1
+-long_name: No synopsis available
++long_name: Push to the Shadow Stack from register x1
+ description: |
+-  No description available.
++  A shadow stack push operation is defined as decrement of the ssp by XLEN/8
++  followed by a store of the value in the link register x1 to memory at the
++  new top of the shadow stack.
+ definedBy: Zicfiss
+ assembly: sspush_x1
+ encoding:
+@@ -21,3 +23,21 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  Bits<12> ssp_addr = 0x011;
++  Csr csr_handle = direct_csr_lookup(ssp_addr);
++
++  if (csr_handle.valid == false) {
++    unimplemented_csr($encoding);
++  } else if ((mode() < PrivilegeMode::M && CSR[menvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::U && CSR[senvcfg].SSE == 0)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::VU && (CSR[henvcfg].SSE == 0 || CSR[senvcfg].SSE == 0))) {
++    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++  }
++
++  if ((CSR[menvcfg].SSE == 1'b1) || (CSR[henvcfg].SSE == 1'b1) || (CSR[senvcfg].SSE == 1'b1)) {
++    Bits<XLEN> ssp = csr_sw_read(csr_handle) - (XLEN/8);
++    write_memory<XLEN>(ssp, X[1], $encoding);
++    csr_sw_write(csr_handle, ssp);
++  }
+diff --git a/spec/std/isa/inst/Zicfiss/sspush.x5.yaml b/spec/std/isa/inst/Zicfiss/sspush.x5.yaml
+index 95300ec8fe..c8d7322a88 100644
+--- a/spec/std/isa/inst/Zicfiss/sspush.x5.yaml
++++ b/spec/std/isa/inst/Zicfiss/sspush.x5.yaml
+@@ -6,9 +6,11 @@
+ $schema: inst_schema.json#
+ kind: instruction
+ name: sspush.x5
+-long_name: No synopsis available
++long_name: Push to the Shadow Stack from register x5
+ description: |
+-  No description available.
++  A shadow stack push operation is defined as decrement of the ssp by XLEN/8
++  followed by a store of the value in the link register x5 to memory at the
++  new top of the shadow stack.
+ definedBy: Zicfiss
+ assembly: sspush_x5
+ encoding:
+@@ -21,3 +23,21 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  Bits<12> ssp_addr = 0x011;
++  Csr csr_handle = direct_csr_lookup(ssp_addr);
++
++  if (csr_handle.valid == false) {
++    unimplemented_csr($encoding);
++  } else if ((mode() < PrivilegeMode::M && CSR[menvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::U && CSR[senvcfg].SSE == 0)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::VU && (CSR[henvcfg].SSE == 0 || CSR[senvcfg].SSE == 0))) {
++    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++  }
++
++  if ((CSR[menvcfg].SSE == 1'b1) || (CSR[henvcfg].SSE == 1'b1) || (CSR[senvcfg].SSE == 1'b1)) {
++    Bits<XLEN> ssp = csr_sw_read(csr_handle) - (XLEN/8);
++    write_memory<XLEN>(ssp, X[5], $encoding);
++    csr_sw_write(csr_handle, ssp);
++  }
+diff --git a/spec/std/isa/inst/Zicfiss/ssrdp.yaml b/spec/std/isa/inst/Zicfiss/ssrdp.yaml
+index 3d5a019def..5029b2150b 100644
+--- a/spec/std/isa/inst/Zicfiss/ssrdp.yaml
++++ b/spec/std/isa/inst/Zicfiss/ssrdp.yaml
+@@ -8,7 +8,7 @@ kind: instruction
+ name: ssrdp
+ long_name: Read ssp into a Register
+ description: |
+-  No description available.
++  Move the contents of ssp to a destination register.
+ definedBy: Zicfiss
+ assembly: xd
+ encoding:
+@@ -24,3 +24,21 @@ access:
+   vu: always
+ data_independent_timing: false
+ operation(): |
++  Bits<12> ssp_addr = 0x011;
++  Csr csr_handle = direct_csr_lookup(ssp_addr);
++
++  if (csr_handle.valid == false) {
++    unimplemented_csr($encoding);
++  } else if ((mode() < PrivilegeMode::M && CSR[menvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::U && CSR[senvcfg].SSE == 0)) {
++    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  } else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].SSE == 0) ||
++             (mode() == PrivilegeMode::VU && (CSR[henvcfg].SSE == 0 || CSR[senvcfg].SSE == 0))) {
++    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++  }
++
++  if ((CSR[menvcfg].SSE == 1'b1) || (CSR[henvcfg].SSE == 1'b1) || (CSR[senvcfg].SSE == 1'b1)) {
++    X[xd] = csr_sw_read(csr_handle);
++  } else {
++    X[xd] = 0;
++  }

@@ -1,0 +1,62 @@
+PR #2631  target=linux  overall=compliant
+Spec: Any kernel CSR access-control or emulation path that decodes csr[9:8] for privilege gating must know that 0b10 maps to 'hypervisor'; misinterpreting it as user or supervisor allows guest-controlled CSR read/write from VS-mode that should be blocked.
+Violation: Linux kernel code in KVM or trap emulation paths inspects csr[9:8] to determine CSR privilege level for access-control decisions, but fails to recognize the encoding 0b10 as hypervisor-level, thereby misclassifying hypervisor CSRs (0x600-0x6ff range, e.g. hstatus, hedeleg, hgatp) as belonging to user (0b00) or supervisor (0b01) privilege and allowing reads/writes at an insufficient privilege level.
+Consequence: privilege_escape
+Pattern: (csr[9:8]|CSR_ADDR_ACCESS|csr_addr.*priv|privilege.*csr).*0x[236]|switch.*csr_addr.*case 0x[236]|decode.*csr.*privilege
+------------------------------------------------------------
+[compliant] arch/riscv/kvm/vcpu_insn.c:147-227  csr_insn
+  CSR number extracted via 'csr_num = insn >> SH_RS2' (line 150), which gets the full 12-bit CSR address from instruction bits [31:20]. No csr[9:8] privilege-bit inspection exists. Access control relies on hardware enforcement (CPU traps illegal-privilege CSR accesses as EXC_VIRTUAL_INST_FAULT or EXC_INST_ILLEGAL). The csr_funcs[] lookup table (line 112-116) uses exact 12-bit CSR numbers (e.g., CSR_SIREG=0x151, CSR_CYCLE=0xc00, CSR_SEED=0x015) with no partial bitfield matching. Unknown CSRs (including all hypervisor 0x600 range) fall through to userspace QEMU emulation (line 221-224).
+  | unsigned int csr_num = insn >> SH_RS2;
+  | ...
+  | for (i = 0; i < ARRAY_SIZE(csr_funcs); i++) {
+  |     tcfn = &csr_funcs[i];
+  |     if ((tcfn->base <= csr_num) &&
+  |         (csr_num < (tcfn->base + tcfn->count))) {
+
+[potential_risk] arch/riscv/kvm/vcpu_insn.c:150-150  csr_insn
+  The 12-bit CSR number (csr_num) extracted at line 150 is used without any validation of the implicit privilege field in bits [9:8]. The kernel forwards unknown CSRs directly to userspace (QEMU) via KVM_EXIT_RISCV_CSR at line 223. If a hardware erratum or nested-virtualization scenario caused a hypervisor-only CSR (e.g., HSTATUS=0x600, HEDELEG=0x602, HGATP=0x680) to reach this handler when the guest is at an insufficient privilege level, the kernel would blindly forward it to userspace without detecting the privilege mismatch. Currently mitigated by hardware correctly enforcing CSR privilege and csr_funcs[] not containing any 0x600-range entries.
+  | unsigned int csr_num = insn >> SH_RS2;
+
+[compliant] arch/riscv/kvm/vcpu_insn.c:272-299  system_opcode_insn
+  Dispatcher for SYSTEM opcode instructions. Only matches on instruction opcode masks (CSRRW, CSRRS, CSRRC, etc.) — privilege-agnostic. Correctly delegates KVM_INSN_ILLEGAL_TRAP to truly_illegal_insn() which redirects as EXC_INST_ILLEGAL to guest, preserving hardware-level privilege enforcement.
+  | case KVM_INSN_ILLEGAL_TRAP:
+  |     return truly_illegal_insn(vcpu, run, insn);
+  | case KVM_INSN_VIRTUAL_TRAP:
+  |     return truly_virtual_insn(vcpu, run, insn);
+
+[compliant] arch/riscv/kvm/vcpu_exit.c:228-231  kvm_riscv_vcpu_exit
+  EXC_VIRTUAL_INST_FAULT entry point checks HSTATUS_SPV to confirm trap was taken from VS-mode before dispatching to kvm_riscv_vcpu_virtual_insn(). No CSR privilege bit inspection — hardware has already determined the CSR access was illegal for the guest's privilege mode.
+  | case EXC_VIRTUAL_INST_FAULT:
+  |     if (vcpu->arch.guest_context.hstatus & HSTATUS_SPV)
+  |         ret = kvm_riscv_vcpu_virtual_insn(vcpu, run, trap);
+  |     break;
+
+[compliant] arch/riscv/kernel/traps.c:173-196  do_trap_insn_illegal
+  Host kernel illegal-instruction trap handler. Does NOT decode the CSR number at all. On illegal instruction (including illegal CSR access), attempts riscv_v_first_use_handler() for vector extension lazy-init, then sends SIGILL. No CSR privilege-level checking code exists here. Hardware enforcement is the sole access control mechanism.
+  | asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *regs)
+  | {
+  |     ...
+  |     handled = riscv_v_first_use_handler(regs);
+  |     if (!handled)
+  |         do_trap_error(regs, SIGILL, ILL_ILLOPC, ...);
+
+[compliant] arch/riscv/kvm/aia.c:388-409  kvm_riscv_vcpu_aia_rmw_ireg
+  Handles CSR_SIREG (0x151, bits[9:8]=01, Supervisor) and CSR_STOPEI (0x15c, bits[9:8]=01, Supervisor) emulation. These are correctly supervisor-level CSRs. No hypervisor CSR range (0x200 or 0x600) is handled. The function ignores the csr_num parameter — it reads VSISELECT instead to determine which indirect register to access. No privilege-bit decoding anywhere.
+  | int kvm_riscv_vcpu_aia_rmw_ireg(struct kvm_vcpu *vcpu, unsigned int csr_num,
+  |                                 unsigned long *val, unsigned long new_val,
+  |                                 unsigned long wr_mask)
+  | {
+  |     ...
+  |     isel = ncsr_read(CSR_VSISELECT) & ISELECT_MASK;
+
+[compliant] arch/riscv/include/asm/csr.h:359-434  
+  CSR address definitions show correct privilege-level mapping per the RISC-V spec. VS-level CSRs (0x200-0x2FF) have bits[9:8]=10 (hypervisor). HS-level CSRs (0x600-0x6FF: HSTATUS, HEDELEG, HGATP etc.) also have bits[9:8] that would decode as 00 in the low 10 bits, but with bits[11:10]=01 distinguishing them from user CSRs. No code in the kernel inspects only bits[9:8] for privilege determination — all lookups use the full 12-bit address.
+  | #define CSR_VSSTATUS    0x200
+  | ...
+  | #define CSR_HSTATUS     0x600
+  | #define CSR_HEDELEG     0x602
+  | ...
+  | #define CSR_HGATP       0x680
+  | ...
+  | #define CSR_MSTATUS     0x300
+

@@ -1,0 +1,57 @@
+PR #606  target=freebsd-src  overall=bug_confirmed
+Spec: FreeBSD's RISC-V trap dispatch and INTC driver assume legacy CLINT-mode interrupt delivery where timer (STI), software (SSI), and external (SEI) interrupts arrive with distinct scause codes; ACLIC mode unification collapses all interrupts to SEI scause=9, causing timer and IPI interrupts to be silently redirected to the external interrupt handler chain, hanging the scheduler tick and SMP coordination
+Violation: FreeBSD's intc.c (INTC_NIRQS=16, legacy CLINT-mode controller) and the trap dispatchers do_trap_supervisor/do_trap_user dispatch interrupts by reading frame->tf_scause & SCAUSE_CODE to identify the major interrupt source (1=SSI, 5=STI, 9=SEI). When ACLIC mode is active (eidelivery CSR set), all major interrupts—timer, software, and external—are forwarded to ACLIC and arrive through a single scause code (9, supervisor external interrupt). The intc_intr() handler at intc.c:276 would map every interrupt to scause code 9 and forward it to the external interrupt handler chain, silently discarding timer and IPI interrupts. Conversely, sbi_ipi.c:sbi_ipi_intr() at sbi_ipi.c:106 clears SIP_SSIP directly via csr_clear(sip, SIP_SSIP), which is meaningless in ACLIC mode where the SSIP bit no longer drives interrupt delivery. No code path in FreeBSD's RISC-V port checks eidelivery or ACLIC state before assuming legacy interrupt semantics.
+Consequence: denial_of_service
+Pattern: tf_scause.*SCAUSE_CODE|csr_clear.*sip.*SIP_SSIP|csr_.*sip|intc_intr|frame->tf_scause & SCAUSE_CODE|sbi_ipi_intr|SSIP|STIP
+------------------------------------------------------------
+[bug_confirmed] sys/riscv/riscv/intc.c:262-289  intc_intr
+  intc_intr() dispatches interrupts solely by extracting scause code (line 276: active_irq = frame->tf_scause & SCAUSE_CODE) and using it as an index into isrcs[]. When AIA/ACLIC mode is active (eidelivery CSR set), all major interrupts—timer (scause=5), software (scause=1), and external (scause=9)—are forwarded through ACLIC and arrive as scause=9 (supervisor external interrupt). The handler would route every interrupt to isrcs[9], silently discarding timer and IPI interrupts. No code checks eidelivery or ACLIC state before assuming legacy scause-based dispatch.
+  | active_irq = frame->tf_scause & SCAUSE_CODE;
+  | if (active_irq >= INTC_NIRQS)
+  |     return (FILTER_HANDLED);
+  | src = &sc->isrcs[active_irq];
+  | if (intr_isrc_dispatch(&src->isrc, frame) != 0) {
+
+[potential_risk] sys/riscv/riscv/intc.c:199-209  intc_enable_intr
+  intc_enable_intr() uses csr_set(sie, 1ul << irq) and intc_disable_intr() uses csr_clear(sie, 1ul << irq) to control interrupt delivery. Under AIA/ACLIC, the sie CSR bits no longer gate interrupt delivery—interrupt routing is managed by the ACLIC's IDC (interrupt delivery control) registers instead. Manipulating sie.SSIE/sie.STIE/sie.SEIE has no effect on actual interrupt delivery in AIA mode, leaving interrupts potentially uncontrollable.
+  | csr_set(sie, 1ul << irq);
+
+[bug_confirmed] sys/riscv/riscv/sbi_ipi.c:96-126  sbi_ipi_intr
+  sbi_ipi_intr() at line 106 calls csr_clear(sip, SIP_SSIP) to clear the software interrupt pending bit. In AIA/ACLIC mode, the SIP_SSIP bit no longer drives interrupt delivery—the ACLIC manages pending state internally. Clearing SIP_SSIP via csr_clear is a no-op that does not clear the actual interrupt source, potentially causing a tight loop of spurious interrupt re-delivery. Furthermore, the sbi_ipi driver registers itself on IRQ_SOFTWARE_SUPERVISOR (IRQ 1 in intc's isrcs[]), but on ACLIC systems with eidelivery set, the intc_intr() handler would route all interrupts to isrcs[9] (SEIP), so sbi_ipi_intr() would never be called at all.
+  | csr_clear(sip, SIP_SSIP);
+  | cpu = PCPU_GET(cpuid);
+  | mb();
+  | ipi_bitmap = atomic_readandclear_32(&sc->pending_ipis[cpu]);
+
+[potential_risk] sys/riscv/riscv/trap.c:306-323  do_trap_supervisor
+  do_trap_supervisor() checks (frame->tf_scause & SCAUSE_INTR) and unconditionally calls intr_irq_handler(frame, INTR_ROOT_IRQ) for all interrupts. It does not inspect whether AIA/ACLIC mode is active. In AIA mode where eideleg/eidelivery delegates all interrupts to ACLIC, the single scause=9 code correctly triggers the interrupt path, but the downstream intc_intr() handler cannot distinguish timer from software from external interrupts, defeating the dispatch. No AIA awareness exists anywhere in the trap dispatch path.
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  |     /* Interrupt */
+  |     intr_irq_handler(frame, INTR_ROOT_IRQ);
+  |     return;
+  | }
+
+[potential_risk] sys/riscv/riscv/trap.c:379-404  do_trap_user
+  Same pattern as do_trap_supervisor: do_trap_user() unconditionally dispatches all interrupts to intr_irq_handler() without any AIA awareness. When ACLIC delivers a user-context interrupt (e.g., a timer interrupt that preempts user mode), the frame's scause will be 9. The interrupt will be dispatched, but intc_intr() will route it as an external interrupt only, silently losing any software-IPI or timer-specific handling that should have occurred.
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  |     /* Interrupt */
+  |     intr_irq_handler(frame, INTR_ROOT_IRQ);
+  |     return;
+  | }
+
+[potential_risk] sys/riscv/include/riscvreg.h:1-210  N/A
+  There are zero AIA-related CSR definitions in riscvreg.h: no siselect/sireg indirect CSR accessors, no eidelivery/eideleg bit definitions, no stopei, no IMSIC register definitions, no smstateen bit definitions for AIA. The absence of these definitions means no kernel code can conditionally adapt to AIA mode even if it wanted to. The entire RISC-V CSR header assumes pre-AIA legacy interrupt semantics. SIP_SEIP is also not defined (only MIP_SEIP exists for M-mode).
+  | /* Note: sip register has no SIP_STIP bit in Spike simulator */
+  | #define SIP_SSIP     (1 << 1)
+  | #define SIP_STIP     (1 << 5)
+  | /* SIP_SEIP not defined */
+
+[potential_risk] sys/riscv/riscv/aplic.c:405-411  aplic_setup_direct_mode
+  aplic_setup_direct_mode() explicitly disables interrupt delivery for all CPUs (APLIC_IDC_IDELIVERY_DISABLE), then later re-enables delivery only when aplic_bind_intr() is called for specific IRQ targets. This is correct for the subset of interrupts handled by APLIC in direct mode, but it does not handle timer (STI) or software (SSI) interrupts at all. The driver's comment at line 455-457 states 'APLIC with IMSIC on hart is not supported', confirming that full AIA/IMSIC support is explicitly out of scope. The APLIC driver coexists with but does not replace the legacy intc.
+  | CPU_FOREACH(cpu) {
+  |     aplic_write(sc, APLIC_IDC_IDELIVERY(sc, cpu),
+  |         APLIC_IDC_IDELIVERY_DISABLE);
+  |     aplic_write(sc, APLIC_IDC_ITHRESHOLD(sc, cpu),
+  |         APLIC_IDC_ITHRESHOLD_DISABLE);
+  | }
+

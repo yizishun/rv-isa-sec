@@ -1,0 +1,50 @@
+PR #91  target=opensbi  overall=potential_risk
+Spec: OpenSBI must correctly preserve the tagcheck-exempt PTE bit when configuring page tables, or else code on non-exempt pages accessing tagged-data pages will be subject to tag checks — the inverse of the intended exemption semantic — enabling privilege-boundary bypasses through misconfigured memory tagging
+Violation: OpenSBI incorrectly sets or clears the tagcheck-exempt PTE attribute on a code page (e.g., during page table setup via sbi_domain, HSM context save/restore, or Svpbmt/Svadu PTE configuration), causing tag checks to be either unexpectedly enforced or silently bypassed when M-mode, S-mode, or U-mode code on that page accesses tagged-data pages
+Consequence: privilege_escape
+Pattern: PTE bit manipulation without preserving memory-tagging-related reserved/attribute bits; CSR save/restore of menvcfg/senvcfg without masking MTE field; page table walk or PTE update that clobbers tagcheck-exempt bit
+------------------------------------------------------------
+[potential_risk] lib/sbi/sbi_hart.c:137-174  mstatus_init
+  Cold-boot menvcfg init reads CSR_MENVCFG raw, modifies only known bits (DTE, CBZE, CBCFE, CBIE, PBMTE, STCE, CDE, ADUE), then writes the full 64-bit value back. Any MTE-related bits at currently-WPRI positions (e.g., bits 35-58 gap including former MT_ASYNC bit 36, or future MTE fields) are preserved verbatim from hardware reset state. If hardware reset leaves MTE bits in an undefined state (non-zero), this propagates the undefined value into runtime. No explicit masking of WPRI/MTE bit positions before write.
+  | menvcfg_val = csr_read64(CSR_MENVCFG);
+  | menvcfg_val &= ~ENVCFG_DTE;
+  | // ... sets/clears known bits (CBZE, CBCFE, CBIE, PBMTE, STCE, CDE, ADUE) ...
+  | csr_write64(CSR_MENVCFG, menvcfg_val);  // writes back all undefined bits verbatim
+
+[potential_risk] lib/sbi/sbi_hsm.c:408-433  __sbi_hsm_suspend_non_ret_save
+  Non-retentive suspend save captures CSR_MENVCFG via raw csr_read64() without masking MTE/WPRI bits. If MTE bits occupy positions in the WPRI gap (bits 35-58), the raw save includes these bits. On hardware that auto-clears MTE state during power-gating, the saved value may capture stale or post-gating-zeroed MTE configuration — creating ambiguity about what state will be restored. No field-level save semantics for potential MTE fields.
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);  // raw save, MTE bits included verbatim
+
+[potential_risk] lib/sbi/sbi_hsm.c:435-446  __sbi_hsm_suspend_non_ret_restore
+  Non-retentive resume restore writes saved_menvcfg back verbatim via csr_write64(). If MTE bits at WPRI positions were captured stale (e.g., the hardware auto-cleared MTE fields during power loss), restoring the old raw value re-applies potentially invalid MTE configuration. Conversely, if sbi_hart_reinit() (called before this restore at init_warm_resume:490) re-initializes menvcfg with correct MTE bits, this restore then overwrites that correct initialization with the raw saved value. No reconciliation between saved menvcfg and freshly-initialized MTE state.
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	csr_write64(CSR_MENVCFG, hdata->saved_menvcfg);  // overwrites reinit'd menvcfg
+
+[potential_risk] lib/sbi/sbi_domain_context.c:102-169  switch_to_next_domain_context
+  Domain context switch swaps CSR_SENVCFG via csr_swap() with dom_ctx->senvcfg. Context structures are zero-initialized via sbi_zalloc() at hart_context_init:181, meaning a newly-entered domain gets senvcfg=0. This clears any MTE-related fields in senvcfg that the prior domain may have configured, causing tag checks to revert to default (likely enforced) behavior. No explicit MTE-field masking or preservation during context swap. Also note: only SFENCE.VMA is issued (line 140), with no tag-TLB or tag-cache invalidation if the MTE extension requires separate flush operations.
+  | ctx->senvcfg = csr_swap(CSR_SENVCFG, dom_ctx->senvcfg);  // dom_ctx->senvcfg = 0 from sbi_zalloc
+  | // ... only SFENCE.VMA issued, no tag-specific fences
+
+[compliant] lib/sbi/sbi_domain_context.c:139-140  switch_to_next_domain_context
+  SATP swap is correctly followed by __sbi_sfence_vma_all() to flush TLB entries. The SFENCE.VMA fence is properly placed after the CSR write and before any address translation use. No SFENCE.VMA is missing here.
+  | ctx->satp = csr_swap(CSR_SATP, dom_ctx->satp);
+  | __sbi_sfence_vma_all();
+
+[compliant] lib/sbi/sbi_hart.c:810-821  sbi_hart_switch_mode
+  When transitioning to S-mode, SATP and VSATP are explicitly zeroed (lines 815, 820). This is correct behavior: M-mode firmware must clear address translation before entering a lower privilege mode that may configure its own page tables. The zeroing of SATP clears the MODE, ASID, and PPN fields, which on MTE-capable hardware also clears any tag-table base address in SATP. This is compliant because S-mode is expected to configure its own SATP including MTE tag-table pointer after entry.
+  | csr_write(CSR_VSATP, 0);  // V=1 path
+  | csr_write(CSR_SATP, 0);   // V=0 path
+
+[potential_risk] lib/sbi/sbi_fwft.c:237-263  fwft_set_pmlen
+  fwft_set_pmlen() uses csr_read_clear(CSR_MENVCFG, ENVCFG_PMM) which atomically clears PMM bits and returns the previous full menvcfg value (prev) including all WPRI/MTE bits. On the error recovery path (line 258), csr_write(CSR_MENVCFG, prev) restores the full old menvcfg value verbatim. If MTE bits at WPRI positions were set before the call, the error path writes them back unmodified — not a bug per se (restoring is safe), but the raw save/capture of MTE bits without awareness is the same pattern risk.
+  | prev = csr_read_clear(CSR_MENVCFG, ENVCFG_PMM);
+  | csr_set(CSR_MENVCFG, pmm);
+  | if ((csr_read(CSR_MENVCFG) & ENVCFG_PMM) != pmm) {
+  | 	csr_write(CSR_MENVCFG, prev);  // restores raw menvcfg including MTE bits
+
+[compliant] lib/sbi/sbi_fwft.c:79-97  fwft_menvcfg_set_bit
+  Single-bit menvcfg manipulation via atomic csr_set/csr_clear operations. Each call touches exactly one bit position. For known bits (DTE, ADUE, LPE, SSE), this is safe. If an MTE bit were at a known shift position, this function would be the correct accessor — it never does read-modify-write of the full register. No risk of WPRI/MTE bit propagation since only targeted bits are modified atomically.
+  | csr_set(CSR_MENVCFG, _ULL(1) << bit);    // atomic set of single bit
+  | csr_clear(CSR_MENVCFG, _ULL(1) << bit);  // atomic clear of single bit
+

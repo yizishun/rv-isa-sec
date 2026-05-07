@@ -1,0 +1,1 @@
+In asynchronous mode, tag mismatch reporting can happen on any trap (exception or interrupt). This change adds additional CSR which can hold address which resulted in tag mismatch. Furthermore if sw check exception is being delivered due to tag mismatch, then also stval2/ htval2/mtval3 CSR holds virtual address resulting in tag mismatch.

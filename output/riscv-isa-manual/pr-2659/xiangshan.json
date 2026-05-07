@@ -1,0 +1,153 @@
+{
+  "pr_number": 2659,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2659,
+    "violation_condition": "At hart reset deassertion, XiangShan's MnstatusBundle initializes NMIE (bit 3) to 1'b1 via withReset(1.U), violating the spec mandate that NMIE resets to 0. The RTL comment at MachineLevel.scala:599 explicitly acknowledges this: 'OpenSBI does not support Smrnmi yet, so NMIE resets enabled for bring-up.' When an external RNMI interrupt signal (nmi_31 or nmi_43) is asserted before software executes its first mnstatus CSR write, the InterruptFilter does NOT gate the NMI (disableAllIntr is false because mnstatusNMIE=1), so the hart vectors to an uninitialized RNMI trap handler address, corrupting mnepc/mncause/mnstatus with the pre-initialization architectural state.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "withReset\\(1\\.U\\).*NMIE|NMIE.*withReset\\(1\\.U\\)|CSRRWField.*\\(3\\)\\.withReset\\(1\\.U\\)",
+    "affected_entities": [
+      "mnstatus",
+      "NMIE",
+      "nmi_31",
+      "nmi_43",
+      "InterruptFilter.disableAllIntr"
+    ],
+    "summary": "mnstatus.NMIE resets to 1 (enabled) instead of 0 (disabled), allowing pre-initialization RNMI delivery that vectors to an undefined trap handler address before software configures RNMI data structures"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MnstatusBundle",
+        "line_start": 598,
+        "line_end": 604,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "MnstatusBundle.NMIE (bit 3) resets to 1 via withReset(1.U), violating the RISC-V Smrnmi spec mandate that NMIE resets to 0 at hart reset. The RTL comment on line 599 explicitly acknowledges the violation: 'OpenSBI does not support Smrnmi yet, so NMIE resets enabled for bring-up.' Per spec, NMIE=0 at reset ensures all interrupts (including NMI) are masked until software explicitly enables NMI handling by writing mnstatus. With NMIE=1 at reset, an NMI asserted before the RNMI trap handler is initialized will cause the hart to vector to an uninitialized mnepc address.",
+      "snippet": "class MnstatusBundle extends CSRBundle {\n  // OpenSBI does not support Smrnmi yet, so NMIE resets enabled for bring-up.\n  val NMIE   = CSRRWField  (3).withReset(1.U).withDescription(\"Enable non-maskable interrupt handling.\")\n  val MNPV   = VirtMode    (7).withReset(0.U)\n  val MNPELP = RO          (9).withReset(0.U)\n  val MNPP   = PrivMode    (12, 11).withReset(PrivMode.U)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "mnstatus CSRModule",
+        "line_start": 418,
+        "line_end": 427,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The spec-mandated WARL behavior for NMIE (write-0-has-no-effect: software clearing NMIE should be ignored, NMIE can only be cleared by hardware on NMI trap entry) is commented out. The comment says 'as opensbi not support smrnmi, we init nmie with 1, and allow software to set nmie close for testing.' While this is intentional for bring-up, it means software can clear NMIE via CSR write, which is a spec violation of the Smrnmi WARL semantics. Combined with NMIE=1 reset, this creates two independent deviations from spec.",
+      "snippet": "val mnstatus = Module(new CSRModule(\"Mnstatus\", new MnstatusBundle)\n    with TrapEntryMNEventSinkBundle\n    with MNretEventSinkBundle{\n    // NMIE write 0 with no effect\n    // as opensbi not support smrnmi, we init nmie with 1...\n//    when(!wdata.NMIE.asBool) {\n//      reg.NMIE := reg.NMIE\n//    }\n  }).setAddr(CSRs.mnstatus)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala",
+        "function_name": "InterruptFilter",
+        "line_start": 533,
+        "line_end": 543,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The InterruptFilter NMI gating logic at line 538 computes disableAllIntrReg = disableDebugIntr || !io.in.mnstatusNMIE. Since mnstatusNMIE=1 at reset (due to the MnstatusBundle withReset(1.U)), disableAllIntrReg resolves solely to disableDebugIntr, which is false when not in debug mode. Consequently, an NMI asserted before software initialization will pass through line 543's Mux(nmiReg, nmiVecReg, ...) unfiltered, directly triggering an RNMI trap entry to an uninitialized handler. This is the exploitable path that materializes the reset-value violation.",
+      "snippet": "  // support smrnmi when NMIE is 0, all interrupt disable\n  val disableDebugIntr = io.in.debugMode || (io.in.dcsr.STEP.asBool && !io.in.dcsr.STEPIE.asBool)\n  val enableDebugIntr = io.in.debugIntr && !disableDebugIntr\n\n  val debugIntrReg = RegNext(enableDebugIntr, false.B)\n  val disableAllIntrReg = RegNext(disableDebugIntr || !io.in.mnstatusNMIE, false.B)\n  val nmiReg = RegNext(io.in.nmi, false.B)\n  val nmiVecReg = RegNext(nmiVec, 0.U.asTypeOf(nmiVec))\n\n  val normalIntrVecReg = mIRVec | hsIRVec | vsMapHostIRVec\n  val intrVecReg = Mux(disableAllIntrReg, 0.U, Mux(nmiReg, nmiVecReg, normalIntrVecReg))"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (trap entry gating)",
+        "line_start": 794,
+        "line_end": 797,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Trap entry to MN state is gated on mnstatus.regOut.NMIE at line 794. With NMIE=1 at reset, trapEntryMNEvent.valid becomes true when hasTrap && nmi && !entryDebugMode && !debugMode. The TrapEntryMNEvent handler saves the current architectural state (PC, priv) into mnepc/mncause/mnstatus and clears NMIE to 0. But the mnepc value saved is the pre-initialization PC, not a valid RNMI handler address. On subsequent MNret, the hart will jump to this garbage address, causing unpredictable execution. This is the full exploit chain: reset NMIE=1 → NMI unfiltered → trap to MN with garbage mnepc → MNret to garbage address.",
+      "snippet": "  trapEntryMNEvent.valid  := ((hasTrap && nmi) || dbltrpToMN) && !entryDebugMode && !debugMode && mnstatus.regOut.NMIE\n  trapEntryMEvent .valid  := hasTrap && entryPrivState.isModeM && !dbltrpToMN && !entryDebugMode && !debugMode && !nmi && mnstatus.regOut.NMIE\n  trapEntryHSEvent.valid  := hasTrap && entryPrivState.isModeHS && !entryDebugMode && !debugMode && mnstatus.regOut.NMIE\n  trapEntryVSEvent.valid  := hasTrap && entryPrivState.isModeVS && !entryDebugMode && !debugMode && mnstatus.regOut.NMIE"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMNEvent.scala",
+        "function_name": "TrapEntryMNEventModule",
+        "line_start": 43,
+        "line_end": 55,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The TrapEntryMNEvent implementation correctly saves architectural state on RNMI trap entry: MNPP ← current PRVM, MNPV ← current V, NMIE ← 0, mnepc ← trap PC, mncause ← {Interrupt, ExceptionCode}. The NMIE=0 write on trap entry is correct per spec — hardware must clear NMIE when taking an RNMI to prevent nested NMIs. The mnepc save logic handles the fetch-malformed-address case correctly via Mux. This module is spec-compliant; the vulnerability is entirely in the reset value and InterruptFilter gating, not in the trap handling itself.",
+      "snippet": "  out.privState.bits             := PrivState.ModeM\n  out.mnstatus.bits.MNPP         := current.privState.PRVM\n  out.mnstatus.bits.MNPV         := current.privState.V\n  out.mnstatus.bits.NMIE         := 0.U\n  out.mnepc.bits.epc             := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))\n  out.mncause.bits.Interrupt     := isInterrupt\n  out.mncause.bits.ExceptionCode := highPrioTrapNO"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/MNretEvent.scala",
+        "function_name": "MNretEventModule",
+        "line_start": 70,
+        "line_end": 83,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The MNretEvent correctly restores state on MNret: NMIE ← 1 (re-enables interrupts), MNPP ← U-mode, MNPV ← Off, target PC ← mnepc. The privilege restoration and MPRV/MDT/SDT clearing logic correctly handles mnret to M, S, and VU modes. The address translation checks (checkPageFault, checkAccessFault, checkGuestPageFault) on the target PC are correctly applied. This module is spec-compliant.",
+      "snippet": "  out.mnstatus.bits.MNPP      := PrivMode.U\n  out.mnstatus.bits.MNPV      := VirtMode.Off.asUInt\n  out.mnstatus.bits.NMIE      := 1.U\n  out.mstatus.bits.MPRV       := Mux(in.mnstatus.MNPP =/= PrivMode.M, 0.U, in.mstatus.MPRV.asUInt)\n  out.targetPc.bits.pc        := in.mnepc.asUInt\n  out.targetPc.bits.raiseIPF  := instrAddrTransType.checkPageFault(in.mnepc.asUInt)\n  out.targetPc.bits.raiseIAF  := instrAddrTransType.checkAccessFault(in.mnepc.asUInt)\n  out.targetPc.bits.raiseIGPF := instrAddrTransType.checkGuestPageFault(in.mnepc.asUInt)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (critical error detection)",
+        "line_start": 1531,
+        "line_end": 1534,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The critical error detection correctly identifies double-trap-in-MN condition (!mnstatus.regOut.NMIE && hasTrap && !entryDebugMode) which is architecturally defined as a fatal error. However, this detection only triggers when NMIE=0 (i.e., during an active NMI handler). When NMIE=1 at reset (the bug condition), this check does not fire, meaning the faulty pre-initialization NMI path bypasses critical error detection entirely and proceeds as a 'normal' RNMI trap.",
+      "snippet": "  val criticalErrors = Seq(\n    (\"csr_dbltrp_inMN\", !mnstatus.regOut.NMIE && hasTrap && !entryDebugMode),\n  )\n  criticalErrorStateInCSR := criticalErrors.map(criticalError => criticalError._2).reduce(_ || _).asBool"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (nmip register)",
+        "line_start": 360,
+        "line_end": 362,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The nmip (non-maskable interrupt pending) register correctly initializes from the NonMaskableIRPendingBundle init value (both NMI_31 and NMI_43 reset to 0). The external NMI signals are properly connected from nonMaskableIRP to nmip fields. The NMI signal to InterruptFilter (line 389: nmip.asUInt.orR) correctly asserts only when at least one NMI pending bit is set. This register and its wiring are spec-compliant.",
+      "snippet": "  val nmip = RegInit(new NonMaskableIRPendingBundle, (new NonMaskableIRPendingBundle).init)\n  nmip.NMI_43 := nonMaskableIRP.NMI_43\n  nmip.NMI_31 := nonMaskableIRP.NMI_31"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "mnepc CSRModule (implied line 410)",
+        "line_start": 410,
+        "line_end": 414,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Mnepc is instantiated as a standard Epc bundle with TrapEntryMNEventSinkBundle. The Epc bundle's reset value is architecture-defined by the base Epc class (not shown but typical reset is 0). If mnepc resets to 0x0 or an arbitrary value, the first RNMI trap before software sets up the handler will save the current PC to mnepc, which is correct trap behavior — not a reset issue in mnepc itself. The risk is that mnepc is architecturally readable via CSR read instructions before software initializes it, revealing the pre-initialization boot PC through the RNMI trap path.",
+      "snippet": "  val mnepc = Module(new CSRModule(\"Mnepc\", new Epc) with TrapEntryMNEventSinkBundle {\n    rdata := SignExt(Cat(reg.epc.asUInt, 0.U(1.W)), XLEN)\n  })\n    .setAddr(CSRs.mnepc)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (MPRV gating with NMIE)",
+        "line_start": 816,
+        "line_end": 818,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The MPRV gating with NMIE correctly implements the spec requirement that when NMIE=0, MPRV is forced to 0 (memory accesses use the native privilege mode, not the MPP-specified mode). This prevents an NMI handler running in M-mode from accidentally using stale MPRV values when accessing memory. The logic at line 817-818 correctly applies NMIE as a qualifier to both PRVM and V in dMode.",
+      "snippet": "        // when NMIE is zero, force to behave as MPRV is zero\n        in.dMode.PRVM := Mux(mstatus.regOut.MPRV.asBool && mnstatus.regOut.NMIE.asBool, mstatus.regOut.MPP, PRVM)\n        in.dMode.V := V.asUInt.asBool || mstatus.regOut.MPRV && mnstatus.regOut.NMIE.asBool && (mstatus.regOut.MPP =/= PrivMode.M) && mstatus.regOut.MPV"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (HVICTL gating with NMIE)",
+        "line_start": 549,
+        "line_end": 549,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The virtual interrupt HVICTL injection gating at InterruptFilter.scala:549 correctly disables HVICTL injection when NMIE=0 (viIsHvictlInjectReg depends on io.in.mnstatusNMIE). This prevents spurious virtual interrupt injections during NMI handling, which could otherwise bypass the virtualization boundary.",
+      "snippet": "  val viIsHvictlInjectReg = RegNext(vsIRModeCond && SelectCandidate5 && io.in.mnstatusNMIE, false.B)"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

@@ -1,0 +1,105 @@
+{
+  "pr_number": 76,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 76,
+    "violation_condition": "In QEMU TCG, when menvcfg.MT_ASYNC is set and a tag-mismatching regular store executes, the software check exception must be deferred to the next trap. If QEMU stores the pending mismatch flag and the faulting virtual address (destined for stval2/htval2/mtval3) in a non-per-CPU location, or fails to clear them on writes to menvcfg/mseccfg that disable tagging, or fails to flush them on privilege-mode transitions, then (a) one hart's trap handler can observe another hart's faulting virtual address in these CSRs, or (b) a guest can read stale virtual addresses from a prior security context after toggling MT_ASYNC off and back on.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "pending.*tag|tag.*pending|mte_defer|mte_async|async.*mismatch|MT_ASYNC|stval2|htval2|mtval3|riscv_cpu_do_interrupt.*mte",
+    "affected_entities": [
+      "stval2",
+      "htval2",
+      "mtval3",
+      "menvcfg",
+      "mseccfg"
+    ],
+    "summary": "Deferred async MTE tag mismatch state in TCG risks cross-CPU info leak via stval2/htval2/mtval3 if pending buffer is not per-hart and not sanitized on mode transitions"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "N/A (definitions)",
+        "line_start": 855,
+        "line_end": 866,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MENVCFG has no MT_ASYNC or MTE-related field. MENVCFG_PBMTE is Page-Based Memory Types (Svpbmt), not Memory Tagging Extension. The vulnerability condition's menvcfg.MT_ASYNC bit does not exist in this RISC-V implementation.",
+      "snippet": "#define MENVCFG_DTE                        (1ULL << 59)\n#define MENVCFG_CDE                        (1ULL << 60)\n#define MENVCFG_ADUE                       (1ULL << 61)\n#define MENVCFG_PBMTE                      (1ULL << 62)\n#define MENVCFG_STCE                       (1ULL << 63)"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.h",
+        "function_name": "N/A (definitions)",
+        "line_start": 44,
+        "line_end": 50,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MSECCFG CSR fields (MML, MMWP, RLB, USEED, SSEED, MLPE, PMM) are exclusively for ePMP/Zkr/MLPE/power management — no MTE tag-enable bits exist. Writing menvcfg/mseccfg cannot toggle any tagging feature because none exists.",
+      "snippet": "MSECCFG_MML   = 1 << 0,\nMSECCFG_MMWP  = 1 << 1,\nMSECCFG_RLB   = 1 << 2,\nMSECCFG_USEED = 1 << 8,\nMSECCFG_SSEED = 1 << 9,\nMSECCFG_MLPE =  1 << 10,\nMSECCFG_PMM = 3ULL << 32,"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "N/A (CSR table and handlers)",
+        "line_start": 6220,
+        "line_end": 6230,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "No stval2, htval2, or mtval3 CSR registrations exist in the CSR dispatch table. These CSRs — the destinations for the faulting virtual address described in the vulnerability — are not implemented in the RISC-V target.",
+      "snippet": "[CSR_MSECCFG]    = { \"mseccfg\",   have_mseccfg, read_mseccfg, write_mseccfg,"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2206,
+        "line_end": 2540,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "riscv_cpu_do_interrupt() contains no MTE-related logic — no pending-tag-mismatch flag is checked, propagated, or flushed. No deferred async trap is injected. The vulnerability's entire mechanism (deferring tag-mismatch to next trap, loading stval2/mtval3 with faulting VA) has no code path.",
+      "snippet": "void riscv_cpu_do_interrupt(CPUState *cs)\n{\n    RISCVCPU *cpu = RISCV_CPU(cs);\n    CPURISCVState *env = &cpu->env;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "N/A (struct CPURISCVState)",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CPURISCVState has no pending-tag-mismatch flag, no faulting VA storage for async tag checks, no mte_active field, and no per-CPU tag state buffer. The entire vulnerability surface — non-per-CPU location for pending mismatch — does not exist because no such state exists.",
+      "snippet": "(struct CPURISCVState — no mte/tag-mismatch fields present)"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "N/A (vmstate)",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "No stval2/htval2/mtval3 fields in vmstate_riscv_cpu. Migration correctness is not at risk because none of the relevant MTE async state exists to migrate.",
+      "snippet": "(vmstate_riscv_cpu — no MTE-tag-mismatch vmstate fields)"
+    },
+    {
+      "location": {
+        "file_path": "hw/riscv/riscv-iommu.c",
+        "function_name": "riscv_iommu_validate_device_ctx",
+        "line_start": 750,
+        "line_end": 762,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The only modified file in this branch adds an IOMMU validation check (rejecting BARE GATP with non-OFF MSIPTP mode). This is unrelated to MTE, memory tagging, or the vulnerability described.",
+      "snippet": "if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&\n    get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=\n    RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {\n    return false;\n}"
+    }
+  ],
+  "overall_severity": "compliant"
+}

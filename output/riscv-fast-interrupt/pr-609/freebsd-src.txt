@@ -1,0 +1,79 @@
+PR #609  target=freebsd-src  overall=compliant
+Spec: Smaclic/Ssaclic no longer depends on Smaiae, so ACLIC-only harts lack IMSIC CSRs; FreeBSD's intr handler reading stopi/sclaimi gets zero → all external interrupts silently lost
+Violation: FreeBSD kernel executing on a hart that implements Smaclic/Ssaclic without Smaiae (IMSIC) reads the CSR-based stopi/sclaimi registers in the trap handler to claim external interrupts; these CSRs do not exist on such a system, so the read returns zero, causing the kernel to silently drop all external interrupts routed through the ACLIC
+Consequence: denial_of_service
+Pattern: csr_read.*[st]opi|csr_read.*[st]claimi|CSR_[ST]OPI|CSR_[ST]CLAIMI|CSR_SIE.*SEIE
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/trap.c:307-323  do_trap_supervisor
+  Trap handler reads scause from the trapframe (saved by exception.S assembly), then delegates to intr_irq_handler(). No CSR-based stopi/sclaimi read is performed. The external interrupt is dispatched through the PIC framework, which uses memory-mapped I/O for claiming.
+  | exception = frame->tf_scause & SCAUSE_CODE;
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  |   /* Interrupt */
+  |   intr_irq_handler(frame, INTR_ROOT_IRQ);
+  |   return;
+  | }
+
+[compliant] sys/riscv/riscv/trap.c:380-404  do_trap_user
+  Same pattern as do_trap_supervisor: reads scause from trapframe, no CSR-based stopi/sclaimi reads. Delegates to intr_irq_handler() for external interrupts.
+  | exception = frame->tf_scause & SCAUSE_CODE;
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  |   /* Interrupt */
+  |   intr_irq_handler(frame, INTR_ROOT_IRQ);
+  |   return;
+  | }
+
+[compliant] sys/riscv/riscv/intc.c:263-289  intc_intr
+  The local interrupt controller handler extracts the interrupt code from scause (saved in the trapframe), not from stopi/sclaimi CSRs. The sepc-saved scause is the standard privileged-spec CSR, always present. SIE_SEIE manipulation via intc_enable_intr/intc_disable_intr uses standard sie CSR bits (not AIA-specific bits), which work correctly in both legacy CLINT and ACLIC-direct modes.
+  | active_irq = frame->tf_scause & SCAUSE_CODE;
+  | if (active_irq >= INTC_NIRQS)
+  |   return (FILTER_HANDLED);
+  | src = &sc->isrcs[active_irq];
+  | if (intr_isrc_dispatch(&src->isrc, frame) != 0) {
+
+[compliant] sys/riscv/riscv/aplic.c:223-246  aplic_intr
+  The APLIC interrupt handler claims interrupts by reading the memory-mapped APLIC_IDC_CLAIMI register via bus_read_4() (aplic_read macro expands to bus_read_4 on sc->mem_res). This is a memory-mapped I/O register at offset 0x1C within the APLIC IDC structure, NOT a CSR read. It works correctly regardless of whether Smaiae (IMSIC) is present. The CLAIMI read returns zero when no interrupt is pending, correctly terminating the claim loop.
+  | while ((claimi = aplic_read(sc, APLIC_IDC_CLAIMI(sc, cpu))) != 0) {
+  |   prio = APLIC_IDC_CLAIMI_PRIO(claimi);
+  |   irq = APLIC_IDC_CLAIMI_IRQ(claimi);
+  |   tf = curthread->td_intr_frame;
+  |   aplic_irq_dispatch(sc, irq, prio, tf);
+
+[compliant] sys/riscv/riscv/aplic.c:451-463  aplic_attach
+  The APLIC driver explicitly rejects IMSIC configurations (Smaiae) via the 'msi-parent' property check, falling back to direct mode only. This is the correct behavior for the scenario described in the spec: APLIC in direct mode without IMSIC. The driver never attempts to use CSR-based stopi/sclaimi because it only supports direct mode.
+  | if (ofw_bus_has_prop(dev, "msi-parent")) {
+  |   device_printf(dev, "APLIC with IMSIC is unsupported\n");
+  |   return (ENXIO);
+  | }
+  | rc = aplic_setup_direct_mode(dev);
+
+[compliant] sys/riscv/riscv/sbi_ipi.c:97-126  sbi_ipi_intr
+  sbi_ipi_intr() clears SIP_SSIP via csr_clear(sip, SIP_SSIP) at line 106. This register is cleared via the SBI IPI mechanism, not via ACLIC. In an ACLIC-direct system, software interrupts (SSI) still arrive through scause=1 because S-mode SSI is a local interrupt, not routed through the external interrupt controller. The SIP_SSIP clearing is the standard RISC-V mechanism and is correct for any system regardless of AIA extensions: SSI is a per-hart local interrupt, not platform-level.
+  | csr_clear(sip, SIP_SSIP);
+  | cpu = PCPU_GET(cpuid);
+  | mb();
+  | ipi_bitmap = atomic_readandclear_32(&sc->pending_ipis[cpu]);
+
+[compliant] sys/riscv/riscv/sbi_ipi.c:55-78  sbi_ipi_pic_ipi_send
+  IPI sending uses sbi_send_ipi() which calls into OpenSBI. OpenSBI's IPI path is separate from the external interrupt controller and uses the CLINT/ACLINT MSWI mechanism or SBI IPI extension. This is independent of whether the platform uses PLIC or APLIC for device interrupts.
+  | sbi_send_ipi(&mask);
+
+[compliant] sys/riscv/include/riscvreg.h:154-163  (global definitions)
+  SIE_SEIE (1 << 9) is defined as the standard supervisor external interrupt enable bit. This is part of the base privileged spec (always present) and is distinct from any AIA-specific sie bits. No stopi/sclaimi CSR definitions exist in this header.
+  | #define SIE_SEIE (1 << 9)
+
+[compliant] sys/riscv/riscv/plic.c:171-188  plic_intr
+  The PLIC driver claims interrupts via memory-mapped PLIC_CONTEXT_CLAIM register (bus_read_4). No CSR reads at all. This works on any system regardless of AIA extensions.
+  | while ((pending = RD4(sc, PLIC_CLAIM(sc, cpu))) != 0) {
+  |   tf = curthread->td_intr_frame;
+  |   plic_irq_dispatch(sc, pending, tf);
+  | }
+
+[compliant] sys/riscv/vmm/vmm_aplic.c:450-480  aplic_check_pending
+  The VMM APLIC emulation checks pending interrupts by scanning the virtual APLIC software state (aplic_irq structures), not by reading CSRs. The VMM never reads stopi/sclaimi CSRs for its guest interrupt injection logic.
+  | mtx_lock_spin(&aplic->mtx);
+  | if ((aplic->domaincfg & DOMAINCFG_IE) == 0) {
+  |   mtx_unlock_spin(&aplic->mtx);
+  |   return (0);
+  | }
+  | for (i = 0; i < aplic->nirqs; i++) {
+

@@ -1,0 +1,54 @@
+PR #91  target=xiangshan  overall=potential_risk
+Spec: Failed to parse agent output as JSON
+Violation: 
+Consequence: function_loss
+Pattern: 
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:593-606  keyid_check
+  KeyID check correctly exempts M-mode via (io.check_env.mode < 3.U). ModeM=3 evaluates 3<3=false, suppressing the check. Non-M-mode accesses with non-zero KeyID in cmode=0 are properly blocked when keyIDen is set. The combined response (resp_pmp | resp_pma | resp_keyid) at line 610 correctly ORs all three check vectors.
+  | val keyid_nz = if (PMPKeyIDBits > 0) addr(PMPAddrBits-1, PMPAddrBits-PMPKeyIDBits) =/= 0.U else false.B
+  | resp.ld := keyid_nz && !io.check_env.cmode && (io.check_env.mode < 3.U) && io.check_env.keyIDen
+  | resp.st := keyid_nz && !io.check_env.cmode && (io.check_env.mode < 3.U) && io.check_env.keyIDen
+  | resp.instr := keyid_nz && !io.check_env.cmode && (io.check_env.mode < 3.U) && io.check_env.keyIDen
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:585-585  PMPChecker (class body)
+  Address truncation for PMP/PMA check correctly strips KeyID bits: check_addr = Mux(keyIDen, req.addr(PMPAddrBits-PMPKeyIDBits-1, 0), req.addr). This ensures PMP/PMA permission checks operate on the real physical address without KeyID bits, preventing KeyID from influencing memory protection decisions.
+  | val check_addr = Mux(io.check_env.keyIDen, req.addr(PMPAddrBits-PMPKeyIDBits-1, 0), req.addr)
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:25-39  Mbmc CSR module
+  CMODE (bit 0) is writable regardless of BME lock state (line 29: reg.CMODE := Mux(wen, wdata.CMODE, reg.CMODE) is outside the mbmc_lock gate). If an attacker can write CMODE from 0→1 while BME is locked, non-zero KeyID accesses that were previously blocked become permitted (because !cmode becomes false in keyid_check). This is only exploitable if CSR write access to Mbmc is reachable from a lower privilege mode after BME lock.
+  | reg.BME := Mux(wen && !mbmc_lock, wdata.BME, reg.BME)
+  | reg.CMODE := Mux(wen, wdata.CMODE, reg.CMODE)  // NOTE: not gated by mbmc_lock
+  | reg.BMA := Mux(wen && !mbmc_lock, wdata.BMA, reg.BMA)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:67-80  EnvCfg (abstract class)
+  EnvCfg class has no MTE-related fields. Bits 60 and 58-34 are entirely absent from the bundle — writes to reserved bit positions are trapped as illegal. No MT_ASYNC (bit 36) or MT_MODE bits exist. The STCE(63), PBMTE(62), ADUE(61), DTE(59), PMM(33:32) field positions match the RISC-V privileged spec. MEnvCfg, HEnvCfg, and SEnvCfg all correctly inherit this base.
+  | val STCE  = RO(63); val PBMTE = RO(62); val ADUE = RO(61); val DTE = RO(59)
+  | val PMM   = EnvPMM(33, 32, wNoEffect)
+  | // bits 60, 58-34 absent — no MT_ASYNC leakage
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:319-327  mseccfg CSR definition
+  mseccfg CSR has no MTE/Svmt fields — no MT_MODE, no MT_ASYNC, no MTE-related control. Fields PMM(33:32), MLPE(10), SSEED(9), USEED(8), RLB(2), MMWP(1), MML(0) are all RO, matching the Smepmp/Smmpm/Zicfilp/Zkr extensions. No stale MTE control bits present.
+  | val PMM = EnvPMM(33,32,wNoEffect).withReset(EnvPMM.Disable)
+  | val MLPE=RO(10); val SSEED=RO(9); val USEED=RO(8)
+  | val RLB=RO(2); val MMWP=RO(1); val MML=RO(0)
+
+[potential_risk] src/main/scala/xiangshan/Bundle.scala:500-518  MbmcStruct / TlbMbmcBundle
+  MbmcStruct field ordering (KEYIDEN, BME, CMODE, BCLEAR, BMA) differs from MbmcBundle CSR field ordering (BMA, KEYIDEN, BME, BCLEAR, CMODE). If TlbMbmcBundle.apply(mbmc_value: UInt) at line 509 were called with raw MbmcBundle.asUInt, the bit extraction via asTypeOf(new MbmcStruct) would swap fields. However, in practice the TLB CSR wrapper (CSR.scala:271-275) wires each field individually, so apply() appears to be dead code. Still a latent risk if apply() is ever used with CSR raw values.
+  | class MbmcStruct extends XSBundle {  // order: KEYIDEN, BME, CMODE, BCLEAR, BMA
+  | class MbmcBundle extends CSRBundle {  // order: BMA, KEYIDEN, BME, BCLEAR, CMODE
+  | def apply(mbmc_value: UInt) = { val mc = mbmc_value.asTypeOf(new MbmcStruct) ... }
+
+[compliant] src/main/scala/xiangshan/cache/mmu/L2TLB.scala:93-103  L2TLB PMP checker setup
+  L2TLB PMP checkers use ModeS for page table walk permission checks. This is correct — PTW memory accesses logically execute with S-mode effective privilege regardless of the requesting hart's current privilege mode (per RISC-V privileged spec). The KEYIDEN and CMODE parameters are properly forwarded from CSR.
+  | pmp_check.foreach(_.check_env.apply(csr_dup(0).mbmc.KEYIDEN.asBool, csr_dup(0).mbmc.CMODE.asBool, ModeS, ...))
+  | pmp_check.foreach(_.check_env.apply(csr_dup(0).mbmc.CMODE.asBool, ModeS, ...))
+
+[compliant] src/main/scala/xiangshan/mem/MemBlock.scala:697-710  MemBlock PMP checker connections
+  MemBlock PMP checkers correctly use tlbcsr.priv.dmode (data access privilege mode) for load/store permission checks. KEYIDEN and CMODE forwarded correctly. The mode reflects the effective privilege for data accesses, which handles MPRV (mstatus.MPRV) remapping properly through the CSR bundle.
+  | p.apply(tlbcsr.mbmc.KEYIDEN.asBool, tlbcsr.mbmc.CMODE.asBool, tlbcsr.priv.dmode, ...)
+
+[compliant] src/main/scala/xiangshan/frontend/Frontend.scala:165-182  Frontend PMP checker connections
+  Frontend (instruction fetch) PMP checkers use tlbCsr.priv.imode for instruction fetch privilege checks. KEYIDEN and CMODE correctly forwarded. Instruction fetch privilege uses the virtualized privilege level, consistent with the hypervisor extension's two-stage translation model.
+  | checker.apply(tlbCsr.mbmc.KEYIDEN.asBool, tlbCsr.mbmc.CMODE.asBool, tlbCsr.priv.imode, ...)
+

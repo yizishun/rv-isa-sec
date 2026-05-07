@@ -1,0 +1,420 @@
+diff --git a/.github/workflows/gem_bump.yml b/.github/workflows/gem_bump.yml
+new file mode 100644
+index 0000000000..b4ee0405d1
+--- /dev/null
++++ b/.github/workflows/gem_bump.yml
+@@ -0,0 +1,97 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++name: Weekly gem version bump
++
++# Creates a chore PR twice a month bumping gem versions for all gems whose
++# source changed since the last release. The workflow is a no-op when no
++# gem source has changed.
++#
++# Idempotent: if a chore/gem-bump-* PR is already open the run exits early.
++
++on:
++  schedule:
++    - cron: "0 2 1,15 * *"  # 02:00 UTC on the 1st and 15th of every month
++  workflow_dispatch:
++
++jobs:
++  gem-bump:
++    runs-on: ubuntu-24.04
++    permissions:
++      contents: write
++      pull-requests: write
++
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++        with:
++          fetch-depth: 0  # Full history needed for tag lookups and git diff
++
++      - name: Set up mise environment
++        uses: ./.github/actions/mise-setup
++
++      - name: Find base ref (last gem release tag)
++        id: base-ref
++        run: |
++          LAST_TAG=$(git tag -l '*-gem-*' --sort=-creatordate | head -1)
++          BASE_REF="${LAST_TAG:-origin/main}"
++          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
++          echo "Using base ref: $BASE_REF"
++
++      - name: Bump gem versions
++        run: |
++          BUNDLE_GEMFILE=$PWD/Gemfile ./bin/chore update gem-versions -b "${{ steps.base-ref.outputs.base_ref }}"
++
++      - name: Check for version changes
++        id: check-changes
++        run: |
++          if git diff --quiet tools/ruby-gems/*/lib/*/version.rb; then
++            echo "changed=false" >> "$GITHUB_OUTPUT"
++            echo "No gem versions changed; nothing to do."
++          else
++            echo "changed=true" >> "$GITHUB_OUTPUT"
++            echo "Gem versions changed:"
++            git diff --stat tools/ruby-gems/*/lib/*/version.rb
++          fi
++
++      - name: Check for existing bump PR
++        id: check-pr
++        if: steps.check-changes.outputs.changed == 'true'
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: |
++          OPEN=$(gh pr list --state open --json headRefName \
++            -q '[.[] | select(.headRefName | startswith("chore/gem-bump-"))] | length')
++          echo "open_count=$OPEN" >> "$GITHUB_OUTPUT"
++          if [ "$OPEN" -gt 0 ]; then
++            echo "An open gem-bump PR already exists; skipping."
++          fi
++
++      - name: Create bump PR
++        if: steps.check-changes.outputs.changed == 'true' && steps.check-pr.outputs.open_count == '0'
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: |
++          BRANCH="chore/gem-bump-$(date +%Y-%m-%d)"
++          git config user.name "github-actions[bot]"
++          git config user.email "github-actions[bot]@users.noreply.github.com"
++          git checkout -b "$BRANCH"
++          git add tools/ruby-gems/*/lib/*/version.rb tools/ruby-gems/*/*.gemspec Gemfile.lock
++          git commit -m "chore: bump gem versions"
++          git push origin "$BRANCH"
++
++          # Build PR body listing bumped gems and their new versions
++          BODY="Automated gem version bump."$'\n\n'
++          BODY+="**Bumped gems:**"$'\n'
++          while IFS= read -r version_file; do
++            GEM_DIR=$(dirname "$(dirname "$version_file")")
++            GEM_NAME=$(basename "$GEM_DIR")
++            NEW_VERSION=$(ruby -e "content = File.read('$version_file'); puts content[/[\"'](\d+\.\d+\.\d+)[\"']/, 1]")
++            BODY+="- \`${GEM_NAME}\` → ${NEW_VERSION}"$'\n'
++          done < <(git diff HEAD~1 --name-only -- 'tools/ruby-gems/*/lib/*/version.rb')
++
++          gh pr create \
++            --title "chore: bump gem versions ($(date +%Y-%m-%d))" \
++            --body "$BODY" \
++            --base main \
++            --head "$BRANCH"
+diff --git a/bin/chore b/bin/chore
+index e10818965d..519b8342a1 100755
+--- a/bin/chore
++++ b/bin/chore
+@@ -106,7 +106,7 @@ gen_subcmd_usage() {
+   echo ""
+   echo "  all:           Generate all development artifacts"
+   echo "  gem-versions:  Sync inter-gem version pins in gemspecs and Gemfile.lock files"
+-  echo "                 for the locally-developed gems in tools/ruby-gems/"
++  echo "                 (no version bumping; use 'chore update gem-versions' to also bump)"
+   echo "  vscode-idl:    Generate tools/vscode/idl/syntaxes/idl.tmLanguage.json"
+   echo "  regress:       Generate .github/workflows/regress.yml"
+   echo "  ruby-type-def: Generate Ruby type signatutres"
+@@ -133,6 +133,8 @@ update_subcmd_usage() {
+   echo ""
+   echo "Commands:"
+   echo ""
++  echo "  gem-versions:  Bump versions of changed gems and sync inter-gem pins"
++  echo "                 ('chore update gem-versions -h' for more)"
+   echo "  gems:          Update Ruby Gems and regenerate type definitions"
+   echo "  eqntott:       Update the eqntott binary used by the udb gem"
+   echo "                 ('chore update eqntott -h' for more)"
+@@ -193,6 +195,21 @@ update_z3_usage() {
+   echo ""
+ }
+ 
++update_gem_versions_usage() {
++  echo "Usage: chore update gem-versions [-h] [-b BASE_REF]"
++  echo ""
++  echo ""
++  echo "Options:"
++  echo ""
++  echo "  -h:      Print help"
++  echo "  -b REF:  Base git ref to compare against (default: origin/main)"
++  echo "           Use the last release tag to detect changes since the last release."
++  echo ""
++  echo "Auto-increments versions for gems whose source changed since BASE_REF (with"
++  echo "cascade), then syncs inter-gem dependency pins in gemspecs and Gemfile.lock."
++  echo ""
++}
++
+ update_gems_usage() {
+   echo "Usage: chore update gems [-h]"
+   echo ""
+@@ -307,8 +324,7 @@ do_lock_all_gemfiles() {
+ 
+ #
+ # Sync inter-gem version pins in gemspecs and Gemfile.lock files for the
+-# locally-developed gems in tools/ruby-gems/. Also auto-increments versions
+-# for any gem whose source changed without a bump (with cascade).
++# locally-developed gems in tools/ruby-gems/.
+ # Returns: 0 on success, 1 if files changed (when fail_on_change=1)
+ #
+ do_gen_gem_versions() {
+@@ -324,6 +340,21 @@ do_gen_gem_versions() {
+   fi
+ }
+ 
++#
++# Auto-increment versions for gems with source changes (with cascade),
++# then sync inter-gem version pins in gemspecs and Gemfile.lock.
++# Args: $1 - base ref (optional; defaults to origin/main)
++# Returns: 0 on success
++#
++do_update_gem_versions() {
++  local extra_args=()
++  if [ -n "$1" ]; then
++    extra_args=(--base-ref "$1")
++  fi
++  echo "Bumping versions and syncing inter-gem pins for tools/ruby-gems/ gems"
++  "$UDB_ROOT/bin/ruby" "$UDB_ROOT"/tools/scripts/gen_gem_versions.rb --auto-bump "${extra_args[@]}"
++}
++
+ #
+ # Generate all development artifacts
+ #
+@@ -649,6 +680,27 @@ case "$subcommand" in
+     done
+     target="$1"; shift
+     case "$target" in
++      gem-versions )
++        base_ref=""
++        while getopts ":hb:" opt; do
++          case $opt in
++            h )
++              update_gem_versions_usage
++              exit 0
++              ;;
++            b )
++              base_ref="$OPTARG"
++              ;;
++            ? )
++              echo "[ERROR]: Invalid option: -${OPTARG}"
++              update_gem_versions_usage
++              exit 1
++              ;;
++          esac
++        done
++        do_update_gem_versions "$base_ref"
++        exit 0
++        ;;
+       gems )
+           while getopts ":h" opt; do # Go through the options
+             case $opt in
+diff --git a/tools/ruby-gems/udb/RELEASE.md b/tools/ruby-gems/udb/RELEASE.md
+index 5f056bdd2a..6f48ff721b 100644
+--- a/tools/ruby-gems/udb/RELEASE.md
++++ b/tools/ruby-gems/udb/RELEASE.md
+@@ -11,9 +11,14 @@ This document describes how to prepare and publish a release of the `udb` gem to
+ 
+ > **Automated releases:** The publish step (Steps 2–4 below) is handled
+ > automatically by the
+-> [Release udb gem to RubyGems.org](../../.github/workflows/release_udb_gem.yml)
+-> GitHub Actions workflow.  Simply bump the version in `version.rb`, commit,
+-> and merge to `main` — the workflow will build, publish, and tag the release.
++> [Release gems to RubyGems.org](../../.github/workflows/release_gems.yml)
++> GitHub Actions workflow whenever a version bump is merged to `main`.
++>
++> **Version bumps** are normally created automatically by the
++> [Bi-monthly gem version bump](../../.github/workflows/gem_bump.yml) workflow,
++> which opens a chore PR twice a month for any gems with source changes since
++> the last release. To trigger a release outside the bi-monthly cadence, manually
++> bump the version in `version.rb`, commit, and merge to `main`.
+ > Manual publishing (Steps 2–4) is only needed if the CI workflow is unavailable.
+ 
+ ---
+@@ -45,7 +50,16 @@ The high-level steps are:
+ 
+ ## Step 1 – Bump the version
+ 
+-Edit `tools/ruby-gems/udb/lib/udb/version.rb` and update the version string:
++Version bumps are normally handled automatically by the bi-monthly chore job.
++To trigger a release outside the bi-monthly cadence, run the update command from
++the repository root, using the last release tag as the base ref:
++
++```sh
++LAST_TAG=$(git tag -l 'udb-gem-*' --sort=-creatordate | head -1)
++bin/chore update gem-versions -b "${LAST_TAG:-origin/main}"
++```
++
++Or edit `tools/ruby-gems/udb/lib/udb/version.rb` directly:
+ 
+ ```ruby
+ module Udb
+@@ -53,14 +67,17 @@ module Udb
+ end
+ ```
+ 
+-Commit the change and tag the commit:
++After bumping, run `bin/chore gen gem-versions` to sync the inter-gem dependency
++pins and `Gemfile.lock`, then commit all changed files and open a PR:
+ 
+ ```sh
+-git add tools/ruby-gems/udb/lib/udb/version.rb
+-git commit -m "chore(udb): bump gem version to X.Y.Z"
+-git tag udb-vX.Y.Z
++bin/chore gen gem-versions
++git add tools/ruby-gems/*/lib/*/version.rb tools/ruby-gems/*/*.gemspec Gemfile.lock
++git commit -m "chore: bump gem versions to X.Y.Z"
+ ```
+ 
++Merging the PR to `main` triggers the automated publish workflow.
++
+ ---
+ 
+ ## Step 2 – Build the gem
+diff --git a/tools/scripts/gen_gem_versions.rb b/tools/scripts/gen_gem_versions.rb
+index bc9dbf8ba1..ff9ff5e736 100644
+--- a/tools/scripts/gen_gem_versions.rb
++++ b/tools/scripts/gen_gem_versions.rb
+@@ -5,15 +5,18 @@
+ # frozen_string_literal: true
+ 
+ # Script to:
+-#   Step A: Auto-increment versions for gems whose source changed without a bump (with cascade)
+ #   Step B: Update inter-gem dependency pins in gemspecs to exact current versions
+ #   Step C: Regenerate Gemfile.lock files (sync only, no --update)
+ #
++#   With --auto-bump:
++#   Step A0: Bring any version files that lag behind the base ref forward
++#   Step A:  Auto-increment versions for gems whose source changed without a bump (with cascade)
++#
+ # Usage:
+-#   gen_gem_versions.rb [--fail-on-change] [--check] [--base-ref <ref>]
++#   gen_gem_versions.rb [--auto-bump] [--fail-on-change] [--base-ref <ref>]
+ #
++#   --auto-bump       Detect source changes and auto-increment gem versions (Steps A0+A)
+ #   --fail-on-change  Exit 1 if any file changed (for CI drift detection)
+-#   --check           Only detect version-bump issues, no writes; exit 1 if any found
+ #   --base-ref <ref>  Git ref to compare against (default: $GITHUB_BASE_REF or origin/main)
+ 
+ require "digest"
+@@ -390,60 +393,6 @@ def all_tracked_files
+   version_files + gemspec_files + lockfiles
+ end
+ 
+-def run_check_mode(base_ref)
+-  puts "Checking gem version bumps..."
+-  puts "Base ref: #{base_ref}"
+-  puts
+-
+-  changed_files = get_changed_files(base_ref)
+-  if changed_files.nil?
+-    puts "No git history available; skipping check."
+-    exit 0
+-  end
+-
+-  if changed_files.empty?
+-    puts "No files changed."
+-    exit 0
+-  end
+-
+-  failures = []
+-
+-  GEMS.each do |gem_config|
+-    gem_name = gem_config[:name]
+-    if needs_bump?(gem_config, changed_files, base_ref)
+-      current_version = read_version(gem_config[:version_file])
+-      puts "✗ #{gem_name}: Files changed but version not bumped (current: #{current_version})"
+-      failures << gem_name
+-    else
+-      # Determine why it's OK
+-      source_files = gem_config[:source_files]
+-      additional_dirs = gem_config[:additional_dirs] || []
+-      gem_files_changed = changed_files.any? { |f| source_files.include?(f) }
+-      additional_files_changed = additional_dirs.any? { |dir| changed_files.any? { |f| f.start_with?(dir) } }
+-
+-      if gem_files_changed || additional_files_changed
+-        current_version = read_version(gem_config[:version_file])
+-        puts "✓ #{gem_name}: Version bumped to #{current_version}"
+-      else
+-        puts "✓ #{gem_name}: No changes"
+-      end
+-    end
+-  end
+-
+-  if failures.any?
+-    puts
+-    puts "ERROR: The following gems have source changes without version bumps:"
+-    failures.each { |name| puts "  - #{name}" }
+-    puts
+-    puts "Please bump the version in the version.rb file for each modified gem."
+-    exit 1
+-  end
+-
+-  puts
+-  puts "All gem version checks passed!"
+-  exit 0
+-end
+-
+ # --- Main ---
+ 
+ def default_base_ref
+@@ -455,44 +404,41 @@ def default_base_ref
+ end
+ 
+ if __FILE__ == $PROGRAM_NAME
+-  options = { fail_on_change: false, check: false, base_ref: default_base_ref }
++  options = { fail_on_change: false, auto_bump: false, base_ref: default_base_ref }
+ 
+   OptionParser.new do |opts|
++    opts.on("--auto-bump", "Auto-increment versions for gems with source changes (Steps A0+A)") do
++      options[:auto_bump] = true
++    end
+     opts.on("--fail-on-change", "Exit 1 if any file changed") do
+       options[:fail_on_change] = true
+     end
+-    opts.on("--check", "Only check for version-bump issues, no writes") do
+-      options[:check] = true
+-    end
+     opts.on("--base-ref REF", "Git ref to compare against (default: $GITHUB_BASE_REF or origin/main)") do |ref|
+       options[:base_ref] = ref
+     end
+   end.parse!
+ 
+-  if options[:check]
+-    run_check_mode(options[:base_ref])
+-    # run_check_mode exits internally
+-  end
+-
+   # Normal / --fail-on-change mode
+   tracked = all_tracked_files
+   sha_before = options[:fail_on_change] ? sha256_files(tracked) : nil
+ 
+-  # Step A0: bring any version files that are behind origin/main forward
+-  puts "Step A0: Bringing stale version files forward to base..."
+-  bring_versions_forward(options[:base_ref])
++  if options[:auto_bump]
++    # Step A0: bring any version files that are behind the base ref forward
++    puts "Step A0: Bringing stale version files forward to base..."
++    bring_versions_forward(options[:base_ref])
+ 
+-  # Step A: auto-increment versions for changed gems (with cascade)
+-  puts "Step A: Checking for gems that need version bumps..."
+-  changed_files = get_changed_files(options[:base_ref])
+-  if changed_files.nil?
+-    puts "  Skipping (git history unavailable)"
+-  else
+-    needs_bump = compute_needs_bump_set(changed_files, options[:base_ref])
+-    if needs_bump.empty?
+-      puts "  No version bumps needed"
++    # Step A: auto-increment versions for changed gems (with cascade)
++    puts "Step A: Checking for gems that need version bumps..."
++    changed_files = get_changed_files(options[:base_ref])
++    if changed_files.nil?
++      puts "  Skipping (git history unavailable)"
+     else
+-      do_version_bumps(needs_bump, options[:base_ref])
++      needs_bump = compute_needs_bump_set(changed_files, options[:base_ref])
++      if needs_bump.empty?
++        puts "  No version bumps needed"
++      else
++        do_version_bumps(needs_bump, options[:base_ref])
++      end
+     end
+   end
+ 

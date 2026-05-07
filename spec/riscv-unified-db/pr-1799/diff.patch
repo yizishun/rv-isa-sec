@@ -1,0 +1,1320 @@
+diff --git a/.default-gems b/.default-gems
+index 857cb42b7b..982cf9f867 100644
+--- a/.default-gems
++++ b/.default-gems
+@@ -1 +1 @@
+-bundler -v 4.0.8
++bundler 4.0.8
+diff --git a/.github/actions/mise-setup/action.yml b/.github/actions/mise-setup/action.yml
+index aa2e928128..704b2145a7 100644
+--- a/.github/actions/mise-setup/action.yml
++++ b/.github/actions/mise-setup/action.yml
+@@ -10,7 +10,12 @@ inputs:
+ runs:
+   using: composite
+   steps:
+-    - uses: jdx/mise-action@v2
++    - name: Pre-initialize GPG
++      shell: bash
++      run: mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
++    - uses: jdx/mise-action@v4
++      with:
++        version: 2026.4.18
+     # Set bundler gem path before restoring the cache and before bin/setup,
+     # so bundle install (inside bin/setup) writes to the cacheable path.
+     - name: Set bundler PATH
+@@ -41,8 +46,8 @@ runs:
+         username: ${{ github.actor }}
+         password: ${{ github.token }}
+     # Restore all four caches BEFORE bin/setup runs.  bin/setup has idempotency
+-    # guards in each section (bundle check, extconf.rb file checks, node_modules
+-    # directory check, uv sync lockfile check) that skip work when the cache hit
++    # guards in each section (bundle check, extconf.rb file checks, shared venv/npm
++    # directory checks, uv sync lockfile check) that skip work when the cache hit
+     # already populated the relevant paths.  This means bin/setup completes in
+     # seconds on a cache hit without any separate install steps.
+     - name: Cache bundler gems
+@@ -55,15 +60,21 @@ runs:
+       with:
+         path: ~/.cache/udb
+         key: udb-deps-${{ runner.os }}-${{ hashFiles('tools/ruby-gems/udb/lib/udb/Z3_VERSION', 'tools/ruby-gems/udb/lib/udb/ESPRESSO_VERSION', 'tools/ruby-gems/udb/lib/udb/EQNTOTT_VERSION', 'tools/ruby-gems/udb/lib/udb/MUST_VERSION') }}
++    # bin/.venv-deps installs to ~/.local/share/udb/venv-<hash>/ (not in-tree).
++    # Cache the uv artifact cache (for fast re-installs) and the shared venv dir.
+     - name: Cache uv packages
+       uses: actions/cache@v4
+       with:
+-        path: ~/.cache/uv
++        path: |
++          ~/.cache/uv
++          ~/.local/share/udb/venv-*
+         key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
++    # bin/.npm-deps installs to ~/.local/share/udb/npm-<hash>/node_modules and
++    # leaves a symlink at node_modules.  Cache the real install dir, not the symlink.
+     - name: Cache npm packages
+       uses: actions/cache@v4
+       with:
+-        path: node_modules
++        path: ~/.local/share/udb/npm-*
+         key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+     - name: Set up environment and install dependencies
+       shell: bash
+diff --git a/.github/workflows/autofix.yaml b/.github/workflows/autofix.yaml
+index c27626b42a..5e1754e84c 100644
+--- a/.github/workflows/autofix.yaml
++++ b/.github/workflows/autofix.yaml
+@@ -14,8 +14,7 @@ jobs:
+       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+         with:
+           fetch-depth: 0
+-      - uses: jdx/mise-action@v4
+-      - run: bundle install
+-      - run: bin/setup
+-      - run: BUNDLE_GEMFILE=$PWD/Gemfile ./bin/chore gen all
++      - name: Set up mise environment
++        uses: "./.github/actions/mise-setup"
++      - run: ./bin/chore gen all
+       - uses: autofix-ci/action@7a166d7532b277f34e16238930461bf77f9d7ed8 # v1.3.3
+diff --git a/.gitignore b/.gitignore
+index 4fc063f3c5..0d48adc78b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ .bundle
+ !.bundle/config
++vendor/bundle
+ .python
+ .antora
+ .home
+diff --git a/.mise.toml b/.mise.toml
+index c311e352a5..701ed8724c 100644
+--- a/.mise.toml
++++ b/.mise.toml
+@@ -22,6 +22,8 @@ BUNDLE_FROZEN = "1"
+ # Disable the CHECKSUMS section in lockfiles — checksums can't be fully populated
+ # across all platforms (e.g. aarch64 variants on an x86 machine) so we opt out entirely.
+ BUNDLE_LOCKFILE_CHECKSUMS = "false"
++# install at XDG_DATA_HOME:-~/.local/share/gem
++BUNDLE_PATH = "{{xdg_data_home}}/gem"
+ 
+ [settings]
+ ruby.compile = false
+diff --git a/bin/.npm-deps b/bin/.npm-deps
+new file mode 100755
+index 0000000000..cbd8020aa6
+--- /dev/null
++++ b/bin/.npm-deps
+@@ -0,0 +1,44 @@
++#!/usr/bin/env bash
++# bin/.npm-deps — install/sync npm packages to a shared, hash-keyed location.
++#
++# Installs once per unique package-lock.json and symlinks node_modules back
++# into the worktree.  Multiple worktrees with the same lockfile share a single
++# installation; worktrees at different lockfile versions get independent
++# directories and never clobber each other.
++#
++# Called by bin/setup and by git hooks (post-merge, post-checkout).
++
++ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
++
++_NPM_LOCK_HASH=$(sha256sum "$ROOT/package-lock.json" | cut -c1-16)
++_NPM_SHARED="${XDG_DATA_HOME:-$HOME/.local/share}/udb/npm-$_NPM_LOCK_HASH"
++
++_NPM_MARKER="$_NPM_SHARED/.npm-install-complete"
++
++if [[ ! -f "$_NPM_MARKER" ]]; then
++  echo "npm: installing packages (npm-$_NPM_LOCK_HASH)..."
++  # Run npm ci from the repo root so it sees package.json, package-lock.json,
++  # and workspaces correctly, then relocate the result to the shared path.
++  rm -rf "$ROOT/node_modules" "$_NPM_SHARED"
++  WD=$(pwd)
++  cd "$ROOT" || exit 1
++  if ! "$ROOT/bin/npm" ci; then
++    echo "ERROR: npm ci failed." >&2
++    exit 1
++  fi
++  mkdir -p "$_NPM_SHARED"
++  mv "$ROOT/node_modules" "$_NPM_SHARED/node_modules"
++  touch "$_NPM_MARKER"
++  cd "$WD" || exit 1
++  echo "npm: packages installed"
++else
++  echo "npm: packages up to date (npm-$_NPM_LOCK_HASH)"
++fi
++
++# Point this worktree's node_modules at the shared installation.
++_NPM_LINK_TARGET="$_NPM_SHARED/node_modules"
++_NPM_LINK="$ROOT/node_modules"
++if [[ "$(readlink "$_NPM_LINK" 2>/dev/null)" != "$_NPM_LINK_TARGET" ]]; then
++  rm -rf "$_NPM_LINK"
++  ln -s "$_NPM_LINK_TARGET" "$_NPM_LINK"
++fi
+diff --git a/bin/.toolchain.sh b/bin/.toolchain.sh
+index 423875ce66..174ca58d0e 100644
+--- a/bin/.toolchain.sh
++++ b/bin/.toolchain.sh
+@@ -99,7 +99,7 @@ _prompt_toolchain_selection() {
+   printf "  [1] Container (recommended)\n"
+   printf "      Docker/Podman pulls a pre-built image (~500 MB) from GHCR.\n\n"
+   printf "  [2] Native\n"
+-  printf "      Requires GCC 14+ with C++23 support and a RISC-V cross-toolchain.\n\n"
++  printf "      Requires GCC 13.3+ with C++23 support and a RISC-V cross-toolchain.\n\n"
+ 
+   local _choice
+   while true; do
+diff --git a/bin/.venv-deps b/bin/.venv-deps
+new file mode 100755
+index 0000000000..01f0f83113
+--- /dev/null
++++ b/bin/.venv-deps
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++# bin/.venv-deps — install/sync Python packages to a shared, hash-keyed location.
++#
++# Uses UV_PROJECT_ENVIRONMENT to direct uv sync to a shared venv outside the
++# worktree, keyed by uv.lock hash.  Multiple worktrees with the same lockfile
++# share a single venv; worktrees at different lockfile versions get independent
++# environments and never clobber each other.
++#
++# Called by bin/setup and by git hooks (post-merge, post-checkout).
++
++ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
++
++_VENV_LOCK_HASH=$(sha256sum "$ROOT/uv.lock" | cut -c1-16)
++_VENV_SHARED="${XDG_DATA_HOME:-$HOME/.local/share}/udb/venv-$_VENV_LOCK_HASH"
++
++_VENV_MARKER="$_VENV_SHARED/.uv-sync-complete"
++
++if [[ ! -f "$_VENV_MARKER" ]]; then
++  echo "uv: syncing packages (venv-$_VENV_LOCK_HASH)..."
++  WD=$(pwd)
++  cd "$ROOT" || exit 1
++  rm -rf "$_VENV_SHARED"
++  if ! UV_PROJECT_ENVIRONMENT="$_VENV_SHARED" "$ROOT/bin/uv" sync; then
++    echo "ERROR: uv sync failed." >&2
++    exit 1
++  fi
++  touch "$_VENV_MARKER"
++  echo "uv: packages installed"
++  cd "$WD" || exit 1
++else
++  echo "uv: packages up to date (venv-$_VENV_LOCK_HASH)"
++fi
++
++# Point this worktree's .venv at the shared installation.
++_VENV_LINK="$ROOT/.venv"
++if [[ "$(readlink "$_VENV_LINK" 2>/dev/null)" != "$_VENV_SHARED" ]]; then
++  rm -rf "$_VENV_LINK"
++  ln -s "$_VENV_SHARED" "$_VENV_LINK"
++fi
+diff --git a/bin/asciidoctor b/bin/asciidoctor
+index 77b4aeaa66..5b0a8ff092 100755
+--- a/bin/asciidoctor
++++ b/bin/asciidoctor
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- bundle exec --gemfile "${ROOT}/Gemfile" asciidoctor "$@"
++cd "$ROOT" || exit 1
++exec "$ROOT/bin/mise" exec --cd "$EXEC_DIR" -- bundle exec --gemfile "${ROOT}/Gemfile" asciidoctor "$@"
+diff --git a/bin/bash b/bin/bash
+index 62b44aafab..ab1edb7f9f 100755
+--- a/bin/bash
++++ b/bin/bash
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- bash "$@"
++cd "$ROOT" || exit 1
++exec "$ROOT/bin/mise" exec --cd "$EXEC_DIR" -- bash "$@"
+diff --git a/bin/bundle b/bin/bundle
+index c3b02e55b2..ca61632f7e 100755
+--- a/bin/bundle
++++ b/bin/bundle
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- bundle "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- bundle "$@"
+diff --git a/bin/cmake b/bin/cmake
+index 9b3e0e1d3a..30b208e84e 100755
+--- a/bin/cmake
++++ b/bin/cmake
+@@ -2,4 +2,4 @@
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+ cd "$ROOT" || exit 1
+-exec mise exec --cd "$EXEC_DIR" -- cmake "$@"
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- cmake "$@"
+diff --git a/bin/doctor b/bin/doctor
+index 5c6f150026..dda62565b6 100755
+--- a/bin/doctor
++++ b/bin/doctor
+@@ -79,16 +79,15 @@ _check_core_prerequisites() {
+     _record_fail
+   fi
+ 
+-  # mise
+-  if command -v mise > /dev/null 2>&1; then
++  # mise (via bin/mise bootstrap wrapper)
++  if "$ROOT/bin/mise" --version > /dev/null 2>&1; then
+     local mise_ver
+-    mise_ver=$(mise --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
++    mise_ver=$("$ROOT/bin/mise" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+     _pass "mise  ${_C_DIM}${mise_ver}${_C_RESET}"
+     _record_pass
+   else
+-    _fail "mise not found"
+-    _info "Fix: curl https://mise.run | sh"
+-    _info "     or see https://mise.jdx.dev for other install methods"
++    _fail "mise not available (bin/mise bootstrap failed)"
++    _info "Fix: ensure bin/mise is executable and can reach the internet on first run"
+     _record_fail
+     # mise is required for everything else — bail early on the mise-tool checks
+     _MISE_MISSING=1
+@@ -109,7 +108,7 @@ _check_mise_tool() {
+   local binary="${_MISE_BINARY_OVERRIDE[$tool]:-$tool}"
+ 
+   local bin_path
+-  bin_path=$(mise which "$binary" 2>/dev/null)
++  bin_path=$("$ROOT/bin/mise" which "$binary" 2>/dev/null)
+   if [[ -z "$bin_path" ]]; then
+     _fail "$tool not installed"
+     _info "Fix: run \`mise install\` in the repo root"
+@@ -164,7 +163,7 @@ _check_ruby_ecosystem() {
+   fi
+ 
+   local bundle_bin
+-  bundle_bin=$(mise which bundle 2>/dev/null)
++  bundle_bin=$("$ROOT/bin/mise" which bundle 2>/dev/null)
+   if [[ -z "$bundle_bin" ]]; then
+     _fail "bundle not found (is ruby installed via mise?)"
+     _info "Fix: run \`mise install\`"
+@@ -173,30 +172,83 @@ _check_ruby_ecosystem() {
+     return
+   fi
+ 
+-  if BUNDLE_GEMFILE="$ROOT/Gemfile" "$bundle_bin" check > /dev/null 2>&1; then
++  if "$ROOT/bin/bundle" check > /dev/null 2>&1; then
+     _pass "Gemfile gems installed"
+     _record_pass
+   else
+     _fail "Gemfile gems not installed"
+-    _info "Fix: run \`bundle install\` in the repo root"
++    _info "Fix: run \`./bin/bundle install\` in the repo root"
+     _record_fail
+     _GEMS_FAILED=1
+   fi
+ }
+ 
+ # ---------------------------------------------------------------------------
+-# Section 4: Node.js Ecosystem
++# Section 4: Python Ecosystem
++# ---------------------------------------------------------------------------
++
++_check_python_ecosystem() {
++  _section "Python Ecosystem"
++
++  if [[ -n "${_MISE_MISSING:-}" ]]; then
++    _warn "Skipping (mise not installed)"
++    _record_warn
++    return
++  fi
++
++  local expected_hash expected_target link_target
++  expected_hash=$(sha256sum "$ROOT/uv.lock" | cut -c1-16)
++  expected_target="${XDG_DATA_HOME:-$HOME/.local/share}/udb/venv-$expected_hash"
++  link_target=$(readlink "$ROOT/.venv" 2>/dev/null)
++
++  if [[ "$link_target" == "$expected_target" ]]; then
++    _pass ".venv linked to shared install  ${_C_DIM}venv-${expected_hash}${_C_RESET}"
++    _record_pass
++  elif [[ -z "$link_target" && -d "$ROOT/.venv" ]]; then
++    _warn ".venv is a plain directory, not a shared symlink"
++    _info "Fix: run \`bin/setup\` to migrate to the shared install"
++    _record_warn
++  elif [[ -n "$link_target" ]]; then
++    _warn ".venv symlink does not match current uv.lock"
++    _info "Expected: $expected_target"
++    _info "Actual:   $link_target"
++    _info "Fix: run \`bin/setup\` to update the symlink"
++    _record_warn
++  else
++    _fail ".venv not found"
++    _info "Fix: run \`bin/setup\`"
++    _record_fail
++  fi
++}
++
++# ---------------------------------------------------------------------------
++# Section 5: Node.js Ecosystem
+ # ---------------------------------------------------------------------------
+ 
+ _check_node_ecosystem() {
+   _section "Node.js Ecosystem"
+ 
+-  if [[ -d "$ROOT/node_modules" ]]; then
+-    _pass "node_modules present"
++  local expected_hash expected_target link_target
++  expected_hash=$(sha256sum "$ROOT/package-lock.json" | cut -c1-16)
++  expected_target="${XDG_DATA_HOME:-$HOME/.local/share}/udb/npm-$expected_hash/node_modules"
++  link_target=$(readlink "$ROOT/node_modules" 2>/dev/null)
++
++  if [[ "$link_target" == "$expected_target" ]]; then
++    _pass "node_modules linked to shared install  ${_C_DIM}npm-${expected_hash}${_C_RESET}"
+     _record_pass
++  elif [[ -z "$link_target" && -d "$ROOT/node_modules" ]]; then
++    _warn "node_modules is a plain directory, not a shared symlink"
++    _info "Fix: run \`bin/setup\` to migrate to the shared install"
++    _record_warn
++  elif [[ -n "$link_target" ]]; then
++    _warn "node_modules symlink does not match current package-lock.json"
++    _info "Expected: $expected_target"
++    _info "Actual:   $link_target"
++    _info "Fix: run \`bin/setup\` to update the symlink"
++    _record_warn
+   else
+     _fail "node_modules not found"
+-    _info "Fix: run \`npm ci\` in the repo root"
++    _info "Fix: run \`bin/setup\`"
+     _record_fail
+   fi
+ }
+@@ -224,8 +276,14 @@ _check_developer_setup() {
+     fi
+ 
+     if [[ -f "${git_hooks_dir}/hooks/post-merge" ]]; then
+-      _pass "Post-merge hook installed"
+-      _record_pass
++      if grep -qE 'bin/uv" sync|bin/npm" install' "${git_hooks_dir}/hooks/post-merge" 2>/dev/null; then
++        _warn "Post-merge hook is stale"
++        _info "Fix: run \`bin/install_hooks\`"
++        _record_warn
++      else
++        _pass "Post-merge hook installed"
++        _record_pass
++      fi
+     else
+       _warn "Post-merge hook not installed"
+       _info "Fix: run \`bin/install_hooks\` in the repo root"
+@@ -233,8 +291,14 @@ _check_developer_setup() {
+     fi
+ 
+     if [[ -f "${git_hooks_dir}/hooks/post-checkout" ]]; then
+-      _pass "Post-checkout hook installed"
+-      _record_pass
++      if grep -qE 'bin/uv" sync|bin/npm" install' "${git_hooks_dir}/hooks/post-checkout" 2>/dev/null; then
++        _warn "Post-checkout hook is stale"
++        _info "Fix: run \`bin/install_hooks\`"
++        _record_warn
++      else
++        _pass "Post-checkout hook installed"
++        _record_pass
++      fi
+     else
+       _warn "Post-checkout hook not installed"
+       _info "Fix: run \`bin/install_hooks\` in the repo root"
+@@ -256,7 +320,7 @@ _check_developer_setup() {
+   fi
+ 
+   local ruby_bin
+-  ruby_bin=$(mise which ruby 2>/dev/null)
++  ruby_bin=$("$ROOT/bin/mise" which ruby 2>/dev/null)
+   if [[ -z "$ruby_bin" ]]; then
+     _warn "Native deps check skipped (ruby not installed via mise)"
+     _record_warn
+@@ -303,7 +367,7 @@ _check_developer_setup() {
+     local z3_output z3_exit
+     z3_output=$(
+       BUNDLE_GEMFILE="$ROOT/Gemfile" \
+-        "$ruby_bin" -r udb -e "Udb::Z3Loader.ensure_z3_loaded" 2>&1
++        "$ROOT/bin/ruby" -r udb -e "Udb::Z3Loader.ensure_z3_loaded" 2>&1
+     )
+     z3_exit=$?
+ 
+@@ -369,14 +433,25 @@ _check_cxx_toolchain() {
+ 
+   else
+     # --- Native mode ---
++    # When UDB_TOOLCHAIN_NONE=1 the user has opted out of the C++ toolchain;
++    # downgrade any failures to warnings so they don't block a green summary.
++    local _cxx_record_bad
++    if [[ "${UDB_TOOLCHAIN_NONE:-0}" = "1" ]]; then
++      _cxx_record_bad() { _record_warn; }
++      _cxx_bad() { _warn "$@"; }
++    else
++      _cxx_record_bad() { _record_fail; }
++      _cxx_bad() { _fail "$@"; }
++    fi
++
+     local gpp_path
+     gpp_path=$(PATH="$native_path" command -v g++ 2>/dev/null)
+ 
+     if [[ -z "$gpp_path" ]]; then
+-      _fail "Native g++ not found"
++      _cxx_bad "Native g++ not found"
+       _info "Fix option 1: install a C++ toolchain (e.g. \`apt install build-essential\`)"
+       _info "Fix option 2: echo 'UDB_TOOLCHAIN_CONTAINER=1' > .toolchain-local"
+-      _record_fail
++      _cxx_record_bad
+     else
+       local gpp_ver_line gpp_ver
+       gpp_ver_line=$(PATH="$native_path" g++ --version 2>/dev/null | head -1)
+@@ -395,7 +470,7 @@ include("${ROOT}/.toolchain/check_cxx.cmake")
+ EOF
+ 
+       local cmake_bin
+-      cmake_bin=$(mise which cmake 2>/dev/null)
++      cmake_bin=$("$ROOT/bin/mise" which cmake 2>/dev/null)
+       cmake_bin="${cmake_bin:-cmake}"
+ 
+       local cmake_exit=0
+@@ -407,14 +482,13 @@ EOF
+         _pass "C++ requirements met (C++23, concepts, constexpr from_chars)"
+         _record_pass
+       else
+-        _fail "Native g++ does not meet C++ requirements (C++23 + constexpr from_chars)"
+-        _info "Fix option 1: install a newer compiler (GCC 14+ or Clang 17+)"
++        _cxx_bad "Native g++ does not meet C++ requirements (C++23 + constexpr from_chars)"
++        _info "Fix option 1: install a newer compiler (GCC 13.3+ or Clang 17+)"
+         _info "Fix option 2: echo 'UDB_TOOLCHAIN_CONTAINER=1' > .toolchain-local"
+-        _record_fail
++        _info "              then run ./bin/setup"
++        _cxx_record_bad
+       fi
+     fi
+-
+-    _info "To switch to container: echo 'UDB_TOOLCHAIN_CONTAINER=1' > .toolchain-local"
+   fi
+ }
+ 
+@@ -422,11 +496,18 @@ EOF
+ # Main
+ # ---------------------------------------------------------------------------
+ 
+-printf "${_C_BOLD}=== UDB Environment Doctor ===${_C_RESET}\n"
++printf "${_C_BOLD}${_C_CYAN}"
++printf " _   _ ____  ___      ${_C_RED}███${_C_CYAN}\n"
++printf "| | | |  _ \\| _ )   ${_C_RED}███████${_C_CYAN}\n"
++printf "| |_| | |_) | _ \\   ${_C_RED}███████${_C_CYAN}\n"
++printf " \\___/|____/|___/     ${_C_RED}███${_C_CYAN}\n"
++printf "${_C_RESET}"
++printf "${_C_DIM}  environment doctor${_C_RESET}\n"
+ 
+ _check_core_prerequisites
+ _check_mise_tools
+ _check_ruby_ecosystem
++_check_python_ecosystem
+ _check_node_ecosystem
+ _check_developer_setup
+ _check_cxx_toolchain
+@@ -434,11 +515,11 @@ _check_cxx_toolchain
+ # Summary
+ printf "\n"
+ if [[ $_FAIL_COUNT -eq 0 && $_WARN_COUNT -eq 0 ]]; then
+-  printf "${_C_BOLD}${_C_GREEN}=== Summary: $_PASS_COUNT passed, $_FAIL_COUNT failed, $_WARN_COUNT warnings ===${_C_RESET}\n"
++  printf "  ${_C_BOLD}${_C_GREEN}✓  Summary: $_PASS_COUNT passed, $_FAIL_COUNT failed, $_WARN_COUNT warnings${_C_RESET}\n"
+ elif [[ $_FAIL_COUNT -eq 0 ]]; then
+-  printf "${_C_BOLD}${_C_YELLOW}=== Summary: $_PASS_COUNT passed, $_FAIL_COUNT failed, $_WARN_COUNT warnings ===${_C_RESET}\n"
++  printf "  ${_C_BOLD}${_C_YELLOW}!  Summary: $_PASS_COUNT passed, $_FAIL_COUNT failed, $_WARN_COUNT warnings${_C_RESET}\n"
+ else
+-  printf "${_C_BOLD}${_C_RED}=== Summary: $_PASS_COUNT passed, $_FAIL_COUNT failed, $_WARN_COUNT warnings ===${_C_RESET}\n"
++  printf "  ${_C_BOLD}${_C_RED}✗  Summary: $_PASS_COUNT passed, $_FAIL_COUNT failed, $_WARN_COUNT warnings${_C_RESET}\n"
+ fi
+ 
+ [[ $_FAIL_COUNT -eq 0 ]]
+diff --git a/bin/gem b/bin/gem
+index c34a16219f..93720c4415 100755
+--- a/bin/gem
++++ b/bin/gem
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- gem "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- gem "$@"
+diff --git a/bin/idlc b/bin/idlc
+index 5e1cc56f2d..9e5346459c 100755
+--- a/bin/idlc
++++ b/bin/idlc
+@@ -1,3 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+-BUNDLE_GEMFILE="${ROOT}/Gemfile" exec mise exec -- bundle exec idlc "$@"
++EXEC_DIR=${PWD}
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "${EXEC_DIR}" -- bundle exec --gemfile "${ROOT}/Gemfile" idlc "$@"
+diff --git a/bin/install_hooks b/bin/install_hooks
+index 9f9821c352..d0729917cb 100755
+--- a/bin/install_hooks
++++ b/bin/install_hooks
+@@ -29,7 +29,7 @@ _changed=$(git diff-tree -r --name-only --no-commit-id ORIG_HEAD HEAD 2>/dev/nul
+ 
+ if echo "$_changed" | grep -qF '.mise.toml'; then
+   echo "⚙  .mise.toml changed — running mise install..."
+-  mise install
++  "${ROOT}/bin/mise" install
+ fi
+ 
+ if echo "$_changed" | grep -qF 'Gemfile.lock'; then
+@@ -38,13 +38,13 @@ if echo "$_changed" | grep -qF 'Gemfile.lock'; then
+ fi
+ 
+ if echo "$_changed" | grep -qF 'uv.lock'; then
+-  echo "⚙  uv.lock changed — running uv sync..."
+-  "$ROOT/bin/uv" sync
++  echo "⚙  uv.lock changed — syncing Python packages..."
++  "$ROOT/bin/.venv-deps"
+ fi
+ 
+ if echo "$_changed" | grep -qF 'package-lock.json'; then
+-  echo "⚙  package-lock.json changed — running npm install..."
+-  "$ROOT/bin/npm" install
++  echo "⚙  package-lock.json changed — syncing npm packages..."
++  "$ROOT/bin/.npm-deps"
+ fi
+ HOOK
+ chmod +x "$GIT_HOOKS_DIR/post-merge"
+@@ -65,7 +65,7 @@ _changed=$(git diff --name-only "$1" "$2" 2>/dev/null)
+ 
+ if echo "$_changed" | grep -qF '.mise.toml'; then
+   echo "⚙  .mise.toml changed — running mise install..."
+-  mise install
++  "${ROOT}/bin/mise" install
+ fi
+ 
+ if echo "$_changed" | grep -qF 'Gemfile.lock'; then
+@@ -74,13 +74,13 @@ if echo "$_changed" | grep -qF 'Gemfile.lock'; then
+ fi
+ 
+ if echo "$_changed" | grep -qF 'uv.lock'; then
+-  echo "⚙  uv.lock changed — running uv sync..."
+-  "$ROOT/bin/uv" sync
++  echo "⚙  uv.lock changed — syncing Python packages..."
++  "$ROOT/bin/.venv-deps"
+ fi
+ 
+ if echo "$_changed" | grep -qF 'package-lock.json'; then
+-  echo "⚙  package-lock.json changed — running npm install..."
+-  "$ROOT/bin/npm" install
++  echo "⚙  package-lock.json changed — syncing npm packages..."
++  "$ROOT/bin/.npm-deps"
+ fi
+ HOOK
+ chmod +x "$GIT_HOOKS_DIR/post-checkout"
+diff --git a/bin/make b/bin/make
+index ef4af77f03..e1276ad116 100755
+--- a/bin/make
++++ b/bin/make
+@@ -1,7 +1,7 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
++cd "$ROOT" || exit 1
+ # Strip bin/ from PATH to avoid wrapper recursion (same pattern as bin/doctor)
+ PATH="${PATH//"${ROOT}/bin:"/}"
+-exec mise exec --cd "${EXEC_DIR}" -- make "$@"
++exec "${ROOT}/bin/mise" exec --cd "${EXEC_DIR}" -- make "$@"
+diff --git a/bin/mise b/bin/mise
+new file mode 100755
+index 0000000000..2af7c3b870
+--- /dev/null
++++ b/bin/mise
+@@ -0,0 +1,340 @@
++#!/usr/bin/env bash
++set -eu
++
++MISE_INSTALL_MUSL=1
++
++__mise_bootstrap() {
++    local cache_home="${XDG_CACHE_HOME:-$HOME/.cache}/mise"
++    export MISE_INSTALL_PATH="$cache_home/mise-2026.4.18"
++    install() {
++        local initial_working_dir="$PWD"
++        #!/bin/sh
++        set -eu
++
++        #region logging setup
++        if [ "${MISE_DEBUG-}" = "true" ] || [ "${MISE_DEBUG-}" = "1" ]; then
++          debug() {
++            echo "$@" >&2
++          }
++        else
++          debug() {
++            :
++          }
++        fi
++
++        if [ "${MISE_QUIET-}" = "1" ] || [ "${MISE_QUIET-}" = "true" ]; then
++          info() {
++            :
++          }
++        else
++          info() {
++            echo "$@" >&2
++          }
++        fi
++
++        error() {
++          echo "$@" >&2
++          exit 1
++        }
++        #endregion
++
++        #region environment setup
++        get_os() {
++          os="$(uname -s)"
++          if [ "$os" = Darwin ]; then
++            echo "macos"
++          elif [ "$os" = Linux ]; then
++            echo "linux"
++          else
++            error "unsupported OS: $os"
++          fi
++        }
++
++        get_arch() {
++          musl=""
++          if type ldd >/dev/null 2>/dev/null; then
++            if [ "${MISE_INSTALL_MUSL-}" = "1" ] || [ "${MISE_INSTALL_MUSL-}" = "true" ]; then
++              musl="-musl"
++            elif [ "$(uname -o)" = "Android" ]; then
++              # Android (Termux) always uses musl
++              musl="-musl"
++            else
++              libc=$(ldd /bin/ls | grep 'musl' | head -1 | cut -d ' ' -f1)
++              if [ -n "$libc" ]; then
++                musl="-musl"
++              fi
++            fi
++          fi
++          arch="$(uname -m)"
++          if [ "$arch" = x86_64 ]; then
++            echo "x64$musl"
++          elif [ "$arch" = aarch64 ] || [ "$arch" = arm64 ]; then
++            echo "arm64$musl"
++          elif [ "$arch" = armv7l ]; then
++            echo "armv7$musl"
++          else
++            error "unsupported architecture: $arch"
++          fi
++        }
++
++        get_ext() {
++          if [ -n "${MISE_INSTALL_EXT:-}" ]; then
++            echo "$MISE_INSTALL_EXT"
++          elif [ -n "${MISE_VERSION:-}" ] && echo "$MISE_VERSION" | grep -q '^v2024'; then
++            # 2024 versions don't have zstd tarballs
++            echo "tar.gz"
++          elif tar_supports_zstd; then
++            echo "tar.zst"
++          else
++            echo "tar.gz"
++          fi
++        }
++
++        tar_supports_zstd() {
++          if ! command -v zstd >/dev/null 2>&1; then
++            false
++          # tar is bsdtar
++          elif tar --version | grep -q 'bsdtar'; then
++            true
++          # tar version is >= 1.31
++          elif tar --version | grep -q '1\.\(3[1-9]\|[4-9][0-9]\)'; then
++            true
++          else
++            false
++          fi
++        }
++
++        shasum_bin() {
++          if command -v shasum >/dev/null 2>&1; then
++            echo "shasum"
++          elif command -v sha256sum >/dev/null 2>&1; then
++            echo "sha256sum"
++          else
++            error "mise install requires shasum or sha256sum but neither is installed. Aborting."
++          fi
++        }
++
++        get_checksum() {
++          version=$1
++          os=$2
++          arch=$3
++          ext=$4
++          url="https://github.com/jdx/mise/releases/download/v${version}/SHASUMS256.txt"
++          current_version="v2026.4.18"
++          current_version="${current_version#v}"
++
++          # For current version use static checksum otherwise
++          # use checksum from releases
++          if [ "$version" = "$current_version" ]; then
++            checksum_linux_x86_64="92f3758ecf3a647d4628307c34c732c17e01c02d2247ceaca37b03b9ad18e7ca  ./mise-v2026.4.18-linux-x64.tar.gz"
++            checksum_linux_x86_64_musl="dcb0187879dcd8adb0f26279f08f9b06f7b78fa3fea3fb95ffd4db72375201f4  ./mise-v2026.4.18-linux-x64-musl.tar.gz"
++            checksum_linux_arm64="8228332b424ae1c291dbfa686d3fd8e87e814722f3eb537fd129b28d68794510  ./mise-v2026.4.18-linux-arm64.tar.gz"
++            checksum_linux_arm64_musl="a451af75120d69139c3a88622299a893c2ef6eabdc80ec1226e2296ab6cc3432  ./mise-v2026.4.18-linux-arm64-musl.tar.gz"
++            checksum_linux_armv7="f3c6af087f7e6e3437676b522d65b3eb42d82747bf3fe45f05aabbd362fd64aa  ./mise-v2026.4.18-linux-armv7.tar.gz"
++            checksum_linux_armv7_musl="b8758417c47a2597ad643d8d2a298c138762a179943c1e38fa15434651ac5c19  ./mise-v2026.4.18-linux-armv7-musl.tar.gz"
++            checksum_macos_x86_64="78b95c4a26d4c7f2bbda91dc119e1001eae33aade428f134dc6f1b6857a02cce  ./mise-v2026.4.18-macos-x64.tar.gz"
++            checksum_macos_arm64="65b8e5f3a8654d725ff3af7781e447e2ed130dcdf412ee937cbd43ef64bb7629  ./mise-v2026.4.18-macos-arm64.tar.gz"
++            checksum_linux_x86_64_zstd="736e3b90346ad48ed190c723d60d7eb01071f345b3bd4f11145584f85416811c  ./mise-v2026.4.18-linux-x64.tar.zst"
++            checksum_linux_x86_64_musl_zstd="48f5e50f439a95bda2548e0da7e7ef706e3b08177a968bca67ba9266fef69699  ./mise-v2026.4.18-linux-x64-musl.tar.zst"
++            checksum_linux_arm64_zstd="f48483d8a8dff30457688f48af6082d2e51e41857fb8d1a8d6a052b416ebadd3  ./mise-v2026.4.18-linux-arm64.tar.zst"
++            checksum_linux_arm64_musl_zstd="6495b9146f464c238ba68bbbc4b6dbf5b687d14c1e2f6999bcca3e0327fc473c  ./mise-v2026.4.18-linux-arm64-musl.tar.zst"
++            checksum_linux_armv7_zstd="e0c9c51599972b62b13c123df96e82f9942dbfc22c559211db367209ef5bb3b6  ./mise-v2026.4.18-linux-armv7.tar.zst"
++            checksum_linux_armv7_musl_zstd="be95f6e6eca0ea634559f2a5bf1547b5ac06ecbf1e4d5f180e4c5cfc3a3282e1  ./mise-v2026.4.18-linux-armv7-musl.tar.zst"
++            checksum_macos_x86_64_zstd="66a8b69d9d48b63b99b45ad4bf3b8ee3372e8678b1969967a1a01fd8776b1793  ./mise-v2026.4.18-macos-x64.tar.zst"
++            checksum_macos_arm64_zstd="fb22e047959241733c02e60061b9499b62553e16adfbeeb70b2493caec1f4434  ./mise-v2026.4.18-macos-arm64.tar.zst"
++
++            # TODO: refactor this, it's a bit messy
++            if [ "$ext" = "tar.zst" ]; then
++              if [ "$os" = "linux" ]; then
++                if [ "$arch" = "x64" ]; then
++                  echo "$checksum_linux_x86_64_zstd"
++                elif [ "$arch" = "x64-musl" ]; then
++                  echo "$checksum_linux_x86_64_musl_zstd"
++                elif [ "$arch" = "arm64" ]; then
++                  echo "$checksum_linux_arm64_zstd"
++                elif [ "$arch" = "arm64-musl" ]; then
++                  echo "$checksum_linux_arm64_musl_zstd"
++                elif [ "$arch" = "armv7" ]; then
++                  echo "$checksum_linux_armv7_zstd"
++                elif [ "$arch" = "armv7-musl" ]; then
++                  echo "$checksum_linux_armv7_musl_zstd"
++                else
++                  warn "no checksum for $os-$arch"
++                fi
++              elif [ "$os" = "macos" ]; then
++                if [ "$arch" = "x64" ]; then
++                  echo "$checksum_macos_x86_64_zstd"
++                elif [ "$arch" = "arm64" ]; then
++                  echo "$checksum_macos_arm64_zstd"
++                else
++                  warn "no checksum for $os-$arch"
++                fi
++              else
++                warn "no checksum for $os-$arch"
++              fi
++            else
++              if [ "$os" = "linux" ]; then
++                if [ "$arch" = "x64" ]; then
++                  echo "$checksum_linux_x86_64"
++                elif [ "$arch" = "x64-musl" ]; then
++                  echo "$checksum_linux_x86_64_musl"
++                elif [ "$arch" = "arm64" ]; then
++                  echo "$checksum_linux_arm64"
++                elif [ "$arch" = "arm64-musl" ]; then
++                  echo "$checksum_linux_arm64_musl"
++                elif [ "$arch" = "armv7" ]; then
++                  echo "$checksum_linux_armv7"
++                elif [ "$arch" = "armv7-musl" ]; then
++                  echo "$checksum_linux_armv7_musl"
++                else
++                  warn "no checksum for $os-$arch"
++                fi
++              elif [ "$os" = "macos" ]; then
++                if [ "$arch" = "x64" ]; then
++                  echo "$checksum_macos_x86_64"
++                elif [ "$arch" = "arm64" ]; then
++                  echo "$checksum_macos_arm64"
++                else
++                  warn "no checksum for $os-$arch"
++                fi
++              else
++                warn "no checksum for $os-$arch"
++              fi
++            fi
++          else
++            if command -v curl >/dev/null 2>&1; then
++              debug ">" curl -fsSL "$url"
++              checksums="$(curl --compressed -fsSL "$url")"
++            else
++              if command -v wget >/dev/null 2>&1; then
++                debug ">" wget -qO - "$url"
++                checksums="$(wget -qO - "$url")"
++              else
++                error "mise standalone install specific version requires curl or wget but neither is installed. Aborting."
++              fi
++            fi
++            # TODO: verify with minisign or gpg if available
++
++            checksum="$(echo "$checksums" | grep "$os-$arch.$ext")"
++            if ! echo "$checksum" | grep -Eq "^([0-9a-f]{32}|[0-9a-f]{64})"; then
++              warn "no checksum for mise $version and $os-$arch"
++            else
++              echo "$checksum"
++            fi
++          fi
++        }
++
++        #endregion
++
++        download_file() {
++          url="$1"
++          download_dir="$2"
++          filename="$(basename "$url")"
++          file="$download_dir/$filename"
++
++          info "mise: installing mise..."
++
++          if command -v curl >/dev/null 2>&1; then
++            debug ">" curl -#fLo "$file" "$url"
++            curl -#fLo "$file" "$url"
++          else
++            if command -v wget >/dev/null 2>&1; then
++              debug ">" wget -qO "$file" "$url"
++              stderr=$(mktemp)
++              wget -O "$file" "$url" >"$stderr" 2>&1 || error "wget failed: $(cat "$stderr")"
++              rm "$stderr"
++            else
++              error "mise standalone install requires curl or wget but neither is installed. Aborting."
++            fi
++          fi
++
++          echo "$file"
++        }
++
++        install_mise() {
++          version="${MISE_VERSION:-v2026.4.18}"
++          version="${version#v}"
++          current_version="v2026.4.18"
++          current_version="${current_version#v}"
++          os="${MISE_INSTALL_OS:-$(get_os)}"
++          arch="${MISE_INSTALL_ARCH:-$(get_arch)}"
++          ext="${MISE_INSTALL_EXT:-$(get_ext)}"
++          install_path="${MISE_INSTALL_PATH:-$HOME/.local/bin/mise}"
++          install_dir="$(dirname "$install_path")"
++          install_from_github="${MISE_INSTALL_FROM_GITHUB:-}"
++          if [ "$version" != "$current_version" ] || [ "$install_from_github" = "1" ] || [ "$install_from_github" = "true" ]; then
++            tarball_url="https://github.com/jdx/mise/releases/download/v${version}/mise-v${version}-${os}-${arch}.${ext}"
++          elif [ -n "${MISE_TARBALL_URL-}" ]; then
++            tarball_url="$MISE_TARBALL_URL"
++          else
++            tarball_url="https://mise.jdx.dev/v${version}/mise-v${version}-${os}-${arch}.${ext}"
++          fi
++
++          download_dir="$(mktemp -d)"
++          cache_file=$(download_file "$tarball_url" "$download_dir")
++          debug "mise-setup: tarball=$cache_file"
++
++          debug "validating checksum"
++          cd "$(dirname "$cache_file")" && get_checksum "$version" "$os" "$arch" "$ext" | "$(shasum_bin)" -c >/dev/null
++
++          # extract tarball
++          if [ -d "$install_path" ]; then
++            error "MISE_INSTALL_PATH '$install_path' is a directory. Please set it to a file path, e.g. '$install_path/mise'."
++          fi
++          mkdir -p "$install_dir"
++          rm -f "$install_path"
++          extract_dir="$(mktemp -d)"
++          cd "$extract_dir"
++          if [ "$ext" = "tar.zst" ] && ! tar_supports_zstd; then
++            zstd -d -c "$cache_file" | tar -xf -
++          else
++            tar -xf "$cache_file"
++          fi
++          mv mise/bin/mise "$install_path"
++
++          # cleanup
++          cd / # Move out of $extract_dir before removing it
++          rm -rf "$download_dir"
++          rm -rf "$extract_dir"
++
++          info "mise: installed successfully to $install_path"
++        }
++
++        after_finish_help() {
++          case "${SHELL:-}" in
++          */zsh)
++            info "mise: run the following to activate mise in your shell:"
++            info "echo \"eval \\\"\\\$($install_path activate zsh)\\\"\" >> \"${ZDOTDIR-$HOME}/.zshrc\""
++            info ""
++            info "mise: run \`mise doctor\` to verify this is set up correctly"
++            ;;
++          */bash)
++            info "mise: run the following to activate mise in your shell:"
++            info "echo \"eval \\\"\\\$($install_path activate bash)\\\"\" >> ~/.bashrc"
++            info ""
++            info "mise: run \`mise doctor\` to verify this is set up correctly"
++            ;;
++          */fish)
++            info "mise: run the following to activate mise in your shell:"
++            info "echo \"$install_path activate fish | source\" >> ~/.config/fish/config.fish"
++            info ""
++            info "mise: run \`mise doctor\` to verify this is set up correctly"
++            ;;
++          *)
++            info "mise: run \`$install_path --help\` to get started"
++            ;;
++          esac
++        }
++
++        install_mise
++        if [ "${MISE_INSTALL_HELP-}" != 0 ]; then
++          after_finish_help
++        fi
++
++        cd -- "$initial_working_dir"
++    }
++    local MISE_INSTALL_HELP=0
++    test -f "$MISE_INSTALL_PATH" || install
++}
++__mise_bootstrap
++exec -a "$0" "$MISE_INSTALL_PATH" "$@"
+diff --git a/bin/node b/bin/node
+index 9a99abf0bb..5ff1923627 100755
+--- a/bin/node
++++ b/bin/node
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- node "$@"
++cd "$ROOT" || exit 1
++exec "$ROOT"/bin/mise exec --cd "$EXEC_DIR" -- node "$@"
+diff --git a/bin/npm b/bin/npm
+index 4180f45279..ebd7645015 100755
+--- a/bin/npm
++++ b/bin/npm
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- npm "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- npm "$@"
+diff --git a/bin/npx b/bin/npx
+index cc51aa5240..7adc1aa29d 100755
+--- a/bin/npx
++++ b/bin/npx
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- npx "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- npx "$@"
+diff --git a/bin/prek b/bin/prek
+index 32f7954980..fffd7dd9d2 100755
+--- a/bin/prek
++++ b/bin/prek
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- prek "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- prek "$@"
+diff --git a/bin/python b/bin/python
+index 2353e56b7f..6cfbfae705 100755
+--- a/bin/python
++++ b/bin/python
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- uv run python "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- uv run python "$@"
+diff --git a/bin/rake b/bin/rake
+index cb87bd444c..783d4cdab8 100755
+--- a/bin/rake
++++ b/bin/rake
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- rake "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- rake "$@"
+diff --git a/bin/rdbg b/bin/rdbg
+index 0b99eb6c38..83147f88f4 100755
+--- a/bin/rdbg
++++ b/bin/rdbg
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- rdbg "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- rdbg "$@"
+diff --git a/bin/regress b/bin/regress
+index e270d61a09..eccf274fa4 100755
+--- a/bin/regress
++++ b/bin/regress
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ 
++EXEC_DIR=$(pwd)
+ cd "$ROOT" || exit 1
+ 
+-exec mise exec -- bundle exec ruby "${ROOT}/tools/test/regress-cli.rb" "$@"
++exec "${ROOT}/bin/mise" exec --cd "${EXEC_DIR}" -- bundle exec ruby "${ROOT}/tools/test/regress-cli.rb" "$@"
+diff --git a/bin/reuse b/bin/reuse
+index c2375b4a1a..b2cb3e7e2f 100755
+--- a/bin/reuse
++++ b/bin/reuse
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- uv run reuse "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- uv run reuse "$@"
+diff --git a/bin/ruby b/bin/ruby
+index cb198f5654..b881ef8e29 100755
+--- a/bin/ruby
++++ b/bin/ruby
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- bundle exec --gemfile "$ROOT"/Gemfile ruby "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- bundle exec --gemfile "$ROOT"/Gemfile ruby "$@"
+diff --git a/bin/setup b/bin/setup
+index b7e612aae0..ed9d84a615 100755
+--- a/bin/setup
++++ b/bin/setup
+@@ -1,4 +1,5 @@
+ #!/bin/bash
++# shellcheck disable=SC2059
+ # bin/setup — one-command developer setup for UnifiedDB.
+ #
+ # Run this once after cloning the repository. Safe to re-run at any time;
+@@ -31,36 +32,55 @@ _info()    { printf "    ${_DIM}%s${_RESET}\n" "$1"; }
+ printf "${_BOLD}=== UnifiedDB Setup ===${_RESET}\n"
+ 
+ # ---------------------------------------------------------------------------
+-# 1. Install mise if needed
++# Install location overview
+ # ---------------------------------------------------------------------------
+ 
+-_section "mise (tool version manager)"
+-
+-MISE_BIN=$(command -v mise 2>/dev/null || true)
+-if [[ -z "$MISE_BIN" && -x "${HOME}/.local/bin/mise" ]]; then
+-  MISE_BIN="${HOME}/.local/bin/mise"
+-fi
+-
+-if [[ -n "$MISE_BIN" ]]; then
+-  _ok "mise already installed ($("$MISE_BIN" --version 2>/dev/null | head -1))"
+-else
+-  _run "Installing mise..."
+-  if ! curl -fsSL https://mise.run | sh; then
+-    printf "\nERROR: mise installation failed.\n" >&2
+-    printf "Install manually: https://mise.jdx.dev/getting-started.html\n" >&2
+-    exit 1
+-  fi
+-  MISE_BIN="${HOME}/.local/bin/mise"
+-  if [[ ! -x "$MISE_BIN" ]]; then
+-    printf "\nERROR: mise not found at %s after install.\n" "$MISE_BIN" >&2
+-    exit 1
++_XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
++_XDG_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}"
++
++_section "Install locations"
++printf "    UDB follows the XDG Base Directory specification.\n"
++printf "    The following directories will be used:\n\n"
++printf "    %-24s  %s\n" "mise tools:"         "${MISE_DATA_DIR:-$_XDG_DATA/mise}"
++printf "    %-24s  %s\n" "Ruby gems:"          "$_XDG_DATA/gem"
++printf "    %-24s  %s\n" "Python packages:"    "$_XDG_DATA/udb/venv-*/"
++printf "    %-24s  %s\n" "npm packages:"       "$_XDG_DATA/udb/npm-*/"
++printf "    %-24s  %s\n" "Caches/native deps:" "$_XDG_CACHE/udb/"
++printf "\n"
++
++if [[ -t 0 ]] && [[ -z "${GITHUB_ACTIONS:-}" ]]; then
++  printf "    Press ${_BOLD}Enter${_RESET} to continue, or type ${_BOLD}m${_RESET} to see how to change these paths: "
++  read -r _SETUP_LOC_CHOICE
++  if [[ "${_SETUP_LOC_CHOICE,,}" == m* ]]; then
++    printf "\n"
++    printf "    To change install paths, export XDG environment variables in your shell\n"
++    printf "    profile (${_CYAN}~/.bashrc${_RESET}, ${_CYAN}~/.zshrc${_RESET}, etc.) before re-running setup:\n\n"
++    printf "    ${_CYAN}export XDG_DATA_HOME=\"\$HOME/.local/share\"${_RESET}   # gems and npm packages\n"
++    printf "    ${_CYAN}export XDG_CACHE_HOME=\"\$HOME/.cache\"${_RESET}        # caches and native deps\n\n"
++    printf "    For tool-specific overrides (take precedence over XDG_DATA_HOME):\n\n"
++    printf "    ${_CYAN}export MISE_DATA_DIR=\"...\"${_RESET}   # mise tools only\n"
++    printf "    ${_CYAN}export BUNDLE_PATH=\"...\"${_RESET}     # Ruby gems only\n\n"
++    printf "    After updating your profile, open a new shell (or source it), then re-run:\n\n"
++    printf "        ${_BOLD}bin/setup${_RESET}\n\n"
++    exit 0
+   fi
+-  _ok "mise installed"
+ fi
+ 
+-# Put mise on PATH for the rest of this script so bin/ wrappers (which call
+-# `mise exec`) can find it even if the user's shell profile isn't activated.
+-export PATH="$(dirname "$MISE_BIN"):$PATH"
++# ---------------------------------------------------------------------------
++# 1. Bootstrap mise via bin/mise
++# ---------------------------------------------------------------------------
++
++_section "mise (tool version manager)"
++
++# bin/mise is a self-bootstrapping wrapper generated by `mise generate bootstrap`.
++# It downloads and caches mise on first run; subsequent runs are instant.
++MISE_BIN="$ROOT/bin/mise"
++_run "Bootstrapping mise..."
++if ! "$MISE_BIN" --version > /dev/null 2>&1; then
++  printf "\nERROR: bin/mise failed to bootstrap.\n" >&2
++  exit 1
++fi
++_ok "mise ready ($("$MISE_BIN" --version 2>/dev/null | head -1))"
+ 
+ # ---------------------------------------------------------------------------
+ # 2. Install tool versions via mise
+@@ -68,9 +88,13 @@ export PATH="$(dirname "$MISE_BIN"):$PATH"
+ 
+ _section "Tool versions (Ruby, Python, Node.js, CMake, …)"
+ 
++# Pre-initialize ~/.gnupg before mise install so parallel gpg invocations
++# (e.g. for node, make, ruby) don't race to create the directory.
++mkdir -p "${GNUPGHOME:-$HOME/.gnupg}" && chmod 700 "${GNUPGHOME:-$HOME/.gnupg}"
++
+ # mise install is idempotent and exits quickly when everything is current.
+ _run "Running mise install..."
+-if ! mise install; then
++if ! "$MISE_BIN" install; then
+   printf "\nERROR: mise install failed.\n" >&2
+   exit 1
+ fi
+@@ -82,7 +106,7 @@ _ok "All tool versions installed"
+ 
+ _section "Ruby gems"
+ 
+-if BUNDLE_GEMFILE="$ROOT/Gemfile" mise exec -- bundle check > /dev/null 2>&1; then
++if BUNDLE_GEMFILE="$ROOT/Gemfile" "$MISE_BIN" exec -- bundle check > /dev/null 2>&1; then
+   _ok "Ruby gems already up to date"
+ else
+   _run "Running bundle install..."
+@@ -105,7 +129,7 @@ if [[ ! -f "$ROOT/ext/rbi-central/README.md" ]]; then
+ fi
+ 
+ _run "Downloading native dependencies..."
+-if ! (cd "${ROOT}/tools/ruby-gems/udb/ext/udb_download" && mise exec -- ruby extconf.rb); then
++if ! (cd "${ROOT}/tools/ruby-gems/udb/ext/udb_download" && "$MISE_BIN" exec -- ruby extconf.rb); then
+   printf "\nERROR: native dependency download failed.\n" >&2
+   exit 1
+ fi
+@@ -117,12 +141,9 @@ _ok "Native dependencies ready"
+ 
+ _section "Python packages"
+ 
+-_run "Running uv sync..."
+-if ! "$ROOT/bin/uv" sync; then
+-  printf "\nERROR: uv sync failed.\n" >&2
++if ! "$ROOT/bin/.venv-deps"; then
+   exit 1
+ fi
+-_ok "Python packages installed"
+ 
+ # ---------------------------------------------------------------------------
+ # 6. npm packages
+@@ -130,15 +151,8 @@ _ok "Python packages installed"
+ 
+ _section "npm packages"
+ 
+-if [[ -d "$ROOT/node_modules" ]]; then
+-  _ok "npm packages already installed"
+-else
+-  _run "Running npm ci..."
+-  if ! "$ROOT/bin/npm" ci; then
+-    printf "\nERROR: npm ci failed.\n" >&2
+-    exit 1
+-  fi
+-  _ok "npm packages installed"
++if ! "$ROOT/bin/.npm-deps"; then
++  exit 1
+ fi
+ 
+ # ---------------------------------------------------------------------------
+@@ -175,7 +189,7 @@ else
+   printf "      A pre-built image (~500 MB) is pulled from GHCR automatically.\n"
+   printf "      No compiler installation needed.\n\n"
+   printf "  ${_BOLD}[2] Native${_RESET}\n"
+-  printf "      Requires GCC 14+ (or Clang 17+) with C++23 support,\n"
++  printf "      Requires GCC 13.3+ (or Clang 17+) with C++23 support,\n"
+   printf "      plus a riscv64-unknown-elf cross-toolchain.\n"
+   printf "      Faster to invoke; more setup required.\n\n"
+   printf "  ${_BOLD}[3] Neither — skip for now${_RESET}\n"
+@@ -247,10 +261,11 @@ printf "  Run ${_CYAN}bin/doctor${_RESET} to confirm everything is working corre
+ 
+ if [[ -z "${MISE_SHELL:-}" ]]; then
+   printf "${_BOLD}Shell activation (recommended)${_RESET}\n"
+-  printf "  mise-managed tools are available in this session, but to make them\n"
+-  printf "  available in all future shells, add the activation line to your shell profile:\n\n"
+-  printf "    ${_DIM}echo 'eval \"\$(mise activate bash)\"' >> ~/.bashrc${_RESET}   # bash\n"
+-  printf "    ${_DIM}echo 'eval \"\$(mise activate zsh)\"'  >> ~/.zshrc${_RESET}    # zsh\n\n"
++  printf "  To use mise-managed tools (ruby, python, node, etc.) directly in your\n"
++  printf "  shell without using bin/ wrappers, add the activation line to your shell\n"
++  printf "  profile and open a new shell (or source the profile):\n\n"
++  printf "    ${_DIM}echo 'eval \"\$(./bin/mise activate bash)\"' >> ~/.bashrc${_RESET}   # bash\n"
++  printf "    ${_DIM}echo 'eval \"\$(./bin/mise activate zsh)\"'  >> ~/.zshrc${_RESET}    # zsh\n\n"
+   printf "  See ${_CYAN}https://mise.jdx.dev/getting-started.html#activate-mise${_RESET} for other shells.\n\n"
+ fi
+ 
+diff --git a/bin/udb b/bin/udb
+index 8dc37a12f1..4cfc89d180 100755
+--- a/bin/udb
++++ b/bin/udb
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- bundle exec --gemfile "$ROOT"/Gemfile udb "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- bundle exec --gemfile "$ROOT"/Gemfile udb "$@"
+diff --git a/bin/udb-gen b/bin/udb-gen
+index 22be834726..bb7ab1ebd2 100755
+--- a/bin/udb-gen
++++ b/bin/udb-gen
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- bundle exec --gemfile "$ROOT"/Gemfile udb-gen "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- bundle exec --gemfile "$ROOT"/Gemfile udb-gen "$@"
+diff --git a/bin/uv b/bin/uv
+index 3c7fd49e25..038f5af244 100755
+--- a/bin/uv
++++ b/bin/uv
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+ ROOT=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+ EXEC_DIR=${PWD}
+-cd "$ROOT"
+-exec mise exec --cd "$EXEC_DIR" -- uv "$@"
++cd "$ROOT" || exit 1
++exec "${ROOT}/bin/mise" exec --cd "$EXEC_DIR" -- uv "$@"
+diff --git a/do b/do
+index 8942a0ebd4..b4c9df72d1 100755
+--- a/do
++++ b/do
+@@ -20,4 +20,4 @@ fi
+ [ -f "${ROOT}/.toolchain-local" ] && source "${ROOT}/.toolchain-local"
+ 
+ # really long way of invoking rake, but renamed to 'do'
+-exec mise exec --cd "${ROOT}" -- bundle exec --gemfile "${ROOT}/Gemfile" ruby -r rake -e "Rake.application.init('do');Rake.application.load_rakefile;Rake.application.top_level" -- "$@"
++exec "${ROOT}/bin/mise" exec --cd "${ROOT}" -- bundle exec --gemfile "${ROOT}/Gemfile" ruby -r rake -e "Rake.application.init('do');Rake.application.load_rakefile;Rake.application.top_level" -- "$@"

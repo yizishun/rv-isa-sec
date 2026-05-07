@@ -1,0 +1,141 @@
+{
+  "pr_number": 1006,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 1006,
+    "violation_condition": "Linux kernel context-switch, KVM world-switch, or signal-delivery code saves PCC (containing the P-bit) and later restores it without preserving the P-bit value, or writes to extended YLEN CSRs (sscratch_y, mscratch_y, vsscratch_y, stvec_y, mtvec_y, vstvec_y, sepc_y, mepc_y, vsepc_y) using CSRRW while in Address Mode without applying SCADDR semantics, causing capability metadata (tag, bounds, permissions) to be silently stripped or corrupted across privilege boundaries.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "(save|restore|swap|switch).*(pcc|sscratch|mscratch|stvec|mtvec|sepc|mepc).*(capability|cheri|p_bit|m_bit|ctag)|CSRRW.*scratch|__switch_to.*cap|kvm_arch.*(save|restore).*cheri|cpu_switch_to.*pcc|cheri_pcc_(save|restore|get|set)",
+    "affected_entities": [
+      "pcc",
+      "sscratch_y",
+      "mscratch_y",
+      "vsscratch_y",
+      "stvec_y",
+      "mtvec_y",
+      "vstvec_y",
+      "sepc_y",
+      "mepc_y",
+      "vsepc_y",
+      "ddc",
+      "CSRRW_CHERI",
+      "CSRRWI_CHERI",
+      "MODESW_CAP",
+      "MODESW_INT",
+      "GCMODE",
+      "SCMODE"
+    ],
+    "summary": "P-bit (formerly M-bit) in PCC controls CHERI Execution Mode across context switches; kernel must propagate it faithfully and respect that CSRRW writes to extended CSRs in Address Mode apply SCADDR (stripping capability metadata), otherwise a process could escape its capability bounds after resume or return-to-userspace."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "__kvm_riscv_switch_to",
+        "line_start": 198,
+        "line_end": 218,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM world-switch uses CSRRW on SSCRATCH (lines 57, 104, 146) and CSRRW on SSTATUS (lines 48, 155) to atomically swap host/guest context. Under Zysentry, these would become extended YLEN CSRs (sscratch_y), and CSRRW would silently strip capability metadata (tag, bounds, permissions) without SCADDR semantics. SPEC VIOLATION IF ZYSENTRY ENABLED: capability state corrupted across guest<->host transitions, enabling privilege escape via forged capabilities in the host.",
+      "snippet": "csrrw\tt0, CSR_SSTATUS, t0       // line 48: atomically swaps sstatus\ncsrrw\tt1, CSR_STVEC, t1          // line 51: atomically swaps stvec\ncsrrw\tt3, CSR_SSCRATCH, a0       // line 57: atomically swaps sscratch\ncsrrw\ta0, CSR_SSCRATCH, a0       // line 104: guest GPR save path uses CSRRW on SSCRATCH\ncsrrw\tt1, CSR_SSCRATCH, t1       // line 146: host restore path uses CSRRW on SSCRATCH"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 125,
+        "line_end": 200,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Exception entry uses CSRRW on CSR_SCRATCH (lines 131, 324, 330) for user/kernel TP swapping and csrw CSR_SCRATCH (lines 200, 273) to zero/reload scratch. Under Zysentry, CSR_SCRATCH maps to sscratch_y, and writes via CSRRW/CSRW without SCADDR semantics would strip capability tags. This is the primary exception path hit on every trap/interrupt; corruption here would affect all subsequent context-switch and signal-delivery decisions.",
+      "snippet": "csrrw tp, CSR_SCRATCH, tp       // line 131: user<->kernel TP swap via SSCRATCH\ncsrw CSR_SCRATCH, x0            // line 200: zero scratch in kernel\ncsrw CSR_SCRATCH, tp            // line 273: restore scratch for user return"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 421,
+        "line_end": 471,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Context switch saves/restores callee-saved GPRs (ra, sp, s0-s11) and SR_SUM status bit via thread_struct. No CHERI extended state is handled because this kernel version has no CHERI support. Status register save/restore uses CSRR/CSRS on CSR_STATUS which is XLEN-width only in this codebase. No PCC, P-bit, or capability metadata exists to be corrupted.",
+      "snippet": "REG_S ra,  TASK_THREAD_RA_RA(a3)     // line 426: save callee GPRs only\ncsrr  s0, CSR_STATUS                   // line 442: read status (XLEN only)\nREG_L ra,  TASK_THREAD_RA_RA(a4)     // line 452: restore callee GPRs only\ncsrs  CSR_STATUS, s0                   // line 451: set SR_SUM (XLEN only)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 578,
+        "line_end": 641,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VCPU load writes guest VS CSRs (VSSTATUS, VSIE, VSTVEC, VSSCRATCH, VSEPC, VSCAUSE, VSTVAL, HEDELEG, HVIP, VSATP) using csr_write/nacl_csr_write (lines 586-622). Under Zysentry, these would be extended YLEN CSRs (vsscratch_y, vstvec_y, vsepc_y), and direct writes would corrupt capability metadata. No save/restore of any CHERI-specific state exists because the feature is absent.",
+      "snippet": "csr_write(CSR_VSSTATUS, csr->vsstatus);     // line 605: writes to VS SSTATUS\ncsr_write(CSR_VSTVEC, csr->vstvec);          // line 607: writes to VS STVEC\ncsr_write(CSR_VSSCRATCH, csr->vsscratch);    // line 608: writes to VS SSCRATCH\ncsr_write(CSR_VSEPC, csr->vsepc);            // line 609: writes to VS SEPC"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_put",
+        "line_start": 643,
+        "line_end": 683,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VCPU put reads back guest VS CSRs using csr_read/nacl_csr_read (lines 663-681). Under Zysentry, reading extended YLEN CSRs back into XLEN-width storage fields in kvm_vcpu_csr (defined with 'unsigned long' at kvm_host.h:157-168) would silently truncate the upper bits containing capability metadata (P-bit, tag, bounds). The storage structure has no fields for capability state.",
+      "snippet": "csr->vsscratch = csr_read(CSR_VSSCRATCH);   // line 676: reads back VS SSCRATCH\ncsr->vsepc = csr_read(CSR_VSEPC);            // line 677: reads back VS SEPC\ncsr->vstvec = csr_read(CSR_VSTVEC);          // line 675: reads back VS STVEC"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "setup_sigcontext",
+        "line_start": 353,
+        "line_end": 388,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Signal frame setup copies pt_regs (GPRs) and FP state, plus V/ZICFISS extension headers. No CHERI extension state exists to save or restore. The signal frame extension mechanism (arch_ext_list, RISCV_V_MAGIC, RISCV_ZICFISS_MAGIC) provides the correct pattern for future CHERI state, but no CHERI magic/header is defined or handled.",
+      "snippet": "err = __copy_to_user(&sc->sc_regs, regs, sizeof(sc->sc_regs));  // line 362: GPRs only\next_size = arch_ext->save(regs, sc_ext_ptr + 1);                // line 372: extension save hook"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "restore_sigcontext",
+        "line_start": 219,
+        "line_end": 278,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Signal frame restore copies back pt_regs (GPRs) and handles only RISCV_V_MAGIC and RISCV_ZICFISS_MAGIC extension headers. No CHERI capability state to restore. The extension dispatch mechanism would need a new CHERI magic to handle capability register restoration, but such code does not exist.",
+      "snippet": "err = __copy_from_user(regs, &sc->sc_regs, sizeof(sc->sc_regs));  // line 226: GPRs only\ncase RISCV_V_MAGIC:                                                 // line 260: V ext only\ncase RISCV_ZICFISS_MAGIC:                                           // line 267: CFI only"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "start_thread",
+        "line_start": 144,
+        "line_end": 180,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "start_thread initializes new process registers (status, epc, sp) and clears shadow stack / IBT state. No PCC or CHERI capability initialization. Under Zysentry, new processes would need their PCC initialized with appropriate bounds/permissions; this path currently has no such logic.",
+      "snippet": "regs->status = SR_PIE;           // line 147: set status bits only\nregs->epc = pc;                  // line 156: set entry point (not PCC)\nregs->sp = sp;                   // line 157: set stack pointer (not capability)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "SAVE_HOST_AND_RESTORE_GUEST_CSRS",
+        "line_start": 41,
+        "line_end": 63,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Macro atomically saves host SSCRATCH and loads guest VCPU arch pointer into SSCRATCH using csrrw (line 57). Under Zysentry, sscratch_y holds a full capability; CSRRW strips tags. The guest SEPC is loaded with csrw (line 54) rather than a capability-aware instruction. Host STVEC is swapped with csrrw (line 51), which would also strip capability metadata from stvec_y.",
+      "snippet": "csrrw\tt1, CSR_STVEC, t1          // line 51: swap stvec (would strip stvec_y cap)\ncsrw\tCSR_SEPC, t2               // line 54: write sepc (would strip sepc_y cap)\ncsrrw\tt3, CSR_SSCRATCH, a0       // line 57: swap sscratch (would strip sscratch_y cap)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

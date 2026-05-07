@@ -1,0 +1,143 @@
+{
+  "pr_number": 112,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 112,
+    "violation_condition": "Linux kernel reads or writes a userspace atomic variable (e.g., via futex(2), ptrace(2), or a shared-memory ABI structure) using a size or alignment that differs from what the userspace compiler produced under this psABI rule — specifically, when the kernel treats an atomic type at its unpadded size/alignment while userspace has promoted it to the next power-of-two width and alignment.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "kernel access to userspace atomic<T> or _Atomic(T) where sizeof(T) is not a power of two, or where natural alignment differs from the psABI-promoted alignment; futex word access, UAPI struct members declared with __u32/__u64 but used as atomics in userspace, and vDSO atomics on non-power-of-two types.",
+    "affected_entities": [
+      "futex",
+      "ptrace",
+      "vDSO atomic operations",
+      "UAPI shared-memory structs with atomic members",
+      "futex_get_user",
+      "futex_put_user",
+      "arch_futex_atomic_op_inuser"
+    ],
+    "summary": "If kernel and userspace disagree on the padded size/alignment of non-power-of-two atomic types (e.g., a 24-bit atomic struct padded to 32 bits per psABI), the kernel may read stale bytes, write to wrong offsets, or trigger spurious alignment faults when accessing userspace atomics via futex or ptrace, causing silent data corruption in synchronization primitives shared across the kernel-user boundary."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "kernel/futex/futex.h",
+        "function_name": "futex_flags_valid",
+        "line_start": 82,
+        "line_end": 108,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "This gate rejects all non-32-bit futex sizes (lines 91-92), ensuring the kernel only operates on 4-byte naturally-aligned futex words. The comment 'Only 32bit futexes are implemented -- for now' documents this as intentional. Without this gate, futex2 8/16/64-bit sizes could reach arch code where RISC-V lacks the corresponding AMO instruction widths.",
+      "snippet": "/* Only 32bit futexes are implemented -- for now */\nif ((flags & FLAGS_SIZE_MASK) != FLAGS_SIZE_32)\n    return false;"
+    },
+    {
+      "location": {
+        "file_path": "kernel/futex/core.c",
+        "function_name": "get_futex_key",
+        "line_start": 548,
+        "line_end": 574,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "get_futex_key() enforces natural alignment: address % size == 0 where size=futex_size(flags). Since flags are always FLAGS_SIZE_32 (size=4), this requires 4-byte alignment, matching the RISC-V psABI requirement for _Atomic(int). The access_ok check (line 573) additionally verifies the user address range is valid. This alignment gate is reached by all futex operations (wait, wake, requeue, lock_pi, unlock_pi) before any userspace memory access.",
+      "snippet": "size = futex_size(flags);\nif (flags & FLAGS_NUMA)\n    size *= 2;\nkey->both.offset = address % PAGE_SIZE;\nif (unlikely((address % size) != 0))\n    return -EINVAL;\naddress -= key->both.offset;\nif (unlikely(!access_ok(uaddr, size)))\n    return -EFAULT;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/futex.h",
+        "function_name": "arch_futex_atomic_op_inuser",
+        "line_start": 36,
+        "line_end": 73,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Uses .w-suffix AMO instructions (amoswap.w, amoadd.w, amoor.w, amoand.w, amoxor.w) with .aqrl ordering on u32 words. These instructions require 4-byte natural alignment per the RISC-V spec; a misaligned AMO would trap as STORE_AMO_PAGE_FAULT. However, get_futex_key() already rejected misaligned addresses (address % 4 != 0) before this function is called. The access_ok(uaddr, sizeof(u32)) check at line 41 is a range check only, not alignment -- but the real alignment enforcement is upstream. The 32-bit-only size combined with 4-byte alignment matches userspace _Atomic(int) on RISC-V, where sizeof(int)==4 and alignof(_Atomic int)==4.",
+      "snippet": "case FUTEX_OP_SET:\n    __futex_atomic_op(\"amoswap.w.aqrl %[ov],%z[op],%[u]\",\n                      ret, oldval, uaddr, oparg);\n    break;\ncase FUTEX_OP_ADD:\n    __futex_atomic_op(\"amoadd.w.aqrl %[ov],%z[op],%[u]\",\n                      ret, oldval, uaddr, oparg);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/futex.h",
+        "function_name": "futex_atomic_cmpxchg_inatomic",
+        "line_start": 75,
+        "line_end": 102,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Uses LR.W/SC.W with .aqrl ordering for the cmpxchg path. LR.W requires 4-byte natural alignment per the RISC-V privileged spec; a misaligned LR.W would trap. This is protected by the same get_futex_key() alignment gate. The 32-bit CAS matches the userspace _Atomic(int) cmpxchg on RISC-V. The oldval cast `(long)(int)oldval` at line 96 sign-extends through a 64-bit register, which is correct for the `bne` comparison against LR.W's zero-extended 32-bit result (lr.w zero-extends into the 64-bit rd on RV64).",
+      "snippet": "\"1:   lr.w %[v],%[u]                       \\n\"\n\"     bne %[v],%z[ov],3f                   \\n\"\n\"2:   sc.w.aqrl %[t],%z[nv],%[u]           \\n\"\n\"     bnez %[t],1b                          \\n\"\n\"3:                                          \\n\""
+    },
+    {
+      "location": {
+        "file_path": "kernel/futex/core.c",
+        "function_name": "handle_futex_death",
+        "line_start": 1015,
+        "line_end": 1128,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The robust-list death handling path independently checks 32-bit alignment at line 1023: (unsigned long)uaddr % sizeof(*uaddr) != 0 returns -1. This path is reached from exit_robust_list() during task exit, NOT through the normal futex syscall entry, so it has its own alignment check. This is correct defense-in-depth: even if the robust list contains a misaligned futex pointer (malicious or buggy userspace), the kernel will refuse to touch it. The FLAGS_SIZE_32 | FLAGS_SHARED flags passed to futex_wake() at line 1069 are hard-coded 32-bit, consistent with the alignment check.",
+      "snippet": "/* Futex address must be 32bit aligned */\nif ((((unsigned long)uaddr) % sizeof(*uaddr)) != 0)\n    return -1;\n\nretry:\n    if (get_user(uval, uaddr))"
+    },
+    {
+      "location": {
+        "file_path": "include/uapi/linux/futex.h",
+        "function_name": "",
+        "line_start": 61,
+        "line_end": 76,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The futex2 UAPI defines FUTEX2_SIZE_U8/U16/U32/U64 (0x00-0x03) and FUTEX2_NUMA + FUTEX2_MPOL flags. The struct futex_waitv uses __u64 val, __u64 uaddr, __u32 flags, __u32 __reserved. This is a descriptor struct, not the atomic variable itself. Its layout (8+8+4+4=24 bytes) has no non-power-of-two members that would trigger the psABI promotion rule. The actual futex word size is encoded in the flags field, which is validated by futex_flags_valid() before any memory access.",
+      "snippet": "#define FUTEX2_SIZE_U8          0x00\n#define FUTEX2_SIZE_U16         0x01\n#define FUTEX2_SIZE_U32         0x02\n#define FUTEX2_SIZE_U64         0x03\n#define FUTEX2_NUMA             0x04\n#define FUTEX2_MPOL             0x08\n#define FUTEX2_PRIVATE          FUTEX_PRIVATE_FLAG\n#define FUTEX2_SIZE_MASK        0x03"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/vdso",
+        "function_name": "",
+        "line_start": 0,
+        "line_end": 0,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "RISC-V vDSO has no futex implementation and no atomic operations on shared-memory types. A grep for 'atomic', 'cmpxchg', and 'futex' in arch/riscv/kernel/vdso/ returned zero matches. There is no vDSO code path that could access userspace atomic variables with mismatched size/alignment on RISC-V.",
+      "snippet": "(no relevant code - vDSO has no futex or atomic operations)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "do_trap_store_misaligned",
+        "line_start": 242,
+        "line_end": 250,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "RISC-V misaligned AMO accesses (e.g., a futex AMO at a non-4-byte-aligned address that bypasses the kernel alignment check) would reach do_trap_store_misaligned -> handle_misaligned_store(). This is a software fixup path for misaligned loads/stores that emulates the access byte-by-byte. However, an AMO instruction cannot be correctly emulated this way because AMOs are atomic read-modify-write operations -- byte-by-byte emulation is inherently non-atomic. Despite this limitation, this path is irrelevant to the current futex code because get_futex_key() and handle_futex_death() both reject misaligned addresses before any AMO is executed. The trap handler is only reachable via other (non-futex) kernel or userspace code paths.",
+      "snippet": "asmlinkage __visible __trap_section void do_trap_store_misaligned(struct pt_regs *regs)\n{\n    do_trap_misaligned(regs, MISALIGNED_STORE);\n}"
+    },
+    {
+      "location": {
+        "file_path": "kernel/futex/core.c",
+        "function_name": "exit_robust_list",
+        "line_start": 1154,
+        "line_end": 1214,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "exit_robust_list() walks a userspace linked list (curr->robust_list) and calls handle_futex_death() for each entry. The futex_offset field is fetched from userspace via get_user() and added to entry pointers to derive the futex word address. The derived address is then alignment-checked inside handle_futex_death(). The list walk itself uses get_user() for the next-pointer fetch (via fetch_robust_entry) and has a hard limit of ROBUST_LIST_LIMIT (2048) to prevent infinite loops on circular lists. No size/alignment mismatch possible since handle_futex_death hard-codes 32-bit access.",
+      "snippet": "while (entry != &head->list) {\n    rc = fetch_robust_entry(&next_entry, &entry->next, &next_pi);\n    if (entry != pending) {\n        if (handle_futex_death((void __user *)entry + futex_offset,\n                                curr, pi, HANDLE_DEATH_LIST))\n            return;"
+    },
+    {
+      "location": {
+        "file_path": "kernel/futex/futex.h",
+        "function_name": "futex_size",
+        "line_start": 77,
+        "line_end": 80,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "futex_size() computes `1 << (flags & FLAGS_SIZE_MASK)`, yielding 1, 2, 4, or 8 bytes. If the futex_flags_valid() gate at line 91 were removed to enable non-32-bit futexes, the RISC-V arch code would need corresponding support: (a) 8-bit futexes would need .b-suffix AMOs (requires Zabha extension, not universally available on RISC-V); (b) 16-bit futexes would need .h-suffix AMOs (also Zabha); (c) 64-bit futexes on RV64 would need .d-suffix AMOs (requires Zaamo, usually present). Without Zabha, the current AMO-based arch_futex_atomic_op_inuser() and the LR/SC-based futex_atomic_cmpxchg_inatomic() would fail to compile or would silently produce wrong code. This is a potential risk only if the 32-bit-only gate is removed without RISC-V arch review.",
+      "snippet": "static inline unsigned int futex_size(unsigned int flags)\n{\n    return 1 << (flags & FLAGS_SIZE_MASK);\n}"
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,93 @@
+{
+  "pr_number": 2608,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 2608,
+    "violation_condition": "In OpenSBI's HSM non-retentive suspend/resume flow (lib/sbi/sbi_hsm.c), the per-hart struct sbi_hsm_data saves MIE, MIP, MEDELEG, MIDELEG, and MENVCFG but does NOT save or restore mstateen0-3. Per the spec (norm:mstateen_zero_initialization), hardware resets all writable mstateen bits to zero on reset. After a deep suspend where the hart loses CSR state, mstateen0-3 come back as all-zero, losing bit 63 (STATEN) which controls access to sstateen/hstateen CSRs, and all other extension-enable bits (CONTEXT, IMSIC, AIA, ENVCFG, etc.) that OpenSBI originally set in mstatus_init(). Resume does not re-call mstatus_init(), so mstateen remains zeroed.",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "HSM suspend/resume save/restore lists in sbi_hsm_data struct (and corresponding __sbi_hsm_hart_suspend/__sbi_hsm_hart_resume helpers) that include M-mode CSRs like menvcfg but omit mstateen0-3 CSR save/restore fields, or any resume path that fails to reinitialize mstateen after a non-retentive suspend where CSR state was lost",
+    "affected_entities": [
+      "mstateen0",
+      "mstateen1",
+      "mstateen2",
+      "mstateen3",
+      "mstatus_init"
+    ],
+    "summary": "OpenSBI's HSM resume path fails to restore mstateen0-3 after non-retentive suspend, causing S-mode to lose access to all state controlled by these CSRs (sstateen, hstateen, IMSIC, AIA, context/environment config CSRs), violating the expectation that M-mode firmware transparently preserves hart state across suspend/resume cycles."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "struct sbi_hsm_data",
+        "line_start": 44,
+        "line_end": 53,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The struct omits mstateen0-3 save fields, but this is by design. mstateen0-3 do NOT need save/restore across non-retentive suspend because they are reinitialized from scratch by mstatus_init() in the warm-resume path (sbi_hart_reinit() → mstatus_init()), identically to how mstatus, mcounteren, scounteren, sstateen*, and hstateen* are handled. Only CSRs containing volatile S-mode-visible state (mie, mip, medeleg, mideleg, menvcfg) need save/restore.",
+      "snippet": "struct sbi_hsm_data {\n    atomic_t state;\n    unsigned long suspend_type;\n    unsigned long saved_mie;\n    unsigned long saved_mip;\n    unsigned long saved_medeleg;"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_save",
+        "line_start": 408,
+        "line_end": 433,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correctly saves only the CSRs whose values may have been modified by S-mode (MIE, MIP.SSIP/STIP, MEDELEG, MIDELEG, MENVCFG). mstateen0-3 are not saved here because they are reinitialized from scratch by mstatus_init() during warm-resume — they contain static hardware-discovery-based values that don't change across suspend.",
+      "snippet": "hdata->saved_mie = csr_read(CSR_MIE);\nhdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);\nhdata->saved_medeleg = csr_read(CSR_MEDELEG);\nhdata->saved_mideleg = csr_read(CSR_MIDELEG);\nif (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_init.c",
+        "function_name": "init_warm_resume",
+        "line_start": 483,
+        "line_end": 499,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The warm-resume path calls sbi_hart_reinit() at line 490 before CSR restore at line 498. sbi_hart_reinit() calls mstatus_init(), which reinitializes mstateen0-3, sstateen*, hstateen*, menvcfg, mstatus, and other CSRs. The subsequent __sbi_hsm_suspend_non_ret_restore() then overlays saved mie/mip/medeleg/mideleg/menvcfg. mstateen0-3 are correctly set before the hart switches back to S-mode via mret. No window of vulnerability exists.",
+      "snippet": "sbi_hsm_hart_resume_start(scratch);\nrc = sbi_hart_reinit(scratch);\nif (rc)\n    sbi_hart_hang();\nrc = sbi_hart_protection_configure(scratch);"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "sbi_hart_reinit",
+        "line_start": 711,
+        "line_end": 721,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Calls mstatus_init() unconditionally, which fully reinitializes mstateen0-3 with STATEN, CONTEXT, HSENVCFG, and optionally AIA/IMSIC/SVSLCT/CTR/SRMCFG based on extension detection. This is the mechanism that ensures mstateen is correctly configured after hardware reset clears all bits. No separate save/restore is needed because the values are deterministically recomputed.",
+      "snippet": "int sbi_hart_reinit(struct sbi_scratch *scratch)\n{\n    int rc;\n    mstatus_init(scratch);\n    rc = fp_init(scratch);\n    if (rc)"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "mstatus_init",
+        "line_start": 89,
+        "line_end": 120,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reinitializes mstateen0 with extension-specific enable bits and mstateen1-3 with STATEN only. Also zeroes sstateen0-3 and hstateen0-3 (lines 122-135). These writes execute during warm-resume before S-mode is re-entered, so the hardware-reset-induced all-zero state is correctly repaired. Compliant with norm:mstateen_zero_initialization expectations.",
+      "snippet": "if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMSTATEEN)) {\n    mstateen_val = 0;\n    mstateen_val |= SMSTATEEN_STATEN;\n    mstateen_val |= SMSTATEEN0_CONTEXT;\n    mstateen_val |= SMSTATEEN0_HSENVCFG;"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "sbi_hsm_hart_resume_finish",
+        "line_start": 464,
+        "line_end": 484,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Called after sbi_hart_reinit() (which reinitializes mstateen). Only restores volatile CSR values (menvcfg, mideleg, medeleg, mie, mip) that S-mode may have changed. mstateen0-3 were already correctly configured by the preceding mstatus_init() call and are not overwritten. The ordering is correct: reinit static CSRs first, then overlay saved volatile state, then mret to S-mode.",
+      "snippet": "/* Restore some of the M-mode CSRs which we are re-configured by\n * the warm-boot sequence. */\n__sbi_hsm_suspend_non_ret_restore(scratch);\nsbi_hart_switch_mode(hartid, scratch->next_arg1,\n             scratch->next_addr,\n             scratch->next_mode, false);"
+    }
+  ],
+  "overall_severity": "compliant"
+}

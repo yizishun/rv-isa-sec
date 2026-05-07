@@ -1,0 +1,85 @@
+PR #2646  target=linux  overall=bug_confirmed
+Spec: KVM does not manage henvcfg.SSE for guests and does not re-read hardware-enforced senvcfg.SSE after ONE_REG SET, so a VMM can observe a stale SSE=1 while the guest's VU-mode shadow stack is actually disabled by read-only-zero chaining — guest userspace runs without the CFI it expects
+Violation: In the Linux kernel, when KVM writes the guest's senvcfg CSR via ONE_REG or directly swaps it into hardware during vcpu_enter_exit, but the hypervisor has henvcfg.SSE=0 (the current default since kvm_riscv_vcpu_setup_config never sets SSE), the spec mandates senvcfg.SSE is 'read-only zero' — meaning the hardware ignores writes and forces reads to return 0. If KVM's ONE_REG GET path (kvm_riscv_vcpu_general_get_csr) returns the in-memory csr->senvcfg value written by the VMM without re-reading the hardware-enforced effective value, the VMM observes a stale SSE=1 while the guest VU-mode actually has xSSE=0, causing guest userspace to silently run without shadow stack CFI protection it believes is active.
+Consequence: function_loss
+Pattern: csr_write(CSR_SENVCFG|CSR_HENVCFG).*ENVCFG_SSE|->senvcfg.*=|henvcfg.*SSE|kvm_riscv_vcpu_general_get_csr.*senvcfg|kvm_riscv_vcpu_setup_config.*henvcfg
+------------------------------------------------------------
+[bug_confirmed] arch/riscv/kvm/vcpu.c:543-576  kvm_riscv_vcpu_setup_config
+  henvcfg.SSE (ENVCFG_SSE, bit 3) is never set. Every other envcfg feature (PBMTE, STCE, CBIE, CBCFE, CBZE, ADUE) is conditionally enabled based on ISA extension availability, but ZICFISS (RISCV_ISA_EXT_ZICFISS=105) is never checked and ENVCFG_SSE is never OR'd into cfg->henvcfg. Per the Zicfiss privileged spec, when henvcfg.SSE=0, senvcfg.SSE is read-only zero — all VS-mode writes to SSR/SSP are silently dropped. This means guest VU-mode shadow stack CFI is unconditionally non-functional regardless of VMM intent.
+  | static void kvm_riscv_vcpu_setup_config(struct kvm_vcpu *vcpu)
+  | {
+  |     ...
+  |     if (riscv_isa_extension_available(isa, SVADU) &&
+  |         !riscv_isa_extension_available(isa, SVADE))
+  |         cfg->henvcfg |= ENVCFG_ADUE;
+  |     /* MISSING: if (riscv_isa_extension_available(isa, ZICFISS))
+  |                 cfg->henvcfg |= ENVCFG_SSE; */
+  |     ...
+  | }
+
+[bug_confirmed] arch/riscv/kvm/vcpu_onereg.c:535-558  kvm_riscv_vcpu_general_set_csr
+  ONE_REG SET path for senvcfg writes reg_val into csr->senvcfg unconditionally with zero bit masking. A VMM can set ENVCFG_SSE (bit 3) in senvcfg via KVM_SET_ONE_REG, KVM accepts and stores it in vcpu->arch.guest_csr.senvcfg, then swap_in_guest_state (vcpu.c:756) writes it to hardware CSR_SENVCFG where it is silently dropped because henvcfg.SSE=0. The stored value creates a false impression that SSE is active.
+  | static int kvm_riscv_vcpu_general_set_csr(struct kvm_vcpu *vcpu,
+  |                       unsigned long reg_num,
+  |                       unsigned long reg_val)
+  | {
+  |     ...
+  |     ((unsigned long *)csr)[reg_num] = reg_val;
+  |     /* NO masking: ENVCFG_SSE is silently accepted */
+  |     ...
+  | }
+
+[potential_risk] arch/riscv/kvm/vcpu_onereg.c:513-533  kvm_riscv_vcpu_general_get_csr
+  ONE_REG GET for senvcfg returns the in-memory csr->senvcfg value directly without re-reading the hardware CSR to verify the hardware-enforced effective value. Before the first VCPU run, if the VMM wrote SSE=1 into senvcfg, GET returns SSE=1 — deceiving the VMM into believing shadow stack is active when henvcfg.SSE=0 guarantees it is not. After the first guest run, swap_in_host_state (vcpu.c:770) overwrites csr->senvcfg with the hardware read-back value (SSE=0), so the window is self-correcting but the pre-run inconsistency can cause VMMs to misconfigure guest CFI.
+  | static int kvm_riscv_vcpu_general_get_csr(struct kvm_vcpu *vcpu,
+  |                       unsigned long reg_num,
+  |                       unsigned long *out_val)
+  | {
+  |     ...
+  |     } else
+  |         *out_val = ((unsigned long *)csr)[reg_num];
+  |     /* Returns in-memory value, not hardware-effective value */
+  |     return 0;
+  | }
+
+[bug_confirmed] arch/riscv/kvm/vcpu.c:578-639  kvm_arch_vcpu_load
+  kvm_arch_vcpu_load writes cfg->henvcfg (with SSE=0) to CSR_HENVCFG on every VCPU load, making the read-only-zero enforcement on senvcfg.SSE permanent for the guest's lifetime. Both the non-NACL path (line 615: csr_write(CSR_HENVCFG, cfg->henvcfg)) and the NACL path (line 596: nacl_csr_write(nsh, CSR_HENVCFG, cfg->henvcfg)) write henvcfg.SSE=0. There is no path that ever sets this bit.
+  | void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+  | {
+  |     ...
+  |     csr_write(CSR_HENVCFG, cfg->henvcfg);
+  |     /* cfg->henvcfg.SSE is always 0 — setup_config never sets it */
+  |     if (IS_ENABLED(CONFIG_32BIT))
+  |         csr_write(CSR_HENVCFGH, cfg->henvcfg >> 32);
+  |     ...
+  | }
+
+[potential_risk] arch/riscv/kvm/vcpu.c:749-761  kvm_riscv_vcpu_swap_in_guest_state
+  swap_in_guest_state does csr_swap(CSR_SENVCFG, csr->senvcfg) at line 756, writing the guest's stored senvcfg into hardware unconditionally. If csr->senvcfg has SSE=1 (set by VMM via ONE_REG), the write to CSR_SENVCFG is attempted but the hardware silently drops the SSE bit because henvcfg.SSE=0. The host_senvcfg is correctly saved. This is the point where the VMM's intent (SSE=1) silently diverges from hardware reality (SSE=0).
+  | static __always_inline void kvm_riscv_vcpu_swap_in_guest_state(struct kvm_vcpu *vcpu)
+  | {
+  |     ...
+  |     vcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);
+  |     /* SSE bit silently dropped by hardware if henvcfg.SSE=0 */
+  |     ...
+  | }
+
+[potential_risk] arch/riscv/kvm/vcpu_sbi_fwft.c:66-73  kvm_sbi_fwft_regnum_to_feature
+  SBI_FWFT_SHADOW_STACK (value 0x2) is listed in kvm_fwft_defined_features[] (line 69) but has no entry in the features[] dispatch table (lines 218-239). Only MISALIGNED_EXC_DELEG and POINTER_MASKING_PMLEN have handlers. Even if a future patch were to add FWFT-based henvcfg.SSE control, the SBI FWFT dispatch path for shadow stack is currently missing, providing no alternative mechanism to enable guest SSE.
+  | static const enum sbi_fwft_feature_t kvm_fwft_defined_features[] = {
+  |     SBI_FWFT_MISALIGNED_EXC_DELEG,
+  |     SBI_FWFT_LANDING_PAD,
+  |     SBI_FWFT_SHADOW_STACK,   /* defined but no handler in features[] */
+  |     SBI_FWFT_DOUBLE_TRAP,
+  |     SBI_FWFT_PTE_AD_HW_UPDATING,
+  |     SBI_FWFT_POINTER_MASKING_PMLEN,
+  | };
+
+[potential_risk] arch/riscv/kvm/vcpu_onereg.c:28-109  kvm_isa_ext_arr
+  ZICFISS is absent from kvm_isa_ext_arr[], the KVM ISA extension passthrough table. RISCV_ISA_EXT_ZICFISS (=105) is defined in arch/riscv/include/asm/hwcap.h for host use, and the host kernel correctly uses it in usercfi.c:set_shstk_status() to configure ENVCFG_SSE. But KVM never maps it, never advertises it to guests via KVM_RISCV_ISA_EXT_*, and therefore kvm_riscv_vcpu_setup_config has no way to discover that the hardware supports Zicfiss. Even a fix to set ENVCFG_SSE would need the extension to be discoverable.
+  | static const struct kvm_isa_ext_info kvm_isa_ext_arr[] = {
+  |     /* 67 entries, none for ZICFISS */
+  |     ...
+  | };
+  | /* RISCV_ISA_EXT_ZICFISS (=105) exists in hwcap.h but KVM never maps it */
+

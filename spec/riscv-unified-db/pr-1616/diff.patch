@@ -1,0 +1,3196 @@
+diff --git a/.github/workflows/regress.yml b/.github/workflows/regress.yml
+index 95eb1ef3d7..61a6757227 100644
+--- a/.github/workflows/regress.yml
++++ b/.github/workflows/regress.yml
+@@ -426,6 +426,15 @@ jobs:
+       uses: "./.github/actions/mise-setup"
+     - name: Generate extension PDF
+       run: "./do gen:profile_release_pdf[RVI20]"
++  regress-profile-strict-cfg:
++    runs-on: ubuntu-latest
++    steps:
++    - name: Clone Github Repo Action
++      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++    - name: Set up mise environment
++      uses: "./.github/actions/mise-setup"
++    - name: Check that profile configs are up to date
++      run: "./bin/chore gen -f profile-cfgs"
+   regress-udb-unit-test:
+     runs-on: ubuntu-latest
+     steps:
+@@ -832,6 +841,7 @@ jobs:
+     - regress-cfg-manual
+     - regress-gen-ext-pdf
+     - regress-gen-profile
++    - regress-profile-strict-cfg
+     - regress-udb-unit-test
+     - regress-gen-go
+     - regress-gen-c-header
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index c582e23ad6..44b7a82f21 100755
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -24,7 +24,7 @@ repos:
+       - id: trailing-whitespace
+         stages: [pre-commit]
+         args: [--markdown-linebreak-ext=md]
+-        exclude: \.svg$|tests/data/golden/.*
++        exclude: \.svg$|cfgs/profile/.*\.yaml$|tests/data/golden/.*
+       - id: mixed-line-ending
+         args: ["--fix=lf"]
+         exclude: ^.*\.bat$
+diff --git a/Rakefile b/Rakefile
+index 26ced1402b..59100c5976 100755
+--- a/Rakefile
++++ b/Rakefile
+@@ -62,7 +62,7 @@ namespace :chore do
+   desc "Update golden instruction appendix"
+   task :update_golden_appendix do
+     Rake::Task["gen:instruction_appendix_adoc"].invoke
+-    sh "mv #{$root}/gen/instructions_appendix/all_instructions.adoc #{$root}/backends/instructions_appendix/all_instructions.golden.adoc"
++    sh "mv #{$root}/gen/instructions_appendix/all_instructions.adoc #{$root}/tests/golden/all_instructions.golden.adoc"
+   end
+ end
+ 
+@@ -672,7 +672,7 @@ namespace :gen do
+     exit(1)
+   end
+ 
+-  desc "Generate config files for profiles"
++  desc "Generate strict config files for profiles"
+   task :cfg do
+     cfg_arch = $resolver.cfg_arch_for("_")
+     FileUtils.mkdir_p $resolver.cfgs_path / "profile"
+@@ -688,7 +688,7 @@ namespace :gen do
+           # To regenerate, run `./do gen:cfg` in the UDB root directory
+           # The data comes from the UDB profile definitions in spec/std/isa/profile/
+ 
+-          #{YAML.dump(profile.to_config)}
++          #{YAML.dump(profile.to_strict_config)}
+         YAML
+       )
+       File.chmod(0444, path)
+diff --git a/backends/instructions_appendix/tasks.rake b/backends/instructions_appendix/tasks.rake
+index 42c74268eb..97114bd518 100755
+--- a/backends/instructions_appendix/tasks.rake
++++ b/backends/instructions_appendix/tasks.rake
+@@ -95,7 +95,7 @@ namespace :test do
+     files = {
+       golden: {
+         file: Tempfile.new("golden"),
+-        path: "#{File.dirname(__FILE__)}/all_instructions.golden.adoc"
++        path: "#{$root}/tests/golden/all_instructions.golden.adoc"
+       },
+       output: {
+         file: Tempfile.new("output"),
+@@ -120,8 +120,8 @@ namespace :test do
+       warn <<~MSG
+         The golden output for the instruction appendix has changed. If this is expected, run
+ 
+-        cp gen/instructions_appendix/all_instructions.adoc backends/instructions_appendix/all_instructions.golden.adoc
+-        git add backends/instructions_appendix/all_instructions.golden.adoc
++        cp gen/instructions_appendix/all_instructions.adoc tests/golden/all_instructions.golden.adoc
++        git add tests/golden/all_instructions.golden.adoc
+ 
+         And commit
+       MSG
+diff --git a/bin/chore b/bin/chore
+index 519b8342a1..ff5fb9e53c 100755
+--- a/bin/chore
++++ b/bin/chore
+@@ -107,6 +107,7 @@ gen_subcmd_usage() {
+   echo "  all:           Generate all development artifacts"
+   echo "  gem-versions:  Sync inter-gem version pins in gemspecs and Gemfile.lock files"
+   echo "                 (no version bumping; use 'chore update gem-versions' to also bump)"
++  echo "  profile-cfgs:  Generate strict config files for profiles (cfgs/profile/)"
+   echo "  vscode-idl:    Generate tools/vscode/idl/syntaxes/idl.tmLanguage.json"
+   echo "  regress:       Generate .github/workflows/regress.yml"
+   echo "  ruby-type-def: Generate Ruby type signatutres"
+@@ -363,6 +364,7 @@ do_gen_all() {
+   do_gen_vscode_idl
+   do_gen_gem_versions
+   do_ruby_type_def all
++  do_gen_profile_cfgs
+   do_gen_xqci_golden
+ }
+ 
+@@ -375,6 +377,36 @@ do_gen_smoke() {
+   do_ruby_type_def all
+ }
+ 
++#
++# Generate strict config files for profiles (cfgs/profile/)
++# Returns: 0 on success, 1 if files changed (when fail_on_change=1)
++#
++do_gen_profile_cfgs() {
++  echo "Generating profile config files in cfgs/profile/"
++  local cfgs_dir="${UDB_ROOT}/cfgs/profile"
++
++  # Capture the state before generation
++  local before_hash=""
++  if [ -d "$cfgs_dir" ]; then
++    before_hash=$(find "$cfgs_dir" -type f -name "*.yaml" -exec md5sum {} \; | sort | md5sum | awk '{print $1}')
++  fi
++
++  "${UDB_ROOT}"/bin/bundle exec rake gen:cfg
++
++  if [ $fail_on_change -eq 1 ]; then
++    local after_hash=""
++    if [ -d "$cfgs_dir" ]; then
++      after_hash=$(find "$cfgs_dir" -type f -name "*.yaml" -exec md5sum {} \; | sort | md5sum | awk '{print $1}')
++    fi
++
++    if [ "$before_hash" != "$after_hash" ]; then
++      echo "[ERROR]: Profile config files changed during generation"
++      return 1
++    fi
++  fi
++  return 0
++}
++
+ #
+ # Generate Xqci golden adoc file
+ #
+@@ -586,6 +618,11 @@ case "$subcommand" in
+         do_gen_regress
+         exit 0
+         ;;
++      profile-cfgs )
++        do_gen_profile_cfgs
++        exit_code=$?
++        exit $exit_code
++        ;;
+       xqci )
+         do_gen_xqci_golden
+         exit 0
+diff --git a/cfgs/example_rv64_with_overlay.yaml b/cfgs/example_rv64_with_overlay.yaml
+index e3c7d01a1b..ab8f76e2bc 100644
+--- a/cfgs/example_rv64_with_overlay.yaml
++++ b/cfgs/example_rv64_with_overlay.yaml
+@@ -46,8 +46,8 @@ implemented_extensions:
+   - [Ssaia, "1.0.0"]
+   - [Ssccfg, "1.0.0"]
+   - [Sstc, "1.0.0"]
+-  - [Sv39, "1.12.0"]
+-  - [Sv48, "1.12.0"]
++  - [Sv39, "1.0"]
++  - [Sv48, "1.0"]
+   - [Zicboz, "1.0.0"]
+   - [Zicbom, "1.0.0"]
+ 
+diff --git a/cfgs/profile/README.adoc b/cfgs/profile/README.adoc
+new file mode 100644
+index 0000000000..aa4b639cfa
+--- /dev/null
++++ b/cfgs/profile/README.adoc
+@@ -0,0 +1,10 @@
++= Profile Configurations
++
++Configs in `cfgs/profile` are generated from the specifications in `spec/std/isa/profile`.
++They are partial configurations that represent a profile-compliant implementation.
++
++The profile configurations are _strict_.
++That is, they list the extension/params listed in the profile spec,
++plus any extensions/params that are required transitively (e.g., A requires Zaamo and Zalrsc)
++
++The strict configs are compatible with non-strict configs (simply more expressive).
+diff --git a/cfgs/profile/RVA20S64.yaml b/cfgs/profile/RVA20S64.yaml
+index 96d747af49..c6c272b58a 100644
+--- a/cfgs/profile/RVA20S64.yaml
++++ b/cfgs/profile/RVA20S64.yaml
+@@ -10,23 +10,24 @@ kind: architecture configuration
+ type: partially configured
+ name: RVA20S64
+ description:
+-params:
+-  MXLEN: 64
++params: {}
+ mandatory_extensions:
+ - name: A
+   version: "~> 2.1"
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: I
+   version: "~> 2.1"
+ - name: M
+   version: "~> 2.0"
+ - name: S
+   version: "~> 1.11"
++- name: Sm
++  version: "~> 1.12.0"
+ - name: Ssccptr
+   version: "~> 1.0"
+ - name: Sstvala
+@@ -34,7 +35,7 @@ mandatory_extensions:
+ - name: Sstvecd
+   version: "~> 1.0"
+ - name: Sv39
+-  version: "~> 1.11"
++  version: "~> 1.0"
+ - name: Svade
+   version: "~> 1.0"
+ - name: Svbare
+@@ -43,6 +44,14 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Za128rs
+   version: "~> 1.0"
++- name: Zaamo
++  version: "~> 1.0.0"
++- name: Zalrsc
++  version: "~> 1.0.0"
++- name: Zca
++  version: "~> 1.0.0"
++- name: Zcd
++  version: "~> 1.0.0"
+ - name: Ziccamoa
+   version: "~> 1.0"
+ - name: Ziccif
+@@ -61,7 +70,7 @@ non_mandatory_extensions:
+ - name: Ssu64xl
+   version: "~> 1.0"
+ - name: Sv48
+-  version: "~> 1.11"
++  version: "~> 1.0"
+ - name: Zca
+   version: "~> 1.0"
+ - name: Zcd
+@@ -71,3 +80,14 @@ non_mandatory_extensions:
+ - name: Zihpm
+   version: "~> 2.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: S_MODE_ENDIANNESS
++      equal: little
++    - name: SXLEN
++      includes: 64
++    - name: UXLEN
++      includes: 64
+diff --git a/cfgs/profile/RVA20U64.yaml b/cfgs/profile/RVA20U64.yaml
+index 7095c81b8b..31f7a8e0aa 100644
+--- a/cfgs/profile/RVA20U64.yaml
++++ b/cfgs/profile/RVA20U64.yaml
+@@ -10,17 +10,16 @@ kind: architecture configuration
+ type: partially configured
+ name: RVA20U64
+ description:
+-params:
+-  MXLEN: 64
++params: {}
+ mandatory_extensions:
+ - name: A
+   version: "~> 2.1"
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: I
+   version: "~> 2.1"
+ - name: M
+@@ -29,6 +28,14 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Za128rs
+   version: "~> 1.0"
++- name: Zaamo
++  version: "~> 1.0.0"
++- name: Zalrsc
++  version: "~> 1.0.0"
++- name: Zca
++  version: "~> 1.0.0"
++- name: Zcd
++  version: "~> 1.0.0"
+ - name: Ziccamoa
+   version: "~> 1.0"
+ - name: Ziccif
+@@ -51,3 +58,10 @@ non_mandatory_extensions:
+ - name: Zihpm
+   version: "~> 2.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: UXLEN
++      includes: 64
+diff --git a/cfgs/profile/RVA22S64.yaml b/cfgs/profile/RVA22S64.yaml
+index 159557a8df..1829663314 100644
+--- a/cfgs/profile/RVA22S64.yaml
++++ b/cfgs/profile/RVA22S64.yaml
+@@ -10,8 +10,7 @@ kind: architecture configuration
+ type: partially configured
+ name: RVA22S64
+ description:
+-params:
+-  MXLEN: 64
++params: {}
+ mandatory_extensions:
+ - name: A
+   version: "~> 2.1"
+@@ -20,15 +19,17 @@ mandatory_extensions:
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: I
+   version: "~> 2.1"
+ - name: M
+   version: "~> 2.0"
+ - name: S
+   version: "~> 1.12"
++- name: Sm
++  version: "~> 1.12.0"
+ - name: Ssccptr
+   version: "~> 1.0"
+ - name: Sscounterenw
+@@ -38,7 +39,7 @@ mandatory_extensions:
+ - name: Sstvecd
+   version: "~> 1.0"
+ - name: Sv39
+-  version: "~> 1.12"
++  version: "~> 1.0"
+ - name: Svade
+   version: "~> 1.0"
+ - name: Svbare
+@@ -53,12 +54,20 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Za64rs
+   version: "~> 1.0"
++- name: Zaamo
++  version: "~> 1.0.0"
++- name: Zalrsc
++  version: "~> 1.0.0"
+ - name: Zba
+   version: "~> 1.0"
+ - name: Zbb
+   version: "~> 1.0"
+ - name: Zbs
+   version: "~> 1.0"
++- name: Zca
++  version: "~> 1.0.0"
++- name: Zcd
++  version: "~> 1.0.0"
+ - name: Zfhmin
+   version: "~> 1.0"
+ - name: Zic64b
+@@ -99,9 +108,9 @@ non_mandatory_extensions:
+ - name: Ssu64xl
+   version: "~> 1.0"
+ - name: Sv48
+-  version: "~> 1.12"
++  version: "~> 1.0"
+ - name: Sv57
+-  version: "~> 1.12"
++  version: "~> 1.0"
+ - name: Svnapot
+   version: "~> 1.0"
+ - name: V
+@@ -121,3 +130,14 @@ non_mandatory_extensions:
+ - name: Zks
+   version: "~> 1.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: S_MODE_ENDIANNESS
++      equal: little
++    - name: SXLEN
++      includes: 64
++    - name: UXLEN
++      includes: 64
+diff --git a/cfgs/profile/RVA22U64.yaml b/cfgs/profile/RVA22U64.yaml
+index de376ca7b9..6bdd281188 100644
+--- a/cfgs/profile/RVA22U64.yaml
++++ b/cfgs/profile/RVA22U64.yaml
+@@ -10,8 +10,7 @@ kind: architecture configuration
+ type: partially configured
+ name: RVA22U64
+ description:
+-params:
+-  MXLEN: 64
++params: {}
+ mandatory_extensions:
+ - name: A
+   version: "~> 2.1"
+@@ -20,9 +19,9 @@ mandatory_extensions:
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: I
+   version: "~> 2.1"
+ - name: M
+@@ -33,12 +32,20 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Za64rs
+   version: "~> 1.0"
++- name: Zaamo
++  version: "~> 1.0.0"
++- name: Zalrsc
++  version: "~> 1.0.0"
+ - name: Zba
+   version: "~> 1.0"
+ - name: Zbb
+   version: "~> 1.0"
+ - name: Zbs
+   version: "~> 1.0"
++- name: Zca
++  version: "~> 1.0.0"
++- name: Zcd
++  version: "~> 1.0.0"
+ - name: Zfhmin
+   version: "~> 1.0"
+ - name: Zic64b
+@@ -83,3 +90,10 @@ non_mandatory_extensions:
+ - name: Zks
+   version: "~> 1.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: UXLEN
++      includes: 64
+diff --git a/cfgs/profile/RVA23M64.yaml b/cfgs/profile/RVA23M64.yaml
+deleted file mode 100644
+index b5c527ed84..0000000000
+--- a/cfgs/profile/RVA23M64.yaml
++++ /dev/null
+@@ -1,159 +0,0 @@
+-# SPDX-License-Identifier: CC0-1.0
+-
+-# AUTO-GENERATED FILE. DO NOT EDIT
+-# To regenerate, run `./do gen:cfg` in the UDB root directory
+-# The data comes from the UDB profile definitions in spec/std/isa/profile/
+-
+----
+-"$schema": config_schema.json#
+-kind: architecture configuration
+-type: partially configured
+-name: RVA23M64
+-description:
+-params:
+-  MXLEN: 64
+-mandatory_extensions:
+-- name: A
+-  version: "~> 2.1"
+-- name: B
+-  version: "~> 1.0.0"
+-- name: C
+-  version: "~> 2.0"
+-- name: D
+-  version: "~> 2.2"
+-- name: F
+-  version: "~> 2.2"
+-- name: I
+-  version: "~> 2.1"
+-- name: M
+-  version: "~> 2.0"
+-- name: S
+-  version: "~> 1.13"
+-- name: Sha
+-  version: "~> 1.0"
+-- name: Sm
+-  version: "~> 1.13"
+-- name: Ssccptr
+-  version: "~> 1.0"
+-- name: Sscofpmf
+-  version: "~> 1.0"
+-- name: Sscounterenw
+-  version: "~> 1.0"
+-- name: Ssnpm
+-  version: "~> 1.0"
+-- name: Sstc
+-  version: "~> 1.0"
+-- name: Sstvala
+-  version: "~> 1.0"
+-- name: Sstvecd
+-  version: "~> 1.0"
+-- name: Ssu64xl
+-  version: "~> 1.0"
+-- name: Supm
+-  version: "~> 1.0"
+-- name: Sv39
+-  version: "~> 1.0"
+-- name: Svade
+-  version: "~> 1.0"
+-- name: Svbare
+-  version: "~> 1.0"
+-- name: Svinval
+-  version: "~> 1.0"
+-- name: Svnapot
+-  version: "~> 1.0"
+-- name: Svpbmt
+-  version: "~> 1.0"
+-- name: U
+-  version: "~> 1.0"
+-- name: V
+-  version: "~> 1.0"
+-- name: Za128rs
+-  version: "~> 1.0"
+-- name: Za64rs
+-  version: "~> 1.0"
+-- name: Zawrs
+-  version: "~> 1.0"
+-- name: Zba
+-  version: "~> 1.0"
+-- name: Zbb
+-  version: "~> 1.0"
+-- name: Zbs
+-  version: "~> 1.0"
+-- name: Zcb
+-  version: "~> 1.0"
+-- name: Zcmop
+-  version: "~> 1.0"
+-- name: Zfa
+-  version: "~> 1.0"
+-- name: Zfhmin
+-  version: "~> 1.0"
+-- name: Zic64b
+-  version: "= 1.0"
+-- name: Zicbom
+-  version: "~> 1.0"
+-- name: Zicbop
+-  version: "~> 1.0"
+-- name: Zicboz
+-  version: "~> 1.0"
+-- name: Ziccamoa
+-  version: "~> 1.0"
+-- name: Ziccif
+-  version: "~> 1.0"
+-- name: Zicclsm
+-  version: "~> 1.0"
+-- name: Ziccrse
+-  version: "~> 1.0"
+-- name: Zicntr
+-  version: "~> 2.0"
+-- name: Zicond
+-  version: "~> 1.0"
+-- name: Zicsr
+-  version: "~> 2.0"
+-- name: Zifencei
+-  version: "~> 1.0"
+-- name: Zihintntl
+-  version: "~> 1.0"
+-- name: Zihintpause
+-  version: "~> 2.0"
+-- name: Zihpm
+-  version: "~> 2.0"
+-- name: Zimop
+-  version: "~> 1.0"
+-- name: Zkt
+-  version: "~> 1.0"
+-- name: Zvbb
+-  version: "~> 1.0"
+-- name: Zvfhmin
+-  version: "~> 1.0"
+-- name: Zvkt
+-  version: "~> 1.0"
+-non_mandatory_extensions:
+-- name: Sdtrig
+-  version: "~> 1.0"
+-- name: Sspm
+-  version: "~> 1.0"
+-- name: Ssstrict
+-  version: "~> 1.0"
+-- name: Sv48
+-  version: "~> 1.13"
+-- name: Sv57
+-  version: "~> 1.13"
+-- name: Svadu
+-  version: "~> 1.0"
+-- name: Svvptc
+-  version: "~> 1.0"
+-- name: Zca
+-  version: "~> 1.0"
+-- name: Zcd
+-  version: "~> 1.0"
+-- name: Zcf
+-  version: "~> 1.0"
+-- name: Zfh
+-  version: "~> 1.0"
+-- name: Zkn
+-  version: "~> 1.0"
+-- name: Zkr
+-  version: "~> 1.0"
+-- name: Zks
+-  version: "~> 1.0"
+-additional_extensions: true
+diff --git a/cfgs/profile/RVA23S64.yaml b/cfgs/profile/RVA23S64.yaml
+index 46717e2877..f4cb588a0e 100644
+--- a/cfgs/profile/RVA23S64.yaml
++++ b/cfgs/profile/RVA23S64.yaml
+@@ -10,8 +10,7 @@ kind: architecture configuration
+ type: partially configured
+ name: RVA23S64
+ description:
+-params:
+-  MXLEN: 64
++params: {}
+ mandatory_extensions:
+ - name: A
+   version: "~> 2.1"
+@@ -20,9 +19,11 @@ mandatory_extensions:
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
++- name: H
++  version: "~> 1.0"
+ - name: I
+   version: "~> 2.1"
+ - name: M
+@@ -31,6 +32,20 @@ mandatory_extensions:
+   version: "~> 1.13"
+ - name: Sha
+   version: "~> 1.0"
++- name: Shcounterenw
++  version: "~> 1.0.0"
++- name: Shgatpa
++  version: "~> 1.0.0"
++- name: Shtvala
++  version: "~> 1.0.0"
++- name: Shvsatpa
++  version: "~> 1.0.0"
++- name: Shvstvala
++  version: "~> 1.0.0"
++- name: Shvstvecd
++  version: "~> 1.0.0"
++- name: Sm
++  version: "~> 1.13.0"
+ - name: Ssccptr
+   version: "~> 1.0"
+ - name: Sscofpmf
+@@ -39,6 +54,8 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Ssnpm
+   version: "~> 1.0"
++- name: Ssstateen
++  version: "~> 1.0"
+ - name: Sstc
+   version: "~> 1.0"
+ - name: Sstvala
+@@ -69,6 +86,10 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Za64rs
+   version: "~> 1.0"
++- name: Zaamo
++  version: "~> 1.0.0"
++- name: Zalrsc
++  version: "~> 1.0.0"
+ - name: Zawrs
+   version: "~> 1.0"
+ - name: Zba
+@@ -77,8 +98,12 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Zbs
+   version: "~> 1.0"
++- name: Zca
++  version: "~> 1.0.0"
+ - name: Zcb
+   version: "~> 1.0"
++- name: Zcd
++  version: "~> 1.0.0"
+ - name: Zcmop
+   version: "~> 1.0"
+ - name: Zfa
+@@ -108,7 +133,7 @@ mandatory_extensions:
+ - name: Zicsr
+   version: "~> 2.0"
+ - name: Zifencei
+-  version: "~> 1.0"
++  version: "~> 2.0"
+ - name: Zihintntl
+   version: "~> 1.0"
+ - name: Zihintpause
+@@ -121,10 +146,28 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Zvbb
+   version: "~> 1.0"
++- name: Zve32f
++  version: "~> 1.0.0"
++- name: Zve32x
++  version: "~> 1.0.0"
++- name: Zve64d
++  version: "~> 1.0.0"
++- name: Zve64f
++  version: "~> 1.0.0"
++- name: Zve64x
++  version: "~> 1.0.0"
+ - name: Zvfhmin
+   version: "~> 1.0"
++- name: Zvkb
++  version: "~> 1.0.0"
+ - name: Zvkt
+   version: "~> 1.0"
++- name: Zvl128b
++  version: "~> 1.0.0"
++- name: Zvl32b
++  version: "~> 1.0.0"
++- name: Zvl64b
++  version: "~> 1.0.0"
+ non_mandatory_extensions:
+ - name: Sdtrig
+   version: "~> 1.0"
+@@ -133,9 +176,9 @@ non_mandatory_extensions:
+ - name: Ssstrict
+   version: "~> 1.0"
+ - name: Sv48
+-  version: "~> 1.13"
++  version: "~> 1.0"
+ - name: Sv57
+-  version: "~> 1.13"
++  version: "~> 1.0"
+ - name: Svadu
+   version: "~> 1.0"
+ - name: Svvptc
+@@ -149,3 +192,14 @@ non_mandatory_extensions:
+ - name: Zkr
+   version: "~> 1.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: S_MODE_ENDIANNESS
++      equal: little
++    - name: SXLEN
++      includes: 64
++    - name: UXLEN
++      includes: 64
+diff --git a/cfgs/profile/RVA23U64.yaml b/cfgs/profile/RVA23U64.yaml
+index 02a82a62c6..045aa0055e 100644
+--- a/cfgs/profile/RVA23U64.yaml
++++ b/cfgs/profile/RVA23U64.yaml
+@@ -10,8 +10,7 @@ kind: architecture configuration
+ type: partially configured
+ name: RVA23U64
+ description:
+-params:
+-  MXLEN: 64
++params: {}
+ mandatory_extensions:
+ - name: A
+   version: "~> 2.1"
+@@ -20,9 +19,9 @@ mandatory_extensions:
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: I
+   version: "~> 2.1"
+ - name: M
+@@ -37,6 +36,10 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Za64rs
+   version: "~> 1.0"
++- name: Zaamo
++  version: "~> 1.0.0"
++- name: Zalrsc
++  version: "~> 1.0.0"
+ - name: Zawrs
+   version: "~> 1.0"
+ - name: Zba
+@@ -45,8 +48,12 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Zbs
+   version: "~> 1.0"
++- name: Zca
++  version: "~> 1.0.0"
+ - name: Zcb
+   version: "~> 1.0"
++- name: Zcd
++  version: "~> 1.0.0"
+ - name: Zcmop
+   version: "~> 1.0"
+ - name: Zfa
+@@ -87,10 +94,28 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Zvbb
+   version: "~> 1.0"
++- name: Zve32f
++  version: "~> 1.0.0"
++- name: Zve32x
++  version: "~> 1.0.0"
++- name: Zve64d
++  version: "~> 1.0.0"
++- name: Zve64f
++  version: "~> 1.0.0"
++- name: Zve64x
++  version: "~> 1.0.0"
+ - name: Zvfhmin
+   version: "~> 1.0"
++- name: Zvkb
++  version: "~> 1.0.0"
+ - name: Zvkt
+   version: "~> 1.0"
++- name: Zvl128b
++  version: "~> 1.0.0"
++- name: Zvl32b
++  version: "~> 1.0.0"
++- name: Zvl64b
++  version: "~> 1.0.0"
+ non_mandatory_extensions:
+ - name: Zabha
+   version: "~> 1.0"
+@@ -129,3 +154,10 @@ non_mandatory_extensions:
+ - name: Zvksg
+   version: "~> 1.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: UXLEN
++      includes: 64
+diff --git a/cfgs/profile/RVB23M64.yaml b/cfgs/profile/RVB23M64.yaml
+deleted file mode 100644
+index fe3cb7fe79..0000000000
+--- a/cfgs/profile/RVB23M64.yaml
++++ /dev/null
+@@ -1,149 +0,0 @@
+-# SPDX-License-Identifier: CC0-1.0
+-
+-# AUTO-GENERATED FILE. DO NOT EDIT
+-# To regenerate, run `./do gen:cfg` in the UDB root directory
+-# The data comes from the UDB profile definitions in spec/std/isa/profile/
+-
+----
+-"$schema": config_schema.json#
+-kind: architecture configuration
+-type: partially configured
+-name: RVB23M64
+-description:
+-params:
+-  MXLEN: 64
+-mandatory_extensions:
+-- name: A
+-  version: "~> 2.1"
+-- name: B
+-  version: "~> 1.0.0"
+-- name: C
+-  version: "~> 2.0"
+-- name: D
+-  version: "~> 2.2"
+-- name: F
+-  version: "~> 2.2"
+-- name: I
+-  version: "~> 2.1"
+-- name: M
+-  version: "~> 2.0"
+-- name: S
+-  version: "~> 1.13"
+-- name: Sm
+-  version: "~> 1.13"
+-- name: Ssccptr
+-  version: "~> 1.0"
+-- name: Sscofpmf
+-  version: "~> 1.0"
+-- name: Sscounterenw
+-  version: "~> 1.0"
+-- name: Sstc
+-  version: "~> 1.0"
+-- name: Sstvala
+-  version: "~> 1.0"
+-- name: Sstvecd
+-  version: "~> 1.0"
+-- name: Ssu64xl
+-  version: "~> 1.0"
+-- name: Sv39
+-  version: "~> 1.0"
+-- name: Svade
+-  version: "~> 1.0"
+-- name: Svbare
+-  version: "~> 1.0"
+-- name: Svinval
+-  version: "~> 1.0"
+-- name: Svnapot
+-  version: "~> 1.0"
+-- name: Svpbmt
+-  version: "~> 1.0"
+-- name: U
+-  version: "~> 1.0"
+-- name: Za128rs
+-  version: "~> 1.0"
+-- name: Za64rs
+-  version: "~> 1.0"
+-- name: Zawrs
+-  version: "~> 1.0"
+-- name: Zba
+-  version: "~> 1.0"
+-- name: Zbb
+-  version: "~> 1.0"
+-- name: Zbs
+-  version: "~> 1.0"
+-- name: Zcb
+-  version: "~> 1.0"
+-- name: Zcmop
+-  version: "~> 1.0"
+-- name: Zfa
+-  version: "~> 1.0"
+-- name: Zic64b
+-  version: "= 1.0"
+-- name: Zicbom
+-  version: "~> 1.0"
+-- name: Zicbop
+-  version: "~> 1.0"
+-- name: Zicboz
+-  version: "~> 1.0"
+-- name: Ziccamoa
+-  version: "~> 1.0"
+-- name: Ziccif
+-  version: "~> 1.0"
+-- name: Zicclsm
+-  version: "~> 1.0"
+-- name: Ziccrse
+-  version: "~> 1.0"
+-- name: Zicntr
+-  version: "~> 2.0"
+-- name: Zicond
+-  version: "~> 1.0"
+-- name: Zicsr
+-  version: "~> 2.0"
+-- name: Zifencei
+-  version: "~> 1.0"
+-- name: Zihintntl
+-  version: "~> 1.0"
+-- name: Zihintpause
+-  version: "~> 2.0"
+-- name: Zihpm
+-  version: "~> 2.0"
+-- name: Zimop
+-  version: "~> 1.0"
+-- name: Zkt
+-  version: "~> 1.0"
+-non_mandatory_extensions:
+-- name: Sdtrig
+-  version: "~> 1.0"
+-- name: Sha
+-  version: "~> 1.0"
+-- name: Ssnpm
+-  version: "~> 1.0"
+-- name: Sspm
+-  version: "~> 1.0"
+-- name: Ssstrict
+-  version: "~> 1.0"
+-- name: Sv48
+-  version: "~> 1.13"
+-- name: Sv57
+-  version: "~> 1.13"
+-- name: Svadu
+-  version: "~> 1.0"
+-- name: Svvptc
+-  version: "~> 1.0"
+-- name: Zca
+-  version: "~> 1.0"
+-- name: Zcd
+-  version: "~> 1.0"
+-- name: Zcf
+-  version: "~> 1.0"
+-- name: Zfh
+-  version: "~> 1.0"
+-- name: Zfhmin
+-  version: "~> 1.0"
+-- name: Zkn
+-  version: "~> 1.0"
+-- name: Zkr
+-  version: "~> 1.0"
+-- name: Zks
+-  version: "~> 1.0"
+-additional_extensions: true
+diff --git a/cfgs/profile/RVB23S64.yaml b/cfgs/profile/RVB23S64.yaml
+index 19b2da2e44..8fd277fd06 100644
+--- a/cfgs/profile/RVB23S64.yaml
++++ b/cfgs/profile/RVB23S64.yaml
+@@ -10,8 +10,7 @@ kind: architecture configuration
+ type: partially configured
+ name: RVB23S64
+ description:
+-params:
+-  MXLEN: 64
++params: {}
+ mandatory_extensions:
+ - name: A
+   version: "~> 2.1"
+@@ -20,15 +19,17 @@ mandatory_extensions:
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: I
+   version: "~> 2.1"
+ - name: M
+   version: "~> 2.0"
+ - name: S
+   version: "~> 1.13"
++- name: Sm
++  version: "~> 1.13.0"
+ - name: Ssccptr
+   version: "~> 1.0"
+ - name: Sscofpmf
+@@ -61,6 +62,10 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Za64rs
+   version: "~> 1.0"
++- name: Zaamo
++  version: "~> 1.0.0"
++- name: Zalrsc
++  version: "~> 1.0.0"
+ - name: Zawrs
+   version: "~> 1.0"
+ - name: Zba
+@@ -69,8 +74,12 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Zbs
+   version: "~> 1.0"
++- name: Zca
++  version: "~> 1.0.0"
+ - name: Zcb
+   version: "~> 1.0"
++- name: Zcd
++  version: "~> 1.0.0"
+ - name: Zcmop
+   version: "~> 1.0"
+ - name: Zfa
+@@ -98,7 +107,7 @@ mandatory_extensions:
+ - name: Zicsr
+   version: "~> 2.0"
+ - name: Zifencei
+-  version: "~> 1.0"
++  version: "~> 2.0"
+ - name: Zihintntl
+   version: "~> 1.0"
+ - name: Zihintpause
+@@ -121,9 +130,9 @@ non_mandatory_extensions:
+ - name: Ssstrict
+   version: "~> 1.0"
+ - name: Sv48
+-  version: "~> 1.13"
++  version: "~> 1.0"
+ - name: Sv57
+-  version: "~> 1.13"
++  version: "~> 1.0"
+ - name: Svadu
+   version: "~> 1.0"
+ - name: Svvptc
+@@ -145,3 +154,14 @@ non_mandatory_extensions:
+ - name: Zks
+   version: "~> 1.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: S_MODE_ENDIANNESS
++      equal: little
++    - name: SXLEN
++      includes: 64
++    - name: UXLEN
++      includes: 64
+diff --git a/cfgs/profile/RVB23U64.yaml b/cfgs/profile/RVB23U64.yaml
+index 4a10bb03fb..89123ab9bb 100644
+--- a/cfgs/profile/RVB23U64.yaml
++++ b/cfgs/profile/RVB23U64.yaml
+@@ -10,8 +10,7 @@ kind: architecture configuration
+ type: partially configured
+ name: RVB23U64
+ description:
+-params:
+-  MXLEN: 64
++params: {}
+ mandatory_extensions:
+ - name: A
+   version: "~> 2.1"
+@@ -20,9 +19,9 @@ mandatory_extensions:
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: I
+   version: "~> 2.1"
+ - name: M
+@@ -33,6 +32,10 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Za64rs
+   version: "~> 1.0"
++- name: Zaamo
++  version: "~> 1.0.0"
++- name: Zalrsc
++  version: "~> 1.0.0"
+ - name: Zawrs
+   version: "~> 1.0"
+ - name: Zba
+@@ -41,8 +44,12 @@ mandatory_extensions:
+   version: "~> 1.0"
+ - name: Zbs
+   version: "~> 1.0"
++- name: Zca
++  version: "~> 1.0.0"
+ - name: Zcb
+   version: "~> 1.0"
++- name: Zcd
++  version: "~> 1.0.0"
+ - name: Zcmop
+   version: "~> 1.0"
+ - name: Zfa
+@@ -139,3 +146,10 @@ non_mandatory_extensions:
+ - name: Zvkt
+   version: "~> 1.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: UXLEN
++      includes: 64
+diff --git a/cfgs/profile/RVI20U32.yaml b/cfgs/profile/RVI20U32.yaml
+index 360130cbba..ef5915ad83 100644
+--- a/cfgs/profile/RVI20U32.yaml
++++ b/cfgs/profile/RVI20U32.yaml
+@@ -10,8 +10,7 @@ kind: architecture configuration
+ type: partially configured
+ name: RVI20U32
+ description:
+-params:
+-  MXLEN: 32
++params: {}
+ mandatory_extensions:
+ - name: I
+   version: "~> 2.1"
+@@ -21,9 +20,9 @@ non_mandatory_extensions:
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: M
+   version: "~> 2.0"
+ - name: Zca
+@@ -39,3 +38,10 @@ non_mandatory_extensions:
+ - name: Zihpm
+   version: "~> 2.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: UXLEN
++      includes: 32
+diff --git a/cfgs/profile/RVI20U64.yaml b/cfgs/profile/RVI20U64.yaml
+index d26a4e2ce8..863df298fe 100644
+--- a/cfgs/profile/RVI20U64.yaml
++++ b/cfgs/profile/RVI20U64.yaml
+@@ -10,8 +10,7 @@ kind: architecture configuration
+ type: partially configured
+ name: RVI20U64
+ description:
+-params:
+-  MXLEN: 64
++params: {}
+ mandatory_extensions:
+ - name: I
+   version: "~> 2.1"
+@@ -21,9 +20,9 @@ non_mandatory_extensions:
+ - name: C
+   version: "~> 2.0"
+ - name: D
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: F
+-  version: "~> 2.2"
++  version: "~> 2.2.0"
+ - name: M
+   version: "~> 2.0"
+ - name: Zca
+@@ -39,3 +38,10 @@ non_mandatory_extensions:
+ - name: Zihpm
+   version: "~> 2.0"
+ additional_extensions: true
++requirements:
++  param:
++    allOf:
++    - name: U_MODE_ENDIANNESS
++      equal: little
++    - name: UXLEN
++      includes: 64
+diff --git a/cfgs/rv32-riscv-tests.yaml b/cfgs/rv32-riscv-tests.yaml
+index 930fc25fd7..70e8a619c5 100644
+--- a/cfgs/rv32-riscv-tests.yaml
++++ b/cfgs/rv32-riscv-tests.yaml
+@@ -18,7 +18,7 @@ implemented_extensions:
+   - [S, "1.11.0"]
+   - [U, "1.0.0"]
+   - [Zifencei, "2.0.0"]
+-  - [Sv32, "1.11.0"]
++  - [Sv32, "1.0"]
+   - [F, "2.2.0"]
+   - [Zcf, "1.0"]
+ 
+diff --git a/cfgs/rv32-vector.yaml b/cfgs/rv32-vector.yaml
+index 3df1e5f65a..16e64fd249 100644
+--- a/cfgs/rv32-vector.yaml
++++ b/cfgs/rv32-vector.yaml
+@@ -22,7 +22,7 @@ implemented_extensions:
+   - [S, "1.11.0"]
+   - [U, "1.0.0"]
+   - [Zifencei, "2.0.0"]
+-  - [Sv32, "1.11.0"]
++  - [Sv32, "1.0"]
+   - [V, "1.0.0"]
+   - [Zve64f, "1.0.0"]
+   - [Zve64d, "1.0.0"]
+diff --git a/cfgs/rv64-riscv-tests.yaml b/cfgs/rv64-riscv-tests.yaml
+index af0fdc33eb..a5a2ade4f2 100644
+--- a/cfgs/rv64-riscv-tests.yaml
++++ b/cfgs/rv64-riscv-tests.yaml
+@@ -17,7 +17,7 @@ implemented_extensions:
+   - [S, "1.11.0"]
+   - [U, "1.0.0"]
+   - [Zifencei, "2.0.0"]
+-  - [Sv39, "1.11.0"]
++  - [Sv39, "1.0"]
+   - [Zca, "1.0.0"]
+   - [F, "2.2.0"]
+ 
+diff --git a/cfgs/rv64-vector.yaml b/cfgs/rv64-vector.yaml
+index 4be6edc5f3..f2a0dfb920 100644
+--- a/cfgs/rv64-vector.yaml
++++ b/cfgs/rv64-vector.yaml
+@@ -19,7 +19,7 @@ implemented_extensions:
+   - [S, "1.11.0"]
+   - [U, "1.0.0"]
+   - [Zifencei, "2.0.0"]
+-  - [Sv39, "1.11.0"]
++  - [Sv39, "1.0"]
+   - [V, "1.0.0"]
+   - [F, "2.2"]
+   - [D, "2.2"]
+diff --git a/spec/std/isa/csr/mcycleh.yaml b/spec/std/isa/csr/mcycleh.yaml
+index 26551fef43..d2f336ccd7 100644
+--- a/spec/std/isa/csr/mcycleh.yaml
++++ b/spec/std/isa/csr/mcycleh.yaml
+@@ -11,7 +11,7 @@ definedBy:
+   allOf:
+     - xlen: 32
+     - extension:
+-        name: Zicntr
++        name: Sm
+ address: 0xB80
+ writable: true
+ description: |
+diff --git a/spec/std/isa/ext/A.yaml b/spec/std/isa/ext/A.yaml
+index 8f48d6ca06..5eddcc6264 100644
+--- a/spec/std/isa/ext/A.yaml
++++ b/spec/std/isa/ext/A.yaml
+@@ -19,13 +19,11 @@ versions:
+       - name: Unknown
+         email: unknown@void.segfault
+         company: Unknown
+-    requirements:
+-      extension:
+-        allOf:
+-          - name: Zaamo
+-            version: "= 1.0.0"
+-          - name: Zalrsc
+-            version: "= 1.0.0"
++requirements:
++  extension:
++    allOf:
++      - name: Zaamo
++      - name: Zalrsc
+ description: |
+ 
+   The atomic-instruction extension, named `A`, contains
+diff --git a/spec/std/isa/ext/S.yaml b/spec/std/isa/ext/S.yaml
+index efa8196b5e..df5e7ed85d 100644
+--- a/spec/std/isa/ext/S.yaml
++++ b/spec/std/isa/ext/S.yaml
+@@ -12,12 +12,24 @@ versions:
+ - version: "1.11.0"
+   state: ratified
+   ratification_date: 2019-06
++  requirements:
++    extension:
++      name: Sm
++      version: "= 1.11"
+ - version: "1.12.0"
+   state: ratified
+   ratification_date: 2021-12
++  requirements:
++    extension:
++      name: Sm
++      version: "= 1.12"
+ - version: "1.13.0"
+   state: ratified
+   ratification_date: 2024-10
++  requirements:
++    extension:
++      name: Sm
++      version: "= 1.13"
+ requirements:
+   extension:
+     name: U
+diff --git a/spec/std/isa/ext/Sv32.yaml b/spec/std/isa/ext/Sv32.yaml
+index 9f581556c1..55c2dc7417 100644
+--- a/spec/std/isa/ext/Sv32.yaml
++++ b/spec/std/isa/ext/Sv32.yaml
+@@ -10,25 +10,13 @@ long_name: 32-bit virtual address translation (3 level)
+ description: 32-bit virtual address translation (3 level)
+ type: privileged
+ versions:
+-  - version: "1.11.0"
++  - version: "1.0"
+     state: ratified
+     ratification_date: 2019-05
+-    requirements:
+-      extension:
++requirements:
++  allOf:
++    - extension:
+         name: S
+-        version: ">= 1.11"
+-  - version: "1.12.0"
+-    state: ratified
+-    ratification_date: 2021-12
+-    url: https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf
+-    requirements:
+-      extension:
+-        name: S
+-        version: ">= 1.12"
+-  - version: "1.13.0"
+-    state: ratified
+-    ratification_date: 2024-10
+-    requirements:
+-      extension:
+-        name: S
+-        version: ">= 1.13"
++    - param:
++        name: SXLEN
++        includes: 32
+diff --git a/spec/std/isa/ext/Sv39.yaml b/spec/std/isa/ext/Sv39.yaml
+index 9b06048864..78882c6821 100644
+--- a/spec/std/isa/ext/Sv39.yaml
++++ b/spec/std/isa/ext/Sv39.yaml
+@@ -10,25 +10,13 @@ long_name: 39-bit virtual address translation (3 level)
+ description: 39-bit virtual address translation (3 level)
+ type: privileged
+ versions:
+-  - version: "1.11.0"
++  - version: "1.0"
+     state: ratified
+     ratification_date: 2019-05
+-    requirements:
+-      extension:
++requirements:
++  allOf:
++    - extension:
+         name: S
+-        version: ">= 1.11"
+-  - version: "1.12.0"
+-    state: ratified
+-    ratification_date: 2021-12
+-    url: https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf
+-    requirements:
+-      extension:
+-        name: S
+-        version: ">= 1.12"
+-  - version: "1.13.0"
+-    state: ratified
+-    ratification_date: 2024-10
+-    requirements:
+-      extension:
+-        name: S
+-        version: ">= 1.13"
++    - param:
++        name: SXLEN
++        includes: 64
+diff --git a/spec/std/isa/ext/Sv48.yaml b/spec/std/isa/ext/Sv48.yaml
+index cefa2c0ce6..6c0114fd83 100644
+--- a/spec/std/isa/ext/Sv48.yaml
++++ b/spec/std/isa/ext/Sv48.yaml
+@@ -10,25 +10,9 @@ long_name: 48-bit virtual address translation (4 level)
+ description: 48-bit virtual address translation (4 level)
+ type: privileged
+ versions:
+-  - version: "1.11.0"
++  - version: "1.0"
+     state: ratified
+     ratification_date: 2019-05
+-    requirements:
+-      extension:
+-        name: Sv39
+-        version: ">= 1.11"
+-  - version: "1.12.0"
+-    state: ratified
+-    ratification_date: 2021-12
+-    url: https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf
+-    requirements:
+-      extension:
+-        name: Sv39
+-        version: ">= 1.12"
+-  - version: "1.13.0"
+-    state: ratified
+-    ratification_date: 2024-10
+-    requirements:
+-      extension:
+-        name: Sv39
+-        version: ">= 1.13"
++requirements:
++  extension:
++    name: Sv39
+diff --git a/spec/std/isa/ext/Sv57.yaml b/spec/std/isa/ext/Sv57.yaml
+index 6a19ebd8a1..b6f393fe9c 100644
+--- a/spec/std/isa/ext/Sv57.yaml
++++ b/spec/std/isa/ext/Sv57.yaml
+@@ -10,25 +10,9 @@ long_name: 57-bit virtual address translation (5 level)
+ description: 57-bit virtual address translation (5 level)
+ type: privileged
+ versions:
+-  - version: "1.11.0"
++  - version: "1.0"
+     state: ratified
+     ratification_date: unknown
+-    requirements:
+-      extension:
+-        name: Sv48
+-        version: ">= 1.11"
+-  - version: "1.12.0"
+-    state: ratified
+-    ratification_date: 2021-12
+-    url: https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf
+-    requirements:
+-      extension:
+-        name: Sv48
+-        version: ">= 1.12"
+-  - version: "1.13.0"
+-    state: ratified
+-    ratification_date: 2024-10
+-    requirements:
+-      extension:
+-        name: Sv48
+-        version: ">= 1.13"
++requirements:
++  extension:
++    name: Sv48
+diff --git a/spec/std/isa/ext/Zawrs.yaml b/spec/std/isa/ext/Zawrs.yaml
+index 4ce17136ce..a0408777be 100644
+--- a/spec/std/isa/ext/Zawrs.yaml
++++ b/spec/std/isa/ext/Zawrs.yaml
+@@ -20,6 +20,6 @@ description: |
+     accelerator device indicating completion of a job previously submitted to the device.
+ type: unprivileged
+ versions:
+-  - version: "1.0.1"
++  - version: "1.0.0"
+     state: ratified
+     ratification_date: 2022-11
+diff --git a/spec/std/isa/ext/Zihpm.yaml b/spec/std/isa/ext/Zihpm.yaml
+index 7fa1330902..4bf925aab8 100644
+--- a/spec/std/isa/ext/Zihpm.yaml
++++ b/spec/std/isa/ext/Zihpm.yaml
+@@ -13,15 +13,3 @@ versions:
+   - version: "2.0.0"
+     state: ratified
+     ratification_date: 2023-03
+-requirements:
+-  idl(): |
+-    -> (HPM_COUNTER_EN[3] || HPM_COUNTER_EN[4] || HPM_COUNTER_EN[5] ||
+-        HPM_COUNTER_EN[6] || HPM_COUNTER_EN[7] || HPM_COUNTER_EN[8] ||
+-        HPM_COUNTER_EN[9] || HPM_COUNTER_EN[10] || HPM_COUNTER_EN[11] ||
+-        HPM_COUNTER_EN[12] || HPM_COUNTER_EN[13] || HPM_COUNTER_EN[14] ||
+-        HPM_COUNTER_EN[15] || HPM_COUNTER_EN[16] || HPM_COUNTER_EN[17] ||
+-        HPM_COUNTER_EN[18] || HPM_COUNTER_EN[19] || HPM_COUNTER_EN[20] ||
+-        HPM_COUNTER_EN[21] || HPM_COUNTER_EN[22] || HPM_COUNTER_EN[23] ||
+-        HPM_COUNTER_EN[24] || HPM_COUNTER_EN[25] || HPM_COUNTER_EN[26] ||
+-        HPM_COUNTER_EN[27] || HPM_COUNTER_EN[28] || HPM_COUNTER_EN[29] ||
+-        HPM_COUNTER_EN[30] || HPM_COUNTER_EN[31]);
+diff --git a/spec/std/isa/param/MTVEC_MODES.yaml b/spec/std/isa/param/MTVEC_MODES.yaml
+index 76ee58d6a5..1b0a61315e 100644
+--- a/spec/std/isa/param/MTVEC_MODES.yaml
++++ b/spec/std/isa/param/MTVEC_MODES.yaml
+@@ -30,6 +30,13 @@ schema:
+   maxItems: 2
+   uniqueItems: true
+ requirements:
+-  idl(): |
+-    (MTVEC_ACCESS == "ro") -> ($array_size(MTVEC_MODES) == 1);
+-  reason: If `mtvec` is read-only, the mode cannot be changed.
++  # If `mtvec` is read-only, the mode cannot be changed.
++  if:
++    param:
++      name: MTVEC_ACCESS
++      equal: ro
++  then:
++    param:
++      name: MTVEC_MODES
++      size: true
++      equal: 1
+diff --git a/spec/std/isa/profile/RVA20S64.yaml b/spec/std/isa/profile/RVA20S64.yaml
+index 38ef4aab0a..a80c772da1 100644
+--- a/spec/std/isa/profile/RVA20S64.yaml
++++ b/spec/std/isa/profile/RVA20S64.yaml
+@@ -38,7 +38,7 @@ extensions:
+       Svbare is a new extension name introduced with RVA20.
+   Sv39:
+     presence: mandatory
+-    version: "~> 1.11"
++    version: "~> 1.0"
+   Svade:
+     presence: mandatory
+     version: "~> 1.0"
+@@ -64,7 +64,7 @@ extensions:
+       Sstvala is a new extension name introduced with RVA20.
+   Sv48:
+     presence: optional
+-    version: "~> 1.11"
++    version: "~> 1.0"
+   Ssu64xl:
+     presence: optional
+     version: "~> 1.0"
+@@ -72,5 +72,12 @@ extensions:
+       Ssu64xl is a new extension name introduced with RVA20.
+ requirements:
+   param:
+-    name: U_MODE_ENDIANNESS
+-    equal: little
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: S_MODE_ENDIANNESS
++        equal: little
++      - name: SXLEN
++        includes: 64
++      - name: UXLEN
++        includes: 64
+diff --git a/spec/std/isa/profile/RVA20U64.yaml b/spec/std/isa/profile/RVA20U64.yaml
+index b2e63b8194..a8f4e099a0 100644
+--- a/spec/std/isa/profile/RVA20U64.yaml
++++ b/spec/std/isa/profile/RVA20U64.yaml
+@@ -8,7 +8,7 @@ kind: profile
+ name: RVA20U64
+ long_name: U-mode extensions for version 20 of the 64-bit Apps Processor profile
+ marketing_name: RVA20U64
+-mode: Unpriv
++mode: U
+ base: 64
+ release: { $ref: profile_release/RVA20.yaml# }
+ introduction: |
+@@ -21,21 +21,26 @@ extensions:
+   $remove: Zifencei # Not allowed as an option for Unpriv ISA (only available in Priv ISA).
+   A:
+     presence: mandatory
++    version: ~> 2.1
+   C:
+     presence: mandatory
++    version: ~> 2.0
+   D:
+     presence: mandatory
++    version: ~> 2.2.0
+   F:
+     presence: mandatory
++    version: ~> 2.2.0
+   M:
+     presence: mandatory
++    version: ~> 2.0
+   U:
+     presence: mandatory
+     version: "~> 1.0"
+-  Zicsr:
++  Zicntr:
+     presence: mandatory
+     version: "~> 2.0"
+-  Zicntr:
++  Zicsr:
+     presence: mandatory
+     version: "~> 2.0"
+   Ziccif:
+@@ -102,7 +107,11 @@ recommendations:
+   - text: |
+       Implementations are strongly recommended to raise illegal-instruction
+       exceptions on attempts to execute unimplemented opcodes.
++
+ requirements:
+   param:
+-    name: U_MODE_ENDIANNESS
+-    equal: little
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: UXLEN
++        includes: 64
+diff --git a/spec/std/isa/profile/RVA22S64.yaml b/spec/std/isa/profile/RVA22S64.yaml
+index b38b092cff..d91150f882 100644
+--- a/spec/std/isa/profile/RVA22S64.yaml
++++ b/spec/std/isa/profile/RVA22S64.yaml
+@@ -36,13 +36,13 @@ extensions:
+     version: "~> 1.0"
+   Sv39:
+     presence: mandatory
+-    version: "~> 1.12"
++    version: "~> 1.0"
+   Sv48:
+     presence: optional
+-    version: "~> 1.12"
++    version: "~> 1.0"
+   Sv57:
+     presence: optional
+-    version: "~> 1.12"
++    version: "~> 1.0"
+   Svnapot:
+     presence: optional
+     version: "~> 1.0"
+@@ -78,3 +78,14 @@ extensions:
+       The Sha extension name was introduced in RVA23/RVB23 and wasn't
+       in the ratified RVA22 profile but has since been added retroactively
+       as a documentation-only change (doesn't affect requirements or functionality).
++requirements:
++  param:
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: S_MODE_ENDIANNESS
++        equal: little
++      - name: SXLEN
++        includes: 64
++      - name: UXLEN
++        includes: 64
+diff --git a/spec/std/isa/profile/RVA22U64.yaml b/spec/std/isa/profile/RVA22U64.yaml
+index 0a16f8eb8d..5ebcda3b02 100644
+--- a/spec/std/isa/profile/RVA22U64.yaml
++++ b/spec/std/isa/profile/RVA22U64.yaml
+@@ -8,7 +8,7 @@ kind: profile
+ name: RVA22U64
+ long_name: U-mode extensions for version 22 of the 64-bit Apps Processor profile
+ marketing_name: RVA22U64
+-mode: Unpriv
++mode: U
+ base: 64
+ release: { $ref: profile_release/RVA22.yaml# }
+ introduction: |
+@@ -138,3 +138,10 @@ extra_notes:
+     text: |
+       The Zfinx, Zdinx, Zhinx, Zhinxmin extensions are incompatible
+       with the profile mandates to support the F and D extensions.
++requirements:
++  param:
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: UXLEN
++        includes: 64
+diff --git a/spec/std/isa/profile/RVA23M64.yaml b/spec/std/isa/profile/RVA23M64.yaml
+deleted file mode 100644
+index dd72a6410c..0000000000
+--- a/spec/std/isa/profile/RVA23M64.yaml
++++ /dev/null
+@@ -1,24 +0,0 @@
+-# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+-# SPDX-License-Identifier: BSD-3-Clause-Clear
+-
+-# yaml-language-server: $schema=../../../schemas/profile_schema.json
+-
+-$schema: profile_schema.json#
+-kind: profile
+-name: RVA23M64
+-long_name: M-mode extensions for version 23 of the 64-bit Apps Processor profile (not ratified)
+-marketing_name: RVA23M64
+-mode: M
+-base: 64
+-release: { $ref: profile_release/RVA23.yaml# }
+-introduction: |
+-  The RVA23M64 profile specifies the ISA features available to machine-mode
+-  execution environments in 64-bit applications processors.
+-
+-  [NOTE]
+-  The RVA23M64 profile is not a ratified profile by RISC-V International.
+-  It only exists here to support certificates based on RVA23 Profile Release having M-mode extensions.
+-extensions:
+-  $inherits:
+-    - "profile/RVB23M64.yaml#/extensions"
+-    - "profile/RVA23S64.yaml#/extensions"
+diff --git a/spec/std/isa/profile/RVA23S64.yaml b/spec/std/isa/profile/RVA23S64.yaml
+index 04d2494b66..b12958018a 100644
+--- a/spec/std/isa/profile/RVA23S64.yaml
++++ b/spec/std/isa/profile/RVA23S64.yaml
+@@ -48,8 +48,21 @@ extensions:
+ 
+   Ssnpm:
+     presence: mandatory
++    version: ~> 1.0
+   #    Pointer masking, with *senvcfg*.PME supporting, at minimum
+ 
+   Sha:
+     presence: mandatory
++    version: ~> 1.0
+   # collection of Hypervisor extensions
++requirements:
++  param:
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: S_MODE_ENDIANNESS
++        equal: little
++      - name: SXLEN
++        includes: 64
++      - name: UXLEN
++        includes: 64
+diff --git a/spec/std/isa/profile/RVA23U64.yaml b/spec/std/isa/profile/RVA23U64.yaml
+index 1244091d79..83e48cb75a 100644
+--- a/spec/std/isa/profile/RVA23U64.yaml
++++ b/spec/std/isa/profile/RVA23U64.yaml
+@@ -8,7 +8,7 @@ kind: profile
+ name: RVA23U64
+ long_name: U-mode extensions for version 23 of the 64-bit Apps Processor profile
+ marketing_name: RVA23U64
+-mode: Unpriv
++mode: U
+ base: 64
+ release: { $ref: profile_release/RVA23.yaml# }
+ introduction: |
+@@ -34,21 +34,27 @@ extensions:
+ 
+   Zfhmin:
+     presence: mandatory
++    version: ~> 1.0
+ 
+   V:
+     presence: mandatory
++    version: ~> 1.0
+ 
+   Zvfhmin:
+     presence: mandatory
++    version: ~> 1.0
+ 
+   Zvbb:
+     presence: mandatory
++    version: ~> 1.0
+ 
+   Zvkt:
+     presence: mandatory
++    version: ~> 1.0
+ 
+   Supm:
+     presence: mandatory
++    version: ~> 1.0
+ 
+   #--------------------------------------------
+   # Zvbc is an expansion option in RVB23U64
+@@ -60,6 +66,7 @@ extensions:
+   Zvbc:
+     presence:
+       optional: development
++    version: ~> 1.0
+ 
+   #########################################################################
+   # TRANSITORY EXPANSION extensions in RVA23U64
+@@ -68,3 +75,10 @@ extensions:
+   #--------------------------------------------
+   # (there are no Transitory expansion options in RVA23U64)
+   #--------------------------------------------
++requirements:
++  param:
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: UXLEN
++        includes: 64
+diff --git a/spec/std/isa/profile/RVB23M64.yaml b/spec/std/isa/profile/RVB23M64.yaml
+deleted file mode 100644
+index 8b32635c04..0000000000
+--- a/spec/std/isa/profile/RVB23M64.yaml
++++ /dev/null
+@@ -1,86 +0,0 @@
+-# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+-# SPDX-License-Identifier: BSD-3-Clause-Clear
+-
+-# yaml-language-server: $schema=../../../schemas/profile_schema.json
+-
+-$schema: profile_schema.json#
+-kind: profile
+-name: RVB23M64
+-long_name: M-mode extensions for version 23 of the 64-bit Bespoke Apps Processor profile (not ratified)
+-marketing_name: RVB23M64
+-mode: M
+-base: 64
+-release: { $ref: profile_release/RVB23.yaml# }
+-introduction: |
+-  The RVB23M64 profile specifies the ISA features available to machine-mode
+-  execution environments in 64-bit applications processors.
+-
+-  [NOTE]
+-  The RVB23M64 profile is not a ratified profile by RISC-V International.
+-  It only exists here to support certificates based on RVB23 Profile Release having M-mode extensions.
+-extensions:
+-  $inherits:
+-    - "profile/RVB23S64.yaml#/extensions"
+-
+-  #########################################################################
+-  # MANDATORY extensions in RVB23 (and RVA23)
+-  #########################################################################
+-  Sm:
+-    version: "~> 1.13"
+-    presence: mandatory
+-
+-  #########################################################################
+-  # OPTIONAL LOCALIZED extensions in RVB23M64
+-  #########################################################################
+-
+-  # None
+-
+-  #########################################################################
+-  # OPTIONAL DEVELOPMENT extensions in RVB23M64
+-  #########################################################################
+-
+-  # None
+-
+-  #########################################################################
+-  # OPTIONAL EXPANSION extensions in RVB23M64
+-  #########################################################################
+-
+-  # None
+-
+-  #########################################################################
+-  # OPTIONAL EXPANSION extensions in both RVB23M64 and RVA23M64
+-  #########################################################################
+-
+-  # None
+-
+-requirements:
+-  param:
+-    allOf:
+-      - name: MTVEC_BASE_ALIGNMENT_DIRECT
+-        equal: 4
+-      - name: MTVEC_MODES
+-        equal: [0, 1]
+-      - name: PRECISE_SYNCHRONOUS_EXCEPTIONS
+-        equal: true
+-      - name: TRAP_ON_ECALL_FROM_M
+-        equal: true
+-      - name: TRAP_ON_EBREAK
+-        equal: true
+-      - name: REPORT_VA_IN_MTVAL_ON_BREAKPOINT
+-        equal: true
+-      - name: REPORT_VA_IN_MTVAL_ON_INSTRUCTION_ACCESS_FAULT
+-        equal: true
+-      - name: REPORT_VA_IN_MTVAL_ON_LOAD_ACCESS_FAULT
+-        equal: true
+-      - name: REPORT_VA_IN_MTVAL_ON_STORE_AMO_ACCESS_FAULT
+-        equal: true
+-      - name: REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION
+-        equal: true
+-      - name: M_MODE_ENDIANNESS
+-        equal: little
+-      - name: MXLEN
+-        equal: 64
+-      - name: NUM_PMP_ENTRIES
+-        greaterThanOrEqual: 4
+-      - name: PMP_GRANULARITY
+-        lessThanOrEqual: 12
+diff --git a/spec/std/isa/profile/RVB23S64.yaml b/spec/std/isa/profile/RVB23S64.yaml
+index 8bd45d5b59..ffe2ea68a9 100644
+--- a/spec/std/isa/profile/RVB23S64.yaml
++++ b/spec/std/isa/profile/RVB23S64.yaml
+@@ -52,7 +52,7 @@ extensions:
+   #########################################################################
+   Zifencei:
+     presence: mandatory
+-    version: "~>1.0"
++    version: "~>2.0"
+     note: |
+       Instruction-Fetch fence instruction.
+ 
+@@ -190,6 +190,7 @@ extensions:
+   Sha:
+     presence:
+       optional: expansion
++    version: ~> 1.0
+     note: |
+       The set of augmented hypervisor extensions: H, Ssstateen,
+       Shcounterenw, Shvstvala, Shtvala, Shvstvecd, Shvsatpa, Shgatpa
+@@ -215,14 +216,14 @@ extensions:
+   Sv48:
+     presence:
+       optional: expansion
+-    version: "~>1.13"
++    version: "~>1.0"
+     note: |
+       Page-based 48-bit virtual-memory system
+ 
+   Sv57:
+     presence:
+       optional: expansion
+-    version: "~>1.13"
++    version: "~>1.0"
+     note: |
+       Page-based 57-bit virtual-memory system
+ 
+@@ -297,3 +298,14 @@ recommendations:
+   - text: |
+       Implementations are strongly recommended to raise illegal-instruction
+       exceptions on attempts to execute unimplemented opcodes.
++requirements:
++  param:
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: S_MODE_ENDIANNESS
++        equal: little
++      - name: SXLEN
++        includes: 64
++      - name: UXLEN
++        includes: 64
+diff --git a/spec/std/isa/profile/RVB23U64.yaml b/spec/std/isa/profile/RVB23U64.yaml
+index 4dc6719a2b..a7b1320623 100644
+--- a/spec/std/isa/profile/RVB23U64.yaml
++++ b/spec/std/isa/profile/RVB23U64.yaml
+@@ -8,7 +8,7 @@ kind: profile
+ name: RVB23U64
+ long_name: U-mode extensions for version 23 of the 64-bit Bespoke Apps Processor profile
+ marketing_name: RVB23U64
+-mode: Unpriv
++mode: U
+ base: 64
+ release: { $ref: profile_release/RVB23.yaml# }
+ introduction: |
+@@ -271,3 +271,10 @@ extensions:
+   #--------------------------------------------
+   # (there are no Transitory expansion options in RVB23)
+   #--------------------------------------------
++requirements:
++  param:
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: UXLEN
++        includes: 64
+diff --git a/spec/std/isa/profile/RVI20U32.yaml b/spec/std/isa/profile/RVI20U32.yaml
+index 3ad4a9a367..07b9396548 100644
+--- a/spec/std/isa/profile/RVI20U32.yaml
++++ b/spec/std/isa/profile/RVI20U32.yaml
+@@ -8,7 +8,7 @@ kind: profile
+ name: RVI20U32
+ long_name: U-mode extensions for version 20 of a 32-bit processor
+ marketing_name: RVI20U32
+-mode: Unpriv
++mode: U
+ base: 32
+ release: { $ref: profile_release/RVI20.yaml# }
+ introduction: |
+@@ -81,3 +81,10 @@ recommendations:
+   - text: |
+       Implementations are strongly recommended to raise illegal-instruction
+       exceptions on attempts to execute unimplemented opcodes.
++requirements:
++  param:
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: UXLEN
++        includes: 32
+diff --git a/spec/std/isa/profile/RVI20U64.yaml b/spec/std/isa/profile/RVI20U64.yaml
+index 244fbfe361..01357b73e0 100644
+--- a/spec/std/isa/profile/RVI20U64.yaml
++++ b/spec/std/isa/profile/RVI20U64.yaml
+@@ -10,3 +10,10 @@ long_name: U-mode extensions for version 20 of a 64-bit processor
+ $inherits: "profile/RVI20U32.yaml#"
+ base: 64
+ marketing_name: RVI20U64
++requirements:
++  param:
++    allOf:
++      - name: U_MODE_ENDIANNESS
++        equal: little
++      - name: UXLEN
++        includes: 64
+diff --git a/tests/golden/REUSE.toml b/tests/golden/REUSE.toml
+new file mode 100644
+index 0000000000..2708881421
+--- /dev/null
++++ b/tests/golden/REUSE.toml
+@@ -0,0 +1,9 @@
++version = 1
++
++# Computer-generated files that are checked in
++[[annotations]]
++path = [
++    "*",
++]
++SPDX-FileCopyrightText = "NONE"
++SPDX-License-Identifier = "CC0-1.0"
+diff --git a/backends/instructions_appendix/all_instructions.golden.adoc b/tests/golden/all_instructions.golden.adoc
+similarity index 100%
+rename from backends/instructions_appendix/all_instructions.golden.adoc
+rename to tests/golden/all_instructions.golden.adoc
+diff --git a/tools/python/profile_extensions.golden b/tests/golden/profile_extensions.golden
+similarity index 67%
+rename from tools/python/profile_extensions.golden
+rename to tests/golden/profile_extensions.golden
+index a473b13d27..2abaa1daa5 100644
+--- a/tools/python/profile_extensions.golden
++++ b/tests/golden/profile_extensions.golden
+@@ -1,15 +1,15 @@
+ RVA20S64:
+ - A ~> 2.1 mandatory
+ - C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
++- D ~> 2.2.0 mandatory
++- F ~> 2.2.0 mandatory
+ - I ~> 2.1 mandatory
+ - M ~> 2.0 mandatory
+ - S ~> 1.11 mandatory
+ - Ssccptr ~> 1.0 mandatory
+ - Sstvala ~> 1.0 mandatory
+ - Sstvecd ~> 1.0 mandatory
+-- Sv39 ~> 1.11 mandatory
++- Sv39 ~> 1.0 mandatory
+ - Svade ~> 1.0 mandatory
+ - Svbare ~> 1.0 mandatory
+ - U ~> 1.0 mandatory
+@@ -22,7 +22,7 @@ RVA20S64:
+ - Zicsr ~> 2.0 mandatory
+ - Zifencei ~> 2.0 mandatory
+ - Ssu64xl ~> 1.0 optional
+-- Sv48 ~> 1.11 optional
++- Sv48 ~> 1.0 optional
+ - Zca ~> 1.0 optional
+ - Zcd ~> 1.0 optional
+ - Zcf ~> 1.0 optional
+@@ -30,8 +30,8 @@ RVA20S64:
+ RVA20U64:
+ - A ~> 2.1 mandatory
+ - C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
++- D ~> 2.2.0 mandatory
++- F ~> 2.2.0 mandatory
+ - I ~> 2.1 mandatory
+ - M ~> 2.0 mandatory
+ - U ~> 1.0 mandatory
+@@ -50,8 +50,8 @@ RVA22S64:
+ - A ~> 2.1 mandatory
+ - B ~> 1.0.0 mandatory
+ - C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
++- D ~> 2.2.0 mandatory
++- F ~> 2.2.0 mandatory
+ - I ~> 2.1 mandatory
+ - M ~> 2.0 mandatory
+ - S ~> 1.12 mandatory
+@@ -59,7 +59,7 @@ RVA22S64:
+ - Sscounterenw ~> 1.0 mandatory
+ - Sstvala ~> 1.0 mandatory
+ - Sstvecd ~> 1.0 mandatory
+-- Sv39 ~> 1.12 mandatory
++- Sv39 ~> 1.0 mandatory
+ - Svade ~> 1.0 mandatory
+ - Svbare ~> 1.0 mandatory
+ - Svinval ~> 1.0 mandatory
+@@ -89,8 +89,8 @@ RVA22S64:
+ - Sscofpmf ~> 1.0 optional
+ - Sstc ~> 1.0 optional
+ - Ssu64xl ~> 1.0 optional
+-- Sv48 ~> 1.12 optional
+-- Sv57 ~> 1.12 optional
++- Sv48 ~> 1.0 optional
++- Sv57 ~> 1.0 optional
+ - Svnapot ~> 1.0 optional
+ - V ~> 1.0 optional
+ - Zca ~> 1.0 optional
+@@ -104,8 +104,8 @@ RVA22U64:
+ - A ~> 2.1 mandatory
+ - B ~> 1.0.0 mandatory
+ - C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
++- D ~> 2.2.0 mandatory
++- F ~> 2.2.0 mandatory
+ - I ~> 2.1 mandatory
+ - M ~> 2.0 mandatory
+ - U ~> 1.0 mandatory
+@@ -135,97 +135,25 @@ RVA22U64:
+ - Zfh ~> 1.0 optional
+ - Zkn ~> 1.0 optional
+ - Zks ~> 1.0 optional
+-RVA23M64:
+-- A ~> 2.1 mandatory
+-- B ~> 1.0.0 mandatory
+-- C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
+-- I ~> 2.1 mandatory
+-- M ~> 2.0 mandatory
+-- S ~>1.13 mandatory
+-- Sha ~>1.0 mandatory
+-- Sm ~> 1.13 mandatory
+-- Ssccptr ~>1.0 mandatory
+-- Sscofpmf ~>1.0 mandatory
+-- Sscounterenw ~>1.0 mandatory
+-- Ssnpm ~>1.0 mandatory
+-- Sstc ~>1.0 mandatory
+-- Sstvala ~>1.0 mandatory
+-- Sstvecd ~>1.0 mandatory
+-- Ssu64xl ~>1.0 mandatory
+-- Supm ~>1.0 mandatory
+-- Sv39 ~>1.0 mandatory
+-- Svade ~>1.0 mandatory
+-- Svbare ~>1.0 mandatory
+-- Svinval ~>1.0 mandatory
+-- Svnapot ~>1.0 mandatory
+-- Svpbmt ~>1.0 mandatory
+-- U ~> 1.0 mandatory
+-- V ~> 1.0 mandatory
+-- Za128rs ~> 1.0 mandatory
+-- Za64rs ~>1.0 mandatory
+-- Zawrs ~>1.0 mandatory
+-- Zba ~> 1.0 mandatory
+-- Zbb ~> 1.0 mandatory
+-- Zbs ~> 1.0 mandatory
+-- Zcb ~>1.0 mandatory
+-- Zcmop ~>1.0 mandatory
+-- Zfa ~>1.0 mandatory
+-- Zfhmin ~> 1.0 mandatory
+-- Zic64b = 1.0 mandatory
+-- Zicbom ~> 1.0 mandatory
+-- Zicbop ~> 1.0 mandatory
+-- Zicboz ~> 1.0 mandatory
+-- Ziccamoa ~> 1.0 mandatory
+-- Ziccif ~> 1.0 mandatory
+-- Zicclsm ~> 1.0 mandatory
+-- Ziccrse ~> 1.0 mandatory
+-- Zicntr ~> 2.0 mandatory
+-- Zicond ~>1.0 mandatory
+-- Zicsr ~> 2.0 mandatory
+-- Zifencei ~>1.0 mandatory
+-- Zihintntl ~>1.0 mandatory
+-- Zihintpause ~> 2.0 mandatory
+-- Zihpm ~> 2.0 mandatory
+-- Zimop ~>1.0 mandatory
+-- Zkt ~> 1.0 mandatory
+-- Zvbb ~>1.0 mandatory
+-- Zvfhmin ~>1.0 mandatory
+-- Zvkt ~>1.0 mandatory
+-- Zca ~> 1.0 optional
+-- Zcd ~> 1.0 optional
+-- Zcf ~> 1.0 optional
+-- Sdtrig ~>1.0 {'optional': 'expansion'}
+-- Sspm ~>1.0 {'optional': 'expansion'}
+-- Ssstrict ~>1.0 {'optional': 'expansion'}
+-- Sv48 ~>1.13 {'optional': 'expansion'}
+-- Sv57 ~>1.13 {'optional': 'expansion'}
+-- Svadu ~>1.0 {'optional': 'expansion'}
+-- Svvptc ~>1.0 {'optional': 'expansion'}
+-- Zfh ~>1.0 {'optional': 'expansion'}
+-- Zkr ~>1.0 {'optional': 'expansion'}
+-- Zkn ~>1.0 {'optional': 'localized'}
+-- Zks ~>1.0 {'optional': 'localized'}
+ RVA23S64:
+ - A ~> 2.1 mandatory
+ - B ~> 1.0.0 mandatory
+ - C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
++- D ~> 2.2.0 mandatory
++- F ~> 2.2.0 mandatory
+ - I ~> 2.1 mandatory
+ - M ~> 2.0 mandatory
+ - S ~>1.13 mandatory
+-- Sha ~>1.0 mandatory
++- Sha ~> 1.0 mandatory
+ - Ssccptr ~>1.0 mandatory
+ - Sscofpmf ~>1.0 mandatory
+ - Sscounterenw ~>1.0 mandatory
+-- Ssnpm ~>1.0 mandatory
++- Ssnpm ~> 1.0 mandatory
+ - Sstc ~>1.0 mandatory
+ - Sstvala ~>1.0 mandatory
+ - Sstvecd ~>1.0 mandatory
+ - Ssu64xl ~>1.0 mandatory
+-- Supm ~>1.0 mandatory
++- Supm ~> 1.0 mandatory
+ - Sv39 ~>1.0 mandatory
+ - Svade ~>1.0 mandatory
+ - Svbare ~>1.0 mandatory
+@@ -255,23 +183,23 @@ RVA23S64:
+ - Zicntr ~> 2.0 mandatory
+ - Zicond ~>1.0 mandatory
+ - Zicsr ~> 2.0 mandatory
+-- Zifencei ~>1.0 mandatory
++- Zifencei ~>2.0 mandatory
+ - Zihintntl ~>1.0 mandatory
+ - Zihintpause ~> 2.0 mandatory
+ - Zihpm ~> 2.0 mandatory
+ - Zimop ~>1.0 mandatory
+ - Zkt ~> 1.0 mandatory
+-- Zvbb ~>1.0 mandatory
+-- Zvfhmin ~>1.0 mandatory
+-- Zvkt ~>1.0 mandatory
++- Zvbb ~> 1.0 mandatory
++- Zvfhmin ~> 1.0 mandatory
++- Zvkt ~> 1.0 mandatory
+ - Zca ~> 1.0 optional
+ - Zcd ~> 1.0 optional
+ - Zcf ~> 1.0 optional
+ - Sdtrig ~>1.0 {'optional': 'expansion'}
+ - Sspm ~>1.0 {'optional': 'expansion'}
+ - Ssstrict ~>1.0 {'optional': 'expansion'}
+-- Sv48 ~>1.13 {'optional': 'expansion'}
+-- Sv57 ~>1.13 {'optional': 'expansion'}
++- Sv48 ~>1.0 {'optional': 'expansion'}
++- Sv57 ~>1.0 {'optional': 'expansion'}
+ - Svadu ~>1.0 {'optional': 'expansion'}
+ - Svvptc ~>1.0 {'optional': 'expansion'}
+ - Zkr ~>1.0 {'optional': 'expansion'}
+@@ -279,11 +207,11 @@ RVA23U64:
+ - A ~> 2.1 mandatory
+ - B ~> 1.0.0 mandatory
+ - C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
++- D ~> 2.2.0 mandatory
++- F ~> 2.2.0 mandatory
+ - I ~> 2.1 mandatory
+ - M ~> 2.0 mandatory
+-- Supm ~>1.0 mandatory
++- Supm ~> 1.0 mandatory
+ - U ~> 1.0 mandatory
+ - V ~> 1.0 mandatory
+ - Za128rs ~> 1.0 mandatory
+@@ -312,9 +240,9 @@ RVA23U64:
+ - Zihpm ~> 2.0 mandatory
+ - Zimop ~>1.0 mandatory
+ - Zkt ~> 1.0 mandatory
+-- Zvbb ~>1.0 mandatory
+-- Zvfhmin ~>1.0 mandatory
+-- Zvkt ~>1.0 mandatory
++- Zvbb ~> 1.0 mandatory
++- Zvfhmin ~> 1.0 mandatory
++- Zvkt ~> 1.0 mandatory
+ - Zca ~> 1.0 optional
+ - Zcd ~> 1.0 optional
+ - Zcf ~> 1.0 optional
+@@ -322,7 +250,7 @@ RVA23U64:
+ - Zacas ~>1.0 {'optional': 'development'}
+ - Zama16b ~>1.0 {'optional': 'development'}
+ - Ziccamoc ~>1.0 {'optional': 'development'}
+-- Zvbc ~>1.0 {'optional': 'development'}
++- Zvbc ~> 1.0 {'optional': 'development'}
+ - Zbc ~>1.0 {'optional': 'expansion'}
+ - Zfbfmin ~>1.0 {'optional': 'expansion'}
+ - Zfh ~>1.0 {'optional': 'expansion'}
+@@ -333,79 +261,12 @@ RVA23U64:
+ - Zvfh ~>1.0 {'optional': 'expansion'}
+ - Zvkng ~>1.0 {'optional': 'localized'}
+ - Zvksg ~>1.0 {'optional': 'localized'}
+-RVB23M64:
+-- A ~> 2.1 mandatory
+-- B ~> 1.0.0 mandatory
+-- C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
+-- I ~> 2.1 mandatory
+-- M ~> 2.0 mandatory
+-- S ~>1.13 mandatory
+-- Sm ~> 1.13 mandatory
+-- Ssccptr ~>1.0 mandatory
+-- Sscofpmf ~>1.0 mandatory
+-- Sscounterenw ~>1.0 mandatory
+-- Sstc ~>1.0 mandatory
+-- Sstvala ~>1.0 mandatory
+-- Sstvecd ~>1.0 mandatory
+-- Ssu64xl ~>1.0 mandatory
+-- Sv39 ~>1.0 mandatory
+-- Svade ~>1.0 mandatory
+-- Svbare ~>1.0 mandatory
+-- Svinval ~>1.0 mandatory
+-- Svnapot ~>1.0 mandatory
+-- Svpbmt ~>1.0 mandatory
+-- U ~> 1.0 mandatory
+-- Za128rs ~> 1.0 mandatory
+-- Za64rs ~>1.0 mandatory
+-- Zawrs ~>1.0 mandatory
+-- Zba ~> 1.0 mandatory
+-- Zbb ~> 1.0 mandatory
+-- Zbs ~> 1.0 mandatory
+-- Zcb ~>1.0 mandatory
+-- Zcmop ~>1.0 mandatory
+-- Zfa ~>1.0 mandatory
+-- Zic64b = 1.0 mandatory
+-- Zicbom ~> 1.0 mandatory
+-- Zicbop ~> 1.0 mandatory
+-- Zicboz ~> 1.0 mandatory
+-- Ziccamoa ~> 1.0 mandatory
+-- Ziccif ~> 1.0 mandatory
+-- Zicclsm ~> 1.0 mandatory
+-- Ziccrse ~> 1.0 mandatory
+-- Zicntr ~> 2.0 mandatory
+-- Zicond ~>1.0 mandatory
+-- Zicsr ~> 2.0 mandatory
+-- Zifencei ~>1.0 mandatory
+-- Zihintntl ~>1.0 mandatory
+-- Zihintpause ~> 2.0 mandatory
+-- Zihpm ~> 2.0 mandatory
+-- Zimop ~>1.0 mandatory
+-- Zkt ~> 1.0 mandatory
+-- Zca ~> 1.0 optional
+-- Zcd ~> 1.0 optional
+-- Zcf ~> 1.0 optional
+-- Sdtrig ~>1.0 {'optional': 'expansion'}
+-- Sha ~>1.0 {'optional': 'expansion'}
+-- Ssnpm ~>1.0 {'optional': 'expansion'}
+-- Sspm ~>1.0 {'optional': 'expansion'}
+-- Ssstrict ~>1.0 {'optional': 'expansion'}
+-- Sv48 ~>1.13 {'optional': 'expansion'}
+-- Sv57 ~>1.13 {'optional': 'expansion'}
+-- Svadu ~>1.0 {'optional': 'expansion'}
+-- Svvptc ~>1.0 {'optional': 'expansion'}
+-- Zfh ~>1.0 {'optional': 'expansion'}
+-- Zfhmin ~> 1.0 {'optional': 'expansion'}
+-- Zkr ~>1.0 {'optional': 'expansion'}
+-- Zkn ~>1.0 {'optional': 'localized'}
+-- Zks ~>1.0 {'optional': 'localized'}
+ RVB23S64:
+ - A ~> 2.1 mandatory
+ - B ~> 1.0.0 mandatory
+ - C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
++- D ~> 2.2.0 mandatory
++- F ~> 2.2.0 mandatory
+ - I ~> 2.1 mandatory
+ - M ~> 2.0 mandatory
+ - S ~>1.13 mandatory
+@@ -443,7 +304,7 @@ RVB23S64:
+ - Zicntr ~> 2.0 mandatory
+ - Zicond ~>1.0 mandatory
+ - Zicsr ~> 2.0 mandatory
+-- Zifencei ~>1.0 mandatory
++- Zifencei ~>2.0 mandatory
+ - Zihintntl ~>1.0 mandatory
+ - Zihintpause ~> 2.0 mandatory
+ - Zihpm ~> 2.0 mandatory
+@@ -453,12 +314,12 @@ RVB23S64:
+ - Zcd ~> 1.0 optional
+ - Zcf ~> 1.0 optional
+ - Sdtrig ~>1.0 {'optional': 'expansion'}
+-- Sha ~>1.0 {'optional': 'expansion'}
++- Sha ~> 1.0 {'optional': 'expansion'}
+ - Ssnpm ~>1.0 {'optional': 'expansion'}
+ - Sspm ~>1.0 {'optional': 'expansion'}
+ - Ssstrict ~>1.0 {'optional': 'expansion'}
+-- Sv48 ~>1.13 {'optional': 'expansion'}
+-- Sv57 ~>1.13 {'optional': 'expansion'}
++- Sv48 ~>1.0 {'optional': 'expansion'}
++- Sv57 ~>1.0 {'optional': 'expansion'}
+ - Svadu ~>1.0 {'optional': 'expansion'}
+ - Svvptc ~>1.0 {'optional': 'expansion'}
+ - Zfh ~>1.0 {'optional': 'expansion'}
+@@ -470,8 +331,8 @@ RVB23U64:
+ - A ~> 2.1 mandatory
+ - B ~> 1.0.0 mandatory
+ - C ~> 2.0 mandatory
+-- D ~> 2.2 mandatory
+-- F ~> 2.2 mandatory
++- D ~> 2.2.0 mandatory
++- F ~> 2.2.0 mandatory
+ - I ~> 2.1 mandatory
+ - M ~> 2.0 mandatory
+ - U ~> 1.0 mandatory
+diff --git a/tools/python/tasks.rake b/tools/python/tasks.rake
+index 8e7317ceff..052fa29cfb 100644
+--- a/tools/python/tasks.rake
++++ b/tools/python/tasks.rake
+@@ -6,7 +6,7 @@ namespace :chore do
+   desc "Update golden profile_extensions output"
+   task :update_golden_profile_extensions do
+     Rake::Task["gen:resolved_arch"].invoke
+-    sh "uv run #{$root}/tools/python/profile_extensions.py #{$root}/gen/resolved_spec/_ > #{$root}/tools/python/profile_extensions.golden"
++    sh "uv run #{$root}/tools/python/profile_extensions.py #{$root}/gen/resolved_spec/_ > #{$root}/tests/golden/profile_extensions.golden"
+   end
+ 
+ end
+@@ -19,7 +19,7 @@ namespace :test do
+ 
+     $logger.info "Testing profile_extensions"
+     sh "uv run #{$root}/tools/python/profile_extensions.py #{$root}/gen/resolved_spec/_ > test-profile_extensions.txt"
+-    sh "diff -u #{$root}/tools/python/profile_extensions.golden test-profile_extensions.txt" do |ok, res|
++    sh "diff -u #{$root}/tests/golden/profile_extensions.golden test-profile_extensions.txt" do |ok, res|
+ 
+       rm "test-profile_extensions.txt", :force => true, :verbose => false
+       if ok
+@@ -31,7 +31,7 @@ namespace :test do
+ 
+           If this is expected, run:
+           ./do chore:update_golden_profile_extensions
+-          git add tools/python/profile_extensions.golden
++          git add tests/golden/profile_extensions.golden
+ 
+           And commit.
+         MSG
+diff --git a/tools/ruby-gems/idlc/lib/idlc.rb b/tools/ruby-gems/idlc/lib/idlc.rb
+index fffad6961e..c9ded8e4f6 100644
+--- a/tools/ruby-gems/idlc/lib/idlc.rb
++++ b/tools/ruby-gems/idlc/lib/idlc.rb
+@@ -55,6 +55,14 @@ class Compiler
+ 
+     attr_reader :parser
+ 
++    # Class-level parse cache: absolute file path (String) → IsaSyntaxNode.
++    # Shared across all Compiler instances so each file is parsed only once per
++    # process.  Safe to share because IsaSyntaxNode#to_ast is non-destructive
++    # and returns a fresh, independent IsaAst on every call.
++    # Mutex guards writes; under MRI, reads without the lock are safe.
++    @@parse_cache = {}
++    @@parse_cache_mutex = Mutex.new
++
+     def initialize
+       @parser = ::IdlParser.new
+     end
+@@ -71,40 +79,56 @@ def unset_pb
+     end
+ 
+     def compile_file(path, source_mapper = nil)
+-      @parser.set_input_file(path.to_s)
++      path_key = path.realpath.to_s
+ 
+-      unless source_mapper.nil?
+-        source_mapper[path.to_s] = path.read
+-      end
+-
+-      old_format = @pb.format unless @pb.nil?
+-      @pb.format = "Parsing #{File.basename(path)} [:bar]" unless @pb.nil?
+-      pid = unless @pb.nil?
+-              fork {
+-                loop do
+-                  sleep 1
+-                  @pb.advance unless @pb.nil?
+-                end
+-              }
+-      end
+-      m = @parser.parse path.read
+-      unless @pb.nil?
+-        Process.kill("TERM", T.must(pid))
+-        Process.wait(T.must(pid))
+-        @pb.format = old_format
+-      end
++      m = T.let(@@parse_cache[path_key], T.nilable(IsaSyntaxNode))
+ 
+       if m.nil?
+-        raise SyntaxError, <<~MSG
+-          While parsing #{@parser.input_file}:#{@parser.failure_line}:#{@parser.failure_column}
+-
+-          #{@parser.failure_reason}
+-        MSG
++        @@parse_cache_mutex.synchronize do
++          # Re-check inside the lock in case another thread just populated the entry.
++          unless @@parse_cache.key?(path_key)
++            @parser.set_input_file(path_key)
++
++            content = path.read
++            source_mapper[path_key] = content unless source_mapper.nil?
++
++            old_format = @pb.format unless @pb.nil?
++            @pb.format = "Parsing #{File.basename(path)} [:bar]" unless @pb.nil?
++            pid = unless @pb.nil?
++                    fork {
++                      loop do
++                        sleep 1
++                        @pb.advance unless @pb.nil?
++                      end
++                    }
++                  end
++            m = @parser.parse(content)
++            unless @pb.nil?
++              Process.kill("TERM", T.must(pid))
++              Process.wait(T.must(pid))
++              @pb.format = old_format
++            end
++
++            if m.nil?
++              raise SyntaxError, <<~MSG
++                While parsing #{@parser.input_file}:#{@parser.failure_line}:#{@parser.failure_column}
++
++                #{@parser.failure_reason}
++              MSG
++            end
++
++            raise "unexpected type #{m.class.name}" unless m.is_a?(IsaSyntaxNode)
++
++            @@parse_cache[path_key] = m
++          end
++          m = @@parse_cache[path_key]
++        end
++      else
++        # Cache hit: still populate source_mapper if provided (test-only path).
++        source_mapper[path_key] = path.read unless source_mapper.nil?
+       end
+ 
+-      raise "unexpected type #{m.class.name}" unless m.is_a?(IsaSyntaxNode)
+-
+-      ast = m.to_ast
++      ast = T.must(m).to_ast
+ 
+       ast.children.each do |child|
+         next unless child.is_a?(IncludeStatementAst)
+diff --git a/tools/ruby-gems/udb/lib/udb/cfg_arch.rb b/tools/ruby-gems/udb/lib/udb/cfg_arch.rb
+index d590999334..547eb2c6f8 100644
+--- a/tools/ruby-gems/udb/lib/udb/cfg_arch.rb
++++ b/tools/ruby-gems/udb/lib/udb/cfg_arch.rb
+@@ -277,7 +277,7 @@ def full_config_valid?
+           reasons << "#{h.fetch("name")} is not a known extension"
+         end
+         if extensions.any? { |e| e.name == h.fetch("name") } && !T.must(extension(h.fetch("name"))).versions.any? { |v| v.version_spec == h.fetch("version") }
+-          reasons << "#{h.fetch("version")} is not a known extension"
++          reasons << "#{h.fetch("version")} is not a known version of extension #{h.fetch("name")}"
+         end
+       end
+ 
+@@ -665,6 +665,12 @@ def inspect
+     #   @param name [String] The $1 name
+     #   @return [$3] The $1
+     #   @return [nil] if there is no $1 named +name+
++    # Class-level cache of raw YAML file contents keyed by "#{resolved_spec_path}/#{obj_type_dir}".
++    # Maps each directory to an array of [content, original_path, realpath] triples so that a
++    # second ConfiguredArchitecture sharing the same spec path skips disk I/O and file locking.
++    # Benign race: two threads both missing the cache produce identical entries.
++    @@yaml_data_cache = Concurrent::Hash.new
++
+     sig { params(fn_name: String, arch_dir: String, obj_class: T.class_of(TopLevelDatabaseObject)).void }
+     def self.generate_obj_methods(fn_name, arch_dir, obj_class)
+ 
+@@ -675,12 +681,25 @@ def self.generate_obj_methods(fn_name, arch_dir, obj_class)
+ 
+         @objects[arch_dir] = Concurrent::Array.new
+         @object_hashes[arch_dir] = Concurrent::Hash.new
+-        Dir.glob(@arch_dir / arch_dir / "**" / "*.yaml") do |obj_path|
+-          f = File.open(obj_path)
+-          f.flock(File::LOCK_EX)
+-          obj_yaml = YAML.load(f.read, filename: obj_path, permitted_classes: [Date])
+-          f.flock(File::LOCK_UN)
+-          @objects[arch_dir] << obj_class.new(obj_yaml, Pathname.new(obj_path).realpath, T.cast(self, ConfiguredArchitecture))
++
++        yaml_cache_key = "#{@arch_dir}/#{arch_dir}"
++        cached_files = @@yaml_data_cache[yaml_cache_key]
++        if cached_files.nil?
++          entries = []
++          Dir.glob(@arch_dir / arch_dir / "**" / "*.yaml") do |obj_path|
++            File.open(obj_path) do |f|
++              f.flock(File::LOCK_EX)
++              content = f.read
++              f.flock(File::LOCK_UN)
++              entries << [content, obj_path, Pathname.new(obj_path).realpath]
++            end
++          end
++          cached_files = @@yaml_data_cache[yaml_cache_key] = entries
++        end
++
++        cached_files.each do |content, obj_path, realpath|
++          obj_yaml = YAML.load(content, filename: obj_path, permitted_classes: [Date])
++          @objects[arch_dir] << obj_class.new(obj_yaml, realpath, T.cast(self, ConfiguredArchitecture))
+           @object_hashes[arch_dir][@objects[arch_dir].last.name] = @objects[arch_dir].last
+         end
+         @objects[arch_dir]
+diff --git a/tools/ruby-gems/udb/lib/udb/cli.rb b/tools/ruby-gems/udb/lib/udb/cli.rb
+index 483a4b24dc..73c764359c 100644
+--- a/tools/ruby-gems/udb/lib/udb/cli.rb
++++ b/tools/ruby-gems/udb/lib/udb/cli.rb
+@@ -82,17 +82,21 @@ def spec
+       method_option :custom, type: :string, desc: "Path to custom specification directory, if needed", default: Udb.default_custom_isa_path.to_s
+       method_option :config_dir, type: :string, desc: "Path to directory with config files", default: Udb.default_cfgs_path.to_s
+       method_option :gen, type: :string, desc: "Path to folder used for generation", default: Udb.default_gen_path.to_s
++      method_option :strict_partial, type: :boolean, desc: "Whether or not to check if a partial config is fully specified -- that is, all requirements of a mandatory extension are also listed in mandatory extensions and/or parameters", default: false
+       method_option :z3parallel, type: :boolean, desc: "Use parallel.enable for Z3", default: true
+       def cfg(name_or_path)
+         raise ArgumentError, "Spec directory does not exist: #{options[:std]}" unless File.directory?(options[:std])
+ 
+         Udb.global_options.parallel_z3 = options[:z3parallel]
+ 
++
+         cfg_file =
+           if File.file?(name_or_path)
+             Pathname.new(name_or_path)
+           elsif File.file?("#{options[:config_dir]}/#{name_or_path}.yaml")
+             Pathname.new("#{options[:config_dir]}/#{name_or_path}.yaml")
++          elsif File.file?("#{options[:config_dir]}/profile/#{name_or_path}.yaml")
++            Pathname.new("#{options[:config_dir]}/profile/#{name_or_path}.yaml")
+           else
+             raise ArgumentError, "Cannot find config: #{name_or_path}"
+           end
+@@ -108,7 +112,12 @@ def cfg(name_or_path)
+           say "Config is #{pastel.red.bold("invalid")}"
+           exit 1
+         end
+-        result = cfg_arch.valid?
++        result =
++          if options[:strict_partial]
++            cfg_arch.partial_config_strictly_specified?
++          else
++            cfg_arch.valid?
++          end
+ 
+         if result.valid
+           say "Config #{pastel.bold(cfg_arch.name)} is #{pastel.green.bold("valid")}"
+diff --git a/tools/ruby-gems/udb/lib/udb/condition.rb b/tools/ruby-gems/udb/lib/udb/condition.rb
+index 58f5cb34ba..bf42ce934f 100644
+--- a/tools/ruby-gems/udb/lib/udb/condition.rb
++++ b/tools/ruby-gems/udb/lib/udb/condition.rb
+@@ -1111,25 +1111,7 @@ def satisfied_by_cfg_arch?(cfg_arch)
+             elsif term.is_a?(ParameterTerm)
+               if cfg_arch.param_values.key?(term.name)
+                 result = term.eval(cfg_arch)
+-                if result == SatisfiedResult::Maybe
+-                  # this might just mean we don't know the value.
+-                  # however, given the parameter schema and constraints, we could know that term is
+-                  # always false or always true. Memoize per (term, cfg_arch) since the same
+-                  # ParameterTerm YAML appears in many Condition objects.
+-                  memo = cfg_arch.param_term_satisfied_memo
+-                  unless memo.key?(term)
+-                    param_cond = Condition.new({ "param" => term.to_h }, cfg_arch)
+-                    memo[term] =
+-                      if param_cond.unsatisfiable_by_cfg_arch?(cfg_arch)
+-                        SatisfiedResult::No
+-                      elsif (-param_cond).unsatisfiable_by_cfg_arch?(cfg_arch)
+-                        SatisfiedResult::Yes
+-                      else
+-                        SatisfiedResult::Maybe
+-                      end
+-                  end
+-                  result = memo[term]
+-                end
++                result = resolve_param_term_from_maybe(term, cfg_arch) if result == SatisfiedResult::Maybe
+                 result
+               else
+                 SatisfiedResult::No
+@@ -1168,25 +1150,7 @@ def satisfied_by_cfg_arch?(cfg_arch)
+               end
+             elsif term.is_a?(ParameterTerm)
+               result = term.eval(cfg_arch)
+-              if result == SatisfiedResult::Maybe
+-                # this might just mean we don't know the value.
+-                # however, given the parameter schema and constraints, we could know that term is
+-                # always false or always true. Memoize per (term, cfg_arch) since the same
+-                # ParameterTerm YAML appears in many Condition objects.
+-                memo = cfg_arch.param_term_satisfied_memo
+-                unless memo.key?(term)
+-                  param_cond = Condition.new({ "param" => term.to_h }, cfg_arch)
+-                  memo[term] =
+-                    if param_cond.unsatisfiable_by_cfg_arch?(cfg_arch)
+-                      SatisfiedResult::No
+-                    elsif (-param_cond).unsatisfiable_by_cfg_arch?(cfg_arch)
+-                      SatisfiedResult::Yes
+-                    else
+-                      SatisfiedResult::Maybe
+-                    end
+-                end
+-                result = memo[term]
+-              end
++              result = resolve_param_term_from_maybe(term, cfg_arch) if result == SatisfiedResult::Maybe
+               result
+             elsif term.is_a?(FreeTerm)
+               raise "unreachable"
+@@ -1659,6 +1623,27 @@ def |(other)
+     def -@
+       Condition.not(self, @cfg_arch)
+     end
++
++    private
++
++    # When term.eval returns Maybe, check whether the parameter schema and constraints
++    # imply the term is always false or always true, and cache the result per (term, cfg_arch).
++    sig { params(term: ParameterTerm, cfg_arch: ConfiguredArchitecture).returns(SatisfiedResult) }
++    def resolve_param_term_from_maybe(term, cfg_arch)
++      memo = cfg_arch.param_term_satisfied_memo
++      unless memo.key?(term)
++        param_cond = Condition.new({ "param" => term.to_h }, cfg_arch)
++        memo[term] =
++          if param_cond.unsatisfiable_by_cfg_arch?(cfg_arch)
++            SatisfiedResult::No
++          elsif (-param_cond).unsatisfiable_by_cfg_arch?(cfg_arch)
++            SatisfiedResult::Yes
++          else
++            SatisfiedResult::Maybe
++          end
++      end
++      memo[term]
++    end
+   end
+ 
+   class LogicCondition < Condition
+diff --git a/tools/ruby-gems/udb/lib/udb/config.rb b/tools/ruby-gems/udb/lib/udb/config.rb
+index 169f2ca740..2f70132cc7 100644
+--- a/tools/ruby-gems/udb/lib/udb/config.rb
++++ b/tools/ruby-gems/udb/lib/udb/config.rb
+@@ -156,13 +156,29 @@ def self.create(cfg_file_path_or_portfolio_grp, info)
+             }
+           end
+         }
+-        data.fetch("params")["MXLEN"] = portfolio_grp.max_base
+         freeze_data(data)
+         PartialConfig.send(:new, data, info)
+       else
+         T.absurd(cfg_file_path_or_portfolio_grp)
+       end
+     end
++
++    # Create an AbstractConfig directly from a config data hash, bypassing file I/O.
++    # Used when the config is already in memory (e.g., portfolio-derived temp configs).
++    sig { params(data: T::Hash[String, T.untyped], info: Resolver::ConfigInfo).returns(AbstractConfig) }
++    def self.create_from_data(data, info)
++      freeze_data(data)
++      case data["type"]
++      when "fully configured"
++        FullConfig.send(:new, data, info)
++      when "partially configured"
++        PartialConfig.send(:new, data, info)
++      when "unconfigured"
++        UnConfig.send(:new, data, info)
++      else
++        raise "Unexpected type (#{data['type']}) in config"
++      end
++    end
+   end
+ 
+   #################################################################
+@@ -220,12 +236,25 @@ def initialize(data, info)
+       @param_values = @data.key?("params") ? @data["params"] : [].freeze
+ 
+       @mxlen = @data.dig("params", "MXLEN")
++
+       if @mxlen.nil?
+-        Udb.logger.error "Must set MXLEN for a configured config"
+-        raise InvalidConfigError
++        # Infer MXLEN from subordinate mode XLENs: if any of UXLEN/SXLEN/VSXLEN/VUXLEN
++        # can be 64, then MXLEN must be 64 (lower modes cannot exceed machine-mode width).
++        MODE_XLEN_PARAMS.each do |param|
++          val = @data.dig("params", param)
++          if val == 64 || (val.is_a?(Array) && val.include?(64))
++            @mxlen = 64
++            break
++          end
++        end
++
++        if @mxlen.nil?
++          param_req = @data.dig("requirements", "param")
++          @mxlen = 64 if !param_req.nil? && param_req_implies_64?(param_req)
++        end
+       end
+ 
+-      @mxlen.freeze
++      @mxlen.freeze unless @mxlen.nil?
+     end
+ 
+     ###############################
+@@ -235,7 +264,7 @@ def initialize(data, info)
+     sig { override.returns(T::Hash[String, ParamValueType]) }
+     def param_values = @param_values
+ 
+-    sig { override.returns(Integer) }
++    sig { override.returns(T.nilable(Integer)) }
+     def mxlen = @mxlen
+ 
+     sig { override.returns(T::Boolean) }
+@@ -301,6 +330,37 @@ def additional_extensions_allowed? = @data.key?("additional_extensions") ? @data
+ 
+     sig { returns(T.nilable(T::Hash[String, T.untyped])) }
+     def requirements = @data["requirements"]
++
++    private
++
++    MODE_XLEN_PARAMS = %w[UXLEN SXLEN VSXLEN VUXLEN].freeze
++
++    # Returns true if the param requirements condition guarantees that at least one
++    # subordinate-mode XLEN param must be 64, which implies MXLEN = 64.
++    #
++    # Entailment rules:
++    #   allOf: any child entailing 64 is sufficient (all must hold)
++    #   anyOf: all children must entail 64 (only one needs to hold, so we can't
++    #          conclude 64 unless every branch requires it)
++    #   noneOf/not/if/oneOf: too complex to reason about without a solver → false
++    #   leaf with a MODE_XLEN_PARAMS name and equal/includes 64 → true
++    #   anything else (extension, xlen, idl, other params) → false
++    sig { params(yaml: T.untyped).returns(T::Boolean) }
++    def param_req_implies_64?(yaml)
++      return false unless yaml.is_a?(Hash)
++
++      if yaml.key?("allOf")
++        yaml["allOf"].any? { |child| param_req_implies_64?(child) }
++      elsif yaml.key?("anyOf")
++        yaml["anyOf"].all? { |child| param_req_implies_64?(child) }
++      elsif yaml.key?("param")
++        param_req_implies_64?(yaml["param"])
++      elsif yaml.key?("name") && MODE_XLEN_PARAMS.include?(yaml["name"])
++        yaml["equal"] == 64 || yaml["includes"] == 64
++      else
++        false
++      end
++    end
+   end
+ 
+   ################################################################################################################
+@@ -320,7 +380,7 @@ def initialize(data, info)
+ 
+       @mxlen = @data.dig("params", "MXLEN").freeze
+       if @mxlen.nil?
+-        Udb.logger.error "Must set MXLEN for a configured config"
++        Udb.logger.error "Must set MXLEN for a full config"
+         raise InvalidConfigError
+       end
+     end
+diff --git a/tools/ruby-gems/udb/lib/udb/logic.rb b/tools/ruby-gems/udb/lib/udb/logic.rb
+index 222e278027..71edd37f35 100644
+--- a/tools/ruby-gems/udb/lib/udb/logic.rb
++++ b/tools/ruby-gems/udb/lib/udb/logic.rb
+@@ -324,7 +324,7 @@ class ParameterComparisonType < T::Enum
+     sig { params(yaml: T::Hash[String, T.untyped]).void }
+     def initialize(yaml)
+       @yaml = yaml
+-      @yaml_no_reason = (yaml.key?("reason") ? yaml.reject { |k, _| k == "reason" } : yaml.dup).freeze
++      @yaml_no_reason = yaml.key?("reason") ? yaml.reject { |k, _| k == "reason" }.freeze : yaml
+     end
+ 
+     sig { returns(T::Hash[String, T.untyped]) }
+@@ -1236,19 +1236,6 @@ def self.inc_z3_cache_hits
+     # we can safely remember and return these values
+     class MemoizedState
+       attr_accessor :is_cnf, :cnf_form, :is_nested_cnf, :is_reduced, :terms, :literals, :is_satisfiable, :equisat_cnf, :equiv_cnf, :terms_no_antecendents
+-
+-      def initialize
+-        @is_cnf = nil
+-        @cnf_form = nil
+-        @is_nested_cnf = nil
+-        @is_reduced = nil
+-        @terms = nil
+-        @literals = nil
+-        @is_satisfiable = nil
+-        @equisat_cnf = nil
+-        @equiv_cnf = nil
+-        @terms_no_antecendents = nil
+-      end
+     end
+ 
+     attr_accessor :memo
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/portfolio.rb b/tools/ruby-gems/udb/lib/udb/obj/portfolio.rb
+index d96f1e6fcc..c86b091a20 100644
+--- a/tools/ruby-gems/udb/lib/udb/obj/portfolio.rb
++++ b/tools/ruby-gems/udb/lib/udb/obj/portfolio.rb
+@@ -23,6 +23,7 @@ module Udb
+   class PortfolioExtensionRequirement
+     extend T::Sig
+     extend Forwardable
++    include Comparable
+ 
+     def_delegators :@ext_req,
+       :name,
+@@ -41,12 +42,22 @@ class PortfolioExtensionRequirement
+         presence: T.nilable(Presence)
+       ).void
+     }
+-    def initialize(name, requirements, arch:, note:, req_id:, presence:)
++    def initialize(name, requirements, arch:, note: nil, req_id: nil, presence: nil)
+       @ext_req = arch.extension_requirement(name, requirements)
+       @note = note
+       @req_id = req_id
+       @presence = presence
+     end
++
++    sig { params(other: T.any(PortfolioExtensionRequirement, ExtensionRequirement)).returns(T.nilable(Integer)) }
++    def <=>(other)
++      case other
++      when PortfolioExtensionRequirement
++        @ext_req <=> other.ext_req
++      when ExtensionRequirement
++        @ext_req <=> other
++      end
++    end
+   end
+ 
+ ##################
+@@ -440,22 +451,22 @@ def instruction_presence_obj(inst_name)
+         end
+     end
+ 
+-    sig { returns(T::Hash[String, T.untyped]) }
+-    def to_config
+-      {
++    sig { params(mandatory: T::Array[PortfolioExtensionRequirement]).returns(T::Hash[String, T.untyped]) }
++    def to_config(mandatory: mandatory_ext_reqs)
++      c = {
+         "$schema" => "config_schema.json#",
+         "kind" => "architecture configuration",
+         "type" => "partially configured",
+         "name" => name,
+         "description" => description,
+-        "params" => all_in_scope_params.map do |p|
++        "params" => all_in_scope_params.sort.map do |p|
+           if p.single_value?
+             [p.name, p.value]
+           else
+             nil
+           end
+         end.compact.to_h,
+-        "mandatory_extensions" => mandatory_ext_reqs.map do |ext_req|
++        "mandatory_extensions" => mandatory.sort.map do |ext_req|
+           {
+             "name" => ext_req.name,
+             "version" => \
+@@ -466,7 +477,7 @@ def to_config
+               end
+           }
+         end,
+-        "non_mandatory_extensions" => optional_ext_reqs.map do |ext_req|
++        "non_mandatory_extensions" => optional_ext_reqs.sort.map do |ext_req|
+           {
+             "name" => ext_req.name,
+             "version" => \
+@@ -479,19 +490,41 @@ def to_config
+         end,
+         "additional_extensions" => true
+       }
++      c["requirements"] = requirements_condition.to_h unless requirements_condition.empty?
++      c
+     end
+ 
+-    # returns a config arch that treats the Portfolio like a partial config
+-    sig { returns(ConfiguredArchitecture) }
+-    def to_cfg_arch
+-      @cfg_arch_for_mandatory ||= begin
+-        Tempfile.create do |f|
+-          f.write YAML.dump(to_config)
+-          f.fsync
++    # @return portfolio in config form, with requirements of mandatory extensions expanded
++    sig { returns(T::Hash[String, T.untyped]) }
++    def to_strict_config
++      strict_mandatory_ext_reqs = mandatory_ext_reqs
++      mandatory_ext_req_names = strict_mandatory_ext_reqs.map(&:name).to_set
++      cfg_arch_obj = to_cfg_arch
++
++      cfg_arch_obj.extensions.each do |ext|
++        next if mandatory_ext_req_names.include?(ext.name)
++
++        if (-ext.to_ext_req.to_condition & cfg_arch_obj.to_condition).unsatisfiable_by_cfg_arch?(cfg_arch_obj)
++          # what's the minimum?
++          min_ext_ver = ext.versions.find do |ext_ver|
++            compat_with_ext_ver = Condition.new({ "extension" => { "name" => ext.name, "version" => "= #{ext_ver.version_str}" } }, cfg_arch_obj)
++            c = (compat_with_ext_ver & cfg_arch_obj.to_condition)
++            c.satisfiable_by_cfg_arch?(cfg_arch_obj)
++          end
++          raise "condition problem: ext is required but none of the versions are" if min_ext_ver.nil?
+ 
+-          @cfg_arch.config.info.resolver.cfg_arch_for(Pathname.new f.path)
++          strict_mandatory_ext_reqs << PortfolioExtensionRequirement.new(ext.name, "~> #{min_ext_ver.version_str}", arch: cfg_arch_obj)
++          mandatory_ext_req_names.add(ext.name)
+         end
+       end
++
++      to_config(mandatory: strict_mandatory_ext_reqs)
++    end
++
++    # returns a config arch that treats the Portfolio like a partial config
++    sig { returns(ConfiguredArchitecture) }
++    def to_cfg_arch
++      @cfg_arch_for_mandatory ||= cfg_arch_for_config_data(to_config)
+     end
+ 
+     # returns a config arch that treats the *optional* extensions in Portfolio like a partial config
+@@ -525,15 +558,38 @@ def to_cfg_arch_for_optional
+             end,
+             "additional_extensions" => true
+           }
++        contents["requirements"] = requirements_condition.to_h unless requirements_condition.empty?
++        cfg_arch_for_config_data(contents)
++      end
++    end
++
++    # Build a ConfiguredArchitecture from an in-memory config data hash.
++    # Uses the fast path (no disk round-trip) when the parent has no overlay;
++    # falls back to the full pipeline when the parent's resolved spec differs.
++    sig { params(config_data: T::Hash[String, T.untyped]).returns(ConfiguredArchitecture) }
++    def cfg_arch_for_config_data(config_data)
++      resolver = @cfg_arch.config.info.resolver
++      if @cfg_arch.config.info.overlay_path.nil?
++        resolver.cfg_arch_for_data(config_data)
++      else
+         Tempfile.create do |f|
+-          f.write YAML.dump(contents)
++          f.write YAML.dump(config_data)
+           f.fsync
+-
+-          @cfg_arch.config.info.resolver.cfg_arch_for(Pathname.new f.path)
++          resolver.cfg_arch_for(Pathname.new f.path)
+         end
+       end
+     end
+ 
++    sig { returns(AbstractCondition) }
++    def requirements_condition
++      @requirements_condition ||=
++        if @data.key?("requirements")
++          Condition.new(@data.fetch("requirements"), cfg_arch)
++        else
++          AlwaysTrueCondition.new(cfg_arch)
++        end
++    end
++
+     # @return [String] Given an instruction +inst_name+, return the presence as a string.
+     #                  If the instruction name isn't found in the portfolio, return "-".
+     sig { params(inst_name: String).returns(T.nilable(Presence)) }
+@@ -739,8 +795,7 @@ def in_scope_csrs(design)
+ 
+       return @in_scope_csrs unless @in_scope_csrs.nil?
+ 
+-      @in_scope_csrs =
+-        in_scope_min_satisfying_extension_versions.map { |ext_ver| ext_ver.in_scope_csrs(design.possible_xlens) }.flatten.uniq
++      @in_scope_csrs = to_cfg_arch.in_scope_csrs()
+     end
+ 
+     # @param design [Design] The design
+diff --git a/tools/ruby-gems/udb/lib/udb/obj/profile.rb b/tools/ruby-gems/udb/lib/udb/obj/profile.rb
+index 68276928e4..e654a8d278 100644
+--- a/tools/ruby-gems/udb/lib/udb/obj/profile.rb
++++ b/tools/ruby-gems/udb/lib/udb/obj/profile.rb
+@@ -196,10 +196,6 @@ def base
+       @data["base"]
+     end
+ 
+-    def all_in_scope_params
+-      [Portfolio::InScopeParameter.new(@cfg_arch.param("MXLEN"), { "const" => @data["base"] }, "")]
+-    end
+-
+     # Too complicated to put in profile ERB template.
+     # @param presence_type [String]
+     # @param heading_level [Integer]
+diff --git a/tools/ruby-gems/udb/lib/udb/resolver.rb b/tools/ruby-gems/udb/lib/udb/resolver.rb
+index d60cf70f88..1523a460a6 100644
+--- a/tools/ruby-gems/udb/lib/udb/resolver.rb
++++ b/tools/ruby-gems/udb/lib/udb/resolver.rb
+@@ -322,6 +322,28 @@ def cfg_arch_for(config_path_or_name)
+       end
+     end
+ 
++    # Create a ConfiguredArchitecture directly from an in-memory config data hash,
++    # bypassing resolve_config and resolve_arch entirely. Only valid when the config
++    # has no arch_overlay (i.e., it uses the standard spec at gen/resolved_spec/_).
++    # Callers must ensure this precondition holds before calling this method.
++    sig { params(config_data: T::Hash[String, T.untyped]).returns(Udb::ConfiguredArchitecture) }
++    def cfg_arch_for_data(config_data)
++      info = ConfigInfo.new(
++        name: config_data["name"],
++        path: Pathname.new("portfolio/#{config_data["name"]}"),
++        overlay_path: nil,
++        unresolved_yaml: config_data,
++        spec_path: std_path,
++        merged_spec_path: @gen_path / "spec" / "_",
++        resolved_spec_path: @gen_path / "resolved_spec" / "_",
++        resolver: self
++      )
++      Udb::ConfiguredArchitecture.new(
++        config_data["name"],
++        Udb::AbstractConfig.create_from_data(config_data, info)
++      )
++    end
++
+     SCHEMAS_BASE_URL = "https://riscv.github.io/riscv-unified-db/schemas"
+ 
+     # Resolve schema files by rewriting their $id to the full published URL and
+diff --git a/tools/ruby-gems/udb/test/test_cfg.rb b/tools/ruby-gems/udb/test/test_cfg.rb
+index 17982c8f47..86d65262ea 100644
+--- a/tools/ruby-gems/udb/test/test_cfg.rb
++++ b/tools/ruby-gems/udb/test/test_cfg.rb
+@@ -40,4 +40,16 @@ def teardown
+       MSG
+     end
+   end
++
++  # make sure all the profile configs in the repo are valid
++  Dir[Udb.repo_root / "cfgs" / "profile" / "*.yaml"].each do |cfg_path|
++    define_method "test_cfg_profile_#{File.basename(cfg_path, ".yaml")}_valid" do
++      cfg_arch = @resolver.cfg_arch_for(Pathname.new cfg_path)
++      result = cfg_arch.valid?
++      assert result.valid, <<~MSG
++        Config '#{File.basename(cfg_path, ".yaml")}' is not valid.
++        To see why, run `./bin/udb validate cfg #{cfg_path}`
++      MSG
++    end
++  end
+ end
+diff --git a/tools/test/regress-cli.rb b/tools/test/regress-cli.rb
+index 38a36f4386..202d5a1a80 100644
+--- a/tools/test/regress-cli.rb
++++ b/tools/test/regress-cli.rb
+@@ -306,7 +306,7 @@ def cmd_run_tests_parallel(jobs, n_workers)
+       @logger.info summary
+     else
+       @logger.error summary
+-      exit_with(:general_error)
++      exit_with(:error)
+     end
+   end
+   private :cmd_run_tests_parallel
+diff --git a/tools/test/regress-tests.yaml b/tools/test/regress-tests.yaml
+index 787ff4bed1..529f839f99 100644
+--- a/tools/test/regress-tests.yaml
++++ b/tools/test/regress-tests.yaml
+@@ -124,6 +124,14 @@ tests:
+       - name: Generate extension PDF
+         run: ./do gen:profile_release_pdf[RVI20]
+ 
++  regress-profile-strict-cfg:
++    ci_stage: pr
++    tags:
++      - smoke
++    test:
++      - name: Check that profile configs are up to date
++        run: ./bin/chore gen -f profile-cfgs
++
+   regress-udb-unit-test:
+     ci_stage: pr
+     tags:

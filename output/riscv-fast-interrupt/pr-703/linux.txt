@@ -1,0 +1,62 @@
+PR #703  target=linux  overall=potential_risk
+Spec: Smip alters interrupt trap microarchitecture (GPR save) but not exception traps; if mtvec uses Direct mode (shared entry), synchronous exceptions incorrectly receive Smip treatment, corrupting kernel exception handling state
+Violation: The kernel enables the Smip fast-interrupt extension (e.g., via menvcfg or siselect CSR) while mtvec.mode is set to 0 (Direct mode), causing synchronous exceptions to share the same trap entry point as interrupts. On a synchronous exception, the hardware applies Smip's GPR-saving behavior—which is designed only for interrupts—corrupting the exception handler's expected register state and stack layout.
+Consequence: data_corruption
+Pattern: mtvec.*mode.*0|CSR_WRITE.*mtvec.*DIRECT|menvcfg.*smip|siselect.*smip.*enable
+------------------------------------------------------------
+[potential_risk] arch/riscv/kernel/head.S:203-213  .Lsetup_trap_vector
+  Kernel sets CSR_TVEC to handle_exception address in Direct mode (mode=0) without checking whether M-mode firmware has previously enabled Smip via menvcfg or mseccfg. If firmware enables Smip while stvec.mode=Direct, synchronous exceptions would share the same entry point as interrupts, and hardware would apply Smip's GPR-saving behavior—designed only for interrupts—corrupting the exception handler's expected register state and stack layout.
+  | .Lsetup_trap_vector:
+  | 	/* Set trap vector to exception handler */
+  | 	la a0, handle_exception
+  | 	csrw CSR_TVEC, a0
+  | 
+  | 	/* Set sup0 scratch register to 0, indicating to exception vector that
+  | 	 * we are presently executing in kernel.
+  | 	 */
+  | 	csrw CSR_SCRATCH, zero
+  | 	ret
+
+[compliant] arch/riscv/kernel/suspend.c:15-42  suspend_save_csrs
+  Suspend path correctly saves/restores CSR_TVEC (line 19/49) and CSR_ENVCFG (line 18/48, gated on XLINUXENVCFG). This is a standard save/restore pattern that preserves whatever mode firmware set, and does not itself enable or disable Smip. Compliant because the kernel does not write Smip-enable bits.
+  | context->tvec = csr_read(CSR_TVEC);
+  | ...
+  | csr_write(CSR_TVEC, context->tvec);
+
+[potential_risk] arch/riscv/kernel/entry.S:125-238  handle_exception
+  The trap handler assumes standard RISC-V save/restore semantics: registers are explicitly saved to the stack (PT_RA, PT_GP, PT_T0, save_from_x6_to_x31 at lines 164-167) and CSR_SCRATCH-based kernel/user detection is used (line 131). If Smip were enabled with mtvec.mode=Direct by firmware, Smip's automatic GPR saving would conflict with the handler's explicit save sequence—the hardware would save a subset of GPRs before the handler runs, but the handler code would still execute its full save routine, leading to double-save or mismatched stack layout.
+  | SYM_CODE_START(handle_exception)
+  | 	csrrw tp, CSR_SCRATCH, tp
+  | 	bnez tp, .Lsave_context
+  | 
+  | .Lrestore_kernel_tpsp:
+  | 	csrr tp, CSR_SCRATCH
+  | ...
+  | .Lsave_context:
+  | 	REG_S sp, TASK_TI_USER_SP(tp)
+  | 	REG_L sp, TASK_TI_KERNEL_SP(tp)
+  | 	addi sp, sp, -(PT_SIZE_ON_STACK)
+  | 	REG_S x1,  PT_RA(sp)
+
+[compliant] arch/riscv/include/asm/csr.h:233-250  (definitions)
+  The kernel defines SMSTATEEN0, MSECCFG, and ENVCFG CSR bit macros, but has no definitions for Smip-specific bits. The menvcfg CSR (0x30a) is defined but never written with Smip-enable bits. No RISCV_ISA_EXT_SMIP or similar extension ID exists in hwcap.h. The kernel has no awareness of the Smip extension at all—it neither enables it nor guards against it.
+  | /* Smstateen bits */
+  | #define SMSTATEEN0_AIA_IMSIC		...
+  | #define SMSTATEEN0_HSENVCFG		...
+  | /* mseccfg bits */
+  | #define MSECCFG_PMM			ENVCFG_PMM
+
+[potential_risk] arch/riscv/kernel/cpufeature.c:578-581  riscv_isa_ext (table)
+  The ISA extension table has entries for smaia, smmpm, smnpm, and smstateen, but no entry for smip. This means even if hardware advertises Smip in the ISA string, the kernel would not recognize it. More critically, the kernel has no boot-time validation that menvcfg or mseccfg does not have Smip enabled—it trusts firmware to leave M-mode CSRs in a sane state. This is a blind spot: if firmware enables Smip, the kernel has no defense and no mechanism to detect the misconfiguration.
+  | __RISCV_ISA_EXT_DATA(smaia, RISCV_ISA_EXT_SMAIA),
+  | __RISCV_ISA_EXT_DATA(smmpm, RISCV_ISA_EXT_SMMPM),
+  | __RISCV_ISA_EXT_SUPERSET(smnpm, RISCV_ISA_EXT_SMNPM, riscv_xlinuxenvcfg_exts),
+  | __RISCV_ISA_EXT_DATA(smstateen, RISCV_ISA_EXT_SMSTATEEN),
+
+[compliant] arch/riscv/kernel/head.S:233-242  _start_kernel (PMP setup for M-mode)
+  In CONFIG_RISCV_M_MODE path, the kernel temporarily installs a minimal trap handler (.Lpmp_done) in Direct mode for PMP setup. After PMP configuration, control proceeds to setup_trap_vector which installs handle_exception. This is standard and does not enable Smip. The temporary Direct-mode trap handler is only active during PMP init where no interrupts are expected.
+  | la a0, .Lpmp_done
+  | csrw CSR_TVEC, a0
+  | ...
+  | .Lpmp_done:
+

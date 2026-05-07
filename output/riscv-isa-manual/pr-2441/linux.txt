@@ -1,0 +1,109 @@
+PR #2441  target=linux  overall=compliant
+Spec: Generalized RVWMO single-memory-operation guarantee now applies only to accesses of XLEN bits or fewer, with an explicit escape hatch for extensions like V to generate multiple memory operations per instruction — kernel code emulating or intercepting vector memory accesses (KVM, ptrace, signal frames) must not assume single-copy atomicity for wider accesses
+Violation: Kernel code (KVM emulation, ptrace, signal delivery, or context-switch save/restore) assumes that a single aligned memory instruction always produces exactly one memory operation for accesses wider than XLEN bits (e.g., vector V extension loads/stores), when the spec now explicitly carves out that ISA extensions may generate multiple memory operations per instruction.
+Consequence: race_condition
+Pattern: (vmad|vmov|vse|vle|vss|vls|vlux|vsox|vsuxei|vloxei|vsext|vlsext)\.|vector.*(load|store|memory|save|restore)|kvm.*riscv.*emulate.*mem|__kvm_riscv.*mem|kvm_riscv_vcpu.*load|kvm_riscv_vcpu.*store|regcopy.*vector|riscv_vr_get|riscv_vr_set|ptrace.*riscv.*vreg|signal.*frame.*riscv.*vector
+------------------------------------------------------------
+[compliant] arch/riscv/include/asm/vector.h:196-231  __riscv_v_vstate_save
+  Context-switch vector save uses vse8.v to bulk-save all 32 vector registers to a kernel-allocated datap buffer. It saves the vstart CSR too, so partially-completed vector memory operations are properly tracked across context switches. No assumption that a single vector instruction equals a single memory operation — only the register file is saved/restored.
+  | vsetvli %0, x0, e8, m8, ta, ma
+  | 	vse8.v v0, (%1)
+  | 	add %1, %1, %0
+  | 	vse8.v v8, (%1)
+  | 	...
+
+[compliant] arch/riscv/include/asm/vector.h:233-268  __riscv_v_vstate_restore
+  Context-switch vector restore uses vle8.v to bulk-load all 32 vector registers from a kernel datap buffer. CSR state (vstart, vtype, vl, vcsr) is restored via __vstate_csr_restore before the register reload, preserving partial-execution state for restartable vector instructions. Compliant with multi-memory-operation model.
+  | vsetvli %0, x0, e8, m8, ta, ma
+  | 	vle8.v v0, (%1)
+  | 	add %1, %1, %0
+  | 	vle8.v v8, (%1)
+  | 	...
+
+[compliant] arch/riscv/include/asm/vector.h:369-400  __switch_to_vector
+  Context-switch handler correctly distinguishes user-mode and kernel-mode vector contexts. Saves dirty user vstate and defers restore (lazy restore via TIF_RISCV_V_DEFER_RESTORE). For kernel-mode vector, handles preemption flags (RISCV_PREEMPT_V_DIRTY/NEED_RESTORE/IN_SCHEDULE). No assumption of single memory operation per instruction.
+  | regs = task_pt_regs(prev);
+  | 	riscv_v_vstate_save(&prev->thread.vstate, regs);
+  | 	...
+  | 	riscv_v_vstate_set_restore(next, task_pt_regs(next));
+
+[compliant] arch/riscv/kvm/vcpu_insn.c:373-483  kvm_riscv_vcpu_mmio_load
+  KVM MMIO load emulation only decodes scalar load instructions (LW/LD/LB/LBU/LH/LHU and C variants). Vector memory instructions (vle/vlse/vluxei etc.) are not decoded and fall through to return -EOPNOTSUPP at line 450. This is a safe failure — KVM refuses to emulate rather than incorrectly assuming single-memory-operation semantics for vector instructions.
+  | } else {
+  | 	return -EOPNOTSUPP;
+  | }
+
+[compliant] arch/riscv/kvm/vcpu_insn.c:497-618  kvm_riscv_vcpu_mmio_store
+  KVM MMIO store emulation only decodes scalar store instructions (SW/SD/SB/SH and C variants). Vector store instructions (vse/vss/vsoxei etc.) are not decoded and fall through to return -EOPNOTSUPP at line 567. Same safe-failure pattern as the load path.
+  | } else {
+  | 	return -EOPNOTSUPP;
+  | }
+
+[compliant] arch/riscv/kvm/vcpu_vector.c:43-51  kvm_riscv_vcpu_guest_vector_save
+  Guest vector state save on VCPU put correctly checks SR_VS==DIRTY before saving. Uses __kvm_riscv_vector_save which delegates to __riscv_v_vstate_save — bulk register file save, no per-instruction memory-operation assumptions.
+  | if ((cntx->sstatus & SR_VS) == SR_VS_DIRTY) {
+  | 	if (riscv_isa_extension_available(isa, v))
+  | 		__kvm_riscv_vector_save(cntx);
+  | 	kvm_riscv_vcpu_vector_clean(cntx);
+  | }
+
+[compliant] arch/riscv/kvm/vcpu_vector.c:53-61  kvm_riscv_vcpu_guest_vector_restore
+  Guest vector state restore on VCPU load correctly checks SR_VS!=OFF before restore. Bulk register file restore — compliant with multi-memory-operation model.
+  | if ((cntx->sstatus & SR_VS) != SR_VS_OFF) {
+  | 	if (riscv_isa_extension_available(isa, v))
+  | 		__kvm_riscv_vector_restore(cntx);
+  | 	kvm_riscv_vcpu_vector_clean(cntx);
+  | }
+
+[compliant] arch/riscv/kvm/vcpu.c:627-634  kvm_arch_vcpu_load
+  VCPU load sequence: host_vector_save then guest_vector_restore. The vector save/restore pair swaps the register file between host and guest contexts using kernel buffers. No assumptions about guest vector memory instruction atomicity.
+  | kvm_riscv_vcpu_host_vector_save(&vcpu->arch.host_context);
+  | 	kvm_riscv_vcpu_guest_vector_restore(&vcpu->arch.guest_context, vcpu->arch.isa);
+
+[compliant] arch/riscv/kvm/vcpu.c:656-659  kvm_arch_vcpu_put
+  VCPU put sequence: guest_vector_save then host_vector_restore. Mirrors the load path correctly. Compliant.
+  | kvm_riscv_vcpu_guest_vector_save(&vcpu->arch.guest_context, vcpu->arch.isa);
+  | 	kvm_riscv_vcpu_host_vector_restore(&vcpu->arch.host_context);
+
+[compliant] arch/riscv/kernel/signal.c:73-108  save_v_state
+  Signal frame save copies the vector register file (via riscv_v_vstate_save then __copy_to_user) plus CSR metadata (vstart/vl/vtype/vcsr/vlenb). This is a state snapshot, not a trace of individual memory operations. Properly uses get/put_cpu_vector_context to serialize with kernel-mode vector usage.
+  | get_cpu_vector_context();
+  | 	riscv_v_vstate_save(&current->thread.vstate, regs);
+  | 	put_cpu_vector_context();
+  | 	...
+  | 	err |= __copy_to_user(datap, current->thread.vstate.datap, riscv_v_vsize);
+
+[compliant] arch/riscv/kernel/signal.c:115-143  __restore_v_state
+  Signal frame restore calls riscv_v_vstate_set_restore (lazy restore) then copies CSR metadata and full vector register content from the user's signal frame via copy_from_user (not __copy_from_user — correctly does access_ok check to prevent kernel info leak). Restartable vector instruction state (vstart) is properly preserved in the signaled-to frame.
+  | riscv_v_vstate_set_restore(current, regs);
+  | 	...
+  | 	return copy_from_user(current->thread.vstate.datap, datap, riscv_v_vsize);
+
+[compliant] arch/riscv/kernel/ptrace.c:95-129  riscv_vr_get
+  Ptrace get of vector registers: saves dirty vector state (if target==current) via get/put_cpu_vector_context, then membuf_writes the CSR header and full register file. No assumption of single memory operation per instruction — this transfers the register file, not a trace of guest memory operations.
+  | get_cpu_vector_context();
+  | 	riscv_v_vstate_save(&current->thread.vstate, task_pt_regs(current));
+  | 	put_cpu_vector_context();
+  | 	...
+  | 	membuf_write(&to, vstate->datap, riscv_v_vsize);
+
+[compliant] arch/riscv/kernel/ptrace.c:217-251  riscv_vr_set
+  Ptrace set of vector registers: validates CSR values via invalid_ptrace_v_csr (checks vlenb match, reserved bits, vtype SEW/LMUL constraints per RVV 1.0 spec 3.4.2, VLMAX bounds), then copies CSR metadata and full register file from userspace. The validation prevents injection of invalid partial-execution state. Compliant.
+  | if (invalid_ptrace_v_csr(vstate, &ptrace_vstate))
+  | 	return -EINVAL;
+  | 	...
+  | 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, vstate->datap, 0, riscv_v_vsize);
+
+[compliant] arch/riscv/include/asm/entry-common.h:10-21  arch_exit_to_user_mode_prepare
+  Lazy vector restore on return-to-userspace: if TIF_RISCV_V_DEFER_RESTORE is set, clears the flag and calls riscv_v_vstate_restore to reload the full vector register file plus CSRs (vstart/vl/vtype/vcsr) from the kernel buffer. Called with irqs disabled. This is a bulk register file restore, not an assumption about single memory operations.
+  | if (ti_work & _TIF_RISCV_V_DEFER_RESTORE) {
+  | 	clear_thread_flag(TIF_RISCV_V_DEFER_RESTORE);
+  | 	riscv_v_vstate_restore(&current->thread.vstate, regs);
+  | }
+
+[compliant] arch/riscv/kernel/kernel_mode_vector.c:124-152  riscv_v_start_kernel_context
+  Kernel-mode vector context start: transfers ownership from user to kernel, saving user vstate if dirty. Handles nested contexts (depth tracking). The save/restore is of the register file — the vstart CSR tracks partial vector memory instruction progress. Compliant.
+  | __riscv_v_vstate_save(uvstate, uvstate->datap);
+  | 	...
+  | 	riscv_preempt_v_clear_dirty(current);
+

@@ -1,0 +1,125 @@
+PR #2979  target=qemu  overall=potential_risk
+Spec: QEMU narrow-check infrastructure assumes 2× widening; vfncvt.f.f.q requires 4× (FP32→OFP8), risking wrong EMUL register access and silent data corruption if impl falls through existing checks
+Violation: QEMU implements vfncvt.f.f.q (FP32→OFP8 quad-width narrowing) reusing the existing opfv_narrow_check/vext_check_sd infrastructure, which validates only 2×LMUL source alignment (s->lmul+1) and 2×SEW source width (s->sew+1). The instruction requires 4×LMUL source alignment (s->lmul+2) and 4×SEW source width (s->sew+2), since it narrows FP32 (EMUL=4×LMUL, SEW=32) to OFP8 (EMUL=LMUL, SEW=8). Without a dedicated quad-narrow validation path, the TCG helper reads only half the intended source vector register group, operating on stale or unrelated register file data.
+Consequence: data_corruption
+Pattern: vfncvt.f.f.q|vfncvt.sat.f.f.q|quad.*narrow|emu[lL].*4|EMUL.*4|vnarrow.*quad|vext_check.*quad
+------------------------------------------------------------
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:526-535  vext_narrow_check_common
+  This is the root validation function for all vector narrowing instructions. It validates source register alignment at s->lmul+1 (2xLMUL, line 532: require_align(vs2, s->lmul+1)) and constrains SEW to 2x width (line 531: s->sew+1 <= elen>>4). For vfncvt.f.f.q (FP32→OFP8, EMUL=4xLMUL source), this would need s->lmul+2 alignment and s->sew+2 width. No quad-narrow variant of this function exists anywhere. If vfncvt.f.f.q were added reusing this check, misaligned source register numbers (e.g., vs2=2 with LMUL=1) would incorrectly pass validation at 2x alignment but should fail at 4x alignment (requiring vs2%4==0). The TCG helper would then operate on only half the architectural source register group.
+  | static bool vext_narrow_check_common(DisasContext *s, int vd, int vs2, int vm)
+  | {
+  |     return (s->lmul <= 2) &&
+  |            (s->sew < MO_64) &&
+  |            ((s->sew + 1) <= (s->cfg_ptr->elen >> 4)) &&
+  |            require_align(vs2, s->lmul + 1) &&  /* 2xLMUL — needs lmul+2 for quad */
+  |            require_align(vd, s->lmul) &&
+  |            require_vm(vm, vd);
+  | }
+
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:594-602  vext_check_sd
+  Called by opfv_narrow_check for OPFV narrowing instructions. Passes s->sew+1 (2xSEW) as the source EEW to vext_check_input_eew (line 597). For quad narrowing this must be s->sew+2 (4xSEW, i.e., FP32 source for OFP8 dest). The overlap check at line 599 (require_noover(vd, s->lmul, vs, s->lmul+1)) also uses 2xLMUL source group size instead of the required 4xLMUL. With the wrong parameters, the EMUL computation inside vext_check_input_eew would compute lmul+1 instead of lmul+2, underestimating the source group size by a factor of 2, potentially missing real register overlaps.
+  | static bool vext_check_sd(DisasContext *s, int vd, int vs, int vm)
+  | {
+  |     bool ret = vext_narrow_check_common(s, vd, vs, vm) &&
+  |                vext_check_input_eew(s, vs, s->sew + 1, -1, 0, vm);
+  |     if (vd != vs) {
+  |         ret &= require_noover(vd, s->lmul, vs, s->lmul + 1);
+  |     }
+  |     return ret;
+  | }
+
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:397-418  vext_check_input_eew
+  Computes emul_vs1 = eew_vs1 - sew + lmul (line 400). When called by vext_check_sd with eew_vs1=s->sew+1, this gives emul_vs1 = lmul+1 (2xLMUL). For quad narrowing the EEW should be sew+2, yielding emul_vs1 = lmul+2 (4xLMUL). The overlap check at line 412 (is_overlapped(vs1, 1<<MAX(emul_vs1,0), ...)) would use a source group size half of what is architecturally required, potentially missing real overlaps between the expanded source group and other operands. Additionally, the mask overlap check (require_vm) at line 405 would also not detect cases where the source group extends into the v0 register range beyond the 2x prediction.
+  | static bool vext_check_input_eew(DisasContext *s, int vs1, uint8_t eew_vs1,
+  |                                  int vs2, uint8_t eew_vs2, int vm)
+  | {
+  |     bool is_valid = true;
+  |     int8_t emul_vs1 = eew_vs1 - s->sew + s->lmul;  /* lmul+1 for 2x, needs lmul+2 for 4x */
+  |     int8_t emul_vs2 = eew_vs2 - s->sew + s->lmul;
+  |     ...
+  |     if ((vs1 != -1 && vs2 != -1) && (eew_vs1 != eew_vs2) &&
+  |         is_overlapped(vs1, 1 << MAX(emul_vs1, 0),
+  |                       vs2, 1 << MAX(emul_vs2, 0))) {
+  |         is_valid = false;
+  |     }
+
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:3117-3123  opfv_narrow_check
+  This is the OPFV narrow entry point, currently used by vfncvt.f.f.w (2x narrowing). It calls vext_check_sd(s, a->rd, a->rs2, a->vm) which validates only 2x source alignment and width. There is NO opfv_quad_narrow_check or equivalent function anywhere in the QEMU source tree. If vfncvt.f.f.q were added by passing this same check function to GEN_OPFV_NARROW_TRANS, the 2x validation would apply instead of the required 4x validation. The function would need a 'quad' variant that validates s->lmul+2 source alignment and s->sew+2 source width, or the existing vext_check_sd would need a quad-mode parameter.
+  | static bool opfv_narrow_check(DisasContext *s, arg_rmr *a)
+  | {
+  |     return require_rvv(s) &&
+  |            vext_check_isa_ill(s) &&
+  |            /* OPFV narrowing instructions ignore vs1 check */
+  |            vext_check_sd(s, a->rd, a->rs2, a->vm);
+  | }
+
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:3152-3176  GEN_OPFV_NARROW_TRANS
+  The macro that generates trans_ functions for OPFV narrow instructions. The helper dispatch array fns[2] is indexed by s->sew-1 (line 3171: fns[s->sew - 1]), supporting only SEW=16 (fns[0]=_h suffix, narrows 32→16-bit) and SEW=32 (fns[1]=_w suffix, narrows 64→32-bit). For vfncvt.f.f.q, the destination is OFP8 (8-bit), meaning SEW=8 would index at -1 — an out-of-bounds array access. The macro would produce a **compile-time OOB bug** (only detectable at runtime via UB). A new macro or an extension to the existing one is required to add fns[0] = gen_helper_vfncvt_f_f_q with SEW=8 dispatch, alongside the corresponding check that validates 4xLMUL source alignment.
+  | static gen_helper_gvec_3_ptr * const fns[2] = {         \
+  |         gen_helper_##HELPER##_h,                            \
+  |         gen_helper_##HELPER##_w,                            \
+  |     };                                                      \
+  |     ...                                                     \
+  |                            fns[s->sew - 1]);                \
+  |                                  /* SEW=8→index -1: OOB */
+
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:3178-3203  GEN_OPFV_NARROW_BFA_TRANS
+  Same fns[2] dispatch issue as GEN_OPFV_NARROW_TRANS, with the same s->sew-1 indexing at line 3198 (or line 3197 for the BFA helper path via altfmt). Only supports SEW=16 and SEW=32 output types. Currently used by vfncvt.f.f.w and vfncvt_rod_f_f_w (lines 3209-3213) which narrow FP32→FP16 or FP64→FP32 — all standard 2x cases. Would need modification to support SEW=8 (OFP8 output) for quad narrowing. The altfmt dispatch path (gen_helper_##BFA_HELPER) also has no OFP8 variant — the existing BFA helper vfncvtbf16_f_f_w handles FP32→BF16 (also a 2x narrow), not FP32→OFP8.
+  | static gen_helper_gvec_3_ptr * const fns[2] = {                 \
+  |             gen_helper_##HELPER##_h,                                    \
+  |             gen_helper_##HELPER##_w,                                    \
+  |         };                                                              \
+  |         ...                                                             \
+  |                        (s->altfmt ? gen_helper_##BFA_HELPER :           \
+  |                                     fns[s->sew - 1]));                  \
+
+[compliant] target/riscv/vector_helper.c:3953-3959  OPFVV1
+  This macro is type-agnostic and correct for any element type combination. For vfncvt.f.f.q with NOP_UU_B type params (uint8_t dest, uint32_t src, uint32_t intermediate), the read/write operations are type-safe. The macro itself has no EMUL awareness — it trusts the translator to provide a correctly-sized source buffer via tcg_gen_gvec_3_ptr. The vulnerability is entirely on the translator side. This code is compliant for its current use.
+  | #define OPFVV1(NAME, TD, T2, TX2, HD, HS2, OP)         \
+  | static void do_##NAME(void *vd, void *vs2, int i,      \
+  |                       CPURISCVState *env)              \
+  | {                                                      \
+  |     TX2 s2 = *((T2 *)vs2 + HS2(i));                    \
+  |     *((TD *)vd + HD(i)) = OP(s2, &env->fp_status);     \
+  | }
+
+[compliant] target/riscv/vector_helper.c:3961-3990  GEN_VEXT_V_ENV
+  The helper loop iterates vl times calling do_##NAME, with tail-agnostic masking computed from vext_get_total_elems(env, desc, ESZ) where ESZ is the destination element size. For OFP8 destination, ESZ=1 correctly computes the destination group size. The loop has no source buffer bounds checking — it trusts the translator-provided source pointer (vreg_ofs(s, a->rs2)) to point to a correctly-sized buffer. With insufficient source alignment validation in the translator, the HS2(i) index for i >= half the elements would read from adjacent vector registers containing stale/unrelated data. The helper itself is correct for the buffer it receives; the bug is in the translator not ensuring the buffer is large enough.
+  | #define GEN_VEXT_V_ENV(NAME, ESZ)                      \
+  | void HELPER(NAME)(void *vd, void *v0, void *vs2,       \
+  |                   CPURISCVState *env, uint32_t desc)    \
+  | {                                                      \
+  |     uint32_t vl = env->vl;                             \
+  |     ...                                                \
+  |     for (i = env->vstart; i < vl; i++) {               \
+  |         ... do_##NAME(vd, vs2, i, env); ...            \
+  |     }                                                  \
+  |     vext_set_elems_1s(vd, vta, env, total_elems * ESZ);\
+  | }
+
+[compliant] target/riscv/vector_internals.h:114-121  vext_get_total_elems
+  Correctly computes destination element count as (vlenb << emul) / esz where emul = ctz(esz) - ctz(sew) + lmul. For OFP8 dest (esz=1) with SEW=8 and LMUL from descriptor: emul = 0-3+lmul = lmul-3, correctly giving the destination group size. This function is used only for tail-agnostic destination masking in GEN_VEXT_V_ENV, not for source buffer validation. The source access in do_##NAME has no bounds checking. This function is compliant for its current purpose.
+  | static inline uint32_t vext_get_total_elems(CPURISCVState *env, uint32_t desc,
+  |                                             uint32_t esz)
+  | {
+  |     uint32_t sew = 1 << FIELD_EX64(env->vtype, VTYPE, VSEW);
+  |     int8_t emul = ctz(esz) - ctz(sew)
+  |                   + FIELD_EX64(desc, VDATA, LMUL);
+  |     return (env->cfg.vlenb << MAX(emul, 0)) / esz;
+  | }
+
+[compliant] hw/riscv/riscv-iommu.c:753-757  riscv_iommu_validate_device_ctx
+  Newly added validation check: when GATP is in BARE mode (no guest-stage address translation), MSI translation mode must be OFF. This is architecturally correct — if there is no second-stage translation, MSI address remapping through page tables cannot function. The check prevents a misconfigured device context from bypassing MSI isolation when guest translation is disabled. This change appears to close a legitimate validation gap and is unrelated to the Zvfofp8min PR context.
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |         get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |         RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |         return false;
+  |     }
+
+[potential_risk] target/riscv/insn_trans/trans_rvv.c.inc:264-267  vreg_ofs
+  Computes register memory offset as offsetof(CPURISCVState, vreg) + reg * vlenb. Used by GEN_OPFV_NARROW_TRANS to form the source pointer for tcg_gen_gvec_3_ptr via vreg_ofs(s, a->rs2). The function itself is correct, but when used with an insufficiently-validated source register number (vs2 only aligned at 2xLMUL instead of 4xLMUL), the source memory region accessible to the TCG helper spans only half the architectural source register group. With SEW=32 and LMUL=1, the architectural source is vs2..vs2+3 (4 registers), but using vreg_ofs with vs2 only validated at 2x alignment, the helper would read from registers 2-3 (2 registers' worth), with half the source data coming from adjacent unrelated register state.
+  | static inline uint32_t vreg_ofs(DisasContext *s, int reg)
+  | {
+  |     return offsetof(CPURISCVState, vreg) + reg * s->cfg_ptr->vlenb;
+  | }
+

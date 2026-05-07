@@ -1,0 +1,1832 @@
+diff --git a/.github/workflows/regress.yml b/.github/workflows/regress.yml
+index c0dba1336a..956878c477 100644
+--- a/.github/workflows/regress.yml
++++ b/.github/workflows/regress.yml
+@@ -712,6 +712,23 @@ jobs:
+       run: docker load --input ${{ runner.temp }}/docker_image.tar
+     - name: Check profile_extensions
+       run: "./do test:profile_extensions"
++  regress-build-udb-gem:
++    runs-on: ubuntu-latest
++    needs: build-container
++    steps:
++    - name: Clone Github Repo Action
++      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++    - name: Download docker image
++      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
++      with:
++        name: docker_image
++        path: "${{ runner.temp }}"
++    - name: Load image
++      run: docker load --input ${{ runner.temp }}/docker_image.tar
++    - name: Build udb gem via chore
++      run: "./bin/chore build udb-gem"
++    - name: Verify udb gem was built
++      run: ls gen/udb_gem/udb-*.gem
+   regress-regress:
+     runs-on: ubuntu-latest
+     needs: build-container
+@@ -1032,6 +1049,7 @@ jobs:
+     - regress-riscv-tests-64
+     - regress-xqci-doc
+     - regress-profile-extensions
++    - regress-build-udb-gem
+     - regress-regress
+     - build-reuse-manifest
+     - build-udb-api-docs
+diff --git a/.github/workflows/release_udb_gem.yml b/.github/workflows/release_udb_gem.yml
+new file mode 100644
+index 0000000000..cf5961b329
+--- /dev/null
++++ b/.github/workflows/release_udb_gem.yml
+@@ -0,0 +1,79 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++name: Release udb gem to RubyGems.org
++
++# Builds and publishes the udb gem to rubygems.org whenever the version
++# string in version.rb changes on the main branch.
++#
++# A git tag "udb-gem-VERSION" is created on the release commit so the
++# exact source that produced each published gem is always traceable.
++# The tag check also makes the workflow idempotent: re-running it for the
++# same version is a no-op.
++
++on:
++  push:
++    branches:
++      - main
++    paths:
++      - 'tools/ruby-gems/udb/lib/udb/version.rb'
++  workflow_dispatch:
++
++jobs:
++  release-udb-gem:
++    runs-on: ubuntu-24.04
++    permissions:
++      contents: write   # needed to push the release tag
++
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++
++      - name: Get gem version
++        id: version
++        run: |
++          VERSION=$(ruby -e "load 'tools/ruby-gems/udb/lib/udb/version.rb'; puts Udb.version")
++          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
++
++      - name: Check if release tag already exists
++        run: |
++          if git ls-remote --tags origin "refs/tags/udb-gem-${VERSION}" | grep -q .; then
++            echo "TAG_EXISTS=true" >> "$GITHUB_ENV"
++            echo "Tag udb-gem-${VERSION} already exists – skipping release."
++          else
++            echo "TAG_EXISTS=false" >> "$GITHUB_ENV"
++          fi
++
++      - name: Set up Ruby
++        if: env.TAG_EXISTS == 'false'
++        uses: ruby/setup-ruby@v1
++        with:
++          ruby-version: '3.2'
++          bundler-cache: true
++          working-directory: tools/ruby-gems/udb
++
++      - name: Prepare gem staging directory
++        if: env.TAG_EXISTS == 'false'
++        run: |
++          cd tools/ruby-gems/udb
++          bundle exec rake release:udb:prepare
++
++      - name: Build gem
++        if: env.TAG_EXISTS == 'false'
++        run: |
++          cd gen/udb_gem
++          BUNDLE_GEMFILE= gem build udb.gemspec
++
++      - name: Push gem to RubyGems.org
++        if: env.TAG_EXISTS == 'false'
++        env:
++          GEM_HOST_API_KEY: ${{ secrets.RUBYGEM_API_KEY }}
++        run: gem push "gen/udb_gem/udb-${VERSION}.gem"
++
++      - name: Create and push release tag
++        if: env.TAG_EXISTS == 'false'
++        run: |
++          git config user.name "github-actions[bot]"
++          git config user.email "github-actions[bot]@users.noreply.github.com"
++          git tag "udb-gem-${VERSION}"
++          git push origin "udb-gem-${VERSION}"
+diff --git a/Gemfile.lock b/Gemfile.lock
+index d36d1fe3e3..afd86d8fa5 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -344,6 +344,7 @@ DEPENDENCIES
+   idl_highlighter!
+   idlc!
+   minitest
++  rake
+   rdbg
+   rouge
+   rubocop-github
+@@ -364,7 +365,7 @@ DEPENDENCIES
+   yard-sorbet
+ 
+ RUBY VERSION
+-   ruby 3.4.8p72
++  ruby 3.4.8p72
+ 
+ BUNDLED WITH
+-   4.0.7
++  4.0.7
+diff --git a/bin/chore b/bin/chore
+index a3c50c9487..2348b15c52 100755
+--- a/bin/chore
++++ b/bin/chore
+@@ -12,6 +12,7 @@ help() {
+   echo ""
+   echo "Commands:"
+   echo ""
++  echo "  build:     Build an artifact        ('chore build -h' for more)"
+   echo "  container: Container operations     ('chore container -h' for more)"
+   echo "  gen:       Generate an artifact     ('chore gen -h' for more)"
+   echo "  install:   Install new libraries    ('chore install -h' for more)"
+@@ -19,6 +20,31 @@ help() {
+   echo ""
+ }
+ 
++build_subcmd_usage() {
++  echo "Usage: chore build [-h] TARGET"
++  echo ""
++  echo ""
++  echo "Options:"
++  echo ""
++  echo "  -h:      Print help"
++  echo ""
++  echo "Commands:"
++  echo ""
++  echo "  udb-gem:       Build the udb gem    ('chore build udb-gem -h' for more)"
++  echo ""
++}
++
++build_udb_gem_usage() {
++  echo "Usage: chore build udb-gem [-hd]"
++  echo ""
++  echo ""
++  echo "Options:"
++  echo ""
++  echo "  -h:        Print help"
++  echo "  -d DIR:    Override the staging/gen directory (default: <repo-root>/gen/udb_gem)"
++  echo ""
++}
++
+ container_subcmd_usage() {
+   echo "Usage: chore container [-h] COMMAND"
+   echo ""
+@@ -319,6 +345,46 @@ STEPS
+   done
+ }
+ 
++#
++# Build the udb gem
++# Args: $1 - gen_dir (optional override for staging directory; empty string = use default)
++# Returns: 0 on success, exits with 1 on error
++#
++do_build_udb_gem() {
++  local gen_dir=$1
++  source_setup
++
++  local staging_dir="${gen_dir:-${UDB_ROOT}/gen/udb_gem}"
++
++  echo "Preparing udb gem staging directory at ${staging_dir} and building gem..."
++  local rake_env=""
++  if [ -n "$gen_dir" ]; then
++    rake_env="UDB_GEM_GEN_DIR=${gen_dir} "
++  fi
++  # Run prepare and gem build in a single container invocation so that the
++  # staging directory (which may be outside the repo-root mount) is accessible
++  # to both steps.
++  local build_cmd
++  build_cmd=$(cat << CMD
++cd ${UDB_ROOT}/tools/ruby-gems/udb && \
++${rake_env}bundle exec rake release:udb:prepare && \
++cd ${staging_dir} && \
++BUNDLE_GEMFILE= gem build udb.gemspec
++CMD
++  )
++  $RUN /bin/bash -c "$build_cmd" || exit $?
++
++  # Announce the location of the built gem (path is the same on host when
++  # staging_dir is inside the repo root; otherwise just print the directory).
++  local gem_file
++  gem_file=$(ls "${staging_dir}"/udb-*.gem 2>/dev/null | sort -V | tail -1)
++  if [ -n "$gem_file" ]; then
++    echo "udb gem built successfully: ${gem_file}"
++  else
++    echo "udb gem built in: ${staging_dir}"
++  fi
++}
++
+ while getopts ":h" opt; do # Go through the options
+   case $opt in
+     # help
+@@ -685,6 +751,49 @@ case "$subcommand" in
+         exit 1
+     esac
+     ;;
++  build )
++    while getopts ":h" opt; do
++      case $opt in
++        h )
++          build_subcmd_usage
++          exit 0
++        ;;
++        ? )
++          echo "[ERROR]: Invalid option: -${OPTARG}"
++          build_subcmd_usage
++          exit 1
++        ;;
++      esac
++    done
++    target="$1"; shift
++    case "$target" in
++      udb-gem )
++        gen_dir=""
++        while getopts ":hd:" opt; do
++          case $opt in
++            h )
++              build_udb_gem_usage
++              exit 0
++            ;;
++            d )
++              gen_dir=$OPTARG
++            ;;
++            ? )
++              echo "[ERROR]: Invalid option: -${OPTARG}"
++              build_udb_gem_usage
++              exit 1
++            ;;
++          esac
++        done
++        do_build_udb_gem "$gen_dir"
++        exit 0
++      ;;
++      * )
++        echo "Invalid target: $target"
++        build_subcmd_usage
++        exit 1
++    esac
++    ;;
+   * )
+     if [ ! -z "$subcommand" ]; then  # Don't show if no subcommand provided
+       echo "Invalid subcommand: $subcommand"
+diff --git a/doc/HOW-DO-I.adoc b/doc/HOW-DO-I.adoc
+index 54f1005101..c32f154768 100644
+--- a/doc/HOW-DO-I.adoc
++++ b/doc/HOW-DO-I.adoc
+@@ -71,7 +71,7 @@ To add a complex regression, you must:
+ See xref:regress-test-infrastructure.adoc[Regression test infrastructure] for more details.
+ 
+ 
+-=== Update Ruby gems
++=== Update Ruby gem dependencies to latest versions
+ 
+ To update Ruby gems to the latest available versions, run:
+ 
+@@ -82,7 +82,7 @@ To update Ruby gems to the latest available versions, run:
+ 
+ Then `git add` all updated/new files and make a PR.
+ 
+-=== Add a new Ruby gem
++=== Add a new Ruby gem dependence
+ 
+ Add the gem in the appropriate gemspace or Gemfile (top, or one of the sub-project gems under tools/ruby-gems).
+ 
+diff --git a/tools/ruby-gems/udb-gen/Gemfile.lock b/tools/ruby-gems/udb-gen/Gemfile.lock
+index 07aced1131..5a0d65c072 100644
+--- a/tools/ruby-gems/udb-gen/Gemfile.lock
++++ b/tools/ruby-gems/udb-gen/Gemfile.lock
+@@ -337,6 +337,7 @@ PLATFORMS
+ DEPENDENCIES
+   idlc!
+   minitest
++  rake
+   rdbg
+   rouge
+   rubocop-github
+diff --git a/tools/ruby-gems/udb-gen/lib/udb-gen/subcommands/manual.rb b/tools/ruby-gems/udb-gen/lib/udb-gen/subcommands/manual.rb
+index 9ea4a982a9..810428dc43 100644
+--- a/tools/ruby-gems/udb-gen/lib/udb-gen/subcommands/manual.rb
++++ b/tools/ruby-gems/udb-gen/lib/udb-gen/subcommands/manual.rb
+@@ -57,7 +57,7 @@ def initialize
+       short "-o"
+       long "--output-directory=path"
+       convert :path
+-      default Udb.repo_root / "gen" / "manual"
++      default Udb.default_gen_path / "manual"
+     end
+ 
+     RakeApp = Class.new(Rake::Application) do
+diff --git a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi
+index 882769d240..25e1193465 100644
+--- a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi
++++ b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi
+@@ -197,6 +197,9 @@ module Udb
+     sig { returns(::Pathname) }
+     def default_gen_path; end
+ 
++    sig { returns(::Pathname) }
++    def default_schemas_path; end
++
+     sig { returns(::Pathname) }
+     def default_std_isa_path; end
+ 
+@@ -215,7 +218,7 @@ module Udb
+     sig { returns(T.any(::Logger, ::TTY::Logger)) }
+     def logger; end
+ 
+-    sig { returns(::Pathname) }
++    sig { returns(T.nilable(::Pathname)) }
+     def repo_root; end
+ 
+     sig { params(logger: T.any(::Logger, ::TTY::Logger)).returns(T.any(::Logger, ::TTY::Logger)) }
+@@ -228,7 +231,7 @@ module Udb
+ 
+     private
+ 
+-    sig { params(from_dir: ::Pathname).returns(::Pathname) }
++    sig { params(from_dir: ::Pathname).returns(T.nilable(::Pathname)) }
+     def find_udb_root(from_dir); end
+   end
+ end
+@@ -4003,7 +4006,7 @@ Udb::RequirementSpec::REQUIREMENT_REGEX = T.let(T.unsafe(nil), Regexp)
+ class Udb::Resolver
+   sig do
+     params(
+-      repo_root: ::Pathname,
++      repo_root: T.nilable(::Pathname),
+       schemas_path_override: T.nilable(::Pathname),
+       cfgs_path_override: T.nilable(::Pathname),
+       gen_path_override: T.nilable(::Pathname),
+diff --git a/tools/ruby-gems/udb/Gemfile.lock b/tools/ruby-gems/udb/Gemfile.lock
+index 96e3a615c3..91e575acfe 100644
+--- a/tools/ruby-gems/udb/Gemfile.lock
++++ b/tools/ruby-gems/udb/Gemfile.lock
+@@ -117,6 +117,7 @@ GEM
+     racc (1.8.1)
+     rack (3.2.5)
+     rainbow (3.1.1)
++    rake (13.3.1)
+     rbi (0.3.9)
+       prism (~> 1.0)
+       rbs (>= 3.4.4)
+@@ -258,6 +259,7 @@ PLATFORMS
+ DEPENDENCIES
+   idlc!
+   minitest
++  rake
+   rdbg
+   rouge
+   rubocop-github
+diff --git a/tools/ruby-gems/udb/RELEASE.md b/tools/ruby-gems/udb/RELEASE.md
+new file mode 100644
+index 0000000000..5f056bdd2a
+--- /dev/null
++++ b/tools/ruby-gems/udb/RELEASE.md
+@@ -0,0 +1,141 @@
++<!--
++Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++SPDX-License-Identifier: CC0-1.0
++-->
++
++
++# Releasing the `udb` gem
++
++This document describes how to prepare and publish a release of the `udb` gem to
++[rubygems.org](https://rubygems.org).
++
++> **Automated releases:** The publish step (Steps 2–4 below) is handled
++> automatically by the
++> [Release udb gem to RubyGems.org](../../.github/workflows/release_udb_gem.yml)
++> GitHub Actions workflow.  Simply bump the version in `version.rb`, commit,
++> and merge to `main` — the workflow will build, publish, and tag the release.
++> Manual publishing (Steps 2–4) is only needed if the CI workflow is unavailable.
++
++---
++
++## Overview
++
++The `udb` gem is developed inside the `riscv-unified-db` monorepo but is
++distributed as a standalone gem.  Because the gem code references RISC-V
++specification data that lives in `spec/` and `cfgs/` of the monorepo, the
++release process copies that data into a `.data/` directory inside a staging
++copy of the gem before building the `.gem` file.
++
++The high-level steps are:
++
++1. Bump the version.
++2. Run `bin/chore build udb-gem` to create a staging directory and build the `.gem` file.
++3. Push the `.gem` file to rubygems.org.
++
++---
++
++## Prerequisites
++
++* Ruby and Bundler available in your `PATH` (the repo's `bin/` wrappers or a
++  system install both work).
++* A rubygems.org account with push rights to the `udb` gem, and an API key
++  configured in `~/.gem/credentials`.
++
++---
++
++## Step 1 – Bump the version
++
++Edit `tools/ruby-gems/udb/lib/udb/version.rb` and update the version string:
++
++```ruby
++module Udb
++  def self.version = "X.Y.Z"
++end
++```
++
++Commit the change and tag the commit:
++
++```sh
++git add tools/ruby-gems/udb/lib/udb/version.rb
++git commit -m "chore(udb): bump gem version to X.Y.Z"
++git tag udb-vX.Y.Z
++```
++
++---
++
++## Step 2 – Build the gem
++
++Run the following command from the repository root:
++
++```sh
++bin/chore build udb-gem
++```
++
++This will:
++
++1. Prepare a self-contained staging directory at `<repo-root>/gen/udb_gem/`
++   by copying the gem source tree and populating `.data/` with the
++   specification data the gem needs at runtime:
++
++   | Source (monorepo)       | Destination in staging          |
++   |-------------------------|---------------------------------|
++   | `spec/std/isa/`         | `.data/spec/std/isa/`           |
++   | `spec/custom/isa/`      | `.data/spec/custom/isa/`        |
++   | `spec/schemas/`         | `.data/spec/schemas/`           |
++   | `cfgs/`                 | `.data/cfgs/`                   |
++
++2. Run `gem build udb.gemspec` inside the staging directory.
++3. Print the path to the built `.gem` file.
++
++To use a different staging directory, pass `-d DIR`:
++
++```sh
++bin/chore build udb-gem -d /tmp/udb_gem_staging
++```
++
++The underlying Rake task (`rake release:udb:prepare`) can also be run
++directly if needed; the `UDB_GEM_GEN_DIR` environment variable overrides
++the staging directory in that case.
++
++---
++
++## Step 3 – Smoke-test the built gem (optional but recommended)
++
++Install the gem into a temporary sandbox and verify the CLI works:
++
++```sh
++SANDBOX=$(mktemp -d)
++GEM_HOME=$SANDBOX GEM_PATH=$SANDBOX:$(ruby -e 'puts Gem.path.join(":")') \
++  gem install --no-document udb-X.Y.Z.gem
++
++GEM_HOME=$SANDBOX GEM_PATH=$SANDBOX:$(ruby -e 'puts Gem.path.join(":")') \
++  $SANDBOX/bin/udb list extensions
++```
++
++The command should print a list of RISC-V extensions without errors.
++
++---
++
++## Step 4 – Push to rubygems.org
++
++```sh
++gem push udb-X.Y.Z.gem
++```
++
++---
++
++## Automated testing
++
++The unit test `tools/ruby-gems/udb/test/test_gem_install.rb` exercises the
++full prepare → build → install → run cycle automatically.  Run it with:
++
++```sh
++rake test:udb:unit
++```
++
++or directly:
++
++```sh
++cd tools/ruby-gems/udb
++ruby -Ilib:test test/run.rb
++```
+diff --git a/tools/ruby-gems/udb/Rakefile b/tools/ruby-gems/udb/Rakefile
+index 172e6c248a..053e6a3857 100644
+--- a/tools/ruby-gems/udb/Rakefile
++++ b/tools/ruby-gems/udb/Rakefile
+@@ -4,8 +4,78 @@
+ # typed: true
+ # frozen_string_literal: true
+ 
++require "pathname"
++require "fileutils"
++
+ RUBY_UDB_ROOT = Kernel.__dir__
+ 
++namespace :release do
++  namespace :udb do
++    desc "Prepare a copy of the udb gem for release under gen/udb_gem (or UDB_GEM_GEN_DIR)"
++    task :prepare do
++      udb_gem_src = Pathname.new(RUBY_UDB_ROOT)
++      repo_root = (udb_gem_src / ".." / ".." / "..").realpath
++      udb_gem_dst = Pathname.new(ENV.fetch("UDB_GEM_GEN_DIR", (repo_root / "gen" / "udb_gem").to_s))
++
++      puts "Preparing udb gem release copy at #{udb_gem_dst}"
++
++      # Remove existing destination
++      FileUtils.rm_rf(udb_gem_dst)
++
++      # Before copying, record the realpath of each top-level symlink in the source
++      # so we can resolve them after the copy (the symlinks point into the monorepo
++      # and would be broken at a different directory depth).
++      symlink_targets = {}
++      udb_gem_src.children.select(&:symlink?).each do |s|
++        symlink_targets[s.basename.to_s] = s.realpath
++      end
++
++      # Copy the gem source directory contents (symlinks are copied as symlinks).
++      # Copy children individually so contents land directly in udb_gem_dst/
++      # rather than in udb_gem_dst/udb/ (cp_r behaviour when dst already exists).
++      FileUtils.mkdir_p(udb_gem_dst)
++      FileUtils.cp_r(udb_gem_src.children.map(&:to_s), udb_gem_dst.to_s)
++
++      # Remove Gemfile and Gemfile.lock from the copy.
++      # These reference local gem paths (../idlc, ../udb_helpers) that only
++      # exist inside the monorepo and would cause `gem build` to fail elsewhere.
++      FileUtils.rm_f(udb_gem_dst / "Gemfile")
++      FileUtils.rm_f(udb_gem_dst / "Gemfile.lock")
++
++      # Resolve (or remove) each top-level symlink in the copy
++      symlink_targets.each do |name, target|
++        dst_entry = udb_gem_dst / name
++        FileUtils.rm_rf(dst_entry)
++        # Skip entries whose target doesn't exist (e.g. ext/rbi-central when
++        # the submodule isn't checked out) and the schemas symlink (not needed
++        # in the gem; data is under .data/ instead)
++        next unless target.exist?
++        next if name == "schemas"  # symlink to spec/schemas; not needed in gem copy
++
++        if target.directory?
++          FileUtils.cp_r(target, dst_entry)
++        else
++          FileUtils.cp(target, dst_entry)
++        end
++      end
++
++      # Populate .data/ with the required data files from the monorepo
++      data_dir = udb_gem_dst / ".data"
++      {
++        (repo_root / "spec" / "std" / "isa")    => (data_dir / "spec" / "std" / "isa"),
++        (repo_root / "spec" / "custom" / "isa") => (data_dir / "spec" / "custom" / "isa"),
++        (repo_root / "spec" / "schemas")        => (data_dir / "spec" / "schemas"),
++        (repo_root / "cfgs")                    => (data_dir / "cfgs")
++      }.each do |src, dst|
++        FileUtils.mkdir_p(dst.dirname)
++        FileUtils.cp_r(src, dst)
++      end
++
++      puts "udb gem release copy ready at #{udb_gem_dst}"
++    end
++  end
++end
++
+ namespace :gen do
+   namespace :udb do
+     desc "Generate the UDB Ruby API documentation"
+diff --git a/tools/ruby-gems/udb/lib/udb/resolver.rb b/tools/ruby-gems/udb/lib/udb/resolver.rb
+index 78b45e1899..21ca335b7f 100644
+--- a/tools/ruby-gems/udb/lib/udb/resolver.rb
++++ b/tools/ruby-gems/udb/lib/udb/resolver.rb
+@@ -19,47 +19,76 @@ def self.gem_path
+     @gem_path ||= Pathname.new(Gem::Specification.find_by_name("udb").full_gem_path)
+   end
+ 
+-  sig { params(from_dir: Pathname).returns(Pathname) }
++  sig { params(from_dir: Pathname).returns(T.nilable(Pathname)) }
+   def self.find_udb_root(from_dir)
+-    if (from_dir / "do").executable?
++    if from_dir.root?
++      nil
++    elsif (from_dir / "do").executable? && (from_dir / "spec").directory?
+       from_dir
+     else
+-      raise "Cannot find UDB repository root in directory hierarchy" if from_dir.dirname == from_dir
+-
+       find_udb_root(from_dir.dirname)
+     end
+   end
+   private_class_method :find_udb_root
+ 
+-  sig { returns(Pathname) }
++  sig { returns(T.nilable(Pathname)) }
+   def self.repo_root
+     @root ||=
+       if ENV.key?("UDB_ROOT")
+         Pathname.new(ENV["UDB_ROOT"])
+       else
+-        # try to find the root in the directory hierarchy by looking for the do script
+         find_udb_root(Pathname.new(__dir__))
+       end
+   end
+ 
+   sig { returns(Pathname) }
+   def self.default_std_isa_path
+-    repo_root / "spec" / "std" / "isa"
++    if repo_root.nil?
++      # not in the udb repo. try for a copy of the database stored with the gem
++      gem_path / ".data" / "spec" / "std" / "isa"
++    else
++      T.must(repo_root) / "spec" / "std" / "isa"
++    end
+   end
+ 
+   sig { returns(Pathname) }
+   def self.default_custom_isa_path
+-    repo_root / "spec" / "custom" / "isa"
++    if repo_root.nil?
++      # not in the udb repo. try for a copy of the database stored with the gem
++      gem_path / ".data" / "spec" / "custom" / "isa"
++    else
++      T.must(repo_root) / "spec" / "custom" / "isa"
++    end
++  end
++
++  sig { returns(Pathname) }
++  def self.default_schemas_path
++    if repo_root.nil?
++      # not in the udb repo. try for a copy of the database stored with the gem
++      gem_path / ".data" / "spec" / "schemas"
++    else
++      T.must(repo_root) / "spec" / "schemas"
++    end
+   end
+ 
+   sig { returns(Pathname) }
+   def self.default_gen_path
+-    repo_root / "gen"
++    if repo_root.nil?
++      # not in the udb repo. use XDG path
++      data_home = Pathname.new(ENV.fetch("XDG_DATA_HOME", "#{ENV["HOME"]}/.local/share"))
++      data_home / "udb" / Udb.version / "gen"
++    else
++      T.must(repo_root) / "gen"
++    end
+   end
+ 
+   sig { returns(Pathname) }
+   def self.default_cfgs_path
+-    repo_root / "cfgs"
++    if repo_root.nil?
++      gem_path / ".data" / "cfgs"
++    else
++      T.must(repo_root) / "cfgs"
++    end
+   end
+ 
+   # resolves the specification in the context of a config, and writes to a generation folder
+@@ -131,7 +160,7 @@ def resolved_spec_path(cfg_path_or_name)
+     # Any specific path can be overridden. If all paths are overridden, it doesn't matter what repo_root is.
+     sig {
+       params(
+-        repo_root: Pathname,
++        repo_root: T.nilable(Pathname),
+         schemas_path_override: T.nilable(Pathname),
+         cfgs_path_override: T.nilable(Pathname),
+         gen_path_override: T.nilable(Pathname),
+@@ -152,11 +181,11 @@ def initialize(
+       compile_idl: false
+     )
+       @repo_root = repo_root
+-      @schemas_path = schemas_path_override || (@repo_root / "spec" / "schemas")
+-      @cfgs_path = cfgs_path_override || (@repo_root / "cfgs")
+-      @gen_path = gen_path_override || (@repo_root / "gen")
+-      @std_path = std_path_override || (@repo_root / "spec" / "std" / "isa")
+-      @custom_path = custom_path_override || (@repo_root / "spec" / "custom" / "isa")
++      @schemas_path = schemas_path_override || Udb.default_schemas_path
++      @cfgs_path = cfgs_path_override || Udb.default_cfgs_path
++      @gen_path = gen_path_override || Udb.default_gen_path
++      @std_path = std_path_override || Udb.default_std_isa_path
++      @custom_path = custom_path_override || Udb.default_custom_isa_path
+       @quiet = quiet
+       @compile_idl = compile_idl
+       @mutex = Thread::Mutex.new
+diff --git a/tools/ruby-gems/udb/sorbet/rbi/gems/rake@13.3.1.rbi b/tools/ruby-gems/udb/sorbet/rbi/gems/rake@13.3.1.rbi
+new file mode 100644
+index 0000000000..a372541d0d
+--- /dev/null
++++ b/tools/ruby-gems/udb/sorbet/rbi/gems/rake@13.3.1.rbi
+@@ -0,0 +1,860 @@
++# typed: true
++
++# DO NOT EDIT MANUALLY
++# This is an autogenerated file for types exported from the `rake` gem.
++# Please instead update this file by running `bin/tapioca gem rake`.
++
++
++FileList = Rake::FileList
++
++module FileUtils
++  def ruby(*args, **options, &block); end
++  def safe_ln(*args, **options); end
++  def sh(*cmd, &block); end
++  def split_all(path); end
++
++  private
++
++  def create_shell_runner(cmd); end
++  def set_verbose_option(options); end
++  def sh_show_command(cmd); end
++end
++
++FileUtils::LN_SUPPORTED = T.let(T.unsafe(nil), Array)
++FileUtils::RUBY = T.let(T.unsafe(nil), String)
++
++class Module
++  def rake_extension(method); end
++end
++
++module Rake
++  extend ::FileUtils::StreamUtils_
++  extend ::FileUtils
++  extend ::Rake::FileUtilsExt
++
++  class << self
++    def add_rakelib(*files); end
++    def application; end
++    def application=(app); end
++    def each_dir_parent(dir); end
++    def from_pathname(path); end
++    def load_rakefile(path); end
++    def original_dir; end
++    def suggested_thread_count; end
++    def with_application(block_application = T.unsafe(nil)); end
++  end
++end
++
++class Rake::Application
++  include ::Rake::TaskManager
++  include ::Rake::TraceOutput
++
++  def initialize; end
++
++  def add_import(fn); end
++  def add_loader(ext, loader); end
++  def collect_command_line_tasks(args); end
++  def default_task_name; end
++  def deprecate(old_usage, new_usage, call_site); end
++  def display_cause_details(ex); end
++  def display_error_message(ex); end
++  def display_exception_backtrace(ex); end
++  def display_exception_details(ex); end
++  def display_exception_details_seen; end
++  def display_exception_message_details(ex); end
++  def display_prerequisites; end
++  def display_tasks_and_comments; end
++  def dynamic_width; end
++  def dynamic_width_stty; end
++  def dynamic_width_tput; end
++  def exit_because_of_exception(ex); end
++  def find_rakefile_location; end
++  def handle_options(argv); end
++  def has_cause?(ex); end
++  def have_rakefile; end
++  def init(app_name = T.unsafe(nil), argv = T.unsafe(nil)); end
++  def invoke_task(task_string); end
++  def load_imports; end
++  def load_rakefile; end
++  def name; end
++  def options; end
++  def original_dir; end
++  def parse_task_string(string); end
++  def print_rakefile_directory(location); end
++  def rake_require(file_name, paths = T.unsafe(nil), loaded = T.unsafe(nil)); end
++  def rakefile; end
++  def rakefile_location(backtrace = T.unsafe(nil)); end
++  def raw_load_rakefile; end
++  def run(argv = T.unsafe(nil)); end
++  def run_with_threads; end
++  def set_default_options; end
++  def standard_exception_handling; end
++  def standard_rake_options; end
++  def system_dir; end
++  def terminal_columns; end
++  def terminal_columns=(_arg0); end
++  def terminal_width; end
++  def thread_pool; end
++  def top_level; end
++  def top_level_tasks; end
++  def trace(*strings); end
++  def truncate(string, width); end
++  def truncate_output?; end
++  def tty_output=(_arg0); end
++  def tty_output?; end
++  def unix?; end
++  def windows?; end
++
++  private
++
++  def glob(path, &block); end
++  def has_chain?(exception); end
++  def load_debug_at_stop_feature; end
++  def select_tasks_to_show(options, show_tasks, value); end
++  def select_trace_output(options, trace_option, value); end
++  def sort_options(options); end
++  def standard_system_dir; end
++end
++
++Rake::Application::DEFAULT_RAKEFILES = T.let(T.unsafe(nil), Array)
++
++module Rake::Backtrace
++  class << self
++    def collapse(backtrace); end
++  end
++end
++
++Rake::Backtrace::SUPPRESSED_PATHS = T.let(T.unsafe(nil), Array)
++Rake::Backtrace::SUPPRESSED_PATHS_RE = T.let(T.unsafe(nil), String)
++Rake::Backtrace::SUPPRESS_PATTERN = T.let(T.unsafe(nil), Regexp)
++Rake::Backtrace::SYS_KEYS = T.let(T.unsafe(nil), Array)
++Rake::Backtrace::SYS_PATHS = T.let(T.unsafe(nil), Array)
++
++module Rake::Cloneable
++  private
++
++  def initialize_copy(source); end
++end
++
++class Rake::CommandLineOptionError < ::StandardError; end
++
++class Rake::CpuCounter
++  def count; end
++  def count_with_default(default = T.unsafe(nil)); end
++
++  class << self
++    def count; end
++  end
++end
++
++module Rake::DSL
++  include ::FileUtils::StreamUtils_
++  include ::FileUtils
++  include ::Rake::FileUtilsExt
++
++  private
++
++  def cd(*args, **options, &block); end
++  def chdir(*args, **options, &block); end
++  def chmod(*args, **options, &block); end
++  def chmod_R(*args, **options, &block); end
++  def chown(*args, **options, &block); end
++  def chown_R(*args, **options, &block); end
++  def copy(*args, **options, &block); end
++  def cp(*args, **options, &block); end
++  def cp_lr(*args, **options, &block); end
++  def cp_r(*args, **options, &block); end
++  def desc(description); end
++  def directory(*args, &block); end
++  def file(*args, &block); end
++  def file_create(*args, &block); end
++  def import(*fns); end
++  def install(*args, **options, &block); end
++  def link(*args, **options, &block); end
++  def ln(*args, **options, &block); end
++  def ln_s(*args, **options, &block); end
++  def ln_sf(*args, **options, &block); end
++  def ln_sr(*args, **options, &block); end
++  def makedirs(*args, **options, &block); end
++  def mkdir(*args, **options, &block); end
++  def mkdir_p(*args, **options, &block); end
++  def mkpath(*args, **options, &block); end
++  def move(*args, **options, &block); end
++  def multitask(*args, &block); end
++  def mv(*args, **options, &block); end
++  def namespace(name = T.unsafe(nil), &block); end
++  def nowrite(value = T.unsafe(nil)); end
++  def rake_check_options(options, *optdecl); end
++  def rake_output_message(message); end
++  def remove(*args, **options, &block); end
++  def rm(*args, **options, &block); end
++  def rm_f(*args, **options, &block); end
++  def rm_r(*args, **options, &block); end
++  def rm_rf(*args, **options, &block); end
++  def rmdir(*args, **options, &block); end
++  def rmtree(*args, **options, &block); end
++  def ruby(*args, **options, &block); end
++  def rule(*args, &block); end
++  def safe_ln(*args, **options); end
++  def safe_unlink(*args, **options, &block); end
++  def sh(*cmd, &block); end
++  def split_all(path); end
++  def symlink(*args, **options, &block); end
++  def task(*args, &block); end
++  def touch(*args, **options, &block); end
++  def verbose(value = T.unsafe(nil)); end
++  def when_writing(msg = T.unsafe(nil)); end
++end
++
++class Rake::DefaultLoader
++  def load(fn); end
++end
++
++Rake::EARLY = T.let(T.unsafe(nil), Rake::EarlyTime)
++Rake::EMPTY_TASK_ARGS = T.let(T.unsafe(nil), Rake::TaskArguments)
++
++class Rake::EarlyTime
++  include ::Comparable
++  include ::Singleton::SingletonInstanceMethods
++  include ::Singleton
++  extend ::Singleton::SingletonClassMethods
++
++  def <=>(other); end
++  def to_s; end
++
++  class << self
++    private
++
++    def allocate; end
++    def new(*_arg0); end
++  end
++end
++
++class Rake::FileCreationTask < ::Rake::FileTask
++  def needed?; end
++  def timestamp; end
++end
++
++class Rake::FileList
++  include ::Rake::Cloneable
++
++  def initialize(*patterns); end
++
++  def &(*args, &block); end
++  def *(other); end
++  def +(*args, &block); end
++  def -(*args, &block); end
++  def <<(obj); end
++  def <=>(*args, &block); end
++  def ==(array); end
++  def [](*args, &block); end
++  def []=(*args, &block); end
++  def add(*filenames); end
++  def all?(*args, &block); end
++  def any?(*args, &block); end
++  def append(*args, &block); end
++  def assoc(*args, &block); end
++  def at(*args, &block); end
++  def bsearch(*args, &block); end
++  def bsearch_index(*args, &block); end
++  def chain(*args, &block); end
++  def chunk(*args, &block); end
++  def chunk_while(*args, &block); end
++  def clear(*args, &block); end
++  def clear_exclude; end
++  def collect(*args, &block); end
++  def collect!(*args, &block); end
++  def collect_concat(*args, &block); end
++  def combination(*args, &block); end
++  def compact(*args, &block); end
++  def compact!(*args, &block); end
++  def concat(*args, &block); end
++  def count(*args, &block); end
++  def cycle(*args, &block); end
++  def deconstruct(*args, &block); end
++  def delete(*args, &block); end
++  def delete_at(*args, &block); end
++  def delete_if(*args, &block); end
++  def detect(*args, &block); end
++  def difference(*args, &block); end
++  def dig(*args, &block); end
++  def drop(*args, &block); end
++  def drop_while(*args, &block); end
++  def each(*args, &block); end
++  def each_cons(*args, &block); end
++  def each_entry(*args, &block); end
++  def each_index(*args, &block); end
++  def each_slice(*args, &block); end
++  def each_with_index(*args, &block); end
++  def each_with_object(*args, &block); end
++  def egrep(pattern, *options); end
++  def empty?(*args, &block); end
++  def entries(*args, &block); end
++  def exclude(*patterns, &block); end
++  def excluded_from_list?(fn); end
++  def existing; end
++  def existing!; end
++  def ext(newext = T.unsafe(nil)); end
++  def fetch(*args, &block); end
++  def fetch_values(*args, &block); end
++  def fill(*args, &block); end
++  def filter(*args, &block); end
++  def filter!(*args, &block); end
++  def filter_map(*args, &block); end
++  def find(*args, &block); end
++  def find_all(*args, &block); end
++  def find_index(*args, &block); end
++  def first(*args, &block); end
++  def flat_map(*args, &block); end
++  def flatten(*args, &block); end
++  def flatten!(*args, &block); end
++  def grep(*args, &block); end
++  def grep_v(*args, &block); end
++  def group_by(*args, &block); end
++  def gsub(pat, rep); end
++  def gsub!(pat, rep); end
++  def import(array); end
++  def include(*filenames); end
++  def include?(*args, &block); end
++  def index(*args, &block); end
++  def inject(*args, &block); end
++  def insert(*args, &block); end
++  def inspect(*args, &block); end
++  def intersect?(*args, &block); end
++  def intersection(*args, &block); end
++  def is_a?(klass); end
++  def join(*args, &block); end
++  def keep_if(*args, &block); end
++  def kind_of?(klass); end
++  def last(*args, &block); end
++  def lazy(*args, &block); end
++  def length(*args, &block); end
++  def map(*args, &block); end
++  def map!(*args, &block); end
++  def max(*args, &block); end
++  def max_by(*args, &block); end
++  def member?(*args, &block); end
++  def min(*args, &block); end
++  def min_by(*args, &block); end
++  def minmax(*args, &block); end
++  def minmax_by(*args, &block); end
++  def none?(*args, &block); end
++  def one?(*args, &block); end
++  def pack(*args, &block); end
++  def partition(&block); end
++  def pathmap(spec = T.unsafe(nil), &block); end
++  def permutation(*args, &block); end
++  def pop(*args, &block); end
++  def prepend(*args, &block); end
++  def product(*args, &block); end
++  def push(*args, &block); end
++  def rassoc(*args, &block); end
++  def reduce(*args, &block); end
++  def reject(*args, &block); end
++  def reject!(*args, &block); end
++  def repeated_combination(*args, &block); end
++  def repeated_permutation(*args, &block); end
++  def replace(*args, &block); end
++  def resolve; end
++  def reverse(*args, &block); end
++  def reverse!(*args, &block); end
++  def reverse_each(*args, &block); end
++  def rindex(*args, &block); end
++  def rotate(*args, &block); end
++  def rotate!(*args, &block); end
++  def sample(*args, &block); end
++  def select(*args, &block); end
++  def select!(*args, &block); end
++  def shelljoin(*args, &block); end
++  def shift(*args, &block); end
++  def shuffle(*args, &block); end
++  def shuffle!(*args, &block); end
++  def size(*args, &block); end
++  def slice(*args, &block); end
++  def slice!(*args, &block); end
++  def slice_after(*args, &block); end
++  def slice_before(*args, &block); end
++  def slice_when(*args, &block); end
++  def sort(*args, &block); end
++  def sort!(*args, &block); end
++  def sort_by(*args, &block); end
++  def sort_by!(*args, &block); end
++  def sub(pat, rep); end
++  def sub!(pat, rep); end
++  def sum(*args, &block); end
++  def take(*args, &block); end
++  def take_while(*args, &block); end
++  def tally(*args, &block); end
++  def to_a; end
++  def to_ary; end
++  def to_h(*args, &block); end
++  def to_s; end
++  def to_set(*args, &block); end
++  def transpose(*args, &block); end
++  def union(*args, &block); end
++  def uniq(*args, &block); end
++  def uniq!(*args, &block); end
++  def unshift(*args, &block); end
++  def values_at(*args, &block); end
++  def zip(*args, &block); end
++  def |(*args, &block); end
++
++  private
++
++  def add_matching(pattern); end
++  def resolve_add(fn); end
++  def resolve_exclude; end
++
++  class << self
++    def [](*args); end
++    def glob(pattern, *args); end
++  end
++end
++
++Rake::FileList::ARRAY_METHODS = T.let(T.unsafe(nil), Array)
++Rake::FileList::DEFAULT_IGNORE_PATTERNS = T.let(T.unsafe(nil), Array)
++Rake::FileList::DEFAULT_IGNORE_PROCS = T.let(T.unsafe(nil), Array)
++Rake::FileList::DELEGATING_METHODS = T.let(T.unsafe(nil), Array)
++Rake::FileList::GLOB_PATTERN = T.let(T.unsafe(nil), Regexp)
++Rake::FileList::MUST_DEFINE = T.let(T.unsafe(nil), Array)
++Rake::FileList::MUST_NOT_DEFINE = T.let(T.unsafe(nil), Array)
++Rake::FileList::SPECIAL_RETURN = T.let(T.unsafe(nil), Array)
++
++class Rake::FileTask < ::Rake::Task
++  def needed?; end
++  def timestamp; end
++
++  private
++
++  def out_of_date?(stamp); end
++
++  class << self
++    def scope_name(scope, task_name); end
++  end
++end
++
++module Rake::FileUtilsExt
++  include ::FileUtils::StreamUtils_
++  include ::FileUtils
++  extend ::FileUtils::StreamUtils_
++  extend ::FileUtils
++  extend ::Rake::FileUtilsExt
++
++  def cd(*args, **options, &block); end
++  def chdir(*args, **options, &block); end
++  def chmod(*args, **options, &block); end
++  def chmod_R(*args, **options, &block); end
++  def chown(*args, **options, &block); end
++  def chown_R(*args, **options, &block); end
++  def copy(*args, **options, &block); end
++  def cp(*args, **options, &block); end
++  def cp_lr(*args, **options, &block); end
++  def cp_r(*args, **options, &block); end
++  def install(*args, **options, &block); end
++  def link(*args, **options, &block); end
++  def ln(*args, **options, &block); end
++  def ln_s(*args, **options, &block); end
++  def ln_sf(*args, **options, &block); end
++  def ln_sr(*args, **options, &block); end
++  def makedirs(*args, **options, &block); end
++  def mkdir(*args, **options, &block); end
++  def mkdir_p(*args, **options, &block); end
++  def mkpath(*args, **options, &block); end
++  def move(*args, **options, &block); end
++  def mv(*args, **options, &block); end
++  def nowrite(value = T.unsafe(nil)); end
++  def rake_check_options(options, *optdecl); end
++  def rake_output_message(message); end
++  def remove(*args, **options, &block); end
++  def rm(*args, **options, &block); end
++  def rm_f(*args, **options, &block); end
++  def rm_r(*args, **options, &block); end
++  def rm_rf(*args, **options, &block); end
++  def rmdir(*args, **options, &block); end
++  def rmtree(*args, **options, &block); end
++  def safe_unlink(*args, **options, &block); end
++  def symlink(*args, **options, &block); end
++  def touch(*args, **options, &block); end
++  def verbose(value = T.unsafe(nil)); end
++  def when_writing(msg = T.unsafe(nil)); end
++
++  class << self
++    def nowrite_flag; end
++    def nowrite_flag=(_arg0); end
++    def verbose_flag; end
++    def verbose_flag=(_arg0); end
++  end
++end
++
++Rake::FileUtilsExt::DEFAULT = T.let(T.unsafe(nil), Object)
++
++class Rake::InvocationChain < ::Rake::LinkedList
++  def append(invocation); end
++  def member?(invocation); end
++  def to_s; end
++
++  private
++
++  def prefix; end
++
++  class << self
++    def append(invocation, chain); end
++  end
++end
++
++Rake::InvocationChain::EMPTY = T.let(T.unsafe(nil), Rake::InvocationChain::EmptyInvocationChain)
++
++class Rake::InvocationChain::EmptyInvocationChain < ::Rake::LinkedList::EmptyLinkedList
++  def append(invocation); end
++  def member?(obj); end
++  def to_s; end
++end
++
++module Rake::InvocationExceptionMixin
++  def chain; end
++  def chain=(value); end
++end
++
++Rake::LATE = T.let(T.unsafe(nil), Rake::LateTime)
++
++class Rake::LateTime
++  include ::Comparable
++  include ::Singleton::SingletonInstanceMethods
++  include ::Singleton
++  extend ::Singleton::SingletonClassMethods
++
++  def <=>(other); end
++  def to_s; end
++
++  class << self
++    private
++
++    def allocate; end
++    def new(*_arg0); end
++  end
++end
++
++class Rake::LinkedList
++  include ::Enumerable
++
++  def initialize(head, tail = T.unsafe(nil)); end
++
++  def ==(other); end
++  def conj(item); end
++  def each; end
++  def empty?; end
++  def head; end
++  def inspect; end
++  def tail; end
++  def to_s; end
++
++  class << self
++    def cons(head, tail); end
++    def empty; end
++    def make(*args); end
++  end
++end
++
++Rake::LinkedList::EMPTY = T.let(T.unsafe(nil), Rake::LinkedList::EmptyLinkedList)
++
++class Rake::LinkedList::EmptyLinkedList < ::Rake::LinkedList
++  def initialize; end
++
++  def empty?; end
++
++  class << self
++    def cons(head, tail); end
++  end
++end
++
++class Rake::MultiTask < ::Rake::Task
++  private
++
++  def invoke_prerequisites(task_args, invocation_chain); end
++end
++
++class Rake::NameSpace
++  def initialize(task_manager, scope_list); end
++
++  def [](name); end
++  def scope; end
++  def tasks; end
++end
++
++module Rake::PrivateReader
++  mixes_in_class_methods ::Rake::PrivateReader::ClassMethods
++
++  class << self
++    def included(base); end
++  end
++end
++
++module Rake::PrivateReader::ClassMethods
++  def private_reader(*names); end
++end
++
++class Rake::Promise
++  def initialize(args, &block); end
++
++  def recorder; end
++  def recorder=(_arg0); end
++  def value; end
++  def work; end
++
++  private
++
++  def chore; end
++  def complete?; end
++  def discard; end
++  def error?; end
++  def result?; end
++  def stat(*args); end
++end
++
++Rake::Promise::NOT_SET = T.let(T.unsafe(nil), Object)
++
++class Rake::PseudoStatus
++  def initialize(code = T.unsafe(nil)); end
++
++  def >>(n); end
++  def exited?; end
++  def exitstatus; end
++  def stopped?; end
++  def to_i; end
++end
++
++class Rake::RuleRecursionOverflowError < ::StandardError
++  def initialize(*args); end
++
++  def add_target(target); end
++  def message; end
++end
++
++class Rake::Scope < ::Rake::LinkedList
++  def path; end
++  def path_with_task_name(task_name); end
++  def trim(n); end
++end
++
++Rake::Scope::EMPTY = T.let(T.unsafe(nil), Rake::Scope::EmptyScope)
++
++class Rake::Scope::EmptyScope < ::Rake::LinkedList::EmptyLinkedList
++  def path; end
++  def path_with_task_name(task_name); end
++end
++
++class Rake::Task
++  def initialize(task_name, app); end
++
++  def actions; end
++  def add_description(description); end
++  def all_prerequisite_tasks; end
++  def already_invoked; end
++  def application; end
++  def application=(_arg0); end
++  def arg_description; end
++  def arg_names; end
++  def clear; end
++  def clear_actions; end
++  def clear_args; end
++  def clear_comments; end
++  def clear_prerequisites; end
++  def comment; end
++  def comment=(comment); end
++  def enhance(deps = T.unsafe(nil), &block); end
++  def execute(args = T.unsafe(nil)); end
++  def full_comment; end
++  def inspect; end
++  def investigation; end
++  def invoke(*args); end
++  def invoke_prerequisites(task_args, invocation_chain); end
++  def invoke_prerequisites_concurrently(task_args, invocation_chain); end
++  def locations; end
++  def name; end
++  def name_with_args; end
++  def needed?; end
++  def order_only_prerequisites; end
++  def prereqs; end
++  def prerequisite_tasks; end
++  def prerequisites; end
++  def reenable; end
++  def scope; end
++  def set_arg_names(args); end
++  def source; end
++  def sources; end
++  def sources=(_arg0); end
++  def timestamp; end
++  def to_s; end
++  def |(deps); end
++
++  protected
++
++  def collect_prerequisites(seen); end
++  def invoke_with_call_chain(task_args, invocation_chain); end
++
++  private
++
++  def add_chain_to(exception, new_chain); end
++  def add_comment(comment); end
++  def first_sentence(string); end
++  def format_trace_flags; end
++  def lookup_prerequisite(prerequisite_name); end
++  def transform_comments(separator, &block); end
++
++  class << self
++    def [](task_name); end
++    def clear; end
++    def create_rule(*args, &block); end
++    def define_task(*args, &block); end
++    def format_deps(deps); end
++    def scope_name(scope, task_name); end
++    def task_defined?(task_name); end
++    def tasks; end
++  end
++end
++
++class Rake::TaskArgumentError < ::ArgumentError; end
++
++class Rake::TaskArguments
++  include ::Enumerable
++
++  def initialize(names, values, parent = T.unsafe(nil)); end
++
++  def [](index); end
++  def deconstruct_keys(keys); end
++  def each(&block); end
++  def extras; end
++  def fetch(*args, &block); end
++  def has_key?(key); end
++  def inspect; end
++  def key?(key); end
++  def method_missing(sym, *args); end
++  def names; end
++  def new_scope(names); end
++  def to_a; end
++  def to_hash; end
++  def to_s; end
++  def values_at(*keys); end
++  def with_defaults(defaults); end
++
++  protected
++
++  def lookup(name); end
++end
++
++class Rake::TaskLib
++  include ::Rake::Cloneable
++  include ::FileUtils::StreamUtils_
++  include ::FileUtils
++  include ::Rake::FileUtilsExt
++  include ::Rake::DSL
++end
++
++module Rake::TaskManager
++  def initialize; end
++
++  def [](task_name, scopes = T.unsafe(nil)); end
++  def clear; end
++  def create_rule(*args, &block); end
++  def current_scope; end
++  def define_task(task_class, *args, &block); end
++  def enhance_with_matching_rule(task_name, level = T.unsafe(nil)); end
++  def generate_did_you_mean_suggestions(task_name); end
++  def generate_message_for_undefined_task(task_name); end
++  def in_namespace(name); end
++  def intern(task_class, task_name); end
++  def last_description; end
++  def last_description=(_arg0); end
++  def lookup(task_name, initial_scope = T.unsafe(nil)); end
++  def resolve_args(args); end
++  def synthesize_file_task(task_name); end
++  def tasks; end
++  def tasks_in_scope(scope); end
++
++  private
++
++  def add_location(task); end
++  def attempt_rule(task_name, task_pattern, args, extensions, block, level); end
++  def find_location; end
++  def generate_name; end
++  def get_description; end
++  def lookup_in_scope(name, scope); end
++  def make_sources(task_name, task_pattern, extensions); end
++  def resolve_args_with_dependencies(args, hash); end
++  def resolve_args_without_dependencies(args); end
++  def trace_rule(level, message); end
++
++  class << self
++    def record_task_metadata; end
++    def record_task_metadata=(_arg0); end
++  end
++end
++
++class Rake::ThreadHistoryDisplay
++  include ::Rake::PrivateReader
++  extend ::Rake::PrivateReader::ClassMethods
++
++  def initialize(stats); end
++
++  def show; end
++
++  private
++
++  def items; end
++  def rename(hash, key, renames); end
++  def stats; end
++  def threads; end
++end
++
++class Rake::ThreadPool
++  def initialize(thread_count); end
++
++  def future(*args, &block); end
++  def gather_history; end
++  def history; end
++  def join; end
++  def statistics; end
++
++  private
++
++  def __queue__; end
++  def process_queue_item; end
++  def start_thread; end
++  def stat(event, data = T.unsafe(nil)); end
++end
++
++module Rake::TraceOutput
++  def trace_on(out, *strings); end
++end
++
++Rake::VERSION = T.let(T.unsafe(nil), String)
++module Rake::Version; end
++Rake::Version::BUILD = T.let(T.unsafe(nil), String)
++Rake::Version::MAJOR = T.let(T.unsafe(nil), String)
++Rake::Version::MINOR = T.let(T.unsafe(nil), String)
++Rake::Version::NUMBERS = T.let(T.unsafe(nil), Array)
++Rake::Version::OTHER = T.let(T.unsafe(nil), Array)
++
++module Rake::Win32
++  class << self
++    def normalize(path); end
++    def win32_system_dir; end
++    def windows?; end
++  end
++end
++
++class Rake::Win32::Win32HomeError < ::RuntimeError; end
++RakeFileUtils = Rake::FileUtilsExt
++
++class String
++  include ::Comparable
++
++  def ext(newext = T.unsafe(nil)); end
++  def pathmap(spec = T.unsafe(nil), &block); end
++
++  protected
++
++  def pathmap_explode; end
++  def pathmap_partial(n); end
++  def pathmap_replace(patterns, &block); end
++end
+diff --git a/tools/ruby-gems/udb/sorbet/rbi/gems/thor@1.5.0.rbi b/tools/ruby-gems/udb/sorbet/rbi/gems/thor@1.5.0.rbi
+index acb320ac78..b7ad77b8eb 100644
+--- a/tools/ruby-gems/udb/sorbet/rbi/gems/thor@1.5.0.rbi
++++ b/tools/ruby-gems/udb/sorbet/rbi/gems/thor@1.5.0.rbi
+@@ -685,6 +685,19 @@ Thor::Options::OPTS_END = T.let(T.unsafe(nil), String)
+ Thor::Options::SHORT_NUM = T.let(T.unsafe(nil), Regexp)
+ Thor::Options::SHORT_RE = T.let(T.unsafe(nil), Regexp)
+ Thor::Options::SHORT_SQ_RE = T.let(T.unsafe(nil), Regexp)
++
++module Thor::RakeCompat
++  include ::FileUtils::StreamUtils_
++  include ::FileUtils
++  include ::Rake::FileUtilsExt
++  include ::Rake::DSL
++
++  class << self
++    def included(base); end
++    def rake_classes; end
++  end
++end
++
+ class Thor::RequiredArgumentMissingError < ::Thor::InvocationError; end
+ module Thor::Sandbox; end
+ 
+diff --git a/tools/ruby-gems/udb/test/run.rb b/tools/ruby-gems/udb/test/run.rb
+index a4c84adebc..e50f28e18a 100644
+--- a/tools/ruby-gems/udb/test/run.rb
++++ b/tools/ruby-gems/udb/test/run.rb
+@@ -10,6 +10,7 @@
+ require_relative "test_cfg_arch"
+ require_relative "test_cli"
+ require_relative "test_conditions"
++require_relative "test_gem_install"
+ require_relative "test_instruction"
+ require_relative "test_logic"
+ require_relative "test_mmr"
+diff --git a/tools/ruby-gems/udb/test/test_gem_install.rb b/tools/ruby-gems/udb/test/test_gem_install.rb
+new file mode 100644
+index 0000000000..aa9aca2a9c
+--- /dev/null
++++ b/tools/ruby-gems/udb/test/test_gem_install.rb
+@@ -0,0 +1,143 @@
++# typed: false
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# frozen_string_literal: true
++
++require_relative "test_helper"
++
++require "fileutils"
++require "open3"
++require "tmpdir"
++require "pathname"
++
++# Tests that the udb gem can be built with bundled data and installed in a
++# sandbox outside the monorepo, and that the CLI still works correctly.
++class TestGemInstall < Minitest::Test
++  UDB_GEM_DIR = (Pathname.new(__dir__) / "..").realpath
++  REPO_ROOT = (UDB_GEM_DIR / ".." / ".." / "..").realpath
++
++  # Replicate the logic of the release:udb:prepare Rake task directly in Ruby
++  # so we don't need to spawn a subprocess (which would fight with bundler).
++  def prepare_gem_staging(staging)
++    staging = Pathname.new(staging)
++    udb_gem_src = UDB_GEM_DIR
++
++    # Before copying, record the realpath of each top-level symlink in the source
++    # so we can resolve them after the copy (the symlinks point into the monorepo
++    # and would be broken at a different directory depth).
++    symlink_targets = {}
++    udb_gem_src.children.select(&:symlink?).each do |s|
++      symlink_targets[s.basename.to_s] = s.realpath
++    end
++
++    # Copy the gem source directory contents into staging (symlinks are copied as symlinks).
++    # We copy children individually so the contents land directly in staging/
++    # rather than in staging/udb/ (which is what cp_r does when dst already exists).
++    FileUtils.cp_r(udb_gem_src.children.map(&:to_s), staging.to_s)
++
++    # Remove Gemfile and Gemfile.lock from the staging directory.
++    # These reference local gem paths (../idlc, ../udb_helpers) that only
++    # exist inside the monorepo and would cause `gem build` to fail elsewhere.
++    FileUtils.rm_f(staging / "Gemfile")
++    FileUtils.rm_f(staging / "Gemfile.lock")
++
++    # Resolve (or remove) each top-level symlink in the copy
++    symlink_targets.each do |name, target|
++      dst_entry = staging / name
++      FileUtils.rm_rf(dst_entry)
++      # Skip entries whose target doesn't exist (e.g. ext/rbi-central when
++      # the submodule isn't checked out) and the schemas symlink (not needed
++      # in the gem; data is under .data/ instead)
++      next unless target.exist?
++      next if name == "schemas"
++
++      if target.directory?
++        FileUtils.cp_r(target, dst_entry)
++      else
++        FileUtils.cp(target, dst_entry)
++      end
++    end
++
++    # Populate .data/ with the required data files from the monorepo
++    data_dir = staging / ".data"
++    {
++      (REPO_ROOT / "spec" / "std" / "isa")    => (data_dir / "spec" / "std" / "isa"),
++      (REPO_ROOT / "spec" / "custom" / "isa") => (data_dir / "spec" / "custom" / "isa"),
++      (REPO_ROOT / "spec" / "schemas")        => (data_dir / "spec" / "schemas"),
++      (REPO_ROOT / "cfgs")                    => (data_dir / "cfgs")
++    }.each do |src, dst|
++      FileUtils.mkdir_p(dst.dirname)
++      FileUtils.cp_r(src, dst)
++    end
++  end
++
++  # Prepare a staging copy of the gem, build it, install it into a temporary
++  # sandbox, and verify that `udb list extensions` produces expected output.
++  def test_list_extensions_from_installed_gem
++    Dir.mktmpdir("udb_gem_install_test") do |sandbox_dir|
++      sandbox = Pathname.new(sandbox_dir)
++
++      Dir.mktmpdir("udb_gem_staging") do |staging_dir|
++        staging = Pathname.new(staging_dir)
++
++        # Populate the staging directory with the gem source + .data/
++        prepare_gem_staging(staging)
++
++        # Verify the .data directory was populated
++        assert (staging / ".data" / "spec" / "std" / "isa").directory?,
++          "Expected .data/spec/std/isa to exist in the staging gem"
++        assert (staging / ".data" / "spec" / "custom" / "isa").directory?,
++          "Expected .data/spec/custom/isa to exist in the staging gem"
++        assert (staging / ".data" / "spec" / "schemas").directory?,
++          "Expected .data/spec/schemas to exist in the staging gem"
++        assert (staging / ".data" / "cfgs").directory?,
++          "Expected .data/cfgs to exist in the staging gem"
++
++        # Build the gem from the staging directory.
++        # Unset BUNDLE_GEMFILE so bundler doesn't interfere with gem build.
++        build_out, build_err, build_status = Open3.capture3(
++          { "BUNDLE_GEMFILE" => nil },
++          "gem", "build", "udb.gemspec",
++          chdir: staging.to_s
++        )
++        assert build_status.success?,
++          "gem build failed:\nSTDOUT: #{build_out}\nSTDERR: #{build_err}"
++
++        gem_filename = build_out.match(/File: (.+\.gem)/)[1]
++        gem_file = staging / gem_filename
++
++        # Install the gem into the sandbox (without dependencies — they are
++        # available via GEM_PATH from the current Ruby environment).
++        # Unset BUNDLE_GEMFILE so bundler doesn't interfere with gem install.
++        install_out, install_err, install_status = Open3.capture3(
++          { "BUNDLE_GEMFILE" => nil },
++          "gem", "install", gem_file.to_s,
++          "--install-dir", sandbox.to_s,
++          "--no-document",
++          "--ignore-dependencies"
++        )
++        assert install_status.success?,
++          "gem install failed:\nSTDOUT: #{install_out}\nSTDERR: #{install_err}"
++
++        # Run `udb list extensions` from the sandbox.
++        # GEM_HOME=sandbox  → the udb gem (with .data/) is loaded from the sandbox
++        # GEM_PATH=sandbox:...current paths  → dependencies are found in the current env
++        # UDB_ROOT is intentionally NOT set so the gem uses .data/ for its paths
++        # BUNDLE_GEMFILE is unset so bundler doesn't interfere
++        env = {
++          "GEM_HOME" => sandbox.to_s,
++          "GEM_PATH" => ([sandbox.to_s] + Gem.path).join(File::PATH_SEPARATOR),
++          "BUNDLE_GEMFILE" => nil
++        }
++        udb_bin = sandbox / "bin" / "udb"
++        stdout, stderr, status = Open3.capture3(env, udb_bin.to_s, "list", "extensions")
++
++        assert status.success?,
++          "udb list extensions failed:\nSTDOUT: #{stdout}\nSTDERR: #{stderr}"
++        assert_match(/Zvkg/, stdout,
++          "Expected 'Zvkg' in output of `udb list extensions`")
++      end
++    end
++  end
++end
+diff --git a/tools/ruby-gems/udb/udb.gemspec b/tools/ruby-gems/udb/udb.gemspec
+index 67a89ac011..4f1126d8e9 100644
+--- a/tools/ruby-gems/udb/udb.gemspec
++++ b/tools/ruby-gems/udb/udb.gemspec
+@@ -18,7 +18,7 @@ Gem::Specification.new do |s|
+   s.authors     = ["Derek Hower", "James Ball"]
+   s.email       = ["dhower@qti.qualcomm.com", "jamesball@qti.qualcomm.com"]
+   s.homepage    = "https://github.com/riscv/riscv-unified-db"
+-  s.files       = Dir["lib/**/*.rb", "LICENSE", "ext/udb_download/extconf.rb", "lib/udb/Z3_VERSION", "lib/udb/ESPRESSO_VERSION", "lib/udb/MUST_VERSION", "lib/udb/EQNTOTT_VERSION"]
++  s.files       = Dir["lib/**/*.rb", "LICENSE", "ext/udb_download/extconf.rb", "lib/udb/Z3_VERSION", "lib/udb/ESPRESSO_VERSION", "lib/udb/MUST_VERSION", "lib/udb/EQNTOTT_VERSION", ".data/**/*"]
+   s.extensions  = ["ext/udb_download/extconf.rb"]
+   s.license     = "BSD-3-Clause-Clear"
+   s.metadata    = {
+@@ -52,6 +52,7 @@ Gem::Specification.new do |s|
+   s.add_dependency "udb_helpers"
+   s.add_dependency "z3"
+ 
++  s.add_development_dependency "rake"
+   s.add_development_dependency "rubocop-github"
+   s.add_development_dependency "rubocop-minitest"
+   s.add_development_dependency "rubocop-performance"
+diff --git a/tools/test/regress-tests.yaml b/tools/test/regress-tests.yaml
+index 18927ed2ef..503d46f432 100644
+--- a/tools/test/regress-tests.yaml
++++ b/tools/test/regress-tests.yaml
+@@ -202,6 +202,16 @@ tests:
+       - name: Check profile_extensions
+         run: ./do test:profile_extensions
+ 
++  regress-build-udb-gem:
++    ci_stage: pr
++    tags:
++      - smoke
++    test:
++      - name: Build udb gem via chore
++        run: ./bin/chore build udb-gem
++      - name: Verify udb gem was built
++        run: ls gen/udb_gem/udb-*.gem
++
+   regress-regress:
+     ci_stage: pr
+     test:

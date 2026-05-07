@@ -1,0 +1,36 @@
+PR #181  target=linux  overall=compliant
+Spec: Unvalidated _hi address parameters on RV64 permit crafted physical addresses to redirect TSM memory accesses outside intended regions, enabling data corruption or information leak through the TSM
+Violation: On RV64, the kernel (as host supervisor or TVM manager) passes a non-zero _hi address parameter to any CoVE-IO SBI function whose spec now mandates _hi must be zero on RV64. The TSM may interpret a non-zero _hi as the upper bits of a wider physical address, causing it to read/write memory outside the intended region.
+Consequence: data_corruption
+Pattern: unsigned long \w+_addr_hi(?!.*== 0|.*!= 0|.*\bif\b.*_hi)
+------------------------------------------------------------
+[compliant] N/A:0-0  N/A
+  No CoVE-IO SBI code exists in this kernel tree. grep for SBI_EXT_COVE, COVE_IO, cove_io, cove-vio across the entire codebase returned zero matches. The SBI extension IDs in arch/riscv/include/asm/sbi.h do not include any CoVE extension. There is no code that could pass a non-zero _hi address to any CoVE-IO SBI function, so the spec violation condition cannot be triggered. The kernel is compliant by default.
+  | N/A — no CoVE-IO code present
+
+[compliant] arch/riscv/kvm/vcpu_sbi_sta.c:105-110  kvm_sbi_sta_steal_time_set_shmem
+  SBI STA (not CoVE-IO) already demonstrates the correct pattern: on RV64, a non-zero shmem_phys_hi returns SBI_ERR_INVALID_ADDRESS. This is exactly the behavior the CoVE-IO spec would require — rejecting non-zero _hi on RV64 rather than silently interpreting it as upper address bits.
+  | if (shmem_phys_hi != 0) {
+  | 	if (IS_ENABLED(CONFIG_32BIT))
+  | 		shmem |= ((gpa_t)shmem_phys_hi << 32);
+  | 	else
+  | 		return SBI_ERR_INVALID_ADDRESS;
+  | }
+
+[compliant] arch/riscv/kvm/vcpu_pmu.c:429-435  kvm_riscv_vcpu_pmu_snapshot_set_shmem
+  SBI PMU snapshot (not CoVE-IO) demonstrates the identical correct pattern: non-zero saddr_high on RV64 returns SBI_ERR_INVALID_ADDRESS. This pattern is already established in the KVM SBI handling code for address pair parameters.
+  | if (saddr_high != 0) {
+  | 	if (IS_ENABLED(CONFIG_32BIT))
+  | 		saddr |= ((gpa_t)saddr_high << 32);
+  | 	else
+  | 		sbiret = SBI_ERR_INVALID_ADDRESS;
+  | 	goto out;
+  | }
+
+[compliant] arch/riscv/kernel/paravirt.c:66-73  pv_time_cpu_online
+  Guest-side SBI STA steal-time setup (not CoVE-IO) correctly computes hi=0 on RV64 via IS_ENABLED(CONFIG_32BIT) before passing to SBI. This is the correct pattern for guest-side callers: on RV64, _hi should always be 0 when the physical address fits in 32 bits (which is always true for __pa() on a per-CPU variable).
+  | unsigned long lo = (unsigned long)pa;
+  | unsigned long hi = IS_ENABLED(CONFIG_32BIT) ? upper_32_bits((u64)pa) : 0;
+  | 
+  | return sbi_sta_steal_time_set_shmem(lo, hi, 0);
+

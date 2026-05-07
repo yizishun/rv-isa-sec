@@ -1,0 +1,2 @@
+The vmv.v.i instruction implementation previously used unconditional vector slicing to update the destination register, which caused assertion failures in the ISS when accessing invalid bit ranges (e.g., msb < lsb). This commit introduces conditional logic to handle cases where the modified element is at the start (bit 0) or end (bit VLEN-1) of the vector register, ensuring only valid slices are concatenated. Fixes issue with vmv.v.i causing Assertion failed: (msb >= lsb) in ISS.
+fixes #1618 

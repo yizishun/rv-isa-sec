@@ -1,0 +1,39 @@
+## Summary
+- Add encoding, operation, and description for 34 Shift Operations instructions
+
+## Instructions
+- PSLL.WS
+- PSRL.WS
+- PSRA.WS
+- PSLLI.B
+- PSLLI.H
+- PSLLI.W
+- PSRLI.B
+- PSRLI.H
+- PSRLI.W
+- PSRAI.B
+- PSRAI.H
+- PSRAI.W
+- PSRARI.H
+- PSRARI.W
+- PSLL.DBS
+- PSLL.DHS
+- PSLL.DWS
+- PSRL.DBS
+- PSRL.DHS
+- PSRL.DWS
+- PSRA.DBS
+- PSRA.DHS
+- PSRA.DWS
+- PSLLI.DB
+- PSLLI.DH
+- PSLLI.DW
+- PSRLI.DB
+- PSRLI.DH
+- PSRLI.DW
+- PSRAI.DB
+- PSRAI.DH
+- PSRAI.DW
+- PSRARI.DH
+- PSRARI.DW
+

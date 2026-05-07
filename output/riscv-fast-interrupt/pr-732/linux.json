@@ -1,0 +1,167 @@
+{
+  "pr_number": 732,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 732,
+    "violation_condition": "In the Linux kernel with Smnip enabled, if a synchronous exception handler (e.g., page fault, breakpoint) calls local_irq_enable() while the hardware has the pre-fix buggy behavior of raising xithreshold to the triggering interrupt's IPRIO on exception entry, then lower-priority interrupts remain masked despite interrupts being architecturally enabled, because sithreshold was incorrectly elevated by the exception trap itself.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "local_irq_enable() called inside a synchronous exception handler path (handle_exception → excp_vect_table → do_page_fault / do_trap_break / do_trap_ecall_u / handle_break) without verification that sithreshold was not adulterated by the trapping exception; also, any KVM HVICTL injection path that fails to distinguish interrupt vs exception when managing the virtual sithreshold for the guest",
+    "affected_entities": [
+      "sithreshold",
+      "sipstatus.pithreshold",
+      "sret",
+      "mret",
+      "vsithreshold",
+      "vsipstatus.pithreshold",
+      "HVICTL"
+    ],
+    "summary": "PR#732 fixes Smnip spec to guarantee that synchronous exceptions do NOT alter xithreshold, so the kernel's exception handler paths that enable interrupts (page fault, breakpoint, syscall) are safe; without this fix, exception-triggered threshold elevation could silently mask lower-priority interrupts causing priority inversion and interrupt starvation"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 125,
+        "line_end": 238,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Smnip CSR 'sithreshold' is never saved on the stack during exception entry. CSRs saved are STATUS, EPC, TVAL, CAUSE, SCRATCH (lines 184-194) but not sithreshold (0x1B1). On hardware with the pre-fix behavior where exception entry raises xithreshold to the triggering interrupt's IPRIO, the elevated threshold persists throughout exception handling. When sret executes at ret_from_exception (line 315), sithreshold is not restored to its pre-trap value, causing a persistent silent masking of lower-priority interrupts even after the handler returns.",
+      "snippet": "csrr s1, CSR_STATUS\ncsrr s2, CSR_EPC\ncsrr s3, CSR_TVAL\ncsrr s4, CSR_CAUSE\ncsrr s5, CSR_SCRATCH"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "ret_from_exception",
+        "line_start": 247,
+        "line_end": 319,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Trap return only restores CSR_STATUS (line 301) and CSR_EPC (line 302), then executes sret (line 315). Does not restore sithreshold from any saved copy. If handle_exception failed to save it, ret_from_exception cannot restore it. The combined effect is a permanent elevation of sithreshold that survives the trap return, which would mask interrupts below the threshold indefinitely.",
+      "snippet": "csrw CSR_STATUS, a0\ncsrw CSR_EPC, a2\n/* no csrw CSR_SITHRESHOLD anywhere */\nsret"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/fault.c",
+        "function_name": "handle_page_fault",
+        "line_start": 317,
+        "line_end": 319,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Calls local_irq_enable() conditionally at line 319 if the parent context had interrupts enabled. With Smnip, even when sstatus.SIE=1 is set by local_irq_enable(), the sithreshold CSR elevated by the exception entry hardware bug independently gates interrupt delivery. Lower-priority interrupts are silently blocked, causing a denial of service where interrupts appear architecturally enabled but are physically masked. The handler's call to local_irq_disable() at do_page_fault():432 is also ineffective at restoring sithreshold.",
+      "snippet": "if (!regs_irqs_disabled(regs))\n        local_irq_enable();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "do_trap_break",
+        "line_start": 307,
+        "line_end": 324,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Calls local_irq_enable() unconditionally on the user-mode path (line 311) before calling handle_break(). handle_break() may invoke uprobe/kprobe handlers, force_sig_fault, or KGDB notifiers that could be delayed by the silently-elevated sithreshold. The subsequent local_irq_disable() (line 315) cannot fix the sithreshold corruption.",
+      "snippet": "irqentry_enter_from_user_mode(regs);\nlocal_irq_enable();\n\nhandle_break(regs);\n\nlocal_irq_disable();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "DO_ERROR_INFO",
+        "line_start": 150,
+        "line_end": 164,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The DO_ERROR_INFO macro (used to generate do_trap_unknown, do_trap_insn_misaligned, do_trap_insn_fault, do_trap_load_fault) calls local_irq_enable() unconditionally at line 155 on the user-mode path. Four exception handlers generated by this macro call local_irq_enable() without any awareness that sithreshold may have been adulterated by the exception entry itself.",
+      "snippet": "irqentry_enter_from_user_mode(regs);\nlocal_irq_enable();\ndo_trap_error(regs, signo, code, regs->epc, \"Oops - \" str);\nlocal_irq_disable();\nirqentry_exit_to_user_mode(regs);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "do_trap_insn_illegal",
+        "line_start": 173,
+        "line_end": 196,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Calls local_irq_enable() unconditionally at line 179 on the user-mode path before calling riscv_v_first_use_handler() and do_trap_error(). Same vulnerability: sstatus.SIE may be 1 but sithreshold may independently block interrupt delivery if it was corrupted by the exception entry.",
+      "snippet": "irqentry_enter_from_user_mode(regs);\nlocal_irq_enable();\n\nhandled = riscv_v_first_use_handler(regs);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "do_trap_misaligned",
+        "line_start": 219,
+        "line_end": 240,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Calls local_irq_enable() unconditionally at line 225 on the user-mode path. The handler then calls handle_misaligned_load/store which may access user memory and could stall waiting for interrupts that are silently masked by the elevated sithreshold. The paired local_irq_disable() at line 235 cannot restore sithreshold.",
+      "snippet": "irqentry_enter_from_user_mode(regs);\nlocal_irq_enable();\n/* ... handle_misaligned_load/store with IRQs 'enabled' ... */\nlocal_irq_disable();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "do_trap_ecall_u",
+        "line_start": 326,
+        "line_end": 369,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "System call handler enters via syscall_enter_from_user_mode() (line 338) which internally manages IRQ state through generic entry code. If the generic entry code enables interrupts (via sstatus.SIE), the elevated sithreshold from the ecall trap entry would silently mask lower-priority interrupts during syscall execution, even though the syscall appears to be interruptible. The syscall path can be long-running and is a critical region where missed interrupts cause DoS.",
+      "snippet": "syscall = syscall_enter_from_user_mode(regs, syscall);\n/* interrupts potentially enabled, but sithreshold never cleared */\nsyscall_handler(regs, syscall);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 421,
+        "line_end": 471,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Context switch saves/restores callee-saved integer registers, SR_SUM bit in sstatus, and SCS pointer, but does NOT save/restore sithreshold. If a task is preempted during a synchronous exception handler where sithreshold was elevated, the next task inherits the corrupted sithreshold. If that next task runs with interrupts supposedly enabled, it would experience silent interrupt masking. This is a cross-task pollution of per-hart architectural state.",
+      "snippet": "REG_S s0, TASK_THREAD_SUM_RA(a3)\n/* no save of CSR_SITHRESHOLD */\nREG_L s0, TASK_THREAD_SUM_RA(a4)\n/* no restore of CSR_SITHRESHOLD */"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_swap_in_guest_state",
+        "line_start": 749,
+        "line_end": 775,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM VCPU state swap exchanges SCOUNTEREN, SENVCFG, and conditionally SSTATEEN0 between host and guest, but does NOT save/restore sithreshold (host) or vsthreshold (guest). If the host takes a synchronous exception while in HS-mode and the pre-fix hardware elevates hithreshold, the elevated threshold would persist in the host context and could leak into the guest context if not properly managed at VCPU boundaries. Conversely, if the guest's vsthreshold is not saved/restored across VCPU exits, guest interrupt prioritization state is lost.",
+      "snippet": "vcpu->arch.host_scounteren = csr_swap(CSR_SCOUNTEREN, csr->scounteren);\nvcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);\n/* no swap of CSR_SITHRESHOLD / CSR_VSITHRESHOLD */"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia.c",
+        "function_name": "kvm_riscv_vcpu_aia_update_hvip",
+        "line_start": 98,
+        "line_end": 109,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "This function writes IID=IRQ_S_EXT to CSR_HVICTL (line 108) to inject a virtual external interrupt into the guest. Under Smnip, the guest's vsthreshold independently gates whether the injected interrupt is actually delivered, even if HVICTL.IPRIO=1 (pending). The code does not check, save, or restore vsithreshold (CSR 0x241) anywhere, nor does it distinguish interrupt vs exception injection. If the hardware has the pre-fix behavior of elevating vsthreshold on exception entry, a virtual interrupt injected via HVICTL could be silently masked by the guest's corrupted vsthreshold.",
+      "snippet": "ncsr_write(CSR_HVICTL, aia_hvictl_value(!!(csr->hvip & BIT(IRQ_VS_EXT))));\n/* vsthreshold not checked; injected interrupt may be silently gated */"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia.c",
+        "function_name": "kvm_riscv_vcpu_aia_load/kvm_riscv_vcpu_aia_put",
+        "line_start": 111,
+        "line_end": 179,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "VCPU AIA load (line 111) and put (line 146) handle VSISELECT, HVIPRIO1/2, VSIEH, HVIPH, HSTATEEN0, and IMSIC files but completely omit vsthreshold and hithreshold. The load function should write the guest's saved vsthreshold into CSR_VSITHRESHOLD (0x241) so that guest interrupt prioritization is correctly virtualized. The put function should read CSR_VSITHRESHOLD back and store it in the vcpu structure so the guest state is preserved across VCPU switches. Neither is done.",
+      "snippet": "/* kvm_riscv_vcpu_aia_load: loads VSISELECT, HVIPRIO1/2 but not VSITHRESHOLD */\n/* kvm_riscv_vcpu_aia_put: saves VSISELECT, HVIPRIO1/2 but not VSITHRESHOLD */"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

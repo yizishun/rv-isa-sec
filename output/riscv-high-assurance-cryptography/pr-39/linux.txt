@@ -1,0 +1,52 @@
+PR #39  target=linux  overall=potential_risk
+Spec: ACES standard Off/Initial/Clean/Dirty model: kernel MUST issue ace.reset to clear crypto contexts before writing ACES=Initial, because raw CSR writes to ACES do NOT clear CC contents
+Violation: In the Linux kernel, if the context switch path or execve path writes sstatus.ACES to Initial (1) or Clean (2) without first executing ace.reset, the hardware CCs retain prior cryptographic key material but are marked as clean. A subsequent process or VM can then read or use stale cryptographic state belonging to a previous security domain.
+Consequence: info_leak
+Pattern: sstatus.*ACES|SSTATUS_ACES|__ACES|csr_write.*ACES|ace\.reset|ace_reset|ace_clear_all
+------------------------------------------------------------
+[potential_risk] arch/riscv/include/asm/csr.h:30-52  N/A (header definitions)
+  No SR_ACES or SSTATUS_ACES bit definitions exist. The kernel defines SR_FS (lines 30-34), SR_VS (lines 36-46), and SR_XS (lines 48-52) with the standard Off/Initial/Clean/Dirty model, but has no corresponding definitions for ACES. If ACES is later added following this same pattern, sstatus.ACES would be writable via the same CSR but the kernel would have no code to execute ace.reset before setting Initial or Clean state.
+  | #define SR_FS     _AC(0x00006000, UL)  /* No ACES equivalent exists */
+  | #define SR_FS_OFF     _AC(0x00000000, UL)
+  | #define SR_FS_INITIAL _AC(0x00002000, UL)
+  | #define SR_FS_CLEAN   _AC(0x00004000, UL)
+  | #define SR_FS_DIRTY   _AC(0x00006000, UL)
+
+[potential_risk] arch/riscv/kernel/process.c:144-179  start_thread
+  start_thread() clears regs->status to SR_PIE then sets SR_FS_INITIAL for FPU state (line 148-154). No ACES state clearing is performed. If ACES is added, execve would need to execute ace.reset before writing sstatus.ACES=Initial, otherwise cryptographic state from the previous process leaks. The pattern used for shadow stack (set_shstk_status(current, false) at line 163) demonstrates the correct approach: explicitly disable extension state on exec. ACES would need analogous handling.
+  | regs->status = SR_PIE;
+  | if (has_fpu()) {
+  |     regs->status |= SR_FS_INITIAL;
+  |     fstate_restore(current, regs);
+  | }
+  | /* No ACES equivalent: no ace.reset, no SR_ACES handling */
+
+[potential_risk] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The context-switch macro handles FPU (__switch_to_fpu), vector (__switch_to_vector), icache flush, and ENVCFG, but has no ACES state save/restore step. The existing pattern for FPU/vector relies on tracking Dirty/Clean via sstatus fields to implement lazy save/restore. If ACES follows this pattern, the switch_to path would also need to save/restore per-task ACES context, and critically must ensure ace.reset precedes any transition to Initial or Clean during context switch to prevent stale key material from being exposed to the incoming process.
+  | if (has_fpu())       __switch_to_fpu(__prev, __next);
+  | if (has_vector() || has_xtheadvector()) __switch_to_vector(__prev, __next);
+  | if (switch_to_should_flush_icache(__next)) local_flush_icache_all();
+  | __switch_to_envcfg(__next);
+  | ((last) = __switch_to(__prev, __next));
+
+[potential_risk] arch/riscv/kvm/vcpu.c:578-641  kvm_arch_vcpu_load
+  kvm_arch_vcpu_load() restores VSSTATUS, VSIE, VSTVEC, VSSCRATCH, VSEPC, VSCAUSE, VSTVAL, HEDELEG, HVIP, VSATP, HENVCFG, HSTATEEN0 — but has no ACES CSR handling. If a guest VM uses ACES, the VCPU load path must virtualize the ACES state. Without this, a VM could observe stale ACES state from the host or another VM across VCPU migrations, or the host's ace.reset would incorrectly affect guest state.
+  | csr_write(CSR_VSSTATUS, csr->vsstatus);
+  | csr_write(CSR_VSIE, csr->vsie);
+  | /* ... standard CSRs ... */
+  | csr_write(CSR_HENVCFG, cfg->henvcfg);
+  | /* No ACES CSR save/restore at all */
+
+[potential_risk] arch/riscv/kvm/vcpu.c:643-683  kvm_arch_vcpu_put
+  kvm_arch_vcpu_put() saves the guest VSSTATUS and other CSRs but has no ACES-related save path. Corresponding to the load path, the put path must capture guest ACES state so that host ACES state can be restored. Without this, the host's sstatus.ACES and cryptographic context would be corrupted by guest execution.
+  | csr->vsstatus = nacl_csr_read(nsh, CSR_VSSTATUS);
+  | csr->vsie = nacl_csr_read(nsh, CSR_VSIE);
+  | /* ... standard CSRs ... */
+  | csr->vsatp = nacl_csr_read(nsh, CSR_VSATP);
+  | /* No ACES CSR save */
+
+[potential_risk] arch/riscv/kernel/signal.c:1-1  N/A (signal delivery/sigreturn paths)
+  The signal delivery and sigreturn paths have no ACES state preservation in the signal frame. If a process receives a signal while ACES is in Dirty state with active key material in the cryptographic coprocessor registers, those registers are not saved to the sigframe. On sigreturn, the CCs would be restored to architectural reset state (losing the keys) or, worse, could expose stale keys if ACES state transitions are mishandled during signal delivery.
+  | /* arch/riscv/kernel/signal.c: no ACES save/restore in
+  |    setup_sigcontext() or restore_sigcontext() */
+

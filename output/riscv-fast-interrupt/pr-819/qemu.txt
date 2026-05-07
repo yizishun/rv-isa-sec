@@ -1,0 +1,54 @@
+PR #819  target=qemu  overall=compliant
+Spec: Missing mstateen0.ACLIC gate on seivt allows S-mode to read/write the external interrupt vector table CSR when the ACLIC extension is administratively disabled, bypassing M-mode's intended privilege restriction
+Violation: QEMU allows S-mode (or lower) read/write access to the seivt CSR when mstateen0.ACLIC (bit 53) is zero, because the Smstateen access-control check was only applied to sivt but not to seivt
+Consequence: privilege_escape
+Pattern: CSR read/write handler for seivt (0x15A) missing mstateen0 bit 53 ACLIC check that the corresponding handler for sivt (0x15C) has
+------------------------------------------------------------
+[compliant] target/riscv/cpu_bits.h:353-365  (global defines)
+  No SMSTATEEN0_ACLIC (bit 53) define exists, and CSR 0x15A (seivt) is absent from the entire codebase. The vulnerability described in the security spec — S-mode access to seivt without mstateen0.ACLIC check — cannot occur because neither the CSR nor the access-control bit exists. The current codebase is consistent: if seivt/sivt were to be added (as distinct from the AIA STOPEI at 0x15C), both the CSR definition and the SMSTATEEN0_ACLIC bit would need to be introduced together.
+  | #define SMSTATEEN0_CS       (1ULL << 0)
+  | #define SMSTATEEN0_FCSR     (1ULL << 1)
+  | #define SMSTATEEN0_JVT      (1ULL << 2)
+  | #define SMSTATEEN0_CTR      (1ULL << 54)
+  | #define SMSTATEEN0_P1P13    (1ULL << 56)
+  | #define SMSTATEEN0_HSCONTXT (1ULL << 57)
+  | #define SMSTATEEN0_IMSIC    (1ULL << 58)
+  | #define SMSTATEEN0_AIA      (1ULL << 59)
+
+[compliant] target/riscv/csr.c:353-372  aia_smode
+  The aia_smode access-control predicate does check smstateen_acc_ok() for all CSRs it governs — SMSTATEEN0_IMSIC (bit 58) for CSR_STOPEI (0x15C), and SMSTATEEN0_AIA (bit 59) for all other supervisor AIA CSRs. The function correctly delegates to smode() after the smstateen check, providing proper two-layer access control: (1) smstateen bit, then (2) S-mode privilege requirement. If seivt (0x15A) were added under this predicate or a sibling predicate, the same pattern must be extended to include an smstateen_acc_ok check for bit 53.
+  | static RISCVException aia_smode(CPURISCVState *env, int csrno)
+  | {
+  |     int ret;
+  |     if (!riscv_cpu_cfg(env)->ext_ssaia) {
+  |         return RISCV_EXCP_ILLEGAL_INST;
+  |     }
+  |     if (csrno == CSR_STOPEI) {
+  |         ret = smstateen_acc_ok(env, 0, SMSTATEEN0_IMSIC);
+  |     } else {
+  |         ret = smstateen_acc_ok(env, 0, SMSTATEEN0_AIA);
+  |     }
+
+[compliant] target/riscv/csr.c:3455-3489  write_mstateen0
+  write_mstateen0() does not include bit 53 in its writable mask (wr_mask), so mstateen0 bit 53 is always read-as-zero and write-ignored. This is correct for the current codebase state where ACLIC-controlled CSRs (seivt, sivt) are not implemented. The function properly gates writable bits on extension presence (smaia, ssctr, etc.) and privilege version. If seivt were added, this function would need bit 53 added to wr_mask under the appropriate extension guard.
+  | static RISCVException write_mstateen0(CPURISCVState *env, int csrno,
+  |                                       target_ulong new_val, uintptr_t ra)
+  | {
+  |     uint64_t wr_mask = SMSTATEEN_STATEEN | SMSTATEEN0_HSENVCFG;
+  |     ...
+  |     if (riscv_cpu_cfg(env)->ext_smaia) {
+  |         wr_mask |= (SMSTATEEN0_AIA | SMSTATEEN0_IMSIC);
+  |     }
+
+[compliant] target/riscv/csr.c:48-77  smstateen_acc_ok
+  smstateen_acc_ok() is correctly implemented with proper privilege hierarchy: M-mode always bypasses, smstateen-disabled always grants access, then checks mstateen[index] for the requested bit. Virtualization layering (hstateen, sstateen) is correctly handled. The function itself is generic and would work correctly for bit 53 if a caller passed SMSTATEEN0_ACLIC — the bug would be at the call site (missing the check), not in this function.
+  | RISCVException smstateen_acc_ok(CPURISCVState *env, int index, uint64_t bit)
+  | {
+  |     bool virt = env->virt_enabled;
+  |     if (env->priv == PRV_M || !riscv_cpu_cfg(env)->ext_smstateen) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     if (!(env->mstateen[index] & bit)) {
+  |         return RISCV_EXCP_ILLEGAL_INST;
+  |     }
+

@@ -1,0 +1,871 @@
+diff --git a/.github/workflows/regress.yml b/.github/workflows/regress.yml
+index ecc0f91288..6d4aa2b9b5 100644
+--- a/.github/workflows/regress.yml
++++ b/.github/workflows/regress.yml
+@@ -1025,6 +1025,21 @@ jobs:
+         name: idl-doc
+         path: idl.html
+     if: (github.event_name == 'merge_queue') || ((github.event_name == 'push') && (github.ref_name == 'main'))
++  regress-gem-version-bump:
++    runs-on: ubuntu-latest
++    needs: build-container
++    steps:
++    - name: Clone Github Repo Action
++      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++    - name: Download docker image
++      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
++      with:
++        name: docker_image
++        path: "${{ runner.temp }}"
++    - name: Load image
++      run: docker load --input ${{ runner.temp }}/docker_image.tar
++    - name: Check gem versions bumped when source changes
++      run: git fetch --no-tags --prune --no-recurse-submodules origin main && ./bin/ruby tools/scripts/check_gem_version_bump.rb origin/main
+   build-docs-site:
+     runs-on: ubuntu-latest
+     needs: build-container
+@@ -1087,6 +1102,7 @@ jobs:
+     - build-profile
+     - regress-schema-versions
+     - build-idl-doc
++    - regress-gem-version-bump
+     - build-docs-site
+     - regress-pre-commit
+     - regress-llvm
+diff --git a/.github/workflows/release_gems.yml b/.github/workflows/release_gems.yml
+new file mode 100644
+index 0000000000..c2d5ed0329
+--- /dev/null
++++ b/.github/workflows/release_gems.yml
+@@ -0,0 +1,165 @@
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++name: Release gems to RubyGems.org
++
++# Builds and publishes gems to rubygems.org whenever their version.rb changes on main.
++#
++# A git tag "GEM_NAME-gem-VERSION" is created on the release commit so the
++# exact source that produced each published gem is always traceable.
++# The tag check also makes the workflow idempotent: re-running it for the
++# same version is a no-op.
++
++on:
++  push:
++    branches:
++      - main
++    paths:
++      - 'tools/ruby-gems/*/lib/*/version.rb'
++  workflow_dispatch:
++    inputs:
++      gem:
++        description: 'Gem to release (idlc, udb, udb-gen, udb_helpers, or all)'
++        required: false
++        default: 'all'
++
++jobs:
++  detect-gems:
++    runs-on: ubuntu-24.04
++    outputs:
++      gems: ${{ steps.set-gems.outputs.gems }}
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++        with:
++          fetch-depth: 2  # Need to check changed files
++
++      - name: Detect changed gems
++        id: set-gems
++        run: |
++          # Manual dispatch - release specified gem or all gems
++          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
++            if [[ "${{ github.event.inputs.gem }}" == "all" ]]; then
++              GEMS='["idlc","udb","udb-gen","udb_helpers"]'
++            else
++              GEMS='["${{ github.event.inputs.gem }}"]'
++            fi
++          else
++            # Push event - detect which version.rb files changed
++            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
++            GEMS="["
++            SEPARATOR=""
++
++            if echo "$CHANGED_FILES" | grep -q "tools/ruby-gems/idlc/lib/idlc/version.rb"; then
++              GEMS="${GEMS}${SEPARATOR}\"idlc\""
++              SEPARATOR=","
++            fi
++
++            if echo "$CHANGED_FILES" | grep -q "tools/ruby-gems/udb/lib/udb/version.rb"; then
++              GEMS="${GEMS}${SEPARATOR}\"udb\""
++              SEPARATOR=","
++            fi
++
++            if echo "$CHANGED_FILES" | grep -q "tools/ruby-gems/udb-gen/lib/udb-gen/version.rb"; then
++              GEMS="${GEMS}${SEPARATOR}\"udb-gen\""
++              SEPARATOR=","
++            fi
++
++            if echo "$CHANGED_FILES" | grep -q "tools/ruby-gems/udb_helpers/lib/udb_helpers/version.rb"; then
++              GEMS="${GEMS}${SEPARATOR}\"udb_helpers\""
++              SEPARATOR=","
++            fi
++
++            GEMS="${GEMS}]"
++          fi
++
++          echo "gems=$GEMS" >> "$GITHUB_OUTPUT"
++          echo "Gems to release: $GEMS"
++
++  release-gem:
++    needs: detect-gems
++    if: needs.detect-gems.outputs.gems != '[]'
++    runs-on: ubuntu-24.04
++    permissions:
++      contents: write   # needed to push the release tag
++
++    strategy:
++      matrix:
++        gem: ${{ fromJson(needs.detect-gems.outputs.gems) }}
++        include:
++          - gem: idlc
++            gem_dir: idlc
++            gen_dir: idlc_gem
++            version_module: "Idl::Compiler"
++            rake_task: idlc
++          - gem: udb
++            gem_dir: udb
++            gen_dir: udb_gem
++            version_module: "Udb"
++            rake_task: udb
++          - gem: udb-gen
++            gem_dir: udb-gen
++            gen_dir: udb_gen_gem
++            version_module: "UdbGen"
++            rake_task: udb_gen
++          - gem: udb_helpers
++            gem_dir: udb_helpers
++            gen_dir: udb_helpers_gem
++            version_module: "Udb::Helpers"
++            rake_task: udb_helpers
++
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++        with:
++          fetch-depth: 0  # Fetch full history to avoid merge-base errors
++
++      - name: Get gem version
++        id: version
++        run: |
++          VERSION=$(ruby -e "load 'tools/ruby-gems/${{ matrix.gem_dir }}/lib/${{ matrix.gem_dir }}/version.rb'; puts ${{ matrix.version_module }}.version")
++          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
++          echo "Releasing ${{ matrix.gem }} version $VERSION"
++
++      - name: Check if release tag already exists
++        run: |
++          if git ls-remote --tags origin "refs/tags/${{ matrix.gem }}-gem-${VERSION}" | grep -q .; then
++            echo "TAG_EXISTS=true" >> "$GITHUB_ENV"
++            echo "Tag ${{ matrix.gem }}-gem-${VERSION} already exists – skipping release."
++          else
++            echo "TAG_EXISTS=false" >> "$GITHUB_ENV"
++          fi
++
++      - name: Set up Ruby
++        if: env.TAG_EXISTS == 'false'
++        uses: ruby/setup-ruby@v1
++        with:
++          ruby-version: '3.2'
++          bundler-cache: true
++          working-directory: tools/ruby-gems/${{ matrix.gem_dir }}
++
++      - name: Prepare gem staging directory
++        if: env.TAG_EXISTS == 'false'
++        run: |
++          cd tools/ruby-gems/${{ matrix.gem_dir }}
++          bundle exec rake release:${{ matrix.rake_task }}:prepare
++
++      - name: Build gem
++        if: env.TAG_EXISTS == 'false'
++        run: |
++          cd gen/${{ matrix.gen_dir }}
++          BUNDLE_GEMFILE= gem build ${{ matrix.gem }}.gemspec
++
++      - name: Push gem to RubyGems.org
++        if: env.TAG_EXISTS == 'false'
++        env:
++          GEM_HOST_API_KEY: ${{ secrets.RUBYGEM_API_KEY }}
++        run: gem push "gen/${{ matrix.gen_dir }}/${{ matrix.gem }}-${VERSION}.gem"
++
++      - name: Create and push release tag
++        if: env.TAG_EXISTS == 'false'
++        run: |
++          git config user.name "github-actions[bot]"
++          git config user.email "github-actions[bot]@users.noreply.github.com"
++          git tag "${{ matrix.gem }}-gem-${VERSION}"
++          git push origin "${{ matrix.gem }}-gem-${VERSION}"
+diff --git a/.github/workflows/release_udb_gem.yml b/.github/workflows/release_udb_gem.yml
+deleted file mode 100644
+index cf5961b329..0000000000
+--- a/.github/workflows/release_udb_gem.yml
++++ /dev/null
+@@ -1,79 +0,0 @@
+-# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+-# SPDX-License-Identifier: BSD-3-Clause-Clear
+-
+-name: Release udb gem to RubyGems.org
+-
+-# Builds and publishes the udb gem to rubygems.org whenever the version
+-# string in version.rb changes on the main branch.
+-#
+-# A git tag "udb-gem-VERSION" is created on the release commit so the
+-# exact source that produced each published gem is always traceable.
+-# The tag check also makes the workflow idempotent: re-running it for the
+-# same version is a no-op.
+-
+-on:
+-  push:
+-    branches:
+-      - main
+-    paths:
+-      - 'tools/ruby-gems/udb/lib/udb/version.rb'
+-  workflow_dispatch:
+-
+-jobs:
+-  release-udb-gem:
+-    runs-on: ubuntu-24.04
+-    permissions:
+-      contents: write   # needed to push the release tag
+-
+-    steps:
+-      - name: Checkout repository
+-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+-
+-      - name: Get gem version
+-        id: version
+-        run: |
+-          VERSION=$(ruby -e "load 'tools/ruby-gems/udb/lib/udb/version.rb'; puts Udb.version")
+-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+-
+-      - name: Check if release tag already exists
+-        run: |
+-          if git ls-remote --tags origin "refs/tags/udb-gem-${VERSION}" | grep -q .; then
+-            echo "TAG_EXISTS=true" >> "$GITHUB_ENV"
+-            echo "Tag udb-gem-${VERSION} already exists – skipping release."
+-          else
+-            echo "TAG_EXISTS=false" >> "$GITHUB_ENV"
+-          fi
+-
+-      - name: Set up Ruby
+-        if: env.TAG_EXISTS == 'false'
+-        uses: ruby/setup-ruby@v1
+-        with:
+-          ruby-version: '3.2'
+-          bundler-cache: true
+-          working-directory: tools/ruby-gems/udb
+-
+-      - name: Prepare gem staging directory
+-        if: env.TAG_EXISTS == 'false'
+-        run: |
+-          cd tools/ruby-gems/udb
+-          bundle exec rake release:udb:prepare
+-
+-      - name: Build gem
+-        if: env.TAG_EXISTS == 'false'
+-        run: |
+-          cd gen/udb_gem
+-          BUNDLE_GEMFILE= gem build udb.gemspec
+-
+-      - name: Push gem to RubyGems.org
+-        if: env.TAG_EXISTS == 'false'
+-        env:
+-          GEM_HOST_API_KEY: ${{ secrets.RUBYGEM_API_KEY }}
+-        run: gem push "gen/udb_gem/udb-${VERSION}.gem"
+-
+-      - name: Create and push release tag
+-        if: env.TAG_EXISTS == 'false'
+-        run: |
+-          git config user.name "github-actions[bot]"
+-          git config user.email "github-actions[bot]@users.noreply.github.com"
+-          git tag "udb-gem-${VERSION}"
+-          git push origin "udb-gem-${VERSION}"
+diff --git a/Gemfile.lock b/Gemfile.lock
+index afd86d8fa5..885eed2935 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -7,7 +7,7 @@ PATH
+ PATH
+   remote: tools/ruby-gems/idlc
+   specs:
+-    idlc (0.1.0)
++    idlc (0.1.1)
+       activesupport
+       commander (~> 5)
+       pp
+@@ -18,7 +18,7 @@ PATH
+ PATH
+   remote: tools/ruby-gems/udb-gen
+   specs:
+-    udb-gen (0.1.0)
++    udb-gen (0.1.1)
+       asciidoctor
+       asciidoctor-diagram
+       asciidoctor-pdf
+@@ -34,12 +34,12 @@ PATH
+ PATH
+   remote: tools/ruby-gems/udb_helpers
+   specs:
+-    udb_helpers (0.1.0)
++    udb_helpers (0.1.1)
+ 
+ PATH
+   remote: tools/ruby-gems/udb
+   specs:
+-    udb (0.1.0)
++    udb (0.1.1)
+       activesupport
+       asciidoctor
+       awesome_print
+diff --git a/tools/ruby-gems/idlc/Gemfile.lock b/tools/ruby-gems/idlc/Gemfile.lock
+index 32ca6ef326..e84d178bbf 100644
+--- a/tools/ruby-gems/idlc/Gemfile.lock
++++ b/tools/ruby-gems/idlc/Gemfile.lock
+@@ -1,7 +1,7 @@
+ PATH
+   remote: .
+   specs:
+-    idlc (0.1.0)
++    idlc (0.1.1)
+       activesupport
+       commander (~> 5)
+       pp
+diff --git a/tools/ruby-gems/idlc/Rakefile b/tools/ruby-gems/idlc/Rakefile
+index 708ea8db7d..ca3872be92 100644
+--- a/tools/ruby-gems/idlc/Rakefile
++++ b/tools/ruby-gems/idlc/Rakefile
+@@ -3,8 +3,63 @@
+ 
+ # frozen_string_literal: true
+ 
++require "pathname"
++require "fileutils"
++
+ IDLC_ROOT = Kernel.__dir__
+ 
++namespace :release do
++  namespace :idlc do
++    desc "Prepare a copy of the idlc gem for release under gen/idlc_gem (or IDLC_GEM_GEN_DIR)"
++    task :prepare do
++      idlc_gem_src = Pathname.new(IDLC_ROOT)
++      repo_root = (idlc_gem_src / ".." / ".." / "..").realpath
++      idlc_gem_dst = Pathname.new(ENV.fetch("IDLC_GEM_GEN_DIR", (repo_root / "gen" / "idlc_gem").to_s))
++
++      puts "Preparing idlc gem release copy at #{idlc_gem_dst}"
++
++      # Remove existing destination
++      FileUtils.rm_rf(idlc_gem_dst)
++
++      # Before copying, record the realpath of each top-level symlink in the source
++      # so we can resolve them after the copy (the symlinks point into the monorepo
++      # and would be broken at a different directory depth).
++      symlink_targets = {}
++      idlc_gem_src.children.select(&:symlink?).each do |s|
++        symlink_targets[s.basename.to_s] = s.realpath
++      end
++
++      # Copy the gem source directory contents (symlinks are copied as symlinks).
++      # Copy children individually so contents land directly in idlc_gem_dst/
++      # rather than in idlc_gem_dst/idlc/ (cp_r behaviour when dst already exists).
++      FileUtils.mkdir_p(idlc_gem_dst)
++      FileUtils.cp_r(idlc_gem_src.children.map(&:to_s), idlc_gem_dst.to_s)
++
++      # Remove Gemfile and Gemfile.lock from the copy.
++      # These reference local gem paths that only exist inside the monorepo
++      # and would cause `gem build` to fail elsewhere.
++      FileUtils.rm_f(idlc_gem_dst / "Gemfile")
++      FileUtils.rm_f(idlc_gem_dst / "Gemfile.lock")
++
++      # Resolve (or remove) each top-level symlink in the copy
++      symlink_targets.each do |name, target|
++        dst_entry = idlc_gem_dst / name
++        FileUtils.rm_rf(dst_entry)
++        # Skip entries whose target doesn't exist
++        next unless target.exist?
++
++        if target.directory?
++          FileUtils.cp_r(target, dst_entry)
++        else
++          FileUtils.cp(target, dst_entry)
++        end
++      end
++
++      puts "idlc gem release copy ready at #{idlc_gem_dst}"
++    end
++  end
++end
++
+ namespace :test do
+   namespace :idlc do
+     task :ruby do
+diff --git a/tools/ruby-gems/idlc/lib/idlc/version.rb b/tools/ruby-gems/idlc/lib/idlc/version.rb
+index ae4c6f12f1..2b55bbcf37 100644
+--- a/tools/ruby-gems/idlc/lib/idlc/version.rb
++++ b/tools/ruby-gems/idlc/lib/idlc/version.rb
+@@ -5,6 +5,6 @@
+ 
+ module Idl
+   class Compiler
+-    def self.version = "0.1.0"
++    def self.version = "0.1.1"
+   end
+ end
+diff --git a/tools/ruby-gems/udb-gen/Gemfile.lock b/tools/ruby-gems/udb-gen/Gemfile.lock
+index 5a0d65c072..e302ffee5e 100644
+--- a/tools/ruby-gems/udb-gen/Gemfile.lock
++++ b/tools/ruby-gems/udb-gen/Gemfile.lock
+@@ -1,7 +1,7 @@
+ PATH
+   remote: ../idlc
+   specs:
+-    idlc (0.1.0)
++    idlc (0.1.1)
+       activesupport
+       commander (~> 5)
+       pp
+@@ -12,12 +12,12 @@ PATH
+ PATH
+   remote: ../udb_helpers
+   specs:
+-    udb_helpers (0.1.0)
++    udb_helpers (0.1.1)
+ 
+ PATH
+   remote: ../udb
+   specs:
+-    udb (0.1.0)
++    udb (0.1.1)
+       activesupport
+       asciidoctor
+       awesome_print
+@@ -41,7 +41,7 @@ PATH
+ PATH
+   remote: .
+   specs:
+-    udb-gen (0.1.0)
++    udb-gen (0.1.1)
+       asciidoctor
+       asciidoctor-diagram
+       asciidoctor-pdf
+diff --git a/tools/ruby-gems/udb-gen/Rakefile b/tools/ruby-gems/udb-gen/Rakefile
+index 08b0a7e46c..8b50f5c98e 100644
+--- a/tools/ruby-gems/udb-gen/Rakefile
++++ b/tools/ruby-gems/udb-gen/Rakefile
+@@ -4,6 +4,9 @@
+ # typed: true
+ # frozen_string_literal: true
+ 
++require "pathname"
++require "fileutils"
++
+ UDB_GEN_ROOT = Pathname.new Kernel.__dir__
+ $root ||= UDB_GEN_ROOT
+ 
+@@ -13,6 +16,58 @@ file "#{UDB_GEN_ROOT}/Gemfile.lock" do
+   end
+ end
+ 
++namespace :release do
++  namespace :udb_gen do
++    desc "Prepare a copy of the udb-gen gem for release under gen/udb_gen_gem (or UDB_GEN_GEM_GEN_DIR)"
++    task :prepare do
++      udb_gen_gem_src = Pathname.new(UDB_GEN_ROOT)
++      repo_root = (udb_gen_gem_src / ".." / ".." / "..").realpath
++      udb_gen_gem_dst = Pathname.new(ENV.fetch("UDB_GEN_GEM_GEN_DIR", (repo_root / "gen" / "udb_gen_gem").to_s))
++
++      puts "Preparing udb-gen gem release copy at #{udb_gen_gem_dst}"
++
++      # Remove existing destination
++      FileUtils.rm_rf(udb_gen_gem_dst)
++
++      # Before copying, record the realpath of each top-level symlink in the source
++      # so we can resolve them after the copy (the symlinks point into the monorepo
++      # and would be broken at a different directory depth).
++      symlink_targets = {}
++      udb_gen_gem_src.children.select(&:symlink?).each do |s|
++        symlink_targets[s.basename.to_s] = s.realpath
++      end
++
++      # Copy the gem source directory contents (symlinks are copied as symlinks).
++      # Copy children individually so contents land directly in udb_gen_gem_dst/
++      # rather than in udb_gen_gem_dst/udb-gen/ (cp_r behaviour when dst already exists).
++      FileUtils.mkdir_p(udb_gen_gem_dst)
++      FileUtils.cp_r(udb_gen_gem_src.children.map(&:to_s), udb_gen_gem_dst.to_s)
++
++      # Remove Gemfile and Gemfile.lock from the copy.
++      # These reference local gem paths that only exist inside the monorepo
++      # and would cause `gem build` to fail elsewhere.
++      FileUtils.rm_f(udb_gen_gem_dst / "Gemfile")
++      FileUtils.rm_f(udb_gen_gem_dst / "Gemfile.lock")
++
++      # Resolve (or remove) each top-level symlink in the copy
++      symlink_targets.each do |name, target|
++        dst_entry = udb_gen_gem_dst / name
++        FileUtils.rm_rf(dst_entry)
++        # Skip entries whose target doesn't exist
++        next unless target.exist?
++
++        if target.directory?
++          FileUtils.cp_r(target, dst_entry)
++        else
++          FileUtils.cp(target, dst_entry)
++        end
++      end
++
++      puts "udb-gen gem release copy ready at #{udb_gen_gem_dst}"
++    end
++  end
++end
++
+ namespace :test do
+   namespace :udb_gen do
+     task :sorbet do
+diff --git a/tools/ruby-gems/udb-gen/lib/udb-gen/version.rb b/tools/ruby-gems/udb-gen/lib/udb-gen/version.rb
+index e37cae0415..8e7cecb389 100644
+--- a/tools/ruby-gems/udb-gen/lib/udb-gen/version.rb
++++ b/tools/ruby-gems/udb-gen/lib/udb-gen/version.rb
+@@ -5,5 +5,5 @@
+ # frozen_string_literal: true
+ 
+ module UdbGen
+-  def self.version = "0.1.0"
++  def self.version = "0.1.1"
+ end
+diff --git a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/idlc@0.1.0.rbi b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/idlc@0.1.1.rbi
+similarity index 100%
+rename from tools/ruby-gems/udb-gen/sorbet/rbi/gems/idlc@0.1.0.rbi
+rename to tools/ruby-gems/udb-gen/sorbet/rbi/gems/idlc@0.1.1.rbi
+diff --git a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.1.rbi
+similarity index 100%
+rename from tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.0.rbi
+rename to tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb@0.1.1.rbi
+diff --git a/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb_helpers@0.1.0.rbi b/tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb_helpers@0.1.1.rbi
+similarity index 100%
+rename from tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb_helpers@0.1.0.rbi
+rename to tools/ruby-gems/udb-gen/sorbet/rbi/gems/udb_helpers@0.1.1.rbi
+diff --git a/tools/ruby-gems/udb/Gemfile.lock b/tools/ruby-gems/udb/Gemfile.lock
+index 91e575acfe..abb688624d 100644
+--- a/tools/ruby-gems/udb/Gemfile.lock
++++ b/tools/ruby-gems/udb/Gemfile.lock
+@@ -1,7 +1,7 @@
+ PATH
+   remote: ../idlc
+   specs:
+-    idlc (0.1.0)
++    idlc (0.1.1)
+       activesupport
+       commander (~> 5)
+       pp
+@@ -12,12 +12,12 @@ PATH
+ PATH
+   remote: ../udb_helpers
+   specs:
+-    udb_helpers (0.1.0)
++    udb_helpers (0.1.1)
+ 
+ PATH
+   remote: .
+   specs:
+-    udb (0.1.0)
++    udb (0.1.1)
+       activesupport
+       asciidoctor
+       awesome_print
+diff --git a/tools/ruby-gems/udb/lib/udb/version.rb b/tools/ruby-gems/udb/lib/udb/version.rb
+index 98a1c0de56..459f121485 100644
+--- a/tools/ruby-gems/udb/lib/udb/version.rb
++++ b/tools/ruby-gems/udb/lib/udb/version.rb
+@@ -4,5 +4,5 @@
+ # frozen_string_literal: true
+ 
+ module Udb
+-  def self.version = "0.1.0"
++  def self.version = "0.1.1"
+ end
+diff --git a/tools/ruby-gems/udb/sorbet/rbi/gems/idlc@0.1.0.rbi b/tools/ruby-gems/udb/sorbet/rbi/gems/idlc@0.1.1.rbi
+similarity index 100%
+rename from tools/ruby-gems/udb/sorbet/rbi/gems/idlc@0.1.0.rbi
+rename to tools/ruby-gems/udb/sorbet/rbi/gems/idlc@0.1.1.rbi
+diff --git a/tools/ruby-gems/udb/sorbet/rbi/gems/udb_helpers@0.1.0.rbi b/tools/ruby-gems/udb/sorbet/rbi/gems/udb_helpers@0.1.1.rbi
+similarity index 100%
+rename from tools/ruby-gems/udb/sorbet/rbi/gems/udb_helpers@0.1.0.rbi
+rename to tools/ruby-gems/udb/sorbet/rbi/gems/udb_helpers@0.1.1.rbi
+diff --git a/tools/ruby-gems/udb_helpers/Rakefile b/tools/ruby-gems/udb_helpers/Rakefile
+index 7f91bc3635..e448603672 100644
+--- a/tools/ruby-gems/udb_helpers/Rakefile
++++ b/tools/ruby-gems/udb_helpers/Rakefile
+@@ -4,8 +4,63 @@
+ # typed: true
+ # frozen_string_literal: true
+ 
++require "pathname"
++require "fileutils"
++
+ UDB_HELPERS_ROOT = Kernel.__dir__
+ 
++namespace :release do
++  namespace :udb_helpers do
++    desc "Prepare a copy of the udb_helpers gem for release under gen/udb_helpers_gem (or UDB_HELPERS_GEM_GEN_DIR)"
++    task :prepare do
++      udb_helpers_gem_src = Pathname.new(UDB_HELPERS_ROOT)
++      repo_root = (udb_helpers_gem_src / ".." / ".." / "..").realpath
++      udb_helpers_gem_dst = Pathname.new(ENV.fetch("UDB_HELPERS_GEM_GEN_DIR", (repo_root / "gen" / "udb_helpers_gem").to_s))
++
++      puts "Preparing udb_helpers gem release copy at #{udb_helpers_gem_dst}"
++
++      # Remove existing destination
++      FileUtils.rm_rf(udb_helpers_gem_dst)
++
++      # Before copying, record the realpath of each top-level symlink in the source
++      # so we can resolve them after the copy (the symlinks point into the monorepo
++      # and would be broken at a different directory depth).
++      symlink_targets = {}
++      udb_helpers_gem_src.children.select(&:symlink?).each do |s|
++        symlink_targets[s.basename.to_s] = s.realpath
++      end
++
++      # Copy the gem source directory contents (symlinks are copied as symlinks).
++      # Copy children individually so contents land directly in udb_helpers_gem_dst/
++      # rather than in udb_helpers_gem_dst/udb_helpers/ (cp_r behaviour when dst already exists).
++      FileUtils.mkdir_p(udb_helpers_gem_dst)
++      FileUtils.cp_r(udb_helpers_gem_src.children.map(&:to_s), udb_helpers_gem_dst.to_s)
++
++      # Remove Gemfile and Gemfile.lock from the copy.
++      # These reference local gem paths that only exist inside the monorepo
++      # and would cause `gem build` to fail elsewhere.
++      FileUtils.rm_f(udb_helpers_gem_dst / "Gemfile")
++      FileUtils.rm_f(udb_helpers_gem_dst / "Gemfile.lock")
++
++      # Resolve (or remove) each top-level symlink in the copy
++      symlink_targets.each do |name, target|
++        dst_entry = udb_helpers_gem_dst / name
++        FileUtils.rm_rf(dst_entry)
++        # Skip entries whose target doesn't exist
++        next unless target.exist?
++
++        if target.directory?
++          FileUtils.cp_r(target, dst_entry)
++        else
++          FileUtils.cp(target, dst_entry)
++        end
++      end
++
++      puts "udb_helpers gem release copy ready at #{udb_helpers_gem_dst}"
++    end
++  end
++end
++
+ namespace :test do
+   namespace :udb_helpers do
+     desc "Run unit tests for the udb_helpers gem"
+diff --git a/tools/ruby-gems/udb_helpers/lib/udb_helpers/version.rb b/tools/ruby-gems/udb_helpers/lib/udb_helpers/version.rb
+index d759cd10bc..26b37ad8c5 100644
+--- a/tools/ruby-gems/udb_helpers/lib/udb_helpers/version.rb
++++ b/tools/ruby-gems/udb_helpers/lib/udb_helpers/version.rb
+@@ -6,6 +6,6 @@
+ module Udb
+   module Helpers
+     # Version of the gem
+-    def self.version = "0.1.0"
++    def self.version = "0.1.1"
+   end
+ end
+diff --git a/tools/scripts/check_gem_version_bump.rb b/tools/scripts/check_gem_version_bump.rb
+new file mode 100755
+index 0000000000..2c765407ed
+--- /dev/null
++++ b/tools/scripts/check_gem_version_bump.rb
+@@ -0,0 +1,166 @@
++#!/usr/bin/env ruby
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# frozen_string_literal: true
++
++# Script to check if a gem's source files have changed without a version bump.
++# Used in CI to enforce version bumps when gems are modified.
++
++require "pathname"
++
++# Gem configurations: name, source directory, and version file
++GEMS = [
++  {
++    name: "udb",
++    dir: "tools/ruby-gems/udb",
++    version_file: "tools/ruby-gems/udb/lib/udb/version.rb",
++    version_method: "Udb.version"
++  },
++  {
++    name: "idlc",
++    dir: "tools/ruby-gems/idlc",
++    version_file: "tools/ruby-gems/idlc/lib/idlc/version.rb",
++    version_method: "Idl::Compiler.version"
++  },
++  {
++    name: "udb_helpers",
++    dir: "tools/ruby-gems/udb_helpers",
++    version_file: "tools/ruby-gems/udb_helpers/lib/udb_helpers/version.rb",
++    version_method: "Udb::Helpers.version"
++  },
++  {
++    name: "udb-gen",
++    dir: "tools/ruby-gems/udb-gen",
++    version_file: "tools/ruby-gems/udb-gen/lib/udb-gen/version.rb",
++    version_method: "UdbGen.version"
++  }
++].freeze
++
++def get_changed_files(base_ref)
++  # Get list of changed files compared to base branch. Retry fetch if needed
++  cmd = "git diff --name-only #{base_ref}...HEAD 2>&1"
++  output = `#{cmd}`
++  if $?.exitstatus != 0
++    warn "Initial git diff failed: #{output}"
++    # Try fetching the base branch and retry
++    system("git fetch --no-tags --prune --no-recurse-submodules origin main")
++    output = `#{cmd}`
++    if $?.exitstatus != 0
++      warn "Retry git diff failed: #{output}"
++      # Fallback: list all tracked files to avoid false negatives in CI
++      files = `git ls-files 2>/dev/null`.lines.map(&:strip)
++      warn "Falling back to listing all tracked files (#{files.size} files)"
++      return files
++    end
++  end
++  output.lines.map(&:strip)
++end
++
++def get_gem_version(version_file)
++  # Read version from the version file
++  content = File.read(version_file)
++  # Extract version string using regex (matches x.y.z format)
++  if content =~ /["'](\d+\.\d+\.\d+)["']/
++    $1
++  else
++    nil
++  end
++end
++
++def check_gem(gem_config, changed_files, base_ref)
++  gem_name = gem_config[:name]
++  gem_dir = gem_config[:dir]
++  version_file = gem_config[:version_file]
++
++  # Check if any files in the gem directory have changed
++  gem_files_changed = changed_files.any? { |f| f.start_with?(gem_dir) }
++
++  return :no_changes unless gem_files_changed
++
++  # Check if the version file itself changed
++  version_file_changed = changed_files.include?(version_file)
++
++  if version_file_changed
++    # Version file changed, so version was bumped - OK
++    return :version_bumped
++  end
++
++  # Files changed but version didn't - check if version is actually different
++  # (in case version was bumped in a different way, like find-replace)
++  current_version = get_gem_version(version_file)
++  base_version_content = `git show #{base_ref}:#{version_file} 2>&1`
++
++  if $?.exitstatus != 0
++    # File might not exist in base branch (new gem)
++    return :new_gem
++  end
++
++  base_version = nil
++  if base_version_content =~ /["'](\d+\.\d+\.\d+)["']/
++    base_version = $1
++  end
++
++  if current_version != base_version
++    # Version changed but file wasn't in git diff (shouldn't normally happen)
++    return :version_bumped
++  end
++
++  # Files changed but version didn't - FAIL
++  return :version_not_bumped
++end
++
++def main
++  # Get base branch from argument or default to origin/main
++  base_ref = ARGV[0] || "origin/main"
++
++  # Ensure we have the latest base branch
++  system("git fetch origin main:refs/remotes/origin/main 2>/dev/null")
++
++  changed_files = get_changed_files(base_ref)
++
++  if changed_files.empty?
++    puts "No files changed."
++    exit 0
++  end
++
++  puts "Checking gem version bumps..."
++  puts "Base ref: #{base_ref}"
++  puts
++
++  failures = []
++
++  GEMS.each do |gem_config|
++    gem_name = gem_config[:name]
++    status = check_gem(gem_config, changed_files, base_ref)
++
++    case status
++    when :no_changes
++      puts "✓ #{gem_name}: No changes"
++    when :version_bumped
++      current_version = get_gem_version(gem_config[:version_file])
++      puts "✓ #{gem_name}: Version bumped to #{current_version}"
++    when :new_gem
++      puts "✓ #{gem_name}: New gem (no base version)"
++    when :version_not_bumped
++      current_version = get_gem_version(gem_config[:version_file])
++      puts "✗ #{gem_name}: Files changed but version not bumped (current: #{current_version})"
++      failures << gem_name
++    end
++  end
++
++  if failures.any?
++    puts
++    puts "ERROR: The following gems have source changes without version bumps:"
++    failures.each { |name| puts "  - #{name}" }
++    puts
++    puts "Please bump the version in the version.rb file for each modified gem."
++    exit 1
++  end
++
++  puts
++  puts "All gem version checks passed!"
++  exit 0
++end
++
++main if __FILE__ == $PROGRAM_NAME
+diff --git a/tools/test/regress-tests.yaml b/tools/test/regress-tests.yaml
+index 3cae1215dc..9dd698afc7 100644
+--- a/tools/test/regress-tests.yaml
++++ b/tools/test/regress-tests.yaml
+@@ -357,6 +357,14 @@ tests:
+       - name: Build IDL doc
+         run: ./bin/bundle exec asciidoctor -r idl_highlighter -a toc=left -a source-highlighter=rouge -o idl.html doc/idl.adoc
+ 
++  regress-gem-version-bump:
++    ci_stage: pr
++    tags:
++      - smoke
++    test:
++      - name: Check gem versions bumped when source changes
++        run: git fetch --no-tags --prune --no-recurse-submodules origin main && ./bin/ruby tools/scripts/check_gem_version_bump.rb origin/main
++
+   build-docs-site:
+     ci_stage: merge_queue
+     gh_save_artifact:

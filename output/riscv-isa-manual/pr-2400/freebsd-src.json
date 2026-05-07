@@ -1,0 +1,104 @@
+{
+  "pr_number": 2400,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2400,
+    "violation_condition": "In the FreeBSD kernel, writing menvcfg.ADUE or henvcfg.ADUE via csr_write without subsequently executing the architecturally mandated TLB-synchronization fence (SFENCE.VMA with rs1=x0,rs2=x0 for menvcfg; HFENCE.VVMA with rs1=x0,rs2=x0 for henvcfg) leaves stale address-translation cache entries that continue to interpret PTE A/D bits under the old ADUE setting, producing inconsistent hardware-vs-software A/D updates across harts.",
+    "security_consequence": "race_condition",
+    "vulnerability_pattern": "csr_write\\(\\s*(menvcfg|henvcfg)\\b",
+    "affected_entities": [
+      "menvcfg",
+      "henvcfg",
+      "SFENCE.VMA",
+      "HFENCE.VVMA"
+    ],
+    "summary": "FreeBSD bhyve writes henvcfg on VM entry at vmm_riscv.c:632 without a trailing HFENCE.VVMA; if ADUE were ever added to that CSR write path, stale TLB A/D interpretations would leak across VMID boundaries or corrupt guest page-table A/D bits"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "riscv_vmm_vcpu_run",
+        "line_start": 631,
+        "line_end": 632,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Only henvcfg write in the kernel writes HENVCFG_STCE (Sstc timer enable, bit 63), not ADUE (bit 61). STCE does not affect address translation or TLB contents, so no HFENCE.VVMA or SFENCE.VMA synchronization is architecturally required after this write. The preceding hfence_gvma() at line 628 is documented as being for the hgatp write, not henvcfg.",
+      "snippet": "if (has_sstc)\n\t\tcsr_write(henvcfg, HENVCFG_STCE);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "null",
+        "line_start": 176,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "No ADUE bit (bit 61) is defined for any envcfg CSR variant. HENVCFG_STCE, HENVCFG_PBMTE, HENVCFG_CBZE, HENVCFG_CBCFE, HENVCFG_CBIE, and HENVCFG_FIOM are defined, but ADUE is absent. PBMTE (bit 62) is defined but never written via csr_write in kernel code.",
+      "snippet": "#define HENVCFG_STCE   (1UL << 63)\n#define HENVCFG_PBMTE  (1UL << 62)\n...\n#define HENVCFG_FIOM   (1UL << 0)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/riscv.h",
+        "function_name": "null",
+        "line_start": 56,
+        "line_end": 68,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "struct hypcsr declares a 'senvcfg' field (line 67) in the guest CSR save area but vmmops_vcpu_save_csrs() and vmmops_vcpu_restore_csrs() in vmm_riscv.c never save or restore the actual senvcfg CSR. If a guest writes ADUE into senvcfg and the VMM attempts to support ADUE in the future, the field exists but save/restore plumbing is missing. The field is not currently used for any purpose.",
+      "snippet": "struct hypcsr {\n\tuint64_t hvip;\n\t...\n\tuint64_t scounteren;\n\tuint64_t senvcfg;\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_restore_csrs",
+        "line_start": 162,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmmops_vcpu_restore_csrs() restores vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, and vsatp, but never restores senvcfg from hypcsr.senvcfg. If ADUE were ever enabled by writing henvcfg.ADUE or the guest's senvcfg.ADUE were to be context-switched, the restore path is incomplete. Additionally, no HFENCE.VVMA follows any potential henvcfg write in this flow.",
+      "snippet": "csr_write(vsstatus, csrs->vsstatus);\ncsr_write(vsie, csrs->vsie);\n...\ncsr_write(vsatp, csrs->vsatp);\n/* senvcfg NOT restored */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_save_csrs",
+        "line_start": 179,
+        "line_end": 195,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmmops_vcpu_save_csrs() saves all guest-visible CSRs to hypcsr but similarly does not read senvcfg. Any guest modification to senvcfg would be lost across VM exits.",
+      "snippet": "csrs->vsstatus = csr_read(vsstatus);\ncsrs->vsie = csr_read(vsie);\n...\ncsrs->vsatp = csr_read(vsatp);\n/* senvcfg NOT saved */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/machdep.c",
+        "function_name": "initriscv",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "initriscv() and locore.S do not contain any csr_write to menvcfg, henvcfg, or senvcfg. Boot-time CSR configuration does not set ADUE on any privilege level. grep for menvcfg/henvcfg/senvcfg across all of sys/riscv/riscv/ returned zero matches.",
+      "snippet": "(no envcfg CSR writes in boot path)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "riscv_vmm_vcpu_run",
+        "line_start": 610,
+        "line_end": 693,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The VM entry loop rewrites henvcfg with HENVCFG_STCE on every vcpu run (line 632) inside the VMM main loop, and the henvcfg CSR is not saved/restored across vmexits. While currently compliant (STCE only), if ADUE (bit 61) were ever added to this csr_write() without inserting an HFENCE.VVMA afterward, stale TLB entries could interpret PTE A/D bits inconsistently. The RISC-V privileged spec requires HFENCE.VVMA with rs1=x0,rs2=x0 after henvcfg.ADUE modifications.",
+      "snippet": "hfence_gvma();\ncsr_write(hgatp, pmap->pm_satp);\nif (has_sstc)\n\tcsr_write(henvcfg, HENVCFG_STCE);\n/* No HFENCE.VVMA after henvcfg write */"
+    }
+  ],
+  "overall_severity": "compliant"
+}

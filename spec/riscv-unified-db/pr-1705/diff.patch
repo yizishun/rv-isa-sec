@@ -1,0 +1,389 @@
+diff --git a/.github/workflows/release_udb_deps.yml b/.github/workflows/release_udb_deps.yml
+new file mode 100644
+index 0000000000..ae4f1fa46d
+--- /dev/null
++++ b/.github/workflows/release_udb_deps.yml
+@@ -0,0 +1,128 @@
++name: Build and release UDB gem dependencies to GitHub
++
++# Builds and uploads prebuilt espresso and/or must binaries as GitHub release assets.
++# Run this workflow manually whenever a tool version needs to be updated.
++#
++# Steps:
++#   1. Create a GitHub release tag (e.g. espresso-1.0 or must-17fa9f9) on the repo.
++#   2. Trigger this workflow via workflow_dispatch, selecting the tool and tag.
++#   3. The workflow builds on native amd64 and arm64 runners and uploads the binaries.
++
++on:
++  workflow_dispatch:
++    inputs:
++      tool:
++        description: "Tool to build"
++        required: true
++        type: choice
++        options:
++          - espresso
++          - must
++          - z3
++          - all
++      tag:
++        description: "Release tag to upload assets to (e.g. espresso-1.0 or must-17fa9f9)"
++        required: true
++        type: string
++
++jobs:
++  build-z3:
++    if: inputs.tool == 'z3' || inputs.tool == 'all'
++    name: Build Z3 (${{ matrix.arch }})
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - runner: ubuntu-24.04
++            arch: x64
++          - runner: ubuntu-24.04-arm
++            arch: arm64
++    runs-on: ${{ matrix.runner }}
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++
++      - name: Install GitHub CLI
++        run: |
++          type -p curl >/dev/null || (sudo apt update && sudo apt install curl -y)
++          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
++          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
++          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
++          sudo apt update
++          sudo apt install gh -y
++
++      - name: Authenticate GitHub CLI
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          echo "$GH_TOKEN" | gh auth login --with-token
++
++      - name: Build and upload Z3 for ${{ matrix.arch }}
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          ./bin/chore update z3 -n
++
++  build-espresso:
++    if: inputs.tool == 'espresso' || inputs.tool == 'all'
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - runner: ubuntu-24.04
++            arch: x64
++          - runner: ubuntu-24.04-arm
++            arch: arm64
++    runs-on: ${{ matrix.runner }}
++    steps:
++      - name: Checkout
++        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++
++      - name: Set up Docker Buildx
++        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
++
++      - name: Build espresso (${{ matrix.arch }})
++        run: bash tools/scripts/build_espresso_with_docker.sh ./espresso-out ${{ matrix.arch }}
++
++      - name: Rename binary with arch suffix
++        run: mv ./espresso-out/espresso ./espresso-${{ matrix.arch }}
++
++      - name: Upload espresso-${{ matrix.arch }} to release
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          gh release upload "${{ inputs.tag }}" \
++            "espresso-${{ matrix.arch }}" \
++            --clobber
++
++  build-must:
++    if: inputs.tool == 'must' || inputs.tool == 'all'
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - runner: ubuntu-24.04
++            arch: x64
++          - runner: ubuntu-24.04-arm
++            arch: arm64
++    runs-on: ${{ matrix.runner }}
++    steps:
++      - name: Checkout
++        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
++
++      - name: Set up Docker Buildx
++        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
++
++      - name: Build must (${{ matrix.arch }})
++        run: bash tools/scripts/build_must_with_docker.sh ./must-out ${{ matrix.arch }}
++
++      - name: Rename binary with arch suffix
++        run: mv ./must-out/must ./must-${{ matrix.arch }}
++
++      - name: Upload must-${{ matrix.arch }} to release
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          gh release upload "${{ inputs.tag }}" \
++            "must-${{ matrix.arch }}" \
++            --clobber
+diff --git a/tools/scripts/build_espresso_with_docker.sh b/tools/scripts/build_espresso_with_docker.sh
+new file mode 100644
+index 0000000000..3d2e37c595
+--- /dev/null
++++ b/tools/scripts/build_espresso_with_docker.sh
+@@ -0,0 +1,112 @@
++#!/usr/bin/env bash
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# Build espresso from source using Docker and AlmaLinux 8.
++# Produces a statically-linked binary for maximum portability (glibc 2.28+).
++#
++# Usage: build_espresso_with_docker.sh [output_dir] [architecture]
++#   output_dir   - where to place the binary (default: ./espresso-build)
++#   architecture - x64 or arm64 (default: x64)
++
++set -euo pipefail
++
++error() { echo "ERROR: $*" >&2; exit 1; }
++info()  { echo "INFO: $*"  >&2; }
++
++command_exists() { command -v "$1" >/dev/null 2>&1; }
++
++build_espresso_with_docker() {
++    local output_dir="${1:-./espresso-build}"
++    local architecture="${2:-x64}"
++
++    case "${architecture,,}" in
++        x64|amd64|x86_64)
++            architecture="x64"
++            local docker_platform="linux/amd64"
++            ;;
++        arm64|aarch64)
++            architecture="arm64"
++            local docker_platform="linux/arm64"
++            ;;
++        *)
++            error "Invalid architecture: $architecture. Must be x64 or arm64"
++            ;;
++    esac
++
++    info "Building espresso"
++    info "Output directory: $output_dir"
++    info "Architecture: $architecture ($docker_platform)"
++
++    command_exists docker || error "Docker is not installed or not in PATH"
++
++    local temp_dir
++    temp_dir=$(mktemp -d -t espresso-build-XXXXXX)
++    trap "rm -rf '$temp_dir'" EXIT
++
++    info "Using temporary directory: $temp_dir"
++
++    # Write Dockerfile
++    cat > "$temp_dir/Dockerfile" << 'EOF'
++FROM almalinux:8
++
++RUN dnf install -y \
++    gcc-toolset-14 \
++    make \
++    glibc-static \
++    && dnf clean all
++
++ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
++    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:$LD_LIBRARY_PATH
++
++WORKDIR /build
++
++# Clone espresso source
++RUN git clone --depth=1 https://github.com/psksvp/espresso-ab-1.0.git espresso
++
++WORKDIR /build/espresso
++
++# Configure and build with static linking
++RUN ./configure LDFLAGS="-static" && \
++    make -j$(nproc) && \
++    strip espresso
++
++RUN touch /build/BUILD_SUCCESS
++EOF
++
++    local image_name="espresso-builder-$$"
++    info "Building Docker image for $docker_platform..."
++    docker build --platform="$docker_platform" -t "$image_name" -f "$temp_dir/Dockerfile" "$temp_dir" \
++        || error "Docker build failed"
++
++    local container_name="espresso-extract-$$"
++    docker create --name "$container_name" "$image_name" || error "Failed to create container"
++
++    if ! docker cp "$container_name:/build/BUILD_SUCCESS" "$temp_dir/" 2>/dev/null; then
++        docker rm "$container_name" >/dev/null 2>&1 || true
++        docker rmi "$image_name" >/dev/null 2>&1 || true
++        error "espresso build failed - BUILD_SUCCESS marker not found"
++    fi
++
++    mkdir -p "$output_dir"
++    docker cp "$container_name:/build/espresso/espresso" "$output_dir/espresso" \
++        || error "Failed to extract espresso binary"
++    chmod +x "$output_dir/espresso"
++
++    docker rm "$container_name" >/dev/null 2>&1 || true
++    docker rmi "$image_name" >/dev/null 2>&1 || true
++
++    info "Build completed successfully!"
++    info "Binary: $output_dir/espresso"
++    ls -lh "$output_dir/espresso"
++}
++
++if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
++    if [[ $# -gt 0 ]] && [[ "$1" == "-h" || "$1" == "--help" ]]; then
++        echo "Usage: $0 [output_dir] [architecture]" >&2
++        echo "  output_dir   - where to place the binary (default: ./espresso-build)" >&2
++        echo "  architecture - x64 or arm64 (default: x64)" >&2
++        exit 0
++    fi
++    build_espresso_with_docker "${1:-./espresso-build}" "${2:-x64}"
++fi
+diff --git a/tools/scripts/build_must_with_docker.sh b/tools/scripts/build_must_with_docker.sh
+new file mode 100644
+index 0000000000..034db206d3
+--- /dev/null
++++ b/tools/scripts/build_must_with_docker.sh
+@@ -0,0 +1,131 @@
++#!/usr/bin/env bash
++# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++# SPDX-License-Identifier: BSD-3-Clause-Clear
++
++# Build must (mustool) from source using Docker and AlmaLinux 8.
++# Produces a statically-linked binary for maximum portability (glibc 2.28+).
++#
++# Usage: build_must_with_docker.sh [output_dir] [architecture]
++#   output_dir   - where to place the binary (default: ./must-build)
++#   architecture - x64 or arm64 (default: x64)
++#
++# The pinned commit matches MUST_VERSION in the udb gem.
++# To update: change MUST_COMMIT below and update lib/udb/MUST_VERSION accordingly.
++
++set -euo pipefail
++
++error() { echo "ERROR: $*" >&2; exit 1; }
++info()  { echo "INFO: $*"  >&2; }
++
++command_exists() { command -v "$1" >/dev/null 2>&1; }
++
++# Pinned commit - must match lib/udb/MUST_VERSION
++MUST_COMMIT="17fa9f9542a9ce05328dfccd1cd410f05f741ab3"
++
++build_must_with_docker() {
++    local output_dir="${1:-./must-build}"
++    local architecture="${2:-x64}"
++
++    case "${architecture,,}" in
++        x64|amd64|x86_64)
++            architecture="x64"
++            local docker_platform="linux/amd64"
++            ;;
++        arm64|aarch64)
++            architecture="arm64"
++            local docker_platform="linux/arm64"
++            ;;
++        *)
++            error "Invalid architecture: $architecture. Must be x64 or arm64"
++            ;;
++    esac
++
++    info "Building must (mustool @ $MUST_COMMIT)"
++    info "Output directory: $output_dir"
++    info "Architecture: $architecture ($docker_platform)"
++
++    command_exists docker || error "Docker is not installed or not in PATH"
++
++    local temp_dir
++    temp_dir=$(mktemp -d -t must-build-XXXXXX)
++    trap "rm -rf '$temp_dir'" EXIT
++
++    info "Using temporary directory: $temp_dir"
++
++    # Write Dockerfile - MUST_COMMIT is baked in at image-build time via ARG
++    cat > "$temp_dir/Dockerfile" << 'EOF'
++FROM almalinux:8
++
++RUN dnf install -y \
++    gcc-toolset-14 \
++    make \
++    git \
++    zlib-static \
++    glibc-static \
++    libstdc++-static \
++    && dnf clean all
++
++ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
++    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:$LD_LIBRARY_PATH
++
++ARG MUST_COMMIT
++WORKDIR /build
++
++RUN git clone https://github.com/jar-ben/mustool.git must && \
++    cd must && \
++    git checkout ${MUST_COMMIT}
++
++WORKDIR /build/must
++
++# Apply the missing #include <cstdio> patch
++RUN sed -i -e 's/#include <signal.h>/#include <signal.h>\n#include <cstdio>/' \
++    mcsmus/mcsmus/control.cc
++
++# Build; link statically where possible
++RUN make -j$(nproc) LDFLAGS="-static" && \
++    strip must
++
++RUN touch /build/BUILD_SUCCESS
++EOF
++
++    local image_name="must-builder-$$"
++    info "Building Docker image for $docker_platform..."
++    docker build \
++        --platform="$docker_platform" \
++        --build-arg "MUST_COMMIT=$MUST_COMMIT" \
++        -t "$image_name" \
++        -f "$temp_dir/Dockerfile" \
++        "$temp_dir" \
++        || error "Docker build failed"
++
++    local container_name="must-extract-$$"
++    docker create --name "$container_name" "$image_name" || error "Failed to create container"
++
++    if ! docker cp "$container_name:/build/BUILD_SUCCESS" "$temp_dir/" 2>/dev/null; then
++        docker rm "$container_name" >/dev/null 2>&1 || true
++        docker rmi "$image_name" >/dev/null 2>&1 || true
++        error "must build failed - BUILD_SUCCESS marker not found"
++    fi
++
++    mkdir -p "$output_dir"
++    docker cp "$container_name:/build/must/must" "$output_dir/must" \
++        || error "Failed to extract must binary"
++    chmod +x "$output_dir/must"
++
++    docker rm "$container_name" >/dev/null 2>&1 || true
++    docker rmi "$image_name" >/dev/null 2>&1 || true
++
++    info "Build completed successfully!"
++    info "Binary: $output_dir/must"
++    ls -lh "$output_dir/must"
++}
++
++if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
++    if [[ $# -gt 0 ]] && [[ "$1" == "-h" || "$1" == "--help" ]]; then
++        echo "Usage: $0 [output_dir] [architecture]" >&2
++        echo "  output_dir   - where to place the binary (default: ./must-build)" >&2
++        echo "  architecture - x64 or arm64 (default: x64)" >&2
++        exit 0
++    fi
++    build_must_with_docker "${1:-./must-build}" "${2:-x64}"
++fi

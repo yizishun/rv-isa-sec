@@ -1,0 +1,26 @@
+PR #822  target=freebsd-src  overall=compliant
+Spec: ACLIC reuses IMSIC CSRs (stopei/eip/eie) but gates them behind mstateen0 bit 58; FreeBSD kernel has no Smstateen awareness and would trap on access if M-mode firmware disables the bit, causing kernel panic
+Violation: FreeBSD kernel (S-mode) on a system implementing ACLIC accesses stopei, eip[k], or eie[k] CSRs while the controlling mstateen0 CSR has bit 58 clear. M-mode firmware (e.g., OpenSBI) may clear mstateen0[58] at boot or after a warm reset, and the kernel has no mechanism to detect this before touching the IMSIC-reused CSRs, resulting in an unexpected illegal instruction trap.
+Consequence: denial_of_service
+Pattern: csr_read(stopei) OR csr_write(stopei, .*) OR csr_read(eip) OR csr_write(eip, .*) OR csr_read(eie) OR csr_write(eie, .*) without preceding mstateen0 bit-58 check
+------------------------------------------------------------
+[compliant] sys/riscv/include/riscvreg.h:158-170  N/A (header)
+  Header defines SIE_SEIE (bit 9 of sie register) and HIE_VSEIE (bit 10 of hie register), which are standard interrupt-enable bits in the sie/hie CSRs — not the standalone 'eie' S-mode CSR that is IMSIC-reused and gated by mstateen0[58]. No CSR access macros reference stopei, vstopei, eip, or eie as standalone CSRs.
+  | #define SIE_SEIE (1 << 9)
+  | #define HIE_VSEIE (1 << 10)
+  | #define HIE_SGEIE (1 << 12)
+
+[compliant] sys/riscv/riscv/aplic.c:455-457  aplic_attach
+  APLIC driver explicitly rejects combined APLIC+IMSIC configurations, preventing any code path that would touch IMSIC-reused CSRs. This serves as a defense-in-depth mechanism.
+  | /* APLIC with IMSIC on hart is not supported */
+  | device_printf(dev, "APLIC with IMSIC is unsupported\n");
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:586-588  vm_handle_mmip
+  Hypervisor code accesses HVIP_VSEIP and HVIP_VSEIP bit in the hvip/hie hypervisor CSRs — these are the H-extension hypervisor CSRs (HS-mode), not the S-mode eip/eie CSRs reused by IMSIC. The hypervisor CSRs are controlled by hstateen0, not mstateen0, and are outside the scope of the Smidctrl vulnerability.
+  | hypctx->guest_csrs.hvip |= HVIP_VSEIP;
+  | hypctx->guest_csrs.hvip &= ~HVIP_VSEIP;
+
+[compliant] sys/riscv/ (entire subtree):0-0  N/A (absence finding)
+  No kernel code in sys/riscv accesses stopei, vstopei, eip (as standalone CSR), or eie (as standalone CSR). No kernel code reads or writes mstateen0. The IMSIC-reused CSRs that are gated by mstateen0 bit 58 are completely absent from the FreeBSD RISC-V kernel. The vulnerability pattern (access IMSIC-reused CSR without preceding mstateen0[58] check) has zero instances because the prerequisite — CSR access — does not exist.
+  | (No matching code found)
+

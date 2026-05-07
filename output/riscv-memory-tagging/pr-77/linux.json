@@ -1,0 +1,141 @@
+{
+  "pr_number": 77,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 77,
+    "violation_condition": "KVM context-switches hstatus between VCPUs without saving/restoring hstatus.MTAG_I, or the kernel writes a synthesized sstatus/mstatus value (e.g., during signal frame setup, ptrace register set, or user_regs recovery) that corrupts MTAG_I, causing one execution context to inherit another context's code-page tag state",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "save/restore of sstatus/mstatus/hstatus without MTAG_I mask; __fswrite sstatus CSR without MTAG_I preservation; KVM vcpu switch omitting hstatus.MTAG_I in the save/restore sequence",
+    "affected_entities": [
+      "hstatus.MTAG_I",
+      "mstatus.MTAG_I",
+      "HLV",
+      "HSV",
+      "HLVX"
+    ],
+    "summary": "hstatus.MTAG_I and mstatus.MTAG_I are new Zimt CSR bits deposited by hardware on trap entry (HS-mode and M-mode respectively); if the kernel's context-switch or register-save paths omit these bits, a guest VM or process can inherit stale MTAG_I state from a prior context, suppressing tag checks on HLV/HSV emulated accesses and defeating the memory-tagging security boundary"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 176,
+        "line_end": 190,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Trap entry uses csrrc (read-modify-write with bit-clear) to clear SR_SUM|SR_FS_VS from sstatus. This preserves all other sstatus fields including any hypothetical MTAG_I. The read-back value s1 (includes MTAG_I) is saved to PT_STATUS(sp) via REG_S at line 190.",
+      "snippet": "li t0, SR_SUM | SR_FS_VS\ncsrrc s1, CSR_STATUS, t0\n// ... s1 saved to stack\nREG_S s1, PT_STATUS(sp)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "ret_from_exception",
+        "line_start": 279,
+        "line_end": 301,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ret_from_exception restores sstatus from pt_regs->status with a full csrw. Since pt_regs->status was populated on trap entry from the hardware CSR (which includes MTAG_I), and is preserved through in-memory modifications (signal, kprobes, ptrace all preserve it), MTAG_I survives the save→modify→restore cycle.",
+      "snippet": "REG_L a0, PT_STATUS(sp)\n// ... restore_userssp ...\ncsrw CSR_STATUS, a0\n// ... sret"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 441,
+        "line_end": 451,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Context switch saves full sstatus (with any MTAG_I) to prev->thread, then loads next->thread and isolates only SR_SUM via AND, applying it with csrs (bit-set). Since csrs with register operand does read-modify-write (OR), MTAG_I is preserved in current hardware sstatus. User-mode MTAG_I is later restored by ret_from_exception csrw when the task resumes userspace.",
+      "snippet": "csrr  s0, CSR_STATUS\nREG_S s0, TASK_THREAD_SUM_RA(a3)  // save full sstatus\n// ...\nREG_L s0,  TASK_THREAD_SUM_RA(a4)\nli    s1,  SR_SUM\nand   s0,  s0, s1                  // isolate SUM only\ncsrs  CSR_STATUS, s0             // bit-set SUM, preserve all other bits"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "SAVE_HOST_AND_RESTORE_GUEST_CSRS / SAVE_GUEST_AND_RESTORE_HOST_CSRS",
+        "line_start": 41,
+        "line_end": 63,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM vCPU switch uses csrrw (atomic swap) to cross host/guest sstatus at line 48 and 155. The old host sstatus (with MTAG_I) is captured in t0 and saved to KVM_ARCH_HOST_SSTATUS. On guest exit, host sstatus from memory is swapped back via csrrw, capturing the guest sstatus (with guest MTAG_I) into t2 which is then saved to KVM_ARCH_GUEST_SSTATUS. Both MTAG_I values survive the atomic swap.",
+      "snippet": "REG_L t0, (KVM_ARCH_GUEST_SSTATUS)(a0)\ncsrrw t0, CSR_SSTATUS, t0    // swap: host→t0, guest→hw\nREG_S t0, (KVM_ARCH_HOST_SSTATUS)(a0)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_ioctl_run",
+        "line_start": 805,
+        "line_end": 849,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VCPU run loop swaps host/guest hstatus using csr_swap(CSR_HSTATUS, ...) at lines 819/839/845/849. csr_swap (csrrw) is an atomic read-then-write: old hstatus (including MTAG_I) is returned and saved to the host context, while guest hstatus is written. On exit the reverse swap restores host hstatus. MTAG_I in hstatus is preserved through the atomic read-modify-write semantics.",
+      "snippet": "hcntx->hstatus = csr_swap(CSR_HSTATUS, gcntx->hstatus);  // enter guest\n// ... switch_to ...\ngcntx->hstatus = csr_swap(CSR_HSTATUS, hcntx->hstatus);  // exit guest"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_exit.c",
+        "function_name": "kvm_riscv_vcpu_unpriv_read",
+        "line_start": 70,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HLV/HSV unpriv read path saves old hstatus via csr_swap (atomic capture of current hstatus including MTAG_I), later restores it via csr_write(CSR_HSTATUS, old_hstatus). The old_hstatus value was directly read from hardware, so MTAG_I is preserved.",
+      "snippet": "old_hstatus = csr_swap(CSR_HSTATUS, vcpu->arch.guest_context.hstatus);\n// ... HLV/HSV operation ...\ncsr_write(CSR_HSTATUS, old_hstatus);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "setup_sigcontext / restore_sigcontext",
+        "line_start": 219,
+        "line_end": 227,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Signal frame save/restore copies the entire struct pt_regs (including status with MTAG_I) via copy_to_user/copy_from_user. sc_regs is architecturally compatible with the prefix of pt_regs, so MTAG_I in regs->status survives signal delivery and sigreturn.",
+      "snippet": "err = __copy_from_user(regs, &sc->sc_regs, sizeof(sc->sc_regs));  // restore\n// ...\nerr = __copy_to_user(&sc->sc_regs, regs, sizeof(sc->sc_regs));    // save"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "start_thread",
+        "line_start": 144,
+        "line_end": 180,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "start_thread() synthesizes regs->status = SR_PIE for execve(2). This deliberately discards the old process's MTAG_I state, which is correct — exec replaces the address space, so stale code-page tags have no meaning. The new process gets a clean sstatus; when the extension is actually supported, this is the correct place to set initial MTAG_I for the new binary.",
+      "snippet": "regs->status = SR_PIE;\nif (has_fpu())\n\tregs->status |= SR_FS_INITIAL;\n// ... UXL bits ..."
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "copy_thread",
+        "line_start": 253,
+        "line_end": 279,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "copy_thread for fork/clone copies parent's full pt_regs including status (line 268: *childregs = *(current_pt_regs())), so the child inherits the parent's MTAG_I. For kernel threads, a synthetic status = SR_PP|SR_PIE is used — correct since kernel threads never have user MTAG_I.",
+      "snippet": "*childregs = *(current_pt_regs());              // user fork: inherit parent\nchildregs->status = SR_PP | SR_PIE;             // kernel thread: fresh"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "__kvm_riscv_fp_f_save / __kvm_riscv_fp_d_save / __kvm_riscv_fp_f_restore / __kvm_riscv_fp_d_restore",
+        "line_start": 274,
+        "line_end": 440,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM FP save/restore functions use a snapshot pattern: read current sstatus (with MTAG_I) into t2, csrs to enable FS, do FP operations, then csrw CSR_SSTATUS, t2 to restore the exact prior sstatus value. Since t2 was read directly from hardware (which carries MTAG_I), the restore preserves it. This is safe assuming interrupt-disabled context during FP save/restore.",
+      "snippet": "csrr t2, CSR_SSTATUS           // snapshot with MTAG_I\nli t1, SR_FS\ncsrs CSR_SSTATUS, t1           // enable FS (bit-set, preserves MTAG_I)\n// ... FP operations ...\ncsrw CSR_SSTATUS, t2           // restore exact snapshot (includes MTAG_I)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

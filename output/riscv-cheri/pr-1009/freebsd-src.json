@@ -1,0 +1,143 @@
+{
+  "pr_number": 1009,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 1009,
+    "violation_condition": "In the FreeBSD kernel, a capability load instruction (e.g., CLC) executes with an authorizing capability that grants R and C permissions but lacks LM permission, and the loaded value is a valid tagged unsealed capability — the hardware will clear W and LM permissions in the destination register. This occurs during context-switch restore (loading saved user capabilities from the PCB via a kernel-internal authorizing capability), signal frame construction (copying capability arguments to the user stack through a restricted DDC), or copyin/copyout paths where the kernel source capability for a user buffer inadvertently lacks LM permission.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "cheri_cap_load.*(lm_perm|LM_PERM|LoadMutable|CHERI_PERM_LOAD_MUTABLE).*|CL[CWSD].*authorizing.*(without|missing|lacking).*(lm|w_perm)|capability.*restore.*(w_perm|write.*perm).*stripped|context.*switch.*cap.*load.*permission.*clear",
+    "affected_entities": [
+      "CLW",
+      "CLD",
+      "CLS",
+      "CLC",
+      "lm_perm",
+      "w_perm",
+      "ctag"
+    ],
+    "summary": "FreeBSD's context-switch and signal-delivery paths perform capability loads through kernel-internal authorizing capabilities; if any such authorizing capability lacks LM permission, restored user capabilities silently lose write permission, enabling privilege downgrade attacks where a process wakes up with unexpectedly read-only data capabilities after a context switch or signal return."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 284,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — No CHERI capability save/restore: all register saves use plain 'sd' (store double). No CHERI capability registers (ca0-ca7, cra, csp, cgp, ctp) are saved or restored because this kernel has no CHERI support. The LM permission violation pattern does not apply since no CLC/capability-load instructions exist.",
+      "snippet": "sd    ra, (PCB_RA)(x13)\nsd    sp, (PCB_SP)(x13)\nsd    s0, (PCB_S + 0 * 8)(x13)\n..."
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "get_mcontext",
+        "line_start": 206,
+        "line_end": 228,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — Uses plain memcpy to copy integer registers from trapframe to mcontext. No capability registers are copied. No CLC, cheri_cap_load, or LM permission checking exists. The vulnerability pattern (capability load with authorizing cap lacking LM permission) has no code path to trigger.",
+      "snippet": "memcpy(mcp->mc_gpregs.gp_t, tf->tf_t, sizeof(mcp->mc_gpregs.gp_t));\nmemcpy(mcp->mc_gpregs.gp_s, tf->tf_s, sizeof(mcp->mc_gpregs.gp_s));\nmemcpy(mcp->mc_gpregs.gp_a, tf->tf_a, sizeof(mcp->mc_gpregs.gp_a));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_mcontext",
+        "line_start": 231,
+        "line_end": 262,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — Uses plain memcpy to restore integer registers from mcontext to trapframe. Only validates sstatus bits (SD, XS, FS, UPIE, UIE). No CHERI capability restoration, no capability tag or permission validation, no LM permission checks. No capability-load path exists to trigger W/LM permission clearing.",
+      "snippet": "memcpy(tf->tf_t, mcp->mc_gpregs.gp_t, sizeof(tf->tf_t));\nmemcpy(tf->tf_s, mcp->mc_gpregs.gp_s, sizeof(tf->tf_s));\nmemcpy(tf->tf_a, mcp->mc_gpregs.gp_a, sizeof(tf->tf_a));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sendsig",
+        "line_start": 337,
+        "line_end": 413,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — Constructs sigframe on kernel stack via bzero+get_mcontext, then copies to userspace via plain copyout(). The copyout implementation (copyinout.S:115) uses lb/ld/sb/sd. No DDC manipulation, no capability-aware copy, no LM permission checking. The vulnerability pattern (restricted DDC lacking LM) does not exist because DDC is not used or manipulated anywhere.",
+      "snippet": "bzero(&frame, sizeof(frame));\nget_mcontext(td, &frame.sf_uc.uc_mcontext, 0);\n...\nif (copyout(&frame, fp, sizeof(*fp)) != 0) {"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/copyinout.S",
+        "function_name": "copyout",
+        "line_start": 115,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — Standard integer copy loop using lb/sb/ld/sd. Uses ENTER_USER_ACCESS (sets SSTATUS_SUM) for user memory access. No CHERI capability load/store instructions (CLC/CSC). No authorizing capability to strip LM permission from. No DDC involvement.",
+      "snippet": "ENTRY(copyout)\n  beqz  a2, copyout_end\n  add   a3, a1, a2\n  li    a4, VM_MAXUSER_ADDRESS\n  bgeu  a3, a4, copyio_fault_nopcb"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/copyinout.S",
+        "function_name": "copyin",
+        "line_start": 133,
+        "line_end": 144,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — Standard integer copy loop identical to copyout but reading from user address. No capability awareness, no tag preservation, no LM permission path.",
+      "snippet": "ENTRY(copyin)\n  beqz  a2, copyin_end\n  add   a3, a0, a2\n  li    a4, VM_MAXUSER_ADDRESS\n  bgeu  a3, a4, copyio_fault_nopcb"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers",
+        "line_start": 41,
+        "line_end": 114,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — Saves only integer GPRs (ra, tp, gp, t0-t6, s0-s11, a0-a7) and supervisor CSRs (sepc, sstatus, stval, scause) using plain 'sd'. No CHERI capability register save. In CHERI RISC-V, c0-c31(capability registers) would also need saving but none is present. LM permission vulnerability does not apply.",
+      "snippet": ".macro save_registers mode\n  addi  sp, sp, -(TF_SIZE)\n  sd    ra, (TF_RA)(sp)\n  sd    tp, (TF_TP)(sp)\n  sd    gp, (TF_GP)(sp)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — PCB structure stores only integer registers (pcb_ra, pcb_sp, pcb_gp, pcb_tp, pcb_s[12]) and FPU state (pcb_x[32][2], pcb_fcsr). All fields are uint64_t. No capability register storage slots. The vulnerability pattern cannot manifest because there is no capability state to load in the first place.",
+      "snippet": "struct pcb {\n  uint64_t pcb_ra;\n  uint64_t pcb_sp;\n  uint64_t pcb_gp;\n  uint64_t pcb_tp;\n  uint64_t pcb_s[12];"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/ucontext.h",
+        "function_name": "struct __mcontext",
+        "line_start": 57,
+        "line_end": 64,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — mcontext_t contains only gpregs (integer), fpregs (FPU), mc_flags, mc_pad, and mc_spare[8]. No capability register fields. Uses __uint64_t throughout. No CHERI capability context to expose to userspace, so no LM-permission-stripping path exists.",
+      "snippet": "struct __mcontext {\n  struct gpregs  mc_gpregs;\n  struct fpregs  mc_fpregs;\n  int            mc_flags;\n  int            mc_pad;\n  __uint64_t     mc_spare[8];"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/asm.h",
+        "function_name": "ENTER_USER_ACCESS",
+        "line_start": 64,
+        "line_end": 70,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "N/A — User memory access control uses the standard non-CHERI RISC-V SSTATUS_SUM bit (Supervisor User Memory access). No DDC (Default Data Capability) manipulation, no capability bounds narrowing, no authorizing capability LM permission checking. On CHERI hardware, this would be insufficient security-wise, but the vulnerability pattern described in the spec (CLC with authorizing cap lacking LM) does not apply since no CLC instructions exist.",
+      "snippet": "ENTER_USER_ACCESS(tmp)\n  li    tmp, SSTATUS_SUM\n  csrs  sstatus, tmp\nEXIT_USER_ACCESS(tmp)\n  li    tmp, SSTATUS_SUM\n  csrc  sstatus, tmp"
+    }
+  ],
+  "overall_severity": "compliant"
+}

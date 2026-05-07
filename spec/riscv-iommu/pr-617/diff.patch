@@ -1,0 +1,266 @@
+diff --git a/src/iommu.bib b/src/iommu.bib
+index 3113e864..bddf88f2 100644
+--- a/src/iommu.bib
++++ b/src/iommu.bib
+@@ -30,9 +30,13 @@ @electronic{PR441
+   url = {https://github.com/riscv-non-isa/riscv-iommu/pull/441/commits}
+ }
+ @electronic{PR569,
+-  title = {Clarification updates to IOMMU v06252025},
++  title = {Clarification updates to IOMMU v20250625},
+   url = {https://github.com/riscv-non-isa/riscv-iommu/pull/569/commits}
+ }
++@electronic{PR617,
++  title = {Clarification updates to IOMMU v20250828},
++  url = {https://github.com/riscv-non-isa/riscv-iommu/pull/617/commits}
++}
+ @electronic{CBQRI,
+   title = {RISC-V Capacity and Bandwidth QoS Register Interface},
+   url = {https://github.com/riscv-non-isa/riscv-cbqri}
+diff --git a/src/iommu_data_structures.adoc b/src/iommu_data_structures.adoc
+index cfad1923..2bc49734 100644
+--- a/src/iommu_data_structures.adoc
++++ b/src/iommu_data_structures.adoc
+@@ -659,6 +659,8 @@ The `msiptp.MODE` field is used to select the MSI address translation scheme.
+ | 14-15| --       | Designated for custom use.
+ |===
+ 
++When `DC.iohgatp.MODE` is `Bare`, the `msiptp.MODE` must be set to `Off`.
++
+ [[MSI_ID]]
+ ===== MSI address mask (`msi_addr_mask`) and pattern (`msi_addr_pattern`)
+ 
+@@ -761,6 +763,11 @@ misconfigured" (cause = 259).
+ . `capabilities.QOSID` is 1 and `DC.ta.RCID` or `DC.ta.MCID` values
+   are wider than that supported by the IOMMU.
+ 
++When `DC.iohgatp.MODE` is `Bare`, `DC.msiptp.MODE` must be set to `Off` by
++software. All other settings are reserved. Implementations are recommended
++to stop and report "DDT entry misconfigured" (cause = 259) if a reserved
++setting is detected.
++
+ [NOTE]
+ ====
+ Some `DC` fields hold supervisor physical addresses or
+@@ -774,6 +781,13 @@ Other implementations only detect such addresses to be invalid when the data
+ structure referenced by these fields needs to be accessed. Such
+ implementations may detect access-violation faults in the process of making
+ the access.
++
++An earlier version of the specification did not recommend implementations to
++check that `msiptp.MODE` was set to `Off` when `iohgatp.MODE` was `Bare`.
++When `iohgatp.MODE` is `Bare`, second-stage address translation is
++effectively disabled and no valid `GSCID` exists to associate translations
++from an MSI page table with a VM address space. In such cases, software must
++set `msiptp.MODE` to `Off`.
+ ====
+ 
+ === Process-Directory-Table (PDT)
+@@ -1115,13 +1129,15 @@ The process to locate the Process-context for a transaction using its
+ . Let `a` be `pdtp.PPN x 2^12^` and let `i = LEVELS - 1`. When
+   `pdtp.MODE` is `PD20`, `LEVELS` is three. When `pdtp.MODE` is
+   `PD17`, `LEVELS` is two. When `pdtp.MODE` is `PD8`, `LEVELS` is one.
++. If `i != 0`, then let `a = a + PDI[2] × 8`; otherwise, let
++  `a = a + PDI[0] × 16`.
+ . If `DC.iohgatp.mode != Bare`, then `a` is a GPA. Invoke the process
+   to translate `a` to a SPA as an implicit memory access. If faults occur during
+   second-stage address translation of `a` then stop and report the fault detected
+   by the second-stage address translation process. The translated `a` is used in
+   subsequent steps.
+-. If `i == 0` go to step 9.
+-. Let `pdte` be the value of the eight bytes at address `a + PDI[i] x 8`. If
++. If `i == 0` go to step 10.
++. Let `pdte` be the value of the eight bytes at address `a`. If
+   accessing `pdte` violates a PMA or PMP check, then stop and report
+   "PDT entry load access fault" (cause = 265).
+ . If `pdte` access detects a data corruption (a.k.a. poisoned data), then
+@@ -1130,7 +1146,7 @@ The process to locate the Process-context for a transaction using its
+ . If any bits or encoding that are reserved for future standard use are
+   set within `pdte`, stop and report "PDT entry misconfigured" (cause = 267).
+ . Let `i = i - 1` and let `a = pdte.PPN x 2^12^`. Go to step 2.
+-. Let `PC` be the value of the 16-bytes at address `a + PDI[0] x 16`. If accessing `PC`
++. Let `PC` be the value of the 16-bytes at address `a`. If accessing `PC`
+   violates a PMA or PMP check, then stop and report "PDT entry load access
+   fault" (cause = 265). If `PC` access detects a data corruption
+   (a.k.a. poisoned data), then stop and report "PDT data corruption"
+@@ -1399,10 +1415,11 @@ not be invoked for translating addresses in CXL.cache transactions.
+ 
+ [[ATS_PRI]]
+ === PCIe ATS Page Request handling
+-To process a "Page Request" or "Stop Marker" message cite:[PCI], the IOMMU first locates
+-the device-context to determine if ATS and PRI are enabled for the requester.
+-If ATS and PRI are enabled, i.e. `EN_ATS` and `EN_PRI` are both set to 1, the
+- IOMMU queues the message into an in-memory queue called the
++To process a "Page Request" or "Stop Marker" message cite:[PCI], the IOMMU
++first locates the device-context--using the procedure outlined in steps 1
++through 5 of <<P2IOVA>>--to determine if ATS and PRI are enabled for the
++requester.  If ATS and PRI are enabled, i.e. `EN_ATS` and `EN_PRI` are both
++set to 1, the IOMMU queues the message into an in-memory queue called the
+ page-request-queue (`PQ`) (See <<PRQ>>). Following suitable processing of the
+ "Page Request", a software handler may generate a "Page Request Group Response"
+ message to the device.
+@@ -1447,6 +1464,7 @@ The status is set to Invalid Request if the following faults are encountered:
+ 
+ * `ddtp.iommu_mode` is `Bare` (cause = 260)
+ * `EN_PRI` is set to 0 (cause = 260)
++* `device_id` is wider than that supported by the IOMMU mode (cause = 260)
+ 
+ The status is set to Success if no other faults were encountered but the
+ "Page Request" could not be queued due to the page-request queue being full
+@@ -1544,15 +1562,12 @@ that the entry is valid.
+ Software is allowed to make updates to a data structure entry that has the `V`
+ bit set to 1. However, some rules as outlined below must be followed.
+ 
+-* It is generally unsafe for software to update fields of a valid data structure
+-  entry using a set of stores of width less than the minimal single-copy atomic
+-  memory access supported by an IOMMU as it is legal for an IOMMU to read the
+-  entry at any time, including when only some of the partial stores have taken
+-  effect. +
++* It may be unsafe for software to partially update the fields of a valid
++  data structure entry, as it is legal for an IOMMU to read the entry at any
++  time, including when only some of the partial updates have taken effect. +
+ +
+-* For an update to an IOMMU data structure entry to be atomic, software must use
+-  a single store of width equal to the minimal single-copy atomic memory access
+-  supported by an IOMMU. +
++* For an update to an IOMMU data structure entry to be atomically observed by the
++  IOMMU, software must use a store that results in a single memory operation. +
+ +
+ * If the update to a field will make the field inconsistent with another field
+   of the entry then software must first set the `V` field to 0 and use the commands
+diff --git a/src/iommu_debug.adoc b/src/iommu_debug.adoc
+index f33b2b10..0b0dcfa7 100644
+--- a/src/iommu_debug.adoc
++++ b/src/iommu_debug.adoc
+@@ -36,7 +36,7 @@ The translation-response interface consists of a single 64-bit RO register
+ To request a translation, the `tr_req_iova` register is written first with
+ the desired IOVA and the `tr_req_ctl` register is written next. The 'Go/Busy`
+ bit is set in `tr_req_ctl` to indicate a valid request in the registers.  The
+-`Go/Busy` bit is a read-write-sticky (RWS) bit that once set cannot be cleared
++`Go/Busy` bit is a read-write-1-to-set (RW1S) bit that once set cannot be cleared
+ by writing the register. The `Go/Busy` bit will be cleared to 0 by the IOMMU
+ when the process completes (successfully or due to encountering a fault). When
+ the `Go/Busy` bit goes from 1 to 0, a response is valid in the `tr_response`
+diff --git a/src/iommu_preface.adoc b/src/iommu_preface.adoc
+index 4ac010c0..41646234 100644
+--- a/src/iommu_preface.adoc
++++ b/src/iommu_preface.adoc
+@@ -1,4 +1,51 @@
+ == Preface
++[.big]*_Preface to Version 20260215_*
++
++This document describes the RISC-V IOMMU architecture. This release, version
++20260215, includes the following versions of the RISC-V IOMMU Base Architecture
++specification and standard extensions:
++
++[%autowidth,float="center",align="center",cols="^,^,^",options="header",]
++|===
++|       Specification                              |Version |Status
++|*RISC-V IOMMU Base Architecture Specification*   +
++ *Quality-of-Service (QoS) Identifiers Extension* +
++ *Non-leaf PTE Invalidation Extension*            +
++ *Address Range Invalidation Extension*           +
++ *PTE Reserved-for-Software Bits 60-59*
++                                                   |*1.0*  +
++                                                    *1.0*  +
++                                                    *1.0*  +
++                                                    *1.0*  +
++                                                    *1.0*
++                                                            |*Ratified* +
++                                                             *Ratified* +
++                                                             *Ratified* +
++                                                             *Ratified* +
++                                                             *Ratified*
++|===
++
++The following backward-compatible changes--comprising a set of clarifications
++and corrections--have been made since version 20250828:
++
++* Corrected typographic errors and made editorial updates.
++* Reworded the guidance on consistently updating valid data structures.
++* Clarified procedure to use for determining if ATS and PRI are enabled and
++  included missing fault for device ID wider than that supported by the IOMMU.
++* Clarified that pmip is set when OF transitions from 0 to 1 due to counter
++  overflow.
++* Clarified that Priv is ignored when PV is 0 in tr_req_ctl.
++* Clarified that the behavior is unspecified if Exe=1/NW=0 in tr_req_ctl.
++* Clarified memory access by IOFENCE and for IOMMU-generated MSI follow fctl.BE
++  endianess.
++
++The following change has been made which, while not strictly backwards
++compatible, is not expected to cause software portability issues in practice:
++
++* When `iohgatp.MODE` is `Bare`, the `msiptp.MODE` must be set to `Off`.
++
++These changes were made through PR#617, cite:[PR617].
++
+ [.big]*_Preface to Version 20250828_*
+ 
+ This document describes the RISC-V IOMMU architecture. This release, version
+diff --git a/src/iommu_registers.adoc b/src/iommu_registers.adoc
+index 1cae45a6..c6f0ea6d 100644
+--- a/src/iommu_registers.adoc
++++ b/src/iommu_registers.adoc
+@@ -37,6 +37,11 @@ If a register is optional, as determined by the corresponding `capabilities`
+ register bit being 0, then a read from the memory-mapped register offset of
+ the register returns 0 and writes to that offset are ignored.
+ 
++Registers and register fields designated for future standard use must be
++read-only zero. For forward compatibility, registers and register fields
++designated for custom use should be implemented as read-only zero if the
++implementation does not define a custom use for them.
++
+ === Register layout
+ 
+ .IOMMU Memory-mapped register layout
+@@ -299,7 +304,7 @@ If software enables or disables a feature when the IOMMU is not OFF
+ (i.e. when `ddtp.iommu_mode != Off`) then the IOMMU behavior is `UNSPECIFIED`.
+ 
+ If software enables or disables a feature when the IOMMU in-memory queues
+-are enabled (i.e. `cqcsr.cqon/cqen == 1`, `fqcsr.fqon/cqen == 1`, or
++are enabled (i.e. `cqcsr.cqon/cqen == 1`, `fqcsr.fqon/fqen == 1`, or
+ `pqcsr.pqon/pqen == 1`) then the IOMMU behavior is `UNSPECIFIED`.
+ 
+ .Feature-control register fields
+@@ -320,6 +325,8 @@ are enabled (i.e. `cqcsr.cqon/cqen == 1`, `fqcsr.fqon/cqen == 1`, or
+ |Bits ^|Field      |Attribute ^| Description
+ |0     |`BE`       |WARL      | When 0, IOMMU accesses to memory resident data
+                                 structures, as specified in <<ENDIAN_CONFIG>>,
++                                accesses made by the IOMMU during command
++                                processing or for MSI generation,
+                                 and accesses to in-memory queues are performed
+                                 as little-endian accesses and when 1 as
+                                 big-endian accesses.
+@@ -1126,9 +1133,10 @@ interrupt-pending bit.
+                               * `fqcsr.fqmf` is 1.
+                               * A new record is produced in the FQ.
+ 
+-|2      | `pmip` |RW1C      | The performance-monitoring-interrupt-pending is
+-                              set to 1 when `OF` bit in `iohpmcycles` or in any of the
+-                              `iohpmctr1-31` registers transitions from 0 to 1.
++|2      | `pmip` |RW1C      | The performance-monitoring-interrupt-pending bit is
++                              set to 1 when the `OF` bit in `iohpmcycles` or in any of the
++                              `iohpmevt1-31` registers transitions from 0 to 1
++                              due to a counter overflow.
+ |3      | `pip`  |RW1C     a| The page-request-queue-interrupt-pending is set to
+                               1 if `pqcsr.pie` is 1 and any of the following are
+                               true:
+@@ -1522,11 +1530,15 @@ translation-request interface for debug. This register is present when
+                                  of the translation are in the `tr_response`
+                                  register.
+ | 1     |`Priv`     |WARL      | If set to 1, Privileged Mode access
+-                                 is requested else no Privileged Mode access
+-                                 is not requested.
++                                 is requested; otherwise, Privileged Mode access
++                                 is not requested. When `PV` is 0, this field
++                                 is ignored and no Privileged Mode access is
++                                 requested.
+ | 2     |`Exe`      |WARL      | If set to 1, execute permission is
+                                  requested else execute permission is not
+-                                 requested.
++                                 requested. If `Exe` is set to 1, then `NW` must
++                                 be also be set to 1; otherwise the behavior is
++                                 UNSPECIFIED.
+ | 3     |`NW`       |WARL      | If set to 1, read permission is requested.
+                                  If set to 0, both read and write permissions
+                                  are requested.

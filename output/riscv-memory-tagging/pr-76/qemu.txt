@@ -1,0 +1,51 @@
+PR #76  target=qemu  overall=compliant
+Spec: Deferred async MTE tag mismatch state in TCG risks cross-CPU info leak via stval2/htval2/mtval3 if pending buffer is not per-hart and not sanitized on mode transitions
+Violation: In QEMU TCG, when menvcfg.MT_ASYNC is set and a tag-mismatching regular store executes, the software check exception must be deferred to the next trap. If QEMU stores the pending mismatch flag and the faulting virtual address (destined for stval2/htval2/mtval3) in a non-per-CPU location, or fails to clear them on writes to menvcfg/mseccfg that disable tagging, or fails to flush them on privilege-mode transitions, then (a) one hart's trap handler can observe another hart's faulting virtual address in these CSRs, or (b) a guest can read stale virtual addresses from a prior security context after toggling MT_ASYNC off and back on.
+Consequence: info_leak
+Pattern: pending.*tag|tag.*pending|mte_defer|mte_async|async.*mismatch|MT_ASYNC|stval2|htval2|mtval3|riscv_cpu_do_interrupt.*mte
+------------------------------------------------------------
+[compliant] target/riscv/cpu_bits.h:855-866  N/A (definitions)
+  MENVCFG has no MT_ASYNC or MTE-related field. MENVCFG_PBMTE is Page-Based Memory Types (Svpbmt), not Memory Tagging Extension. The vulnerability condition's menvcfg.MT_ASYNC bit does not exist in this RISC-V implementation.
+  | #define MENVCFG_DTE                        (1ULL << 59)
+  | #define MENVCFG_CDE                        (1ULL << 60)
+  | #define MENVCFG_ADUE                       (1ULL << 61)
+  | #define MENVCFG_PBMTE                      (1ULL << 62)
+  | #define MENVCFG_STCE                       (1ULL << 63)
+
+[compliant] target/riscv/pmp.h:44-50  N/A (definitions)
+  MSECCFG CSR fields (MML, MMWP, RLB, USEED, SSEED, MLPE, PMM) are exclusively for ePMP/Zkr/MLPE/power management — no MTE tag-enable bits exist. Writing menvcfg/mseccfg cannot toggle any tagging feature because none exists.
+  | MSECCFG_MML   = 1 << 0,
+  | MSECCFG_MMWP  = 1 << 1,
+  | MSECCFG_RLB   = 1 << 2,
+  | MSECCFG_USEED = 1 << 8,
+  | MSECCFG_SSEED = 1 << 9,
+  | MSECCFG_MLPE =  1 << 10,
+  | MSECCFG_PMM = 3ULL << 32,
+
+[compliant] target/riscv/csr.c:6220-6230  N/A (CSR table and handlers)
+  No stval2, htval2, or mtval3 CSR registrations exist in the CSR dispatch table. These CSRs — the destinations for the faulting virtual address described in the vulnerability — are not implemented in the RISC-V target.
+  | [CSR_MSECCFG]    = { "mseccfg",   have_mseccfg, read_mseccfg, write_mseccfg,
+
+[compliant] target/riscv/cpu_helper.c:2206-2540  riscv_cpu_do_interrupt
+  riscv_cpu_do_interrupt() contains no MTE-related logic — no pending-tag-mismatch flag is checked, propagated, or flushed. No deferred async trap is injected. The vulnerability's entire mechanism (deferring tag-mismatch to next trap, loading stval2/mtval3 with faulting VA) has no code path.
+  | void riscv_cpu_do_interrupt(CPUState *cs)
+  | {
+  |     RISCVCPU *cpu = RISCV_CPU(cs);
+  |     CPURISCVState *env = &cpu->env;
+
+[compliant] target/riscv/cpu.h:1-1  N/A (struct CPURISCVState)
+  CPURISCVState has no pending-tag-mismatch flag, no faulting VA storage for async tag checks, no mte_active field, and no per-CPU tag state buffer. The entire vulnerability surface — non-per-CPU location for pending mismatch — does not exist because no such state exists.
+  | (struct CPURISCVState — no mte/tag-mismatch fields present)
+
+[compliant] target/riscv/machine.c:1-1  N/A (vmstate)
+  No stval2/htval2/mtval3 fields in vmstate_riscv_cpu. Migration correctness is not at risk because none of the relevant MTE async state exists to migrate.
+  | (vmstate_riscv_cpu — no MTE-tag-mismatch vmstate fields)
+
+[compliant] hw/riscv/riscv-iommu.c:750-762  riscv_iommu_validate_device_ctx
+  The only modified file in this branch adds an IOMMU validation check (rejecting BARE GATP with non-OFF MSIPTP mode). This is unrelated to MTE, memory tagging, or the vulnerability described.
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |     get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |     RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |     return false;
+  | }
+

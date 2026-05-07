@@ -1,0 +1,247 @@
+{
+  "pr_number": 706,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 706,
+    "violation_condition": "SSTATUS_SIPU (sstatus bit 16) is set in hardware when a supervisor-level interrupt trap occurs. FreeBSD's save_registers macro (exception.S:103-104) reads sstatus with csrr and manually saves all GPRs to a fixed stack offset, expecting standard RISC-V trap layout. With SIPU set, hardware performs automatic register stacking on interrupt entry that shifts sp before save_registers executes, causing registers to be saved at wrong offsets in the trapframe. The kernel restores corrupted register state on trap return (exception.S:131 via csrw sstatus from the mangled tf_sstatus), yielding corrupted SIE/SPP/SPIE/FS fields and scrambled GPRs.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "csrw\\s+sstatus|csr_write\\(sstatus|SSTATUS_SIE\\)|SSTATUS_FS_MASK|set_mcontext.*SSTATUS_SD.*SSTATUS_XS",
+    "affected_entities": [
+      "sstatus",
+      "mstatus",
+      "sipopret"
+    ],
+    "summary": "Unmanaged SIPU sstatus bit: hardware auto-stacking shifts sp before save_registers, corrupting trapframe layout the kernel depends on"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "load_registers",
+        "line_start": 116,
+        "line_end": 131,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "csrw sstatus at line 131 restores sstatus from trapframe tf_sstatus, modified beforehand: user-mode traps OR-in SPIE (line 120-121), supervisor-mode traps AND-out SIE (line 128-129). The sstatus value originates from hardware csrr at save time (line 103), not from user input. No SIPU bit exists in this codebase; bit 16 is the XS field (SSTATUS_XS_MASK, bits 15:16), which is read-only. The SIPU auto-stacking scenario is hypothetical and has no hardware definition in this tree.",
+      "snippet": "load_registers macro:\n  ld t0, (TF_SSTATUS)(sp)\n  ...\n  csrw sstatus, t0"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers",
+        "line_start": 41,
+        "line_end": 114,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "save_registers manually allocates trapframe space (addi sp, sp, -(TF_SIZE) at line 42) and saves GPRs at fixed offsets from sp. sstatus is read from hardware CSR (line 103 csrr t0, sstatus) and saved to TF_SSTATUS(sp). After saving, supervisor-mode traps clear SUM (line 107-108) but do not touch SIE/SPP/SPIE — those are already set by hardware on trap entry. No SIPU hardware feature exists, so no auto-stacking conflict is possible on current RISC-V implementations.",
+      "snippet": "save_registers macro:\n  addi sp, sp, -(TF_SIZE)\n  sd ra, (TF_RA)(sp)\n  ...\n  csrr t0, sstatus\n  sd t0, (TF_SSTATUS)(sp)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_mcontext",
+        "line_start": 231,
+        "line_end": 262,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "set_mcontext validates user sstatus changes at lines 245-248: any bit outside the allowed set (SD|XS_MASK|FS_MASK|UPIE|UIE) that differs triggers EINVAL. Critical bits SPP (bit 8), SPIE (bit 5), SIE (bit 1), SUM (bit 18) are all blocked. Allowed bits are safe: SD/XS are hardware read-only (writes ignored), FS is overwritten by set_fpcontext (line 299-300 then 311), UPIE/UIE are U-mode-only bits inaccessible from S-mode. The comment at line 238 ('Permit changes to the USTATUS bits') is slightly misleading since UPIE/UIE are in the ignore-mask, but the actual code is correct.",
+      "snippet": "if (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &\n    ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK |\n    SSTATUS_UPIE | SSTATUS_UIE)) != 0)\n    return (EINVAL);\n...\ntf->tf_sstatus = mcp->mc_gpregs.gp_sstatus;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_fpcontext",
+        "line_start": 294,
+        "line_end": 315,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "set_fpcontext unconditionally clears FS field (line 299-300: &= ~SSTATUS_FS_MASK, |= SSTATUS_FS_OFF), then conditionally sets CLEAN if _MC_FP_VALID (line 311). Called at the end of set_mcontext (line 259), it overrides whatever FS value arrived via user mcontext. This prevents userspace from influencing the hardware FS state through signal context manipulation.",
+      "snippet": "td->td_frame->tf_sstatus &= ~SSTATUS_FS_MASK;\ntd->td_frame->tf_sstatus |= SSTATUS_FS_OFF;\n...\nif ((mcp->mc_flags & _MC_FP_VALID) != 0) {\n    td->td_frame->tf_sstatus |= SSTATUS_FS_CLEAN;\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_regs",
+        "line_start": 98,
+        "line_end": 115,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "set_regs (ptrace write path) deliberately does NOT copy regs->sstatus to tf_sstatus. It updates sepc, ra, sp, gp, tp, and GPR arrays but skips sstatus. This is a defense-in-depth measure: ptrace cannot change the saved sstatus in the trapframe, preventing ptrace-based corruption of SPP/SPIE/SIE/SUM. fill_regs (line 85) can read sstatus for debuggers, but writes are blocked.",
+      "snippet": "frame->tf_sepc = regs->sepc;\n/* sstatus explicitly omitted */\nframe->tf_ra = regs->ra;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fork_trampoline",
+        "line_start": 365,
+        "line_end": 376,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "csrw sstatus at line 376 loads sstatus from the current trapframe (TF_SSTATUS(sp)), clears SIE (line 374-375: ~SSTATUS_SIE), then writes to hardware. The trapframe sstatus was set up in cpu_fork (vm_machdep.c:117-118): SPIE=1 and SPP=0 (user mode). With SIE freshly cleared, the child starts with interrupts disabled, correct for returning to userspace. The sstatus value flow is: cpu_fork→trapframe→fork_trampoline→csrw. No user input touches this path.",
+      "snippet": "ld t0, (TF_SSTATUS)(sp)\nli t1, ~SSTATUS_SIE\nand t0, t0, t1\ncsrw sstatus, t0"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 286,
+        "line_end": 304,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "During context switch, if the old thread had FS=DIRTY (line 294-295), the code marks it CLEAN (lines 298-302: mask out FS, OR-in CLEAN) and saves FPE state (line 304). This modifies tf_sstatus in-place via sd t3, (TF_SSTATUS)(t0) at line 302. The mask-then-or pattern is safe: it preserves all non-FS bits (SPP, SPIE, SIE, SUM, etc.) while updating only FS. No race condition — interrupts are already disabled during cpu_switch.",
+      "snippet": "li t2, SSTATUS_FS_MASK\nand t3, t1, t2\nli t2, SSTATUS_FS_DIRTY\nbne t3, t2, 1f\nli t2, ~SSTATUS_FS_MASK\nand t3, t1, t2\nli t2, SSTATUS_FS_CLEAN\nor t3, t3, t2\nsd t3, (TF_SSTATUS)(t0)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 306,
+        "line_end": 323,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KASSERT at line 312 verifies hardware trap entry state: (sstatus & (SPP|SIE)) == SPP, meaning SPP=1 (from S-mode) and SIE=0 (interrupts disabled by hardware). KASSERT at line 315 verifies SUM=0. These sanity checks confirm correct hardware behavior on trap entry. For interrupts (line 319-322), control passes to intr_irq_handler which dispatches through the interrupt framework. No sstatus manipulation occurs here — the trapframe sstatus was already saved by save_registers.",
+      "snippet": "KASSERT((csr_read(sstatus) & (SSTATUS_SPP | SSTATUS_SIE)) ==\n    SSTATUS_SPP, (\"Came from S mode with interrupts enabled\"));\nKASSERT((csr_read(sstatus) & (SSTATUS_SUM)) == 0,\n    (\"Came from S mode with SUM enabled\"));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 237,
+        "line_end": 243,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "In kernel page fault handling, the code reads tf_sstatus.SPIE from the trapframe (line 242) to decide whether to enable interrupts. If the trap occurred with interrupts previously enabled (SPIE=1), interrupts are re-enabled for the potentially-sleeping vm_fault_trap call. This is safe because tf_sstatus was saved from hardware sstatus by save_registers and has not been modified by any user-controlled path in the supervisor trap flow.",
+      "snippet": "if ((frame->tf_sstatus & SSTATUS_SPIE) != 0)\n    intr_enable();"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 440,
+        "line_end": 443,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "First-time FPE trap handling: clears FS field and sets CLEAN in tf_sstatus (lines 441-442). This modifies the in-memory trapframe sstatus using mask-and-set: &= ~SSTATUS_FS_MASK, |= SSTATUS_FS_CLEAN. This is safe because only FS bits are changed; SPP, SPIE, SIE, SUM are preserved. The updated tf_sstatus will be written to hardware via csrw sstatus at load_registers return (exception.S:131), which is correct for enabling FPE on return to userspace.",
+      "snippet": "frame->tf_sstatus &= ~SSTATUS_FS_MASK;\nframe->tf_sstatus |= SSTATUS_FS_CLEAN;\npcb->pcb_fpflags |= PCB_FP_STARTED;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/vm_machdep.c",
+        "function_name": "cpu_fork",
+        "line_start": 108,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "cpu_fork copies parent trapframe to child (line 109 bcopy), then modifies tf_sstatus: OR-in SPIE (line 117, enable interrupts on return) and AND-out SPP (line 118, set user mode). The mask-and-set on individual bits is safe. Saved sstatus_ie=SSTATUS_SIE (line 128) is correct for spinlock enter/exit re-entrancy: on first spinlock_exit, interrupts will be re-enabled because SIE bit is set in the saved value. This matches the expected post-fork state where child runs with interrupts enabled.",
+      "snippet": "bcopy(td1->td_frame, tf, sizeof(*tf));\ntf->tf_sstatus |= (SSTATUS_SPIE);\ntf->tf_sstatus &= ~(SSTATUS_SPP);\ntd2->td_md.md_saved_sstatus_ie = (SSTATUS_SIE);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 67,
+        "line_end": 80,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Host-to-guest world switch uses csrrw t0, sstatus, t0 (line 73) to atomically swap host sstatus into t0 and guest sstatus into hardware. The old host sstatus is then saved to memory (line 80: sd t0, (HYP_H_SSTATUS)(a0)). This is the standard RISC-V pattern for sstatus context switching in a hypervisor: the atomic read-and-write prevents any window where neither old nor new state is captured. The guest sstatus is initialized at vmmops_vcpu_init (vmm_riscv.c:224-225) to SPP|SPIE|FS_INITIAL, a safe supervisor-mode startup state.",
+      "snippet": "ld t0, (HYP_G_SSTATUS)(a0)\n...\ncsrrw t0, sstatus, t0\n...\nsd t0, (HYP_H_SSTATUS)(a0)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 162,
+        "line_end": 175,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Guest-to-host world switch (trap return path) uses csrrw t5, sstatus, t5 (line 169) to atomically swap guest sstatus into t5 and host sstatus into hardware. The old guest sstatus is saved to memory (line 175: sd t5, (HYP_G_SSTATUS)(a0)). This is the symmetric reverse of the host-to-guest swap. The csrrw is followed by CSR restoration of stvec, hstatus, scounteren, sscratch before any host code runs. The atomic sstatus swap guarantees host state integrity — no window where guest sstatus persists after trap return.",
+      "snippet": "ld t5, (HYP_H_SSTATUS)(a0)\n...\ncsrrw t5, sstatus, t5\n...\nsd t5, (HYP_G_SSTATUS)(a0)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "pagetables/va",
+        "line_start": 203,
+        "line_end": 264,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Boot sequence: stvec is configured in two stages — first a temporary trampoline to 'va' (lines 208-212) using physical address translation for the VM enable transition, then the real cpu_exception_handler (lines 231-232). sscratch is zeroed (line 235-236) so first trap will be detected as supervisor-mode. No direct sstatus CSR write occurs in locore.S — sstatus is inherited from the boot environment (M-mode firmware/SBI) and will have SPP=1, SIE=0 after mret→S-mode transition. initriscv() in machdep.c performs no additional sstatus configuration. For mpentry (secondary CPUs, lines 337-394), the same two-stage stvec and sscratch-zeroing pattern is repeated. sstatus is inherited from the SBI HSM hart-start sequence. Correct for current hardware.",
+      "snippet": "la t0, cpu_exception_handler\ncsrw stvec, t0\nli t0, 0\ncsrw sscratch, t0\nla sp, initstack_end\n...\ncall _C_LABEL(initriscv)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/machdep.c",
+        "function_name": "initriscv",
+        "line_start": 557,
+        "line_end": 678,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "initriscv performs no explicit sstatus CSR initialization. The boot environment's sstatus value (SPP=1, SIE=0 from mret, FS=0, XS=hardware-managed) propagates unchanged. This is acceptable because the initial kernel context is correct: interrupts disabled, supervisor mode. The first explicit sstatus writes come from exception.S trap return paths or swtch.S context switches, which always write validated values. No security configuration (speculative execution controls, pointer masking, etc.) is enabled because none are supported on current RISC-V FreeBSD targets. identify_cpu() (line 625) probes ISA extensions but does not configure sstatus.",
+      "snippet": "identify_cpu(0);\n...\npmap_bootstrap(rvbp->kern_phys, kernlen);\n...\ninit_proc0(rvbp->kern_stack);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/cpufunc.h",
+        "function_name": "intr_disable/intr_restore/intr_enable",
+        "line_start": 52,
+        "line_end": 82,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Three sstatus-SIE manipulation primitives: intr_disable uses csrrci (atomic read+clear immediate, line 57) to read current sstatus and clear SIE, returning previous SIE state; intr_restore uses csrs (set bit, line 69) to set SIE if the saved parameter has SIE set; intr_enable uses csrsi (set immediate, line 79) to unconditionally set SIE. All three are atomic and correct. The intr_disable/intr_restore pair is used by spinlock_enter/spinlock_exit (machdep.c:247/266) with per-thread save via td_md.md_saved_sstatus_ie. No sstatus bits beyond SIE are touched.",
+      "snippet": "csrrci %0, sstatus, %1  /* intr_disable */\ncsrs sstatus, %0        /* intr_restore */\ncsrsi sstatus, %0       /* intr_enable */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/fpe.c",
+        "function_name": "fpe_enable/fpe_disable",
+        "line_start": 43,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "fpe_enable writes SSTATUS_FS_INITIAL via csr_set(sstatus, reg) (line 50). fpe_disable clears SSTATUS_FS_MASK via csr_clear(sstatus, mask) (line 60). Both use atomic read-modify-write CSR instructions that touch only the FS field (bits 13:14). No other sstatus fields are affected, preserving SPP, SPIE, SIE, SUM. Called from fpe_init (boot, line 183/185) and from swtch.S macros.",
+      "snippet": "csr_set(sstatus, reg);    /* fpe_enable */\ncsr_clear(sstatus, mask);  /* fpe_disable */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "SSTATUS bit definitions",
+        "line_start": 60,
+        "line_end": 80,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SSTATUS bit definitions are complete and match the RISC-V privileged spec v1.12. Bits 0-1 (UIE, SIE), 4-5 (UPIE, SPIE), 8 (SPP), 13-14 (FS), 15-16 (XS), 18 (SUM), 63/31 (SD). Bit 16 is correctly defined as part of SSTATUS_XS_MASK (bits 15:16, shift 15). There is no SIPU (bit 16 supervisor interrupt push) definition — this feature does not exist in the ratified RISC-V specification and is not defined in FreeBSD.",
+      "snippet": "#define SSTATUS_XS_SHIFT  15\n#define SSTATUS_XS_MASK   (0x3 << SSTATUS_XS_SHIFT)\n#define SSTATUS_SUM       (1 << 18)\n#define SSTATUS_SD        (1ul << 63) /* RV64 */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_init",
+        "line_start": 197,
+        "line_end": 238,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Guest sstatus initialization at lines 224-225: hyp_sstatus = SSTATUS_SPP | SSTATUS_SPIE | SSTATUS_FS_INITIAL. SPP=1 means guest vCPU starts in supervisor mode, SPIE=1 means interrupts will be enabled on first sret, FS_INITIAL means FPU state is initialized. Combined with hstatus.SPV=1 (line 228), this is a correct supervisor-mode guest start. The CSR save/restore functions (vmmops_vcpu_restore_csrs line 162-177, vmmops_vcpu_save_csrs line 180-195) use csr_write/csr_read on vsstatus (virtual sstatus), maintaining proper guest/host isolation.",
+      "snippet": "hypctx->guest_regs.hyp_sstatus = SSTATUS_SPP | SSTATUS_SPIE;\nhypctx->guest_regs.hyp_sstatus |= SSTATUS_FS_INITIAL;"
+    }
+  ],
+  "overall_severity": "compliant"
+}

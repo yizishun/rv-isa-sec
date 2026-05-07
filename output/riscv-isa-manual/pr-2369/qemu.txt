@@ -1,0 +1,48 @@
+PR #2369  target=qemu  overall=potential_risk
+Spec: Zvkgs adds .vs variants of vghsh/vgmul with a new constraint that vd must not overlap the vs2 scalar element group; QEMU must reject this reserved encoding or risk silent cryptographic output corruption
+Violation: QEMU executes vghsh.vs or vgmul.vs without checking that the vd register group overlaps the vs2 scalar element group. The spec marks such overlap as a reserved encoding. Since vd is both a source (partial hash / multiplier) and destination, and vs2 holds the hash subkey H broadcast to all element groups, overlapping vd with vs2 causes the scalar subkey to be overwritten mid-computation, corrupting the GHASH result.
+Consequence: data_corruption
+Pattern: vd.*overlap.*vs2|vs2.*overlap.*vd|vghsh.*\.vs|vgmul.*\.vs|vext_check_isa_ill|reserved.*encoding.*overlap
+------------------------------------------------------------
+[potential_risk] target/riscv/insn_trans/trans_rvvk.c.inc:533-542  vgmul_check
+  vgmul_check() uses vext_check_ss(s, a->rd, a->rs2, a->vm) which validates alignment and masked-v0-overlap but does NOT check for vd-vs2 register group overlap via is_overlapped(). For the existing .vv variant this is spec-compliant (overlap is not reserved for .vv), but this check function would be unsafe if copied as a template for a future .vs variant where vd-vs2 overlap IS a reserved encoding. Compare with vaes_check_overlap() (line 287) and vsm4r_vs_check() (line 591) which both use is_overlapped() to guard against scalar source corruption.
+  | static bool vgmul_check(DisasContext *s, arg_rmr *a)
+  | {
+  |     int egw_bytes = ZVKG_EGS << s->sew;
+  |     return s->cfg_ptr->ext_zvkg == true &&
+  |            vext_check_isa_ill(s) &&
+
+[potential_risk] target/riscv/insn_trans/trans_rvvk.c.inc:546-553  vghsh_check
+  vghsh_check() delegates to opivv_check(s, a) → vext_check_sss() which checks vd-vs1-vs2 alignment and v0-mask overlap but does NOT check vd-vs2 register group overlap. The .vs variant would require an explicit !is_overlapped(a->rd, group_size, a->rs2, 1) guard. The existing .vv semantics are correct per spec, but there is no .vs check function at all — adding one by copying this function would silently omit the critical overlap guard.
+  | static bool vghsh_check(DisasContext *s, arg_rmrr *a)
+  | {
+  |     int egw_bytes = ZVKG_EGS << s->sew;
+  |     return s->cfg_ptr->ext_zvkg == true &&
+  |            opivv_check(s, a) &&
+
+[potential_risk] target/riscv/insn32.decode:1023-1024  decode
+  Only vghsh_vv (@r_vm_1 → arg_rmrr) and vgmul_vv (@r2_vm_1 → arg_rmr) are decoded. No vghsh_vs or vgmul_vs encodings exist. Per the RISC-V crypto spec, .vs variants use different funct6 encodings and treat vs2 as a scalar element group (single subkey H broadcast). Without these encodings, guest code using vghsh.vs or vgmul.vs hits the illegal-instruction path — safe by absence, but Zvkgs is a required dependency for Zvkn (full vector crypto) so the ISA extension is effectively incomplete.
+  | vghsh_vv    101100 1 ..... ..... 010 ..... 1110111 @r_vm_1
+  | vgmul_vv    101000 1 ..... 10001 010 ..... 1110111 @r2_vm_1
+
+[compliant] target/riscv/vcrypto_helper.c:795-833  HELPER(vghsh_vv)
+  Helper reads vs2 per-element-group (vs2[i*2+0], vs2[i*2+1]) treating it as a full vector source — correct behavior for the .vv variant where each element group carries its own hash subkey H. If vd overlaps vs2 in .vv, the later iterations might read from overwritten vd locations, but this is allowed .vv semantics (not reserved). A .vs helper would need to read vs2[0] and vs2[1] once and broadcast H to all iterations.
+  | for (uint32_t i = env->vstart / 4; i < env->vl / 4; i++) {
+  |     uint64_t Y[2] = {vd[i * 2 + 0], vd[i * 2 + 1]};
+  |     uint64_t H[2] = {brev8(vs2[i * 2 + 0]), brev8(vs2[i * 2 + 1])};
+  |     uint64_t X[2] = {vs1[i * 2 + 0], vs1[i * 2 + 1]};
+
+[compliant] target/riscv/vcrypto_helper.c:835-869  HELPER(vgmul_vv)
+  Same pattern as vghsh_vv: reads vs2 per-element-group for .vv semantics. Correct for the existing .vv variant. Note that vgmul.vv has only vd and vs2 operands (no vs1), so vd is simultaneously the multiplier source and destination — overlap between vd and vs2 in .vv is spec-allowed (destructive semantics). A .vs variant would need to broadcast vs2[0:1] as scalar H across all element groups.
+  | for (uint32_t i = env->vstart / 4; i < env->vl / 4; i++) {
+  |     uint64_t Y[2] = {brev8(vd[i * 2 + 0]), brev8(vd[i * 2 + 1])};
+  |     uint64_t H[2] = {brev8(vs2[i * 2 + 0]), brev8(vs2[i * 2 + 1])};
+
+[compliant] target/riscv/insn_trans/trans_rvvk.c.inc:287-291  vaes_check_overlap
+  Reference implementation showing the correct pattern for .vs overlap checking: is_overlapped(vd, op_size, vs2, 1) where vs2 size is 1 (scalar element group). This exact pattern is used by vaes_check_vs() and should be replicated when Zvkgs .vs support is added.
+  | static bool vaes_check_overlap(DisasContext *s, int vd, int vs2)
+  | {
+  |     int8_t op_size = s->lmul <= 0 ? 1 : 1 << s->lmul;
+  |     return !is_overlapped(vd, op_size, vs2, 1);
+  | }
+

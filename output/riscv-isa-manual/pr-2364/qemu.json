@@ -1,0 +1,116 @@
+{
+  "pr_number": 2364,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2364,
+    "violation_condition": "In QEMU TCG, when translating a 16-bit compressed load/store instruction (C.LD/C.SD/C.LDSP/C.SDSP), the translator selects the wrong expansion path based on XLEN or misa bits: on RV32 with Zilsd enabled, the instruction must load/store a 64-bit value to/from a register pair (rd', rd'+1) using two 32-bit memory accesses, but if QEMU instead expands it as an RV64C single 64-bit register load/store (or vice versa on RV64), the emulated register state silently diverges from architectural expectations",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "transc_c_ld|trans_c_sd|c_ldsp|c_sdsp|Zilsd.*trans|decode_compressed.*Zilsd",
+    "affected_entities": [
+      "c-ldsp",
+      "c-sdsp",
+      "c-ld",
+      "c-sd"
+    ],
+    "summary": "Zilsd (RV32) and RV64C share identical compressed opcode encodings for C.LD/C.SD/C.LDSP/C.SDSP but with divergent semantics (register-pair vs single xreg); QEMU TCG must dispatch based on XLEN+misa.Zilsd or silently corrupt guest register state"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/insn16.decode",
+        "function_name": "decode_insn16 (generated) — Quadrant 0 Zclsd patterns",
+        "line_start": 130,
+        "line_end": 141,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Decode pattern interleaving between standard C instructions and Zclsd: on RV32 with Zclsd + F enabled (without RVC), the c_flw entry in the { } multi-pattern block matches the C.LD opcode (011 in Q0) before zclsd_ld is reached. trans_c_flw succeeds via REQUIRE_ZCF_OR_FC when F is present, causing the translator to execute a 32-bit FP load with wrong immediate decoding (uimm_cl_w instead of uimm_cl_d) instead of the Zclsd 64-bit register-pair load. The validation at tcg-cpu.c:850-861 only blocks RVC+RVF and explicit Zcf, not the Zca+RVF combination where Zca is implied by Zclsd.",
+      "snippet": "{\n  ld              011  ... ... .. ... 00 @cl_d\n  c_flw           011  ... ... .. ... 00 @cl_w\n  # *** Zclsd Extension ***\n  zclsd_ld        011  ... ... .. ... 00 @cl_d\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn16.decode",
+        "function_name": "decode_insn16 (generated) — Quadrant 2 Zclsd LDSP patterns",
+        "line_start": 214,
+        "line_end": 221,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same decode interleaving issue for C.LDSP: on RV32 with Zclsd + F (no RVC), the c_flw entry at @c_lwsp format matches the C.LDSP opcode (011 in Q2) before zclsd_ldsp is reached, causing an FP load instead of a 64-bit register-pair load with wrong immediate decoding.",
+      "snippet": "{\n  c64_illegal     011 -  00000  ----- 10 # c.ldsp, RES rd=0\n  ld              011 .  .....  ..... 10 @c_ldsp\n  c_flw           011 .  .....  ..... 10 @c_lwsp\n  zclsd_ldsp      011 .  .....  ..... 10 @c_ldsp\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn16.decode",
+        "function_name": "decode_insn16 (generated) — Quadrant 0 & 2 Zclsd SD/SDSP patterns",
+        "line_start": 136,
+        "line_end": 141,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Decode interleaving for C.SD (Q0) and C.SDSP (Q2): on RV32 with Zclsd + F (no RVC), c_fsw can match before zclsd_sd, causing an FP store instead of a 64-bit register-pair store. This applies to both Q0 @cs_d (lines 136-141) and Q2 @c_sdsp (lines 222-227).",
+      "snippet": "{\n  sd              111  ... ... .. ... 00 @cs_d\n  c_fsw           111  ... ... .. ... 00 @cs_w\n  # *** Zclsd Extension ***\n  zclsd_sd        111  ... ... .. ... 00 @cs_d\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/tcg/tcg-cpu.c",
+        "function_name": "riscv_cpu_validate_set_extensions",
+        "line_start": 850,
+        "line_end": 861,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Validation gap: Zclsd+RVC+F and Zclsd+Zcf are correctly blocked, but Zclsd+Zca+F (where Zca is implied by Zclsd) is not explicitly forbidden. Zclsd auto-enables Zca (line 1135), and F can be independently enabled. In this configuration, c_flw/c_fsw become valid 16-bit instructions that share opcodes with Zclsd's C.LD/C.SD — and since they appear before zclsd_* in the decode blocks, they win the pattern match, silently producing wrong instruction semantics.",
+      "snippet": "if (cpu->cfg.ext_zclsd) {\n    if (riscv_has_ext(env, RVC) && riscv_has_ext(env, RVF)) {\n        error_setg(errp,\n                \"Zclsd cannot be supported together with C and F extension\");\n        return;\n    }\n    if (cpu->cfg.ext_zcf) {\n        error_setg(errp,\n                \"Zclsd cannot be supported together with Zcf extension\");\n        return;\n    }\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_zilsd.c.inc",
+        "function_name": "gen_load_i64",
+        "line_start": 22,
+        "line_end": 45,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correctly implements Zilsd/Zclsd 64-bit load semantics on RV32: uses a single 64-bit qemu_ld_i64 (MO_SQ) for atomicity, extracts high/low halves via tcg_gen_extr_i64_tl, writes to register pair (rd, rd+1). Rejects odd-numbered rd (unaligned register pair). rd=0 special case correctly performs the load (for side effects) but skips register writes.",
+      "snippet": "tcg_gen_qemu_ld_i64(tmp, addr, ctx->mem_idx, MO_SQ | mo_endian(ctx));\n...\ntcg_gen_extr_i64_tl(dest_low, dest_high, tmp);\ngen_set_gpr(ctx, a->rd, dest_low);\ngen_set_gpr(ctx, a->rd + 1, dest_high);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_zilsd.c.inc",
+        "function_name": "gen_store_i64",
+        "line_start": 72,
+        "line_end": 91,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correctly implements Zilsd/Zclsd 64-bit store semantics on RV32: concatenates register pair (rs2, rs2+1) via tcg_gen_concat_tl_i64, performs single 64-bit qemu_st_i64 (MO_SQ). Rejects odd-numbered rs2. rs2=0 special case correctly stores zero.",
+      "snippet": "tcg_gen_concat_tl_i64(tmp, data_low, data_high);\ntcg_gen_qemu_st_i64(tmp, addr, ctx->mem_idx, MO_SQ | mo_endian(ctx));"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_zilsd.c.inc",
+        "function_name": "trans_zilsd_ld / trans_zilsd_sd / trans_zclsd_ld / trans_zclsd_sd / trans_zclsd_ldsp",
+        "line_start": 47,
+        "line_end": 105,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All Zilsd/Zclsd translator entry points correctly gate on REQUIRE_32BIT, preventing these functions from executing on RV64 or RV128 where single-register LD/SD should be used instead. The Zilsd variants check ext_zilsd; the Zclsd variants check ext_zclsd. trans_zclsd_ldsp additionally rejects rd=0 (per spec RES).",
+      "snippet": "static bool trans_zilsd_ld(DisasContext *ctx, arg_zilsd_ld *a)\n{\n    REQUIRE_32BIT(ctx);\n    REQUIRE_ZILSD(ctx);\n    return gen_load_i64(ctx, a);\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn32.decode",
+        "function_name": "decode_insn32 (generated) — Zilsd 32-bit LD/SD patterns",
+        "line_start": 185,
+        "line_end": 194,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The 32-bit encoded LD/SD opcodes also use { } overlapping patterns (trans_ld vs zilsd_ld, trans_sd vs zilsd_sd). Unlike the 16-bit case, there is no intermediate pattern (no c_flw equivalent) between them, so the decode priority is a clean two-entry choice: RV64 path first, RV32+Zilsd second. Safe as designed.",
+      "snippet": "{\n  ld       ............   ..... 011 ..... 0000011 @i\n  zilsd_ld ............   ..... 011 ..... 0000011 @i\n}"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

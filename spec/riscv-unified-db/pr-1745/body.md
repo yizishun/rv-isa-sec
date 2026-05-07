@@ -1,0 +1,1 @@
+`yaml_resolver.rb` used a default path that assumed it was in the repo, which produced lots of warnings when using the standalone gem. We had correct paths available in `resolver.rb`, but it already requires `yaml_resolver.rb`, so importing them would create a circular dependency. This creates a new `paths.rb` file that both can import to work around this.

@@ -1,0 +1,1 @@
+Fixed a bug in tools/ruby-gems/udb/lib/udb/obj/instruction.rb where the sext function call generated for sign-extended decode variables was missing the second argument (the bit width/sign bit position). This aligns the generated IDL code with the sext function definition in util.idl.

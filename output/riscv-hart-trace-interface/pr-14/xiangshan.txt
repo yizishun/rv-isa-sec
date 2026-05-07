@@ -1,0 +1,82 @@
+PR #14  target=xiangshan  overall=bug_confirmed
+Spec: trcstate priority rule (lowest-value-wins) and sdsec mapping contradiction cause silent trace data leakage when security inhibit is overridden by lower-value debug inhibit; multi-hart arbitration and CDC glitches further compound the exposure
+Violation: In XiangShan RTL trace interface, the spec-mandated trcstate priority rule ('prioritize lowest numerical value') creates a priority inversion: debug mode (01) numerically dominates security inhibit (10). When both are asserted simultaneously and debug subsequently exits while security inhibit remains active, trcstate transitions 01→00 instead of holding at 10, causing the encoder to emit a synchronization packet and resume tracing despite an active security fence. Additionally, the sdsec section mandates mapping sec_inhibit to trcstate=01 (the debug value), contradicting the encoding table where security reasons = 10, making security-vs-debug trace stops indistinguishable at the decoder. In multi-hart configurations, trace interconnect arbitration can starve a hart's security inhibit if another hart continuously asserts lower-value debug inhibit.
+Consequence: info_leak
+Pattern: trcstate.*priority|Mux1H.*trcstate|sec_inhibit.*0?1|halted.*OR.*trcstate|multi.*hart.*trace.*arbit|trcstate.*CDC.*glitch|synchronization.*packet.*timing
+------------------------------------------------------------
+[bug_confirmed] src/main/scala/xiangshan/backend/trace/Interface.scala:37-40  FromEncoder
+  FromEncoder bundle carries only 'enable' and 'stall' — the spec-mandated 'notrace[1:0]' (trcstate) field is entirely absent. Without this field, the external trace encoder cannot signal security inhibit (value 10) or debug inhibit (value 01) to the hart. This is the root cause: the hart has no mechanism to receive or act upon a security fence from the trace sink.
+  | class FromEncoder extends Bundle {
+  |   val enable = Bool()
+  |   val stall  = Bool()
+  | }
+
+[bug_confirmed] src/main/scala/xiangshan/backend/trace/TraceBuffer.scala:62-62  TraceBuffer (blockCommit logic)
+  TraceBuffer backpressure (blockCommit) gates commit solely on 'enable && (buffer_full || stall)' with no security-inhibit gating. When the RISC-V Trace Spec mandates that trcstate=10 (security inhibit) must stop trace, this logic has no path to enforce it — trace packets continue to be generated and emitted even if an external security monitor asserts inhibit.
+  | blockCommit := io.in.fromEncoder.enable && (canNotTraceAll || io.in.fromEncoder.stall)
+
+[bug_confirmed] src/main/scala/xiangshan/backend/rob/Rob.scala:1278-1296  Rob (trace commit info)
+  ROB generates trace commit info unconditionally for all committed instructions. There is no security-mode check, no trcstate-dependent suppression, and no distinction between user/supervisor/machine-mode instructions. In a security-inhibit scenario, the ROB will continue emitting trace packets containing retired instruction metadata (iaddr, itype, iretire counts) regardless of an active security fence.
+  | for (i <- 0 until CommitWidth) {
+  |   traceBlocks(i).bits.ftqIdx.foreach(_ := rawInfo(i).ftqIdx)
+  |   ...
+  |   traceValids(i) := io.commits.isCommit && io.commits.commitValid(i)
+  | }
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/DebugLevel.scala:406-417  triggerActionGen
+  triggerActionGen explicitly acknowledges trace actions are unimplemented ('// todo: add more for trace') and generates only DebugMode and BreakpointExp actions. TraceOn, TraceOff, and TraceNotify trigger actions (defined at line 241-243) are dead code — they can never fire because isLegal() at line 245 excludes them, and triggerActionGen never produces them. This means Sdtrig-based trace control is non-functional.
+  | // todo: add more for trace
+  | triggerAction := MuxCase(TriggerAction.None, Seq(
+  |   fireDebugMode -> TriggerAction.DebugMode,
+  |   breakPointExp -> TriggerAction.BreakpointExp,
+  | ))
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/DebugLevel.scala:238-248  TrigAction.isLegal
+  TrigAction.isLegal() only accepts BreakpointExp and DebugMode as legal values. TraceOn(2), TraceOff(3), and TraceNotify(4) are legalized to BreakpointExp on write — a WARL violation. The spec requires these values to be legal and functional for trace control. Writing TraceOff to a trigger's action field silently becomes BreakpointExp, making it impossible to configure trace stop triggers.
+  | override def isLegal(enumeration: CSREnumType, dmode: Bool): Bool =
+  |   enumeration.isOneOf(BreakpointExp) || enumeration.isOneOf(DebugMode) && dmode
+
+[potential_risk] src/main/scala/xiangshan/backend/CtrlBlock.scala:291-320  CtrlBlock (trace wiring)
+  CtrlBlock wires trace output to the SoC interface without inserting any security filter. The tracePriv selection (line 305-308) correctly distinguishes trap/xret privilege from current privilege, but there is no mechanism to zero out or suppress trace group valid bits when a security inhibit is active. The toEncoder.groups(i).valid signals pass through unchanged.
+  | trace.io.in.fromEncoder.enable := io.traceCoreInterface.fromEncoder.enable
+  | trace.io.in.fromRob := rob.io.trace.traceCommitInfo
+  | ...
+  | io.traceCoreInterface.toEncoder.groups(i).valid := trace.io.out.toEncoder.blocks(i).valid
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1251-1258  NewCSR (trace CSR generation)
+  Privilege encoding for trace correctly maps debug mode to Priv.D(=4) and uses Mux1H over the five privilege modes (M, HS, VS, HU, VU) to generate the priv field. The Mux1H usage is correct and includes all legal privilege modes. This is not a trcstate vulnerability; it's the standard priv field for the trace packet and is correctly implemented.
+  | val privForTrace = Mux(debugMode,
+  |   Priv.D,
+  |   Mux1H(
+  |     Seq(privState.isModeM, privState.isModeHS, privState.isModeVS, privState.isModeHU, privState.isModeVU),
+  |     Seq(Priv.M, Priv.HS, Priv.VS, Priv.HU, Priv.VU)
+  |   )
+  | )
+
+[potential_risk] src/main/scala/xiangshan/XSTileWrap.scala:154-159  XSTileWrap (trace CDC)
+  XSTileWrap uses AsyncResetSynchronizerShiftReg (3-stage) on fromEncoder.enable and fromEncoder.stall for CDC. When trcstate/notrace is added, a single-bit synchronizer per bit will be needed for the 2-bit notrace field. Without metastability-hardened synchronizers, a glitch on the notrace bus during a CDC crossing could cause a transient false trcstate value, momentarily defeating the security inhibit. This is a forward-looking risk for when the feature is implemented.
+  | tile.module.io.traceCoreInterface.fromEncoder.enable :=
+  |   AsyncResetSynchronizerShiftReg(io.traceCoreInterface.fromEncoder.enable, 3, 0)
+  | tile.module.io.traceCoreInterface.fromEncoder.stall :=
+  |   AsyncResetSynchronizerShiftReg(io.traceCoreInterface.fromEncoder.stall, 3, 0)
+
+[potential_risk] src/main/scala/top/Top.scala:280-296  Top (multi-core trace)
+  Multi-core trace interface uses a Vec of independent per-core bundles with no shared trace interconnect arbitration. Currently each core has independent enable/stall control. When trcstate is added, if a shared trace sink arbitrates across harts, the priority rule 'lowest numerical value wins' could cause one hart's debug inhibit (01) to starve another hart's security inhibit (10), as described in the security spec. The current flat per-core wiring avoids this only because trcstate is absent.
+  | val traceCoreInterface = Vec(NumCores, new Bundle {
+  |   val fromEncoder = Input(new Bundle {
+  |     val enable = Bool()
+  |     val stall  = Bool()
+  |   })
+  |   val toEncoder   = Output(new Bundle { ... })
+  | })
+
+[potential_risk] src/main/scala/top/XSNoCTop.scala:416-450  HasTraceIO
+  HasTraceIO trait in XSNoCTop mirrors Top.scala with the same per-core flat bit-vector trace interface and no trcstate/notrace fields in either direction. The trait will need to be updated in lockstep with the FromEncoder bundle when trcstate is added, or the SoC boundary will have a width mismatch causing silent trace corruption.
+  | val traceCoreInterface = IO(new Bundle {
+  |   val fromEncoder = Input(new Bundle {
+  |     val enable = Bool()
+  |     val stall  = Bool()
+  |   })
+  |   val toEncoder = Output(new Bundle { ... })
+  | })
+

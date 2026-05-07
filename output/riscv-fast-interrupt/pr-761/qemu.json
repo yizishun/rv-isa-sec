@@ -1,0 +1,84 @@
+{
+  "pr_number": 761,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 761,
+    "violation_condition": "QEMU implements the old xiselect upper bound (0x1100) for the valid range of acliprio/aclicsourcecfg indirect access, causing an off-by-one where xiselect=0x1100 indexes entry 256 in a 256-entry (0..255) array, or QEMU has a bounds-check mismatch between the illegal-instruction trap range (xireg4-xireg6 reserved) and the actual valid indirect-access range, leading to either an out-of-bounds read of stale/uninitialized CSR state or a spurious illegal-instruction fault on a valid access.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "xiselect >= 0x1000 && xiselect <= 0x1100",
+    "affected_entities": [
+      "miselect",
+      "siselect",
+      "xireg",
+      "xireg2",
+      "xireg3",
+      "xireg4",
+      "xireg5",
+      "xireg6"
+    ],
+    "summary": "Off-by-one in xiselect upper bound (0x1100 vs 0x10FF) causes QEMU to expose 257 indirect CSR slots where the architected limit is 256, enabling out-of-bounds access to uninitialized or stale CSR state via xireg/xireg2/xireg3 reads beyond the highest defined acliprio/aclicsourcecfg entry."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xiselect",
+        "line_start": 2451,
+        "line_end": 2458,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "xiselect write mask (ISELECT_MASK_SXCSRIND = 0xfff) correctly bounds the writable iselect range. Any smidctrl-specific xiselect values (e.g., 0x1000-0x1100) do not exist in the current codebase — the mask would truncate bit 12, and the resulting iselect would fall into the unimplemented range, correctly raising ILLEGAL_INST on subsequent xireg access.",
+      "snippet": "    if (riscv_cpu_cfg(env)->ext_smcsrind || riscv_cpu_cfg(env)->ext_sscsrind) {\n        wr_mask &= ISELECT_MASK_SXCSRIND;\n    } else {\n        wr_mask &= ISELECT_MASK_AIA;\n    }"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xireg",
+        "line_start": 2920,
+        "line_end": 2928,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "xireg dispatch correctly handles the three valid ranges (AIA, CD, CTR). Any unimplemented iselect value — including any hypothetical smidctrl range — falls through to the 'done' label returning RISCV_EXCP_ILLEGAL_INST. No out-of-bounds read is possible.",
+      "snippet": "    if (xiselect_aia_range(isel)) {\n        return rmw_xireg_aia(env, csrno, isel, val, new_val, wr_mask);\n    } else if (riscv_cpu_cfg(env)->ext_smcsrind ||\n               riscv_cpu_cfg(env)->ext_sscsrind) {\n        return rmw_xireg_csrind(env, csrno, isel, val, new_val, wr_mask);\n    }\n\ndone:\n    return RISCV_EXCP_ILLEGAL_INST;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xireg_csrind",
+        "line_start": 2832,
+        "line_end": 2841,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The csrind dispatch (used by xireg2-xireg6) correctly only accepts CD (0x40-0x5f) and CTR (0x200-0x2ff) ranges. All other iselect values — including any hypothetical smidctrl ranges — return RISCV_EXCP_ILLEGAL_INST. No stale/uninitialized CSR state is ever leaked; the read path only reads after passing a valid range check.",
+      "snippet": "    if (xiselect_cd_range(isel)) {\n        ret = rmw_xireg_cd(env, csrno, isel, val, new_val, wr_mask);\n    } else if (xiselect_ctr_range(csrno, isel)) {\n        ret = rmw_xireg_ctr(env, csrno, isel, val, new_val, wr_mask);\n    } else {\n        /* unimplemented region -> illegal instruction */\n        return RISCV_EXCP_ILLEGAL_INST;\n    }"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xiregi",
+        "line_start": 2866,
+        "line_end": 2880,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "xireg4-xireg6 (CSR numbers: MIREG4/MIREG5/MIREG6 at 0x355-0x357, SIREG4-SIREG6 at 0x155-0x157, VSIREG4-VSIREG6 at 0x255-0x257) are registered with predicate csrind_any/csrind_smode/csrind_hmode and route through rmw_xiregi → rmw_xireg_csrind. No smidctrl-specific range (0x1000-0x1100) is recognized, so all accesses correctly trap as ILLEGAL_INST. There is no bounds-check mismatch between the trap range and the valid indirect-access range.",
+      "snippet": "    if (CSR_MIREG <= csrno && csrno <= CSR_MIREG6 &&\n        csrno != CSR_MIREG4 - 1) {\n        isel = env->miselect;\n    } else if (CSR_SIREG <= csrno && csrno <= CSR_SIREG6 &&\n               csrno != CSR_SIREG4 - 1) {\n        isel = env->siselect;\n    } else if (CSR_VSIREG <= csrno && csrno <= CSR_VSIREG6 &&\n               csrno != CSR_VSIREG4 - 1) {\n        isel = env->vsiselect;\n    } else {\n        return RISCV_EXCP_ILLEGAL_INST;\n    }\n\n    return rmw_xireg_csrind(env, csrno, isel, val, new_val, wr_mask);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xireg_aia",
+        "line_start": 2688,
+        "line_end": 2710,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The AIA range handler correctly dispatches IPRIO (0x30-0x3f) and IMSIC (0x70-0xff) sub-ranges. Any iselect value outside these sub-ranges sets isel_reserved=true, which causes the error path at line 2717 to return RISCV_EXCP_ILLEGAL_INST regardless of virt mode. This correctly blocks any hypothetical smidctrl iselect values that might enter via the AIA path.",
+      "snippet": "    if (ISELECT_IPRIO0 <= isel && isel <= ISELECT_IPRIO15) {\n        ...\n    } else if (ISELECT_IMSIC_FIRST <= isel && isel <= ISELECT_IMSIC_LAST) {\n        ...\n    } else {\n        isel_reserved = true;\n    }"
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,51 @@
+PR #2659  target=opensbi  overall=potential_risk
+Spec: RNMI entry on top of an active SBI M-mode trap leaves mepc/mcause/mstatus holding the S-mode trap context — OpenSBI's RNMI handler must save mepc/mcause/mstatus via mnscratch before any use, else mret after MNRET returns to a corrupted S-mode context
+Violation: In OpenSBI, when an RNMI interrupts M-mode execution of an SBI handler (e.g., sbi_ecall_handler processing a trap from S-mode), the hardware atomically saves the interrupted PC/priv/cause into mnepc/mnstatus/mncause and clears MNIE — but leaves mepc/mcause/mstatus unchanged (they still hold the original S-mode trap context). If OpenSBI's RNMI handler reads or overwrites mepc/mcause/mstatus without first saving them via the mnscratch-anchored save area, the S-mode trap context is permanently destroyed. The subsequent MNRET resumes the interrupted M-mode code, which upon completion will execute mret using the now-corrupted mepc/mcause/mstatus, resulting in undefined return address, privilege mode, or cause.
+Consequence: data_corruption
+Pattern: handler defined with __attribute__((interrupt("machine"))) or placed at the RNMI trap address that reads/writes mepc, mcause, mstatus, or mstatus.MPP before saving them; or CSR_READ/CSR_WRITE(CSR_MEPC)/CSR_MCAUSE/CSR_MSTATUS in any RNMI code path without prior context save through mnscratch.
+------------------------------------------------------------
+[potential_risk] firmware/fw_base.S:672-690  _trap_handler
+  Standard M-mode trap handler saves/restores mepc/mstatus via TRAP_SAVE_MEPC_MSTATUS (line 676) and TRAP_RESTORE_MEPC_MSTATUS (line 686), then returns via mret (line 690). No RNMI handler exists anywhere in the codebase, meaning if hardware with the Smrnmi extension triggers an RNMI while this handler is in-flight (e.g., during an SBI ecall from S-mode), there is no mnscratch-anchored save area to preserve the S-mode trap context held in mepc/mcause/mstatus. The hardware would atomically switch to mnepc/mncause/mnstatus, but the RNMI handler code that would be needed to save the in-flight M-mode trap context does not exist, making this a feature gap that would become a confirmed vulnerability if RNMI support is implemented without the proper context save protocol.
+  | _trap_handler:
+  |   TRAP_SAVE_AND_SETUP_SP_T0
+  |   TRAP_SAVE_MEPC_MSTATUS 0        // reads mepc, mstatus — no RNMI context save
+  |   TRAP_SAVE_GENERAL_REGS_EXCEPT_SP_T0
+  |   TRAP_SAVE_INFO 0 0
+  |   TRAP_CALL_C_ROUTINE
+  |   TRAP_RESTORE_MEPC_MSTATUS 0     // restores mstatus, mepc — corrupted if RNMI nested
+  |   mret                            // returns to potentially corrupted context
+
+[potential_risk] include/sbi/riscv_encoding.h:492-508  
+  Standard RISC-V M-mode CSRs (CSR_MSCRATCH, CSR_MEPC, CSR_MCAUSE, CSR_MSTATUS) are defined, but standard RNMI CSRs (mnscratch at 0x350, mnepc at 0x351, mncause at 0x352, mnstatus at 0x353) are not defined. This means any future RNMI handler implementation would need to either define these CSRs or use raw CSR numbers. The absence of standard RNMI CSR definitions increases the risk that a future implementation would incorrectly use the regular M-mode CSRs without the mnscratch-anchored save protocol required for RNMI nesting safety.
+  | #define CSR_MSTATUS    0x300
+  | #define CSR_MISA       0x301
+  | ...#define CSR_MSCRATCH   0x340
+  | #define CSR_MEPC       0x341
+  | #define CSR_MCAUSE     0x342
+  | // No: CSR_MNSCRATCH (0x350), CSR_MNEPC (0x351), CSR_MNCAUSE (0x352), CSR_MNSTATUS (0x353)
+
+[potential_risk] include/sbi/sbi_trap.h:129-244  
+  struct sbi_trap_regs stores mepc, mstatus, mstatusH only (lines 200-204). struct sbi_trap_context wraps regs + trap + prev_context pointer (lines 237-244). Neither structure has fields for mnepc/mnstatus/mncause. If an RNMI handler were to re-use this trap context framework for context switching, it would lack the fields needed to properly nest an RNMI on top of an existing SBI trap without destroying the underlying M-mode trap context.
+  | struct sbi_trap_regs {
+  |   ...
+  |   unsigned long mepc;
+  |   unsigned long mstatus;
+  |   unsigned long mstatusH;  // no mnepc, mnstatus, mncause fields
+  | };
+  | struct sbi_trap_context {
+  |   struct sbi_trap_regs regs;
+  |   struct sbi_trap_info trap;
+  |   struct sbi_trap_context *prev_context;  // generic save/restore chain, not RNMI-aware
+  | };
+
+[compliant] firmware/fw_base.S:393-401  _start_warm
+  Cold/warm boot sets up CSR_MTVEC to point to _trap_handler or _trap_handler_hyp. If the Smrnmi extension were present, the RNMI trap vector (potentially via a different mechanism depending on hardware implementation) is NOT configured. This is currently compliant because the codebase does not claim Smrnmi support, but is noted as an initialization gap that must be addressed if RNMI support is added.
+  | lla a4, _trap_handler
+  | csrr a5, CSR_MISA
+  | srli a5, a5, ('H' - 'A')
+  | andi a5, a5, 0x1
+  | beq a5, zero, _skip_trap_handler_hyp
+  | lla a4, _trap_handler_hyp
+  | _skip_trap_handler_hyp:
+  | csrw CSR_MTVEC, a4       // mtvec set; no RNMI trap vector configured
+

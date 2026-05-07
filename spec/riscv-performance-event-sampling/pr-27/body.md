@@ -1,0 +1,1 @@
+As discussed in the previous meeting, Bruce and I have been working on an optional extension for Sspesa implementations that want to provide more metadata per sample, and thereby create more informative time-based profiles. This PR covers the changes that we propose.

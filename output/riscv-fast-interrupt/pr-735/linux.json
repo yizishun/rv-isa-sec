@@ -1,0 +1,124 @@
+{
+  "pr_number": 735,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 735,
+    "violation_condition": "The kernel enables CLIC hardware interrupt push/pop (smip/ssip) but the interrupted context's stack pointer (xscratch or architectural SP) references memory not accessible at that context's privilege level, causing the hardware register save (push) or restore (pop) to fault during address translation or permission checks — especially when MPP/SPP=U but SP points to supervisor-only memory, or when user space deliberately sets SP to unmapped/unwritable pages",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csr_write.*[ms]scratch|csr_write.*[ms]iselect|CSR_XSCRATCH|mnxti|snxti|clint|CLIC_CTRL|mstatus_MPRV|sstatus_SUM|smip|ssip|smclic|snclic|handle_clic|clic_irq",
+    "affected_entities": [
+      "mnxti",
+      "snxti",
+      "mipopret",
+      "sipopret",
+      "mstatus.MPP",
+      "mstatus.MPRV",
+      "sstatus.SPP",
+      "sstatus.SUM",
+      "mscratch",
+      "sscratch",
+      "miselect",
+      "siselect"
+    ],
+    "summary": "CLIC interrupt push/pop now uses previous-privilege-mode translation (MPRV/SUM) for stack memory accesses; kernel must guarantee the interrupted context's SP points to translation-valid, writable (push) or readable (pop) memory at that privilege level, or hardware push/pop faults silently into unrecoverable failure"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 131,
+        "line_end": 200,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Standard S-mode scratch CSR usage: csrrw tp, CSR_SCRATCH, tp at line 131 atomically tests whether exception came from user (scratch=task_struct) or kernel (scratch=0), then csrw CSR_SCRATCH, x0 at line 200 clears it. This is the standard RISC-V kernel/user context detection pattern, not CLIC push/pop. No CLIC mnxti/snxti instructions are used. The kernel never writes xscratch (a CLIC-specific CSR distinct from sscratch/mscratch).",
+      "snippet": "csrrw tp, CSR_SCRATCH, tp  // line 131\nbnez tp, .Lsave_context     // line 132\n...\ncsrw CSR_SCRATCH, x0          // line 200"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_kernel_stack_overflow",
+        "line_start": 322,
+        "line_end": 330,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VMAP_STACK overflow handler uses sscratch as a temporary register via csrrw to swap x31 with sscratch while setting up the overflow stack. Standard CSR usage, no CLIC semantics. The swap is atomic but is purely for register save/restore during stack overflow recovery.",
+      "snippet": "csrrw x31, CSR_SCRATCH, x31   // line 324\n...\ncsrrw x31, CSR_SCRATCH, x31   // line 330"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "__kvm_riscv_switch_to",
+        "line_start": 56,
+        "line_end": 62,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM guest entry uses csrrw t3, CSR_SSCRATCH, a0 at line 57 to atomically save host sscratch and load the kvm_vcpu_arch pointer into sscratch for guest execution. On guest exit (line 146), csrrw t1, CSR_SSCRATCH, t1 restores host sscratch. This is standard KVM context-switch plumbing, not CLIC push/pop. The sscratch value is a kernel virtual address pointer, valid in both host and guest supervisor contexts.",
+      "snippet": "csrrw t3, CSR_SSCRATCH, a0   // line 57: save host, set vcpu_arch ptr\ncsrrw t1, CSR_SSCRATCH, t1   // line 146: restore host sscratch"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 584,
+        "line_end": 623,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VCPU load writes guest vsscratch value into CSR_VSSCRATCH via nacl_csr_write (line 589) or csr_write (line 608). VCPU put reads it back (lines 666, 676). This is standard KVM guest CSR save/restore for the virtual supervisor scratch register. The vs-scratch belongs to the guest VM, so any privilege-level mismatch would be the guest's problem, not the host kernel's. No CLIC xscratch involvement.",
+      "snippet": "nacl_csr_write(nsh, CSR_VSSCRATCH, csr->vsscratch);  // line 589\ncsr_write(CSR_VSSCRATCH, csr->vsscratch);              // line 608\ncsr->vsscratch = nacl_csr_read(nsh, CSR_VSSCRATCH);    // line 666\ncsr->vsscratch = csr_read(CSR_VSSCRATCH);              // line 676"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-aclint-sswi.c",
+        "function_name": "thead_aclint_sswi_probe",
+        "line_start": 187,
+        "line_end": 204,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "T-HEAD ACLINT SSWI probe checks THEAD_C9XX_SXSTATUS_CLINTEE (BIT(17)) before enabling software interrupt IPI delivery. The CLINTEE bit controls ACLINT SSWI hardware, which is a simple software interrupt generator (write to per-CPU SETSSIP register), NOT CLIC hardware push/pop. No mnxti/snxti, no xscratch, no automatic register stacking. This is a distinct hardware block from CLIC.",
+      "snippet": "if (riscv_cached_mvendorid(0) == THEAD_VENDOR_ID &&\n    !(csr_read(THEAD_C9XX_CSR_SXSTATUS) & THEAD_C9XX_SXSTATUS_CLINTEE))\n    return -ENOTSUPP;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "(CSR definitions)",
+        "line_start": 325,
+        "line_end": 325,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Only standard RISC-V scratch CSRs are defined: CSR_SSCRATCH 0x140, CSR_MSCRATCH 0x340, CSR_VSSCRATCH 0x240. No CLIC-specific CSR_XSCRATCH is defined. The CLIC specification defines xscratch as a separate CSR at a different address; its absence means the kernel cannot accidentally configure CLIC push/pop.",
+      "snippet": "#define CSR_SSCRATCH 0x140"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "__kvm_riscv_unpriv_trap",
+        "line_start": 250,
+        "line_end": 271,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM unprivileged trap handler reads scause (line 262) and other CSRs for emulation. Uses standard sret for return, not mnxti/snxti. No CLIC-specific CSR access. The scause handling assumes standard RISC-V exception cause encoding, which would need updating for CLIC, but since CLIC is not supported this is not a current vulnerability.",
+      "snippet": "csrr a1, CSR_SCAUSE          // line 262\nREG_S a1, (KVM_ARCH_TRAP_SCAUSE)(a0)  // line 263\nsret                          // line 270"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "ret_from_exception",
+        "line_start": 247,
+        "line_end": 319,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Exception return path checks SPP/MPP bits in sstatus to determine whether returning to user or kernel (lines 248-256), then restores registers from pt_regs. Uses sret/mret, not snxti/mnxti. No CLIC pop semantics. The standard sscratch restore at this point (via RESTORE_ALL macro) correctly handles the supervisor-level scratch CSR without CLIC involvement.",
+      "snippet": "REG_L s0, PT_STATUS(sp)      // line 248\nandi s0, s0, SR_SPP          // line 254\nbnez s0, 1f                  // line 256\nsret                          // line 315"
+    }
+  ],
+  "overall_severity": "compliant"
+}

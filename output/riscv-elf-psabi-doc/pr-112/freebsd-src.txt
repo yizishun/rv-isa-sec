@@ -1,0 +1,39 @@
+PR #112  target=freebsd-src  overall=compliant
+Spec: RISC-V ELF psABI mandates power-of-two size-and-alignment for _Atomic/std::atomic types ≤128 bits; FreeBSD kernel __packed structures or misaligned atomic pointers violate LR/SC AMO alignment requirements, breaking atomicity and causing silent data corruption under concurrent access
+Violation: FreeBSD kernel code accesses atomically-typed objects through pointers not aligned to the type's power-of-two width (≤128 bits), or embeds atomic types in __packed structures or manually-aligned layouts where the atomic member's offset is not a multiple of its power-of-two size, causing LR/SC or AMO instructions to target misaligned addresses
+Consequence: data_corruption
+Pattern: __packed.*atomic|__attribute__\(\(packed\)\).*atomic|__aligned\([0-9]+\)[^;]*_Atomic|atomic_t.*__attribute__.*\(packed\)|struct.*packed.*atomic|_Atomic.*misalign|misaligned.*lr\.|misaligned.*sc\.|misaligned.*amo
+------------------------------------------------------------
+[compliant] sys/riscv/include/atomic.h:152-535  atomic_add_32 (and all 32/64-bit AMO/LR/SC ops)
+  All RISC-V AMO (amoadd.w/d, amoand.w/d, amoor.w/d, amoswap.w/d) and LR/SC (lr.w/d, sc.w/d) instructions use the 'A' inline-asm constraint which GCC defines as requiring natural alignment. The compiler will never emit these instructions against misaligned addresses. Similarly, atomic_load_acq/atomic_store_rel for 32/64-bit use plain volatile loads/stores with fence(), which don't have alignment concerns beyond the type's natural alignment guaranteed by the C ABI.
+  | __asm __volatile("amoadd.w zero, %1, %0" : "+A" (*p) : "r" (val) : "memory");
+  | __asm __volatile("lr.w %0, %2\n" ... : "=&r" (tmp), "=&r" (res), "+A" (*p) ...);
+
+[compliant] sys/sys/_atomic_subword.h:50-175  _ATOMIC_WORD_ALIGNED, atomic_cmpset_8, atomic_cmpset_16, etc.
+  Sub-word (8/16-bit) atomic operations round down to the nearest 4-byte aligned address via _ATOMIC_WORD_ALIGNED(), then use bit-shift and mask to target the correct byte/halfword within the 32-bit word. This correctly implements sub-word atomics without AMO/LR/SC instructions ever targeting misaligned addresses. The mask/shift logic handles both little-endian and big-endian correctly.
+  | #define _ATOMIC_WORD_ALIGNED(p) (uint32_t *)((__uintptr_t)(p) - ((__uintptr_t)(p) % 4))
+  | _atomic_cmpset_masked_word(_ATOMIC_WORD_ALIGNED(addr), old << shift, val << shift, 0xff << shift);
+
+[compliant] sys/sys/_mutex.h:47-64  struct mtx / struct mtx_padalign
+  struct mtx has its atomic field (mtx_lock: volatile __uintptr_t) preceded by struct lock_object containing pointer-sized and int-sized members. On all supported RISC-V targets, this guarantees natural alignment of mtx_lock. The pad-aligned variant (mtx_padalign) uses __aligned(CACHE_LINE_SIZE) which only increases alignment. The stdatomic.h _Atomic types are C11 user-facing types not used for kernel-internal synchronization; the kernel exclusively uses volatile-qualified members accessed via the machine/atomic.h inline functions.
+  | struct mtx { struct lock_object lock_object; volatile __uintptr_t mtx_lock; };
+  | struct mtx_padalign { volatile __uintptr_t mtx_lock; } __aligned(CACHE_LINE_SIZE);
+
+[compliant] sys/sys/pmclog.h:104-271  struct pmclog_* (all __packed logging structures)
+  All pmclog structures (pmclog_callchain, pmclog_map_in, pmclog_map_out, pmclog_pmcallocate, etc.) are __packed for ABI-compatible logging format, but none contain atomic-typed members. Members are plain uint32_t, uint64_t, uintptr_t, char[N]. These structures are written/read via bcopy/memcpy, not through atomic operations.
+  | struct pmclog_callchain { ... uint32_t pl_pmcid; uint32_t pl_cpuflags; uintptr_t pl_pc[]; } __packed;
+  | struct pmclog_map_in { ... uintfptr_t pl_start; char pl_pathname[PATH_MAX]; } __packed;
+
+[compliant] sys/sys/refcount.h:66-211  refcount_acquire, refcount_release, etc.
+  refcount operations use atomic_fetchadd_int and atomic_fcmpset_int on volatile u_int * parameters. The compiler enforces natural 4-byte alignment for int * pointers per the C ABI. No __packed or custom __aligned annotations on refcount consumers could introduce misalignment without violating the C standard. The fence positioning (fence rel before atomic_fetchadd_int, fence acq after) correctly implements acquire/release semantics on RISC-V.
+  | old = atomic_fetchadd_int(count, 1);
+  | atomic_thread_fence_rel();
+  | old = atomic_fetchadd_int(count, -n);
+  | atomic_thread_fence_acq();
+
+[compliant] sys/riscv/include/atomic.h:51-104  ATOMIC_ACQ_REL macro and acquire/release fence placement
+  The ATOMIC_ACQ_REL macro correctly places fence() before operations for release semantics and after for acquire semantics. The fence() macro emits 'fence' (full sequential fence, iorw:iorw ordering). This is functionally correct on RISC-V — a full fence is stronger than needed (fence r,rw for acquire, fence rw,w for release would suffice) but not incorrect. This does not create alignment issues.
+  | #define ATOMIC_ACQ_REL(NAME, WIDTH)
+  | atomic_##NAME##_rel_##WIDTH(..., v) { fence(); atomic_##NAME##_##WIDTH(p, v); }
+  | atomic_##NAME##_acq_##WIDTH(..., v) { atomic_##NAME##_##WIDTH(p, v); fence(); }
+

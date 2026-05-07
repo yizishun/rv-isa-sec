@@ -1,0 +1,83 @@
+PR #161  target=opensbi  overall=compliant
+Spec: JSON decode error
+Violation: 
+Consequence: function_loss
+Pattern: 
+------------------------------------------------------------
+[bug_confirmed] lib/sbi/sbi_sse.c:548-551  sse_event_inject
+  Before fix (6d5b2b9b): 'e->attrs.status = ~BIT(offset)' used assignment instead of bitwise-AND-clear. This overwrites ALL status bits including the multi-bit STATE field (SBI_SSE_ATTR_STATUS_STATE_OFFSET) and interrupt-related flags, corrupting the SSE event's global state to all-ones-except-pending. The corrected '&=' operation clears only the PENDING bit while preserving state and other flags. Without the fix, an injected SSE event could transition to an illegal state, causing incorrect handler dispatch or state machine corruption in M-mode.
+  | -       e->attrs.status = ~BIT(SBI_SSE_ATTR_STATUS_PENDING_OFFSET);
+  | +       e->attrs.status &= ~BIT(SBI_SSE_ATTR_STATUS_PENDING_OFFSET);
+
+[bug_confirmed] lib/sbi/sbi_domain_context.c:139-141  switch_to_next_domain_context
+  Before fix (4aad9d76): switching SATP to a new domain's value without a subsequent SFENCE.VMA leaves the TLB potentially containing stale virtual-address mappings from the previous domain. An attacker controlling one domain could poison the TLB and, after context-switch to a victim domain, access memory through residual TLB entries that belong to the attacker's address space. The fix inserts __sbi_sfence_vma_all() immediately after the csr_swap(CSR_SATP), ensuring all address-translation cache entries are flushed before any further memory access in the new domain context.
+  | ctx->satp       = csr_swap(CSR_SATP, dom_ctx->satp);
+  | +       __sbi_sfence_vma_all();
+
+[bug_confirmed] lib/sbi/sbi_dbtr.c:553-555  sbi_dbtr_read_trig
+  Before fix (c4a8b4cc8b31): the bounds check 'trig_idx_base + trig_count >= hs->total_trigs' was off-by-one, incorrectly rejecting the valid case where the range exactly touches the last trigger (e.g., reading trigger N-1 with count=1 when total=N). This made the SBI debug trigger read interface unusable for legitimate consumers accessing the final trigger. Additionally, the error code was changed from SBI_ERR_INVALID_PARAM to SBI_ERR_BAD_RANGE, increasing diagnostic precision.
+  | -           trig_idx_base + trig_count >= hs->total_trigs)
+  | -               return SBI_ERR_INVALID_PARAM;
+  | +           trig_idx_base + trig_count > hs->total_trigs)
+  | +               return SBI_ERR_BAD_RANGE;
+
+[bug_confirmed] lib/sbi/sbi_dbtr.c:718-719  sbi_dbtr_update_trig
+  Same off-by-one pattern as read_trig: 'trig_count >= hs->total_trigs' should be 'trig_count > hs->total_trigs'. Asking to update exactly total_trigs triggers is nonsensical (indexes 0..total-1 exist), but the old >= check also rejected trig_count == total_trigs which is valid boundary-check intent. Fixed together with sbi_dbtr_read_trig in c4a8b4cc8b31.
+  | -       if (trig_count >= hs->total_trigs)
+  | +       if (trig_count > hs->total_trigs)
+
+[compliant] lib/sbi/sbi_hsm.c:426-432  __sbi_hsm_suspend_non_ret_save
+  Non-retentive suspend correctly saves MIE, MIP (S-mode SSIP|STIP bits only——M-mode MIP bits are read-only, VS-mode bits are aliases of HVIP), MEDELEG, MIDELEG, and MENVCFG (for priv >= 1.12). The restore in __sbi_hsm_suspend_non_ret_restore (line 440-445) writes them back in correct order before the hart resumes S-mode execution. sbi_hart_reinit()->mstatus_init() additionally restores MSECCFG.SSEED/USEED via hart reinit, so all M-mode CSRs OpenSBI depends on are covered.
+  | hdata->saved_mie = csr_read(CSR_MIE);
+  |         hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+  |         hdata->saved_medeleg = csr_read(CSR_MEDELEG);
+  |         hdata->saved_mideleg = csr_read(CSR_MIDELEG);
+  |         if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  |                 hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+
+[compliant] lib/sbi/sbi_init.c:488-498  init_warm_resume
+  Warm resume path correctly sequences: (1) sbi_hsm_hart_resume_start sets RESUME_PENDING, (2) sbi_hart_reinit reinitializes mstatus/MSECCFG/MENVCFG via mstatus_init (clearing SATP, disabling MIE, etc.), (3) sbi_hart_protection_configure programs PMP before entering S-mode, (4) sbi_hsm_hart_resume_finish restores saved MEDELEG/MIDELEG/MIE/MIP/MENVCFG and switches mode. No window exists where S-mode executes with stale PMP or delegation.
+  | sbi_hsm_hart_resume_start(scratch);
+  |         rc = sbi_hart_reinit(scratch);
+  |         rc = sbi_hart_protection_configure(scratch);
+  |         sbi_hsm_hart_resume_finish(scratch, hartid);
+
+[compliant] lib/sbi/sbi_hart.c:32-189  mstatus_init
+  Comprehensive M-mode CSR initialization: clears MSTATUS then enables FS/VS; configures SCOUNTEREN=0x02 (TM only for S-mode), MCOUNTEREN=-1 (all enabled), MCOUNTINHIBIT; each MHPMEVENTn gets OF|MINH (interrupt disabled, inhibited in M-mode); HSTATUS cleared; MSTATEEN0/1/2/3 configured per-extension (CONTEXT, HSENVCFG, AIA, IMSIC, SVSLCT, CTR, SRMCFG); S/HSTATEEN cleared; MENVCFG configured with DTE=0 and per-extension bits set; MSECCFG.SSEED enabled, USEED disabled for Zkr; MIE cleared; SATP cleared. This is a textbook clean M-mode init with no security gaps.
+  | csr_write64(CSR_MENVCFG, menvcfg_val);
+  |         csr_write(CSR_MIE, 0);
+  |         if (misa_extension('S'))
+  |                 csr_write(CSR_SATP, 0);
+
+[compliant] lib/sbi/sbi_hart.c:212-252  delegate_traps
+  Trap delegation correctly sends SSIP|STIP|SEIP + PMU IRQ to S-mode via MIDELEG, and delegates misaligned fetch, breakpoint, user ecall, and (when platform supports it) page faults and SW check exception to S-mode via MEDELEG. With H-extension present, additionally delegates VS-ecall and guest page faults. Done before entering S-mode in both coldboot and warmboot paths. The CSR writes to MIDELEG/MEDELEG happen after hart features detection but before the final hart init——correct ordering.
+  | csr_write(CSR_MIDELEG, interrupts);
+  |         csr_write(CSR_MEDELEG, exceptions);
+
+[potential_risk] lib/sbi/sbi_domain_context.c:116-128  switch_to_next_domain_context
+  Domain context switch performs PMP reconfiguration (lines 127-128: unconfigure then configure) after updating domain assignment hartmasks but before swapping S-mode CSRs. The PMP unconfigure/configure window is brief and runs entirely in M-mode on the same hart, so no concurrent M-mode access from other harts can exploit it. However, if the platform's PMP unconfigure step leaves entries in a permissive state before the configure step programs the new domain's entries, there is a transient window where PMP restrictions are relaxed. This is mitigated by the fact that the hart is in M-mode (not S/U) during this window, so no lower-privilege code can execute. Risk is low but inherent to the two-step PMP switch design.
+  | /* Reconfigure PMP settings for the new domain */
+  |         sbi_hart_protection_unconfigure(scratch);
+  |         sbi_hart_protection_configure(scratch);
+
+[compliant] lib/sbi/sbi_hart.c:768-834  sbi_hart_switch_mode
+  Mode switch to S-mode correctly: (1) sets MSTATUS.MPP to target mode, clears MPIE (no interrupts on entry), handles MPV for H-extension; (2) writes MEPC to next_addr; (3) for S-mode, writes STVEC (or VSTVEC for VS), clears SSCRATCH/SIE/SATP (or VS equivalents); (4) for U-mode, writes UTVEC/USCRATCH/UIE; (5) executes mret with a0/a1 set. No SFENCE.VMA is needed here because SATP is explicitly cleared——the next stage will set up its own page tables. This is the correct final step in the init sequence.
+  | csr_write(CSR_MSTATUS, val);
+  |         csr_write(CSR_MEPC, next_addr);
+  |         csr_write(CSR_STVEC, next_addr);
+  |         csr_write(CSR_SSCRATCH, 0);
+  |         csr_write(CSR_SIE, 0);
+  |         csr_write(CSR_SATP, 0);
+
+[bug_confirmed] lib/sbi/sbi_string.c:88-99  sbi_strchr
+  Before fix (2bf0de88): sbi_strchr returned NULL instead of a pointer to the null terminator when searching for '\0' (c==0). This is a spec violation: strchr must find the terminating null. OpenSBI uses sbi_strchr internally and strchr(NULL-return) is a well-known source of crashes or logic bugs. Any SBI path that relies on strchr semantics (e.g., parsing extension strings) could misbehave. Fixed by restructuring to a do-while loop that checks every character including '\0'.
+  | -       while (*s != '\0' && *s != (char)c)
+  | -               s++;
+  | -       if (*s == '\0')
+  | -               return NULL;
+  | +       do {
+  | +               if (*s == (char)c)
+  | +                       return (char *)s;
+  | +       } while (*s++ != '\0');
+  | +       return NULL;
+

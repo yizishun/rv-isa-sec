@@ -1,0 +1,92 @@
+{
+  "pr_number": 679,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 679,
+    "violation_condition": "QEMU's process directory table (PDT) walk code in locate_process_context / riscv_iommu_spa_fetch detects a data corruption (e.g., checksum/integrity failure) on a PDT entry and reports fault cause 274 (RISCV_IOMMU_FQ_CAUSE_PT_CORRUPTED, 'second-stage PT load data corruption') instead of the correct cause 269 (RISCV_IOMMU_FQ_CAUSE_PDT_CORRUPTED, 'PDT data corruption fault'). This would occur if QEMU's future PDT corruption detection follows the old buggy reference model behavior where cause 274 is used in the GST_DATA_CORRUPTION path within the PDT walk.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "grep -rn 'PDT.*corrupt\\|corrupt.*PDT\\|FQ_CAUSE_PDT\\|pdt.*FQ_CAUSE_PT_CORRUPT\\|GST_DATA_CORRUPTION.*27[4-9]\\|cause.*274.*pdt\\|pdt.*cause.*274' hw/riscv/riscv-iommu.c",
+    "affected_entities": [
+      "locate_process_context",
+      "pdt_memory_read",
+      "RISCV_IOMMU_FQ_CAUSE_PDT_CORRUPTED",
+      "RISCV_IOMMU_FQ_CAUSE_PT_CORRUPTED"
+    ],
+    "summary": "PDT data corruption fault must be reported as cause 269 (PDT_CORRUPTED), not cause 274 (PT_CORRUPTED); returning the wrong cause class misleads the guest IOMMU driver into treating a process-directory-table integrity failure as a regular second-stage page-table corruption, potentially causing the guest to attempt incorrect recovery (e.g., reloading page tables instead of re-validating the PDT) and leaking the true nature of the fault from the guest's error-handling logic"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "hw/riscv/riscv-iommu.c",
+        "function_name": "riscv_iommu_ctx_fetch (PDT walk section)",
+        "line_start": 1191,
+        "line_end": 1193,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "PDT non-leaf entry read failure maps all MemTxResult errors to FQ_CAUSE_PDT_LOAD_FAULT (265), with no distinction for MEMTX_DECODE_ERROR. Unlike the MSI PT code (line 586-587) which maps MEMTX_DECODE_ERROR → MSI_PT_CORRUPTED, the PDT walk has no path to report cause 269 (PDT_CORRUPTED). If the G-stage PTE walk inside pdt_memory_read produces a MEMTX_DECODE_ERROR, it silently propagates through and is misclassified as a load fault.",
+      "snippet": "if (pdt_memory_read(s, ctx, addr, &de, sizeof(de),\n                    MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {\n    return RISCV_IOMMU_FQ_CAUSE_PDT_LOAD_FAULT;\n}"
+    },
+    {
+      "location": {
+        "file_path": "hw/riscv/riscv-iommu.c",
+        "function_name": "riscv_iommu_ctx_fetch (PDT leaf entry section)",
+        "line_start": 1206,
+        "line_end": 1208,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same issue for PDT leaf entry read: MEMTX_DECODE_ERROR from dma_memory_read inside pdt_memory_read → RISCV_IOMMU_FQ_CAUSE_PDT_LOAD_FAULT. Leaf entry corruption (e.g., checksum failure on the FSC+TA pair) should be cause 269 (PDT_CORRUPTED), not 265.",
+      "snippet": "if (pdt_memory_read(s, ctx, addr, &dc.ta, sizeof(uint64_t) * 2,\n                    MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {\n    return RISCV_IOMMU_FQ_CAUSE_PDT_LOAD_FAULT;\n}"
+    },
+    {
+      "location": {
+        "file_path": "hw/riscv/riscv-iommu.c",
+        "function_name": "pdt_memory_read (G-stage PT walk)",
+        "line_start": 890,
+        "line_end": 1017,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "pdt_memory_read performs internal G-stage page table walks but does not distinguish MEMTX_DECODE_ERROR from other failures. At line 987, a decode error from a G-stage PTE read (potential cause 274, PT_CORRUPTED) is returned verbatim without context that it's a G-stage PT corruption. At line 1016, a decode error from dma_memory_read (potential cause 269, PDT_CORRUPTED) is also returned without distinction. The caller treats both identically as PDT_LOAD_FAULT.",
+      "snippet": "ret = ldq_le_dma(s->target_as, pte_addr, &pte, attrs);\nif (ret != MEMTX_OK) {\n    return ret;  /* MEMTX_DECODE_ERROR indistinguishable from MEMTX_ACCESS_ERROR */\n}"
+    },
+    {
+      "location": {
+        "file_path": "hw/riscv/riscv-iommu.c",
+        "function_name": "riscv_iommu_validate_device_ctx",
+        "line_start": 753,
+        "line_end": 757,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Current diff correctly adds cross-field validation: when iohgatp.MODE is Bare (no G-stage translation), msiptp.MODE must be Off. This prevents the use of MSI page table translation without a valid GSCID context, fixing the privilege_escape issue described in analysis_smip.md. Validation returns false → caller will report cause 259 (DDT_MISCONFIGURED).",
+      "snippet": "if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&\n    get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=\n    RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {\n    return false;\n}"
+    },
+    {
+      "location": {
+        "file_path": "hw/riscv/riscv-iommu-bits.h",
+        "function_name": "(FQ cause enum definition)",
+        "line_start": 406,
+        "line_end": 411,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "RISCV_IOMMU_FQ_CAUSE_PDT_CORRUPTED (269) and RISCV_IOMMU_FQ_CAUSE_PT_CORRUPTED (274) are defined but never referenced in riscv-iommu.c. This is dead code. Any future implementation of corruption detection that accidentally routes to cause 274 (following the reference model's known bug where PT_CORRUPTED is used in the PDT walk path) would leak guest VM state through the fault record's cause field, since cause 274 signals 'second-stage PT corruption' when the actual fault is PDT corruption.",
+      "snippet": "RISCV_IOMMU_FQ_CAUSE_PDT_CORRUPTED        = 269,\n...\nRISCV_IOMMU_FQ_CAUSE_PT_CORRUPTED         = 274"
+    },
+    {
+      "location": {
+        "file_path": "hw/riscv/riscv-iommu.c",
+        "function_name": "riscv_iommu_msi_write (MSI PT read)",
+        "line_start": 584,
+        "line_end": 589,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reference implementation: MSI PT read correctly distinguishes MEMTX_DECODE_ERROR → MSI_PT_CORRUPTED (270) vs other errors → MSI_LOAD_FAULT (261). This pattern should be replicated in the PDT walk code and pdt_memory_read.",
+      "snippet": "if (res != MEMTX_OK) {\n    if (res == MEMTX_DECODE_ERROR) {\n        cause = RISCV_IOMMU_FQ_CAUSE_MSI_PT_CORRUPTED;\n    } else {\n        cause = RISCV_IOMMU_FQ_CAUSE_MSI_LOAD_FAULT;\n    }"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

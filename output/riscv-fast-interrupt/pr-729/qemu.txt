@@ -1,0 +1,29 @@
+PR #729  target=qemu  overall=compliant
+Spec: IVT mode trap delivery must auto-clear the serviced interrupt's pending bit upon successful handler-address fetch; missing this side-effect causes the interrupt to repeatedly re-fire, effectively hanging the guest in an interrupt storm (DoS).
+Violation: When QEMU delivers an interrupt via CLIC IVT (Interrupt Vector Table) mode, the emulation reads the handler address from VTBASE but does NOT clear the corresponding interrupt-pending bit (clicintip[i]) for the serviced interrupt before setting PC, OR unconditionally clears it for level-sensitive interrupts where the spec mandates 'if possible' semantics, meaning level-sensitive interrupts may remain pending due to the external source still asserting the level.
+Consequence: denial_of_service
+Pattern: ivt_fetch.*handler|vtbase.*fetch|riscv_cpu_do_interrupt.*clic|clint.*vectored.*clear|clic_intip.*clear|vt_entry.*pc_set|clear.*pending.*ivt
+------------------------------------------------------------
+[compliant] target/riscv/cpu_helper.c:2421-2422  riscv_cpu_do_interrupt
+  S-mode vectored interrupt path: uses stvec for handler address calculation. No CLIC IVT (stvec bits[1:0]==3) support exists, so there is no IVT pending-bit auto-clear logic to audit. The existing vectored mode (bits[1:0]==1) uses standard trap model where software clears pending bits via CSR writes — no auto-clear is expected per the privileged spec.
+  | env->pc = (env->stvec >> 2 << 2) +
+  |           ((async && (env->stvec & 3) == 1) ? cause * 4 : 0);
+
+[compliant] target/riscv/cpu_helper.c:2506-2507  riscv_cpu_do_interrupt
+  M-mode vectored interrupt path: same as S-mode — uses mtvec with standard vectored mode. No IVT (bits[1:0]==3) handling exists. The standard vectored mode does not require auto-clearing pending bits; software ISR handles this via mip CSR writes.
+  | env->pc = (env->mtvec >> 2 << 2) +
+  |           ((async && (env->mtvec & 3) == 1) ? cause * 4 : 0);
+
+[compliant] target/riscv/cpu_helper.c:2206-2547  riscv_cpu_do_interrupt
+  The entire riscv_cpu_do_interrupt() function — from entry to PC assignment — never touches env->mip or any pending bits. In the standard RISC-V privileged architecture model (the only model implemented), this is correct: interrupt pending bits are cleared by software writing to mip in the ISR, not by the hardware trap delivery path. No missing auto-clear bug exists because the CLIC/IVT feature is not implemented.
+  | /* cs->exception_index ... async ... cause ... */
+  | /* No mip/clicintip access anywhere in this function */
+
+[compliant] target/riscv/csr.c:2996-3006  write_mtvec
+  write_mtvec rejects reserved mode bits[1:0] >= 2. This means CLIC IVT mode (bits[1:0]==3) is correctly rejected as unimplemented rather than silently accepted with broken behavior. This is safe.
+  | if ((val & 3) < 2) {
+  |     env->mtvec = val;
+  | } else {
+  |     qemu_log_mask(LOG_UNIMP, "CSR_MTVEC: reserved mode not supported\n");
+  | }
+

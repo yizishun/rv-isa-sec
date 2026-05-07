@@ -1,0 +1,51 @@
+PR #2755  target=xiangshan  overall=compliant
+Spec: STIP writability must be gated by menvcfg.STCE=0 per spec: if stimecmp implemented AND STCE=1, STIP is read-only in mip; legacy CSR module allows unconditional STIP writes, enabling M-mode to inject spurious S-mode timer interrupts bypassing hardware stimecmp comparator
+Violation: In the legacy CSR module (src/main/scala/xiangshan/backend/fu/CSR.scala:314), mipWMask unconditionally includes bit 5 (STIP) as writable via '((1 << 9) | (1 << 5) | (1 << 1)).U(XLEN.W)' — STIP is always software-writable regardless of menvcfg.STCE. In the new CSR module (MachineLevel.scala:247-257), the gating is correctly implemented: when menvcfg.STCE=1, STIP reads from hardware-generated platformIRP.STIP and writes are ignored; only when menvcfg.STCE=0 does the internal reg.STIP become the read source and accept writes. If the legacy CSR module is instantiated in any build configuration where EXT_SSTC=true (always true per CSRConfig line 65), M-mode software can directly set/clear mip.STIP via CSR write even when menvcfg.STCE=1, bypassing the SstcInterruptGen hardware comparator.
+Consequence: privilege_escape
+Pattern: mipWMask.*5\)|mip.*STIP.*writable|writeMask.*STIP|mip_wmask.*STIP|STIP.*wen.*!.*STCE|STIP.*!.*menvcfg
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/fu/CSR.scala:314-314  class CSR (legacy, dead code)
+  mipWMask unconditionally includes bit 5 (STIP) as writable via '((1 << 9) | (1 << 5) | (1 << 1)).U(XLEN.W)'. No menvcfg.STCE gating exists anywhere in this legacy module. The MaskedRegMap at line 835 writes mipReg with this mask, meaning M-mode software can directly set/clear STIP via CSR write to Mip regardless of menvcfg.STCE. This module is dead code (not instantiated; wrapper/CSR.scala:65 instantiates NewCSR instead), so the risk is only material if this legacy module is resurrected or reused as a template.
+  | val mipWMask = vssip_Mask | ((1 << 9) | (1 << 5) | (1 << 1)).U(XLEN.W)
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/CSR.scala:835-835  class CSR (legacy, dead code)
+  MaskedRegMap(Mip, mipReg.asUInt, mipWMask, ...) applies mipWMask as the writable-bit mask for Mip CSR writes, propagating the unconditional STIP writability to the CSR address map. No side-effect callback checks menvcfg.STCE before allowing the write.
+  | MaskedRegMap(Mip, mipReg.asUInt, mipWMask, MaskedRegMap.NoSideEffect, mipMask, x => (mipWire.asUInt | x) & mipMask),
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:247-257  MipModule (MipToMvip internal)
+  STIP readout is correctly gated: when menvcfg.STCE=1, regOut.STIP reads from platformIRP.STIP (hardware-generated comparator output); when STCE=0, it reads from internal reg.STIP. Writes are correctly blocked: the 'when' conditional at line 250 gates both direct CSR writes (wen) and alias writes (fromMvip.STIP.valid) on '!this.menvcfg.STCE'. This implements the spec requirement that STIP is read-only when SSTC is enabled.
+  | regOut.STIP := Mux(this.menvcfg.STCE.asBool, platformIRP.STIP, reg.STIP.asBool)
+  | when ((wen || fromMvip.STIP.valid) && !this.menvcfg.STCE) {
+  |   reg.STIP := Mux1H(Seq(
+  |     wen -> wdata.STIP,
+  |     fromMvip.STIP.valid -> fromMvip.STIP.bits,
+  |   ))
+  | }.otherwise {
+  |   reg.STIP := reg.STIP
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SstcInterruptGen.scala:34-35  SstcInterruptGen
+  Hardware comparator correctly guards STIP assertion with menvcfg.STCE: o.STIP is only asserted when 'stime >= stimecmp && menvcfg.STCE'. This ensures hardware-generated STIP is only produced when SSTC is enabled, preventing spurious timer interrupts when STCE=0.
+  | o.STIP  := RegEnable(i.stime.bits >= i.stimecmp.rdata && i.menvcfg.STCE, false.B, i.stime.valid || i.stimecmp.wen || i.menvcfg.wen)
+  | o.VSTIP := RegEnable(i.vstime.bits >= i.vstimecmp.rdata && i.henvcfg.STCE, false.B, i.vstime.valid || i.vstimecmp.wen || i.htimedeltaWen || i.menvcfg.wen || i.henvcfg.wen)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:151-157  MvipModule (mvip internal logic)
+  Mvip.STIP alias is correctly gated: reads return 0 when menvcfg.STCE=1 (since STIP is hardware-driven and not software-writable), and writes to mip.STIP via the alias path (toMip.STIP.valid) are blocked when STCE=1. This prevents M-mode from using mvip as a backdoor to set STIP when SSTC is active.
+  | regOut.STIP := Mux(this.menvcfg.STCE.asBool, 0.U, this.mip.STIP.asBool)
+  | toMip.STIP.valid := wen && !this.menvcfg.STCE.asBool
+  | toMip.STIP.bits := wdata.STIP
+
+[compliant] src/main/scala/xiangshan/backend/fu/wrapper/CSR.scala:65-65  class CSR (wrapper)
+  The active CSR wrapper correctly instantiates only NewCSR (val csrMod = Module(new NewCSR)), which has the correct STCE-gated STIP handling. The legacy xiangshan.backend.fu.CSR class is never instantiated.
+  | val csrMod = Module(new NewCSR)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:713-715  MEnvCfg class
+  MEnvCfg.STCE field is correctly defined as RW with reset value 1 when EXT_SSTC=true. The reset value of 1 means SSTC is active by default, consistent with the RISC-V privileged spec.
+  | if (CSRConfig.EXT_SSTC) {
+  |   this.STCE.setRW().withReset(1.U)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/InterruptBundle.scala:109-109  InterruptPendingBundle
+  STIP field in InterruptPendingBundle is defined as RO(5), reflecting the spec requirement that STIP bit position 5 is a readable interrupt-pending indicator. The write-gating in MipModule correctly overrides any write attempts.
+  | val STIP     = RO(5).withDescription("Supervisor timer interrupt pending bit.")
+

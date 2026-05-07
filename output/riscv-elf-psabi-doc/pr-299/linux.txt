@@ -1,0 +1,46 @@
+PR #299  target=linux  overall=potential_risk
+Spec: LP64E ABI introduces ELFCLASS64 with EF_RISCV_RVE flag and reduced register set (x0-x15 only for calling convention); kernel has zero LP64E awareness in elf_check_arch or SET_PERSONALITY, exposing unvalidated x16-x31 register slots to userspace instruments without semantic isolation from the full register file
+Violation: In the Linux kernel, when an LP64E ELF binary is loaded (ELFCLASS64 with EF_RISCV_RVE set in e_flags), arch/riscv/include/asm/elf.h:elf_check_arch() accepts it unconditionally by checking only e_machine==EM_RISCV and EI_CLASS==ELFCLASS64, without validating e_flags for EF_RISCV_RVE. The kernel treats the LP64E process identically to a full LP64 process: it exposes the complete 32-GPR pt_regs layout via ptrace(PTRACE_GETREGS), ELF_CORE_COPY_REGS core dumps, and setup_sigframe signal frames, unaware that per the LP64E ABI, registers x16-x31 'do not participate in the calling convention' and are 'considered temporaries'—their values in pt_regs are architecturally uninitialized for this process and could carry stale data from prior execution contexts if save/restore of x16-x31 is ever optimized away.
+Consequence: info_leak
+Pattern: elf_check_arch.+e_machine.*EM_RISCV.*EI_CLASS.*ELFCLASS64(?!.*e_flags.*EF_RISCV_RVE) or save_from_x6_to_x31 without LP64E register-subset awareness
+------------------------------------------------------------
+[potential_risk] arch/riscv/include/asm/elf.h:37-38  elf_check_arch
+  elf_check_arch() accepts any ELFCLASS64+EM_RISCV binary without inspecting e_flags. EF_RISCV_RVE is not defined anywhere in this kernel tree, meaning an LP64E (RV64E) binary would be accepted and treated identically to full LP64. The kernel's entire register infrastructure—pt_regs with 32 GPRs, user_regs_struct, signal frame sc_regs, ELF_CORE_COPY_REGS, and ptrace REGSET_X—unconditionally exposes 32-GPR layouts. If a future optimization skipped save/restore of x16-x31 for LP64E processes (since the ABI declares them non-participating temporaries), those register slots in signal frames, core dumps, and ptrace output would carry stale data from prior execution contexts.
+  | #define elf_check_arch(x) (((x)->e_machine == EM_RISCV) && \
+  | 		   ((x)->e_ident[EI_CLASS] == ELF_CLASS))
+
+[potential_risk] arch/riscv/include/asm/elf.h:129-133  ELF_CORE_COPY_REGS
+  ELF_CORE_COPY_REGS copies the full struct user_regs_struct (32 GPRs) unconditionally into core dumps. For an LP64E process where x16-x31 are architecturally uninitialized per the LP64E ABI, the values written into the core file would be whatever happened to reside in those hardware registers at trap time—potentially kernel-internal or cross-process data if a future context-switch optimization elides x16-x31 save/restore for LP64E tasks.
+  | #define ELF_CORE_COPY_REGS(dest, regs)			\
+  | do {							\
+  | 	*(struct user_regs_struct *)&(dest) =		\
+  | 		*(struct user_regs_struct *)regs;	\
+  | } while (0);
+
+[potential_risk] arch/riscv/kernel/signal.c:361-362  setup_sigcontext
+  setup_sigcontext() copies sizeof(sc->sc_regs) (the full 32-GPR user_regs_struct) to the user signal frame, with no awareness of LP64E's reduced register set. If x16-x31 save/restore were optimized away for LP64E processes, the signal handler would receive uninitialized or stale register values in the sigcontext for registers x16-x31.
+  | /* sc_regs is structured the same as the start of pt_regs */
+  | err = __copy_to_user(&sc->sc_regs, regs, sizeof(sc->sc_regs));
+
+[potential_risk] arch/riscv/kernel/ptrace.c:40-46  riscv_gpr_get
+  riscv_gpr_get() writes sizeof(struct user_regs_struct) (32 GPRs) to the ptrace membuf unconditionally. A ptracer reading an LP64E tracee via PTRACE_GETREGS would receive register slots for x16-x31. Without LP64E-aware save/restore, these could carry stale data.
+  | static int riscv_gpr_get(struct task_struct *target,
+  | 			 const struct user_regset *regset,
+  | 			 struct membuf to)
+  | {
+  | 	return membuf_write(&to, task_pt_regs(target),
+  | 			    sizeof(struct user_regs_struct));
+  | }
+
+[compliant] arch/riscv/kernel/entry.S:167-167  handle_exception
+  save_from_x6_to_x31 unconditionally saves all registers x6-x31 on exception entry. Combined with restore_from_x6_to_x31 at line 308 on exception return, this ensures that no current code path elides x16-x31 for any process type. The save/restore is LP64E-oblivious but functionally correct—it preserves whatever values the hardware holds. This macro is the critical barrier preventing the theoretical info leak: as long as it runs unconditionally, x16-x31 in pt_regs reflect real hardware state, not uninitialized memory.
+  | save_from_x6_to_x31
+
+[compliant] arch/riscv/kernel/entry.S:425-439  __switch_to
+  __switch_to saves and restores only callee-saved registers (ra, sp, s0-s11). Registers x16-x31 (a6,a7,s2-s11,t3-t6) beyond s0-s11 are NOT saved in the thread struct—they are saved in pt_regs on the kernel stack during exception entry/exit. This is the standard RISC-V context-switch design and is correct because (a) all register state is already in pt_regs if the task was preempted in kernel mode, and (b) callee-saved GPRs are the only ones needing preservation across voluntary context switches.
+  | REG_S ra,  TASK_THREAD_RA_RA(a3)
+  | REG_S sp,  TASK_THREAD_SP_RA(a3)
+  | REG_S s0,  TASK_THREAD_S0_RA(a3)
+  | ...
+  | REG_S s11, TASK_THREAD_S11_RA(a3)
+

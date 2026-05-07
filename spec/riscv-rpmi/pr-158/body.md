@@ -1,0 +1,1 @@
+Add a new TEE service group to allow multiple REEs and TEEs, optionally on top of host and trusted hypervisors, to communicate with each other, synchronously and asynchronously, and to exchange (share, lend and donate) memory.

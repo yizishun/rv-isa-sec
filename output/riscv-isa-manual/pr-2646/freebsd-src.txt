@@ -1,0 +1,72 @@
+PR #2646  target=freebsd-src  overall=compliant
+Spec: FreeBSD kernel must guard every ssp CSR access with an explicit menvcfg.SSE liveness check; the menvcfg→henvcfg→senvcfg read-only-zero cascade means M-mode firmware can silently disable shadow stacks, turning ssp accesses into illegal-instruction exceptions that crash context-switch and signal-delivery paths
+Violation: In the FreeBSD kernel running in S-mode on Zicfiss hardware, code in cpu_switch (sys/riscv/riscv/swtch.S), sendsig/sigreturn (sys/riscv/riscv/exec_machdep.c), or set_mcontext/get_mcontext paths accesses the ssp CSR without first reading menvcfg to test the SSE bit. When M-mode firmware (e.g., OpenSBI) boots with menvcfg.SSE=0—globally disabling shadow stacks—the ssp access raises an illegal-instruction exception (#norm:zicfiss_m_menvcfg-sse). These kernel paths do not expect CSR-access exceptions; the unhandled trap either panics the host or silently skips save/restore, leaking or zeroing per-thread shadow stack state. In bhyve, a host that sets henvcfg.SSE=0 after this PR forces guest senvcfg.SSE to read-only zero; the simplified VU-mode check now depends solely on senvcfg.SSE (#norm:zicfiss_vu_senvcfg-sse), so guest VU-mode ssp accesses raise a virtual-instruction exception that bhyve's vmmops_exception stub (returning ENOSYS) cannot handle, corrupting guest userspace shadow stacks. Additionally, because ssp CSR access is no longer contingent on S-mode being implemented, a FreeBSD kernel that gates ssp usage on S-mode presence rather than on menvcfg.SSE will incorrectly assume availability.
+Consequence: data_corruption
+Pattern: csr_read|csr_write|csr_swap inline asm referencing "ssp" in sys/riscv/riscv/swtch.S (cpu_switch), sys/riscv/riscv/exec_machdep.c (set_mcontext, get_mcontext, sendsig, sigreturn), sys/riscv/vmm/vmm_riscv.c (vmmops_vcpu_save_csrs, vmmops_vcpu_restore_csrs) without a logically-preceding CSR read of menvcfg to test SSE bit, and without a trap wrapper guarding the ssp access
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/swtch.S:258-358  cpu_switch
+  No ssp CSR access exists in cpu_switch. The function saves/restores only ra, sp, s0-s11, and conditionally FPE state. No Zicfiss/shadow-stack code is present, so the described vulnerability (accessing ssp without checking menvcfg.SSE) does not apply.
+  | /* ra, sp, and callee-saved registers */
+  | sd  ra, (PCB_RA)(x13)
+  | sd  sp, (PCB_SP)(x13)
+  | /* s[0-11] */
+  | sd  s0, (PCB_S + 0 * 8)(x13)
+
+[compliant] sys/riscv/riscv/swtch.S:206-248  cpu_throw
+  No ssp CSR access in cpu_throw. Only loads ra, sp, s0-s11 GPRs and conditionally restores FPE registers. No Zicfiss code present.
+  | ld  ra, (PCB_RA)(x13)
+  | ld  sp, (PCB_SP)(x13)
+  | /* s[0-11] */
+  | ld  s0, (PCB_S + 0 * 8)(x13)
+
+[compliant] sys/riscv/riscv/exec_machdep.c:205-228  get_mcontext
+  No ssp CSR access in get_mcontext. Only copies GPRs (t, s, a registers, ra, sp, gp, tp, sepc, sstatus) via memcpy from trapframe and calls get_fpcontext for FPE state. No Zicfiss/shadow-stack state is captured.
+  | memcpy(mcp->mc_gpregs.gp_t, tf->tf_t, sizeof(mcp->mc_gpregs.gp_t));
+  | memcpy(mcp->mc_gpregs.gp_s, tf->tf_s, sizeof(mcp->mc_gpregs.gp_s));
+  | memcpy(mcp->mc_gpregs.gp_a, tf->tf_a, sizeof(mcp->mc_gpregs.gp_a));
+
+[compliant] sys/riscv/riscv/exec_machdep.c:230-262  set_mcontext
+  No ssp CSR access in set_mcontext. Only copies GPRs back to trapframe and calls set_fpcontext. No Zicfiss state is restored.
+  | memcpy(tf->tf_t, mcp->mc_gpregs.gp_t, sizeof(tf->tf_t));
+  | memcpy(tf->tf_s, mcp->mc_gpregs.gp_s, sizeof(tf->tf_s));
+  | memcpy(tf->tf_a, mcp->mc_gpregs.gp_a, sizeof(tf->tf_a));
+
+[compliant] sys/riscv/riscv/exec_machdep.c:336-413  sendsig
+  No ssp CSR access in sendsig. Calls get_mcontext to capture state (which has no Zicfiss awareness), and writes sigframe to userspace stack. No shadow stack pointer is saved or transmitted.
+  | get_mcontext(td, &frame.sf_uc.uc_mcontext, 0);
+  | frame.sf_si = ksi->ksi_info;
+  | frame.sf_uc.uc_sigmask = *mask;
+
+[compliant] sys/riscv/riscv/exec_machdep.c:317-334  sys_sigreturn
+  No ssp CSR access in sigreturn. Copies ucontext from userspace and calls set_mcontext (which has no Zicfiss awareness). No shadow stack pointer is restored.
+  | if (copyin(uap->sigcntxp, &uc, sizeof(uc)))
+  |   return (EFAULT);
+  | error = set_mcontext(td, &uc.uc_mcontext);
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:179-195  vmmops_vcpu_save_csrs
+  No ssp CSR save. Saves only: vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, vsatp. Although hypcsr struct has a 'senvcfg' field, it is NOT populated in this function. No Zicfiss state is captured.
+  | csrs->vsstatus = csr_read(vsstatus);
+  | csrs->vsatp = csr_read(vsatp);
+  | /* senvcfg field in hypcsr struct exists but is never read here */
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:161-177  vmmops_vcpu_restore_csrs
+  No ssp CSR restore. Restores only: vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, vsatp. senvcfg is not written. No Zicfiss state is restored.
+  | csr_write(vsstatus, csrs->vsstatus);
+  | csr_write(vsatp, csrs->vsatp);
+  | /* senvcfg field in hypcsr struct exists but is never written here */
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:905-921  vmmops_exception
+  vmmops_exception is an unimplemented stub returning ENOSYS. If a guest were to trigger a virtual-instruction exception (e.g., from accessing ssp when henvcfg.SSE=0), the VMM cannot inject it into the guest and would likely VM_EXITCODE_BOGUS. However, this is a general bhyve-VMM-incompleteness issue, not Zicfiss-specific, since FreeBSD's own kernel does not use Zicfiss at all.
+  | int
+  | vmmops_exception(void *vcpui, uint64_t scause)
+  | {
+  |   /* TODO: implement me. */
+  |   return (ENOSYS);
+  | }
+
+[compliant] sys/riscv/include/riscvreg.h:176-182  
+  No MENVCFG_SSE, SENVCFG_SSE, or HENVCFG_SSE bit definitions exist. The only henvcfg bits defined are STCE, PBMTE, CBZE, CBCFE, CBIE, FIOM. No Zicfiss CSR field definitions are present anywhere in the kernel.
+  | #define HENVCFG_STCE   (1UL << 63)
+  | #define HENVCFG_PBMTE   (1UL << 62)
+  | /* No MENVCFG_SSE or SENVCFG_SSE definitions */
+

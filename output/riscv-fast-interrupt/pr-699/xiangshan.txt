@@ -1,0 +1,49 @@
+PR #699  target=xiangshan  overall=potential_risk
+Spec: xivt bit 1 redefined as EHV enable for synchronous exception vectoring; hardware must either hardwire EHV=0 with complete BASE masking or fully implement xtvec+cause*32 trap target computation, otherwise exception traps route to attacker-controlled addresses
+Violation: In XiangShan RTL, the xivt CSR (mivt at 0x307 or sivt at 0x107) implements bit 1 as a writable EHV field (WARL, not hardwired to 0), but the trap entry datapath in the CSR module does not implement synchronous exception hardware vectoring logic—i.e., when EHV=1, the exception trap target PC is not computed as xtvec + (mcause/scause × 32), causing traps to fall through to the default xtvec handler or an unpredictable address. Conversely, if bit 1 is hardwired to 0 but the BASE field incorrectly extends down to bit 1, writing bit 1 of the BASE address could be misinterpreted as setting EHV by software expecting Smehv/Ssehv semantics.
+Consequence: privilege_escape
+Pattern: mivt.*bit.*1|sivt.*bit.*1|xivt.*EHV|xtvec.*cause|exception.*vector.*PC|trapEntry.*xtvec|cause.*32.*xtvec
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:125-135  CSRs object (CSR address constants)
+  AIA interrupt vector table CSR addresses mtvt (0x307), stvt (0x107), and utvt (0x7) are declared as constants and added to the valid CSR list (lines 582/587/592) but have NO backing CSRModule implementation anywhere. An access to these CSR addresses would not raise an illegal-instruction exception (decoder considers them valid), but reads return 0 and writes are silently dropped. Software probing for Smehv/Ssccfg support via these CSRs gets no error indication despite missing hardware.
+  | val utvt = 0x7
+  | // ...
+  | val stvt = 0x107
+  | // ...
+  | val mtvt = 0x307
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:16-21  XtvecBundle class
+  XtvecBundle defines mode as a 2-bit WARL field at [1:0] with base address at [63:2]. There is no separate EHV field at bit 1. The mode field with XtvecMode (Direct=0, Vectored=1) is correct for standard RISC-V privileged spec mtvec/stvec. No bit-position error exists in the BASE/ADDR split: addr starts at bit 2, mode occupies [1:0], consistent with spec requirement of 4-byte-aligned trap vectors.
+  | class XtvecBundle extends CSRBundle {
+  |   val mode = XtvecMode(1, 0, wNoFilter).withReset(0.U)
+  |   val addr = WARL(63, 2, wNoFilter).withReset(0.U)
+  | }
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/CSRDefines.scala:158-163  XtvecMode object
+  XtvecMode legalValues only include Direct (0b00) and Vectored (0b01). Value 0b10 (which would encode EHV=1 in Smehv/Ssccfg semantics) is NOT a legal value. Writing 0b10 to mode would fail the WARL isLegal check and be silently dropped (old value preserved). While this is correct WARL behavior, it means software expecting Smehv semantics gets no explicit error — the write to set EHV silently fails and traps continue to use the old mode. Combined with the 'sstvecd' ISA string, this creates a false-claim hazard.
+  | object XtvecMode extends CSREnum with WARLApply {
+  |   val Direct = Value(0.U)
+  |   val Vectored = Value(1.U)
+  |   override protected def legalValues: Seq[EnumType] = Seq(Direct, Vectored)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/TrapHandleModule.scala:92-101  TrapHandleModule (pcFromXtvec logic)
+  The trap entry PC computation correctly implements standard RISC-V vectored mode: target = xtvec.addr + (mode==Vectored && hasIR ? interruptNO[5:0] : 0), with a ×4 byte stride via Cat(..., 0.U(2.W)). When hasIR is false (synchronous exception), offset is 0 — exceptions land at xtvec.base. This is correct per RISC-V privileged spec §3.1.7. There is no exception hardware vectoring (×32 stride), but that feature (Smehv/Ssccfg) requires separate xivt CSR support which is absent.
+  | private val pcFromXtvec = Cat(xtvec.addr.asUInt +
+  |   Mux(xtvec.mode === XtvecMode.Vectored && hasIR, adjustinterruptNO(5, 0), 0.U),
+  |   0.U(2.W))
+
+[compliant] src/main/scala/xiangshan/backend/fu/CSR.scala:1440-1446  CSR module (legacy pcFromXtvec)
+  Legacy CSR PC computation matches the new CSR: xtvecBase + (mode[0] && hasIntr ? causeNO[3:0] : 0), with ×4 stride. Comment explicitly states 'synchronous exceptions ... pc to be set to the address in the BASE field'. Correct standard RISC-V behavior.
+  | private val pcFromXtvec = Cat(xtvecBase +
+  |   Mux(xtvec(0) && hasIntr, causeNO(3, 0), 0.U),
+  |   0.U(2.W))
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/CSR.scala:887-887  MaskedRegMap (vstvec mapping)
+  vstvec is registered in MaskedRegMap with NO write mask: `MaskedRegMap(Vstvec, vstvec)`. Contrast with mtvec (mask: ~0x2, line 827) and stvec (mask: ~0x2, line 788) which both mask out bit 1. This means bit 1 of vstvec is fully writable at VS privilege level. While currently harmless (no EHV logic reads bit 1), it is an inconsistency that could become a problem if EHV support is later added: software running in VS-mode could set EHV without hypervisor awareness.
+  | MaskedRegMap(Vstvec, vstvec),
+
+[potential_risk] src/main/scala/xiangshan/Parameters.scala:299-299  ISA string definition
+  The ISA extension string includes 'sstvecd' (hardware exception vectoring) but ZERO hardware implementation exists for this extension: no xivt/mivt/sivt CSR registers, no EHV field, no exception-cause×32 PC computation. Software that checks the ISA string (e.g., via misa or device tree) would believe exception hardware vectoring is available and may attempt to use it, getting silently wrong trap targets. This is a false-advertisement risk.
+  | "sspm", "ssstateen", "ssstrict", "sstc", "sstvala", "sstvecd", "ssu64xl", "supm", "sv39",
+

@@ -1,0 +1,49 @@
+PR #187  target=qemu  overall=compliant
+Spec: All 10 saturating shift instructions require intermediate computation at double element width to detect overflow before saturation; TCG emitting narrow shift-with-truncation makes saturation dead code and silently corrupts guest data
+Violation: TCG translates saturating shift (PSSLAI.H/W, SSLAI, PSSHA.DHS/DWS, PSSHAR.DHS/DWS, PSSLAI.DH/DW) using an intermediate type no wider than the element width (e.g., int16_t for halfword elements). The saturation check 'if result < -2^15' becomes dead code because the C shift result has already implicitly wrapped modulo 2^16, making overflow detection impossible. The computed result silently wraps instead of saturating, and vxsat is never set.
+Consequence: data_corruption
+Pattern: tcg_gen_shl_i{32,64}.*saturat|gen_helper.*ssla|gen_helper.*pssla|tcg_gen_sari.*round|int16_t.*<<|int32_t.*<<.*vxsat|gen_shift.*saturat|tcg_gen_shl.*(no.*extend|zero_ext)
+------------------------------------------------------------
+[compliant] hw/riscv/riscv-iommu.c:753-757  riscv_iommu_validate_device_ctx
+  New validation check: when IOHGATP mode is BARE (no G-stage translation), MSI translation must be OFF. This enforces the RISC-V IOMMU spec requirement that MSI translation requires an active G-stage page table. Without this check, a misconfigured device context could route MSIs to arbitrary physical addresses through a flat MSI table while G-stage is disabled, creating a guest-controlled MSI injection vector. The check correctly rejects such invalid configurations.
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |         get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |         RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |         return false;
+  |     }
+
+[compliant] target/riscv/vector_helper.c:2942-2973  vssra8/vssra16/vssra32/vssra64
+  V-extension saturating arithmetic right shift (vssra) operates on element-width types with correct C signed-right-shift semantics. No truncation-to-narrower-type issue: the 'a >> shift' expression is computed in int8_t/int16_t/int32_t/int64_t respectively, which matches the element width. C integer promotion to 'int' for int8_t/int16_t means the shift is computed in at least 32-bit precision, so no implicit truncation to element width occurs before the saturation check. This is NOT P-ext — it's V-extension (vector) and uses the correct intermediate widths.
+  | static inline int16_t
+  | vssra16(CPURISCVState *env, int vxrm, int16_t a, int16_t b)
+  | {
+  |     uint8_t round, shift = b & 0xf;
+  |     round = get_round(vxrm, a, shift);
+  |     return (a >> shift) + round;
+
+[compliant] target/riscv/csr.c:977-980  read_vxsat
+  VXSAT CSR read masks to BIT(0) (read-as-zero for bits [XLEN-1:1]), compliant with the spec requirement that vxsat is a single-bit field with reserved bits reading as zero.
+  | static RISCVException read_vxsat(CPURISCVState *env, int csrno,
+  |                                  target_ulong *val)
+  | {
+  |     *val = env->vxsat & BIT(0);
+
+[compliant] target/riscv/csr.c:984-990  write_vxsat
+  VXSAT CSR write masks to BIT(0) (write-ignored for reserved bits), correctly implementing WARL behavior per spec.
+  | static RISCVException write_vxsat(CPURISCVState *env, int csrno,
+  |                                   target_ulong val)
+  | {
+  |     ...
+  |     env->vxsat = val & BIT(0);
+
+[compliant] target/riscv/csr.c:1014-1029  read_vcsr/write_vcsr
+  VCSR CSR read correctly assembles VXRM[1:0] and VXSAT[0] with proper shift/mask, and write correctly extracts them with VCSR_VXRM and VCSR_VXSAT masks. Reserved bits are write-ignored.
+  | *val = (env->vxrm << VCSR_VXRM_SHIFT) | (env->vxsat << VCSR_VXSAT_SHIFT);
+  |     ...
+  |     env->vxrm = (val & VCSR_VXRM) >> VCSR_VXRM_SHIFT;
+  |     env->vxsat = (val & VCSR_VXSAT) >> VCSR_VXSAT_SHIFT;
+
+[compliant] target/riscv/machine.c:146-146  vmstate_riscv_cpu
+  VXSAT state is included in the VMState migration structure via VMSTATE_UINTTL. No missing fields — live-migration preserves vxsat correctly.
+  | VMSTATE_UINTTL(env.vxsat, RISCVCPU),
+

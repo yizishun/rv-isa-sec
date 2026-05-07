@@ -1,0 +1,130 @@
+{
+  "pr_number": 729,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 729,
+    "violation_condition": "The kernel's IRQ entry path (do_irq / handle_arch_irq) or KVM's interrupt dispatch reads mip/sip/hvip to determine which external interrupt fired, but in Smivt IVT mode the hardware auto-clears the corresponding interrupt-pending bit on vector-trap entry before the handler executes, so software observes a stale (cleared) pending bit and either misses the interrupt source or incorrectly dispatches.",
+    "security_consequence": "race_condition",
+    "vulnerability_pattern": "csrr.*mip|csrr.*sip|csrr.*hvip in IRQ entry/dispatch paths that assume interrupt-pending bits remain set across IVT-mode hardware vectoring",
+    "affected_entities": [
+      "mtvt",
+      "stvt",
+      "mip",
+      "sip",
+      "hvip",
+      "ACLIC IVT-mode trap entry"
+    ],
+    "summary": "Smivt IVT mode now auto-clears interrupt-pending bits on trap entry; kernel/KVM irqs_pending tracking and mip-read-based IRQ dispatch can observe cleared bits and lose or misroute interrupts"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-intc.c",
+        "function_name": "riscv_intc_irq",
+        "line_start": 29,
+        "line_end": 35,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Non-AIA IRQ dispatch reads the interrupt cause from regs->cause (originally derived from CSR_CAUSE in entry.S:187), not from sip/mip. CSR_CAUSE identifies the interrupt type that triggered the trap and is not auto-cleared by the hypothesised Smivt vector-trap entry. No sip/mip CSR read exists in the dispatch path.",
+      "snippet": "static void riscv_intc_irq(struct pt_regs *regs)\n{\n\tunsigned long cause = regs->cause & ~CAUSE_IRQ_FLAG;\n\n\tif (generic_handle_domain_irq(intc_domain, cause))"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-intc.c",
+        "function_name": "riscv_intc_aia_irq",
+        "line_start": 37,
+        "line_end": 43,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "AIA IRQ dispatch reads CSR_TOPI in a loop to obtain the top pending interrupt IID. CSR_TOPI is an AIA-specific CSR, not part of the sip/mip/hvip pending-bit set that Smivt would auto-clear. Safe irrespective of IVT-mode vectoring.",
+      "snippet": "static void riscv_intc_aia_irq(struct pt_regs *regs)\n{\n\twhile ((topi = csr_read(CSR_TOPI)))\n\t\tgeneric_handle_domain_irq(intc_domain, topi >> TOPI_IID_SHIFT);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 185,
+        "line_end": 193,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The assembly trap entry reads CSR_CAUSE (line 187) and stashes it into pt_regs->cause. CSR_CAUSE encodes why the trap was taken (e.g. IRQ_S_EXT for external interrupt) and is NOT one of the pending-bit CSRs (sip/mip/hvip) that Smivt would auto-clear on vector trap entry.",
+      "snippet": "csrr s2, CSR_EPC\ncsrr s3, CSR_TVAL\ncsrr s4, CSR_CAUSE          /* ← reads cause, not sip/mip */\ncsrr s5, CSR_SCRATCH\n...\nREG_S s4, PT_CAUSE(sp)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "handle_riscv_irq",
+        "line_start": 438,
+        "line_end": 447,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The IRQ handler wrapper calls handle_arch_irq(regs) — the function pointer set by the INTC driver. No direct sip/mip/hvip CSR read occurs here. The callee resolves interrupt identity from regs->cause (non-AIA) or CSR_TOPI (AIA), both independent of auto-clearing pending bits.",
+      "snippet": "static void noinstr handle_riscv_irq(struct pt_regs *regs)\n{\n\tirq_enter_rcu();\n\told_regs = set_irq_regs(regs);\n\thandle_arch_irq(regs);\n\tset_irq_regs(old_regs);\n\tirq_exit_rcu();\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi-ipi.c",
+        "function_name": "sbi_ipi_handle",
+        "line_start": 21,
+        "line_end": 31,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "This chained IPI handler writes csr_clear(CSR_IP, IE_SIE) to acknowledge the software interrupt, but does NOT read sip/mip to determine which interrupt fired. The dispatch decision was already made upstream by the INTC based on regs->cause. If Smivt auto-cleared SIP.SSIE on vector entry, this csr_clear would become a harmless no-op (writing 0 to an already-zero bit). No mis-dispatch can result.",
+      "snippet": "static void sbi_ipi_handle(struct irq_desc *desc)\n{\n\tchained_irq_enter(chip, desc);\n\tcsr_clear(CSR_IP, IE_SIE);   /* ack write, not a read-for-dispatch */\n\tipi_mux_process();\n\tchained_irq_exit(chip, desc);\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_sync_interrupts",
+        "line_start": 364,
+        "line_end": 399,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reads CSR_VSIE (line 371) and CSR_HVIP (line 374) strictly for post-guest-exit state synchronization — detecting guest-initiated changes to VSSIP and LCOFIP by comparing hardware values against the in-memory shadow (csr->hvip). These reads are not used to decide which interrupt to dispatch. The guest-exit cause comes from CSR_SCAUSE (line 856 in kvm_riscv_vcpu_enter_exit), which is unaffected by Smivt.",
+      "snippet": "csr->vsie = ncsr_read(CSR_VSIE);\n...\nhvip = ncsr_read(CSR_HVIP);\nif ((csr->hvip ^ hvip) & (1UL << IRQ_VS_SOFT)) { /* detect guest changes */"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_enter_exit",
+        "line_start": 854,
+        "line_end": 857,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "After guest exit, reads CSR_SCAUSE (line 856) to capture the guest trap cause, plus CSR_HTVAL/CSR_HTINST for hypervisor trap info. CSR_SCAUSE encodes the reason the guest exited (e.g., VS-level external interrupt) — it is a cause register, not a pending-bit register subject to Smivt auto-clearing.",
+      "snippet": "trap->sepc = gcntx->sepc;\ntrap->scause = csr_read(CSR_SCAUSE);  /* cause, not sip/hvip */\ntrap->stval = csr_read(CSR_STVAL);"
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-sifive-plic.c",
+        "function_name": "plic_handle_irq",
+        "line_start": 382,
+        "line_end": 403,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PLIC interrupt handler reads the PLIC claim/complete MMIO register in a loop — no sip/mip/hvip CSR read. The PLIC is a memory-mapped peripheral; its claim register directly provides the hwirq. Smivt vector-trap auto-clearing of sip bits is irrelevant here.",
+      "snippet": "chained_irq_enter(chip, desc);\nwhile ((hwirq = readl(claim))) {\n\terr = generic_handle_domain_irq(handler->priv->irqdomain, hwirq);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "N/A (CSR definitions)",
+        "line_start": 207,
+        "line_end": 213,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR_HVICTL definition includes IPRIO/IPRIOM fields (GENMASK(7,0) and BIT(8)) used by KVM for interrupt-prio threshold control, but no CSR_SIPTHRESHOLD/CSR_SIPSTATUS SMAIA-style CSRs exist for Smivt. The kernel has no smivt ISA extension detected, isa_bitmap entry, or Smivt feature enable/disable path. The IVT-mode pending-bit auto-clear behavior is entirely absent from this kernel version (Linux 7.0-rc5).",
+      "snippet": "#define HVICTL_IPRIOM\t\tBIT(8)\n#define HVICTL_IPRIO\t\tGENMASK(7, 0)\n/* No Smivt CSR_SIPSTATUS, CSR_SITHRESHOLD, or Smivt enable bits exist */"
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,109 @@
+diff --git a/backends/instructions_appendix/all_instructions.golden.adoc b/backends/instructions_appendix/all_instructions.golden.adoc
+index c2594e45eb..fa262c9076 100644
+--- a/backends/instructions_appendix/all_instructions.golden.adoc
++++ b/backends/instructions_appendix/all_instructions.golden.adoc
+@@ -15040,7 +15040,7 @@ xref:insts:cbo_zero.adoc#udb:doc:inst:cbo_zero[cbo.zero] is ordered by `FENCE` i
+ Both PMP and PMA access control must be the same for all bytes in the block; otherwise, xref:insts:cbo_zero.adoc#udb:doc:inst:cbo_zero[cbo.zero] has UNSPECIFIED behavior.
+ <%- end -%>
+ 
+-Clean operations are treated as stores for page and access permissions. If permission checks fail,
++Zero operations are treated as stores for page and access permissions. If permission checks fail,
+ one of the following exceptions will occur:
+ 
+   <%- if ext?(:H) -%>
+diff --git a/spec/std/isa/inst/Zicbom/cbo.clean.yaml b/spec/std/isa/inst/Zicbom/cbo.clean.yaml
+index a7c2c36fc3..892d6a06c7 100644
+--- a/spec/std/isa/inst/Zicbom/cbo.clean.yaml
++++ b/spec/std/isa/inst/Zicbom/cbo.clean.yaml
+@@ -54,7 +54,7 @@ access:
+   vs: sometimes
+   vu: sometimes
+ access_detail: |
+-  Access is controlled through `menvcfg.CBZE`, `senvcfg.CBZE`, and `henvcfg.CBZE`.
++  Access is controlled through `menvcfg.CBCFE`, `senvcfg.CBCFE`, and `henvcfg.CBCFE`.
+   When access is denied, the instruction either raises an `Illegal Instruction`
+   or `Virtual Instruction` exception according to the table below.
+ 
+diff --git a/spec/std/isa/inst/Zicbom/cbo.flush.yaml b/spec/std/isa/inst/Zicbom/cbo.flush.yaml
+index 7d09f84aef..6c07446481 100644
+--- a/spec/std/isa/inst/Zicbom/cbo.flush.yaml
++++ b/spec/std/isa/inst/Zicbom/cbo.flush.yaml
+@@ -47,7 +47,7 @@ access:
+   vs: sometimes
+   vu: sometimes
+ access_detail: |
+-  Access is controlled through `menvcfg.CBZE`, `senvcfg.CBZE`, and `henvcfg.CBZE`.
++  Access is controlled through `menvcfg.CBCFE`, `senvcfg.CBCFE`, and `henvcfg.CBCFE`.
+   When access is denied, the instruction either raises an `Illegal Instruction`
+   or `Virtual Instruction` exception according to the table below.
+ 
+diff --git a/spec/std/isa/inst/Zicboz/cbo.zero.yaml b/spec/std/isa/inst/Zicboz/cbo.zero.yaml
+index f0cf130ca9..08b41b6ed8 100644
+--- a/spec/std/isa/inst/Zicboz/cbo.zero.yaml
++++ b/spec/std/isa/inst/Zicboz/cbo.zero.yaml
+@@ -18,7 +18,7 @@ description: |
+   Both PMP and PMA access control must be the same for all bytes in the block; otherwise, `cbo.zero` has UNSPECIFIED behavior.
+   <%- end -%>
+ 
+-  Clean operations are treated as stores for page and access permissions. If permission checks fail,
++  Zero operations are treated as stores for page and access permissions. If permission checks fail,
+   one of the following exceptions will occur:
+ 
+     <%- if ext?(:H) -%>
+@@ -66,20 +66,42 @@ access_detail: |
+   ! 1 ! 1 ! 1 ! executes ! executes ! executes ! executes
+   !===
+ operation(): |
+-  if ((mode() == PrivilegeMode::M && CSR[menvcfg].CBZE == 0) ||
+-      (mode() == PrivilegeMode::U && CSR[senvcfg].CBZE == 0)) {
+-    raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++  # Access checks for cbo.zero per envcfg CBZE bits.
++  # M-mode always has access.
++
++  if (CSR[misa].S == 1) {
++    if (CSR[menvcfg].CBZE == 0) {
++      # menvcfg.CBZE=0: all non-M modes trap
++      if (mode() == PrivilegeMode::S || mode() == PrivilegeMode::U) {
++        raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++      }
++      if (CSR[misa].H == 1) {
++        if (mode() == PrivilegeMode::VS || mode() == PrivilegeMode::VU) {
++          raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++        }
++      }
++    } else {
++      # menvcfg.CBZE=1: check lower-level envcfg bits
++      if (mode() == PrivilegeMode::U && CSR[senvcfg].CBZE == 0) {
++        raise(ExceptionCode::IllegalInstruction, mode(), $encoding);
++      }
++      if (CSR[misa].H == 1) {
++        if (CSR[henvcfg].CBZE == 0) {
++          if (mode() == PrivilegeMode::VS || mode() == PrivilegeMode::VU) {
++            raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++          }
++        } else if (mode() == PrivilegeMode::VU && CSR[senvcfg].CBZE == 0) {
++          raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
++        }
++      }
++    }
+   }
+-  else if ((mode() == PrivilegeMode::VS && CSR[henvcfg].CBZE ==0) ||
+-           (mode() == PrivilegeMode::VU && (CSR[henvcfg].CBZE | CSR[senvcfg].CBZE) == 0)) {
+-    raise(ExceptionCode::VirtualInstruction, mode(), $encoding);
+-  } else {
+-    XReg mask = CACHE_BLOCK_SIZE - 1;
+-    XReg cache_block_vaddr = X[xs1] & ~mask;
+ 
+-    TranslationResult result;
+-    result = translate(cache_block_vaddr, MemoryOperation::Write, effective_ldst_mode(), $encoding);
+-    access_check(result.paddr, CACHE_BLOCK_SIZE*8, cache_block_vaddr, MemoryOperation::Write, ExceptionCode::StoreAmoAccessFault, effective_ldst_mode());
++  XReg mask = CACHE_BLOCK_SIZE - 1;
++  XReg cache_block_vaddr = X[xs1] & ~mask;
+ 
+-    cache_block_zero(result.paddr);
+-  }
++  TranslationResult result;
++  result = translate(cache_block_vaddr, MemoryOperation::Write, effective_ldst_mode(), $encoding);
++  access_check(result.paddr, CACHE_BLOCK_SIZE*8, cache_block_vaddr, MemoryOperation::Write, ExceptionCode::StoreAmoAccessFault, effective_ldst_mode());
++
++  cache_block_zero(result.paddr);

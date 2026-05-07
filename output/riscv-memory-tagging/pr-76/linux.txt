@@ -1,0 +1,68 @@
+PR #76  target=linux  overall=bug_confirmed
+Spec: Async MTE tag mismatch can leak prior task's faulting virtual address into current task's software check handler; kernel must handle xtval=4 with stval2, resolve/insulate pending async MTE checks across context-switch boundaries, and save/restore stval2/mtval3 in __switch_to
+Violation: In the Linux kernel, when senvcfg.MT_ASYNC enables asynchronous tag mismatch reporting, a tag-mismatching store from task A can be deferred and delivered as a software check exception (cause=18, xtval=4) on the next trap entry (interrupt or exception) occurring in task B on the same hart. The current do_trap_software_check() only handles CFI violations (xtval=2,3) and treats xtval=4 as an unknown exception, so the kernel misattributes task A's faulting virtual address (from stval2/mtval3) to task B's context. Additionally, stval2/mtval3 are not saved/restored across context switches, so a pending async tag mismatch address persists in the CSR across task boundaries.
+Consequence: info_leak
+Pattern: CSR_STVAL|do_trap_software_check|CFI_TVAL_FCFI_CODE|CFI_TVAL_BCFI_CODE|handle_user_cfi_violation|CSR_ENVCFG|CSR_SENVCFG|__switch_to
+------------------------------------------------------------
+[bug_confirmed] arch/riscv/kernel/traps.c:409-423  do_trap_software_check
+  do_trap_software_check() only handles CFI violations (xtval=2 for FCFI, xtval=3 for BCFI) via handle_user_cfi_violation(). If senvcfg.MTE async were enabled and a deferred tag mismatch (xtval=4) arrived on the next trap entry of a different task, handle_user_cfi_violation() returns false, and the handler falls through to do_trap_unknown() which sends SIGILL/ILL_ILLTRP. This (a) delivers the wrong signal to the wrong task, and (b) misattributes the faulting address from CSR_STVAL (which holds task A's store address) to task B's context. The kernel currently has no code path for xtval=4.
+  | if (!handle_user_cfi_violation(regs))
+  |     do_trap_unknown(regs);  // xtval=4 reaches here → wrong task gets SIGILL
+
+[bug_confirmed] arch/riscv/kernel/traps.c:374-398  handle_user_cfi_violation
+  handle_user_cfi_violation() reads CSR_TVAL and only recognizes tval==2 (CFI_TVAL_FCFI_CODE) and tval==3 (CFI_TVAL_BCFI_CODE). Any other tval value, including 4 (async tag mismatch), causes the function to return false. There is no awareness of MTE-related tval encodings. The tval read via csr_read(CSR_TVAL) comes from the hart's STVAL/MTVAL CSR which, under MTE async, would hold the deferred tag-mismatch address from a previous task.
+  | unsigned long tval = csr_read(CSR_TVAL);
+  | bool is_fcfi = (tval == CFI_TVAL_FCFI_CODE && ...);
+  | bool is_bcfi = (tval == CFI_TVAL_BCFI_CODE && ...);
+  | // tval==4: neither is_fcfi nor is_bcfi → returns false
+
+[bug_confirmed] arch/riscv/kernel/entry.S:421-471  __switch_to
+  __switch_to() saves/restores only callee-saved GPRs (ra, sp, s0-s11) and the SUM bit from sstatus. CSR_STVAL (which holds the faulting virtual address for exceptions, and would hold the deferred tag-mismatch address under MTE async) is NOT saved or restored across context switches. This means a pending async tag mismatch address from a store in task A persists in the STVAL CSR across the context switch boundary into task B, enabling the info leak.
+  | REG_S ra,  TASK_THREAD_RA_RA(a3)    // saved
+  | REG_S sp,  TASK_THREAD_SP_RA(a3)    // saved
+  | REG_S s0-s11, ...                   // saved
+  | // NO csrr/REG_S for CSR_STVAL anywhere in this function
+
+[potential_risk] arch/riscv/kernel/entry.S:182-194  handle_exception
+  handle_exception() reads CSR_TVAL (which is CSR_STVAL in S-mode) on every exception entry and saves it into pt_regs->badaddr. If an async tag mismatch (cause=18, xtval=4) is deferred and delivered on the next trap entry after a context switch, this reads the stale STVAL value from the previous task's deferred tag-mismatch store and saves it into the current task's pt_regs. This is the mechanism by which task A's faulting address leaks into task B's signal frame / coredump.
+  | csrr s2, CSR_EPC
+  | csrr s3, CSR_TVAL       // reads stale STVAL from previous task
+  | csrr s4, CSR_CAUSE
+  | REG_S s3, PT_BADADDR(sp) // saved to current task's pt_regs
+
+[potential_risk] arch/riscv/include/asm/switch_to.h:84-89  __switch_to_envcfg
+  __switch_to_envcfg() writes next->thread.envcfg to CSR_ENVCFG (CSR_SENVCFG in S-mode) during context switch. While this correctly switches per-task envcfg bits (LPE, SSE, PMM, etc.), there is currently no MTE (Memory Tagging Extension) bit defined in the RISC-V ENVCFG bit definitions. If MTE support were added, the senvcfg.MTE bit would need to be managed here. Without it, a task enabling MTE async could leave the bit set across a switch to a task that did not opt in, causing that task's stores to also be subject to async tag mismatch deferral.
+  | asm volatile (ALTERNATIVE("nop", "csrw " __stringify(CSR_ENVCFG) ", %0",
+  |               0, RISCV_ISA_EXT_XLINUXENVCFG, 1)
+  |         :: "r" (next->thread.envcfg) : "memory");
+  | // No MTE bit awareness in envcfg bit definitions
+
+[compliant] arch/riscv/kernel/entry.S:498-501  excp_vect_table
+  The exception vector table correctly routes cause=18 to do_trap_software_check. Causes 16 and 17 are correctly routed to do_trap_unknown (they are reserved in the current privileged spec). The dispatch mechanism itself is correct.
+  | RISCV_PTR do_trap_unknown /* cause=16 */
+  | RISCV_PTR do_trap_unknown /* cause=17 */
+  | RISCV_PTR do_trap_software_check /* cause=18 is sw check exception */
+
+[compliant] arch/riscv/kernel/process.c:182-205  flush_thread
+  flush_thread() correctly resets FPU state, vector state, and pointer masking (SUPM PMM). If MTE were added, flush_thread() would also be the right place to reset any per-task MTE state on exec(), but this is a future concern and not a bug in the current code.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SUPM))
+  |     envcfg_update_bits(current, ENVCFG_PMM, ENVCFG_PMM_PMLEN_0);
+  | // No MTE reset (future concern)
+
+[compliant] arch/riscv/include/asm/csr.h:516-521  null
+  CSR_TVAL correctly maps to CSR_STVAL (0x143) in S-mode and CSR_MTVAL (0x343) in M-mode. The CSR naming convention and mapping are correct and follow the RISC-V privileged spec.
+  | # define CSR_TVAL    CSR_STVAL    // S-mode: 0x143
+  | // or
+  | # define CSR_TVAL    CSR_MTVAL    // M-mode: 0x343
+
+[potential_risk] arch/riscv/kvm/vcpu.c:855-857  kvm_riscv_vcpu_enter_exit
+  KVM's vcpu_enter_exit() reads CSR_STVAL on guest exit and saves it to trap->stval. If a guest were to use MTE async mode, a deferred tag mismatch originating in the guest could be delivered on the next VM exit into the host, with the stale STVAL value read here. However, KVM does manage VS-level trap CSRs (VSTVAL) in vcpu_load/vcpu_put. The risk is lower than the bare-metal case because KVM explicitly saves/restores SENVCFG in the swap-in/swap-out functions (lines 756, 770).
+  | trap->sepc = gcntx->sepc;
+  | trap->scause = csr_read(CSR_SCAUSE);
+  | trap->stval = csr_read(CSR_STVAL);  // could read stale MTE async address
+
+[compliant] arch/riscv/kernel/suspend.c:17-18  null
+  CPU suspend correctly saves and restores CSR_ENVCFG. This ensures MTE-related bits in envcfg (if added) would be preserved across suspend/resume cycles.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_XLINUXENVCFG))
+  |     context->envcfg = csr_read(CSR_ENVCFG);
+

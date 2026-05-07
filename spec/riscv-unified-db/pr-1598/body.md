@@ -1,0 +1,1 @@
+Moved the test code for UnknownLiteral which was executing at load time in tools/ruby-gems/idlc/lib/idlc/ast.rb to a proper unit test file tools/ruby-gems/idlc/test/test_unknown_literal.rb. This ensures that the test is run with the rest of the suite and doesn't clutter the production code.

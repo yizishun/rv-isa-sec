@@ -1,0 +1,55 @@
+PR #2091  target=linux  overall=potential_risk
+Spec: KVM must recognize Zalasr encodings (funct5=00110 load-acquire with aq=1 mandatory, funct5=00111 store-release with rl=1 mandatory) in the AMO opcode space and emulate them with full RCsc acquire-release ordering, otherwise guest synchronisation primitives silently lose ordering guarantees
+Violation: KVM handles a Zalasr instruction trap from a guest VM on a host that lacks native Zalasr support, but the hypervisor either injects an illegal-instruction exception into the guest (because it doesn't recognize the encoding in the AMO opcode space) or emulates the instruction without enforcing acquire-release RCsc ordering semantics as mandated by the spec.
+Consequence: race_condition
+Pattern: arch/riscv/kvm/**/*.c code paths that decode AMO major opcode (0x2F) traps without recognizing funct5=00110 (load-acquire) or funct5=00111 (store-release), OR emulate AMO instructions without implementing the aq/rl ordering annotations
+------------------------------------------------------------
+[potential_risk] arch/riscv/kvm/vcpu_insn.c:353-358  kvm_riscv_vcpu_virtual_insn
+  KVM virtual instruction decoder only handles INSN_OPCODE_SYSTEM (0x73). The AMO major opcode (0x2F, which includes Zalasr load-acquire/store-release encodings at funct7=26/27/29/31) falls into the default case and unconditionally injects EXC_INST_ILLEGAL into the guest via truly_illegal_insn(). If KVM reports Zalasr as available via ONE_REG (which it will, since ZALASR is in the KVM ISA extension array at vcpu_onereg.c:54) but the host somehow traps an AMO-space instruction, the guest receives an illegal-instruction trap rather than instruction emulation with correct acquire-release RCsc ordering.
+  | switch ((insn & INSN_OPCODE_MASK) >> INSN_OPCODE_SHIFT) {
+  | case INSN_OPCODE_SYSTEM:
+  | 	return system_opcode_insn(vcpu, run, insn);
+  | default:
+  | 	return truly_illegal_insn(vcpu, run, insn);
+  | }
+
+[potential_risk] arch/riscv/kvm/vcpu_insn.c:30-44  truly_illegal_insn
+  truly_illegal_insn() injects EXC_INST_ILLEGAL (scause=2) into the guest VCPU without attempting to decode AMO-space opcodes. If a Zalasr load-acquire (e.g. lw.aq, funct7=26) or store-release (e.g. sw.rl, funct7=29) instruction triggers a trap that reaches KVM, the guest receives an illegal-instruction exception rather than a properly emulated acquire-release operation. There is no funct5/funct3 decode step that could distinguish Zalasr instructions from genuinely illegal encodings in the AMO opcode space.
+  | static int truly_illegal_insn(struct kvm_vcpu *vcpu, struct kvm_run *run,
+  | 			      ulong insn)
+  | {
+  | 	struct kvm_cpu_trap utrap = { 0 };
+  | 	utrap.sepc = vcpu->arch.guest_context.sepc;
+  | 	utrap.scause = EXC_INST_ILLEGAL;
+  | 	utrap.stval = insn;
+  | 	kvm_riscv_vcpu_trap_redirect(vcpu, &utrap);
+  | 	return 1;
+  | }
+
+[compliant] arch/riscv/kvm/vcpu_onereg.c:195-196  kvm_riscv_vcpu_isa_ext_disable
+  KVM_RISCV_ISA_EXT_ZALASR cannot be individually disabled by userspace (returns false from kvm_riscv_vcpu_isa_ext_disable). This is consistent with other mandatory AMO-related extensions (ZAAMO, ZALRSC, ZACAS, ZABHA). The extension is only reported if the host CPU natively supports it via the KVM_ISA_EXT_ARR mapping, so a guest shouldn't see Zalasr advertised on a non-supporting host.
+  | case KVM_RISCV_ISA_EXT_ZALASR:
+  | 	return false;
+
+[compliant] arch/riscv/kvm/vcpu_exit.c:200-204  kvm_riscv_vcpu_exit
+  EXC_INST_ILLEGAL trap handler correctly redirects the trap to the guest via vcpu_redirect() without attempting blind emulation. On a typical H-extension system where hedeleg delegates EXC_INST_ILLEGAL to VS-mode, this path is never reached for Zalasr instructions — the hardware delivers the trap directly to the guest. The KVM interception path (non-delegated) preserves the original scause/stval and redirects cleanly.
+  | case EXC_INST_ILLEGAL:
+  | 	kvm_riscv_vcpu_pmu_incr_fw(vcpu, SBI_PMU_FW_ILLEGAL_INSN);
+  | 	vcpu->stat.instr_illegal_exits++;
+  | 	ret = vcpu_redirect(vcpu, trap);
+  | 	break;
+
+[potential_risk] arch/riscv/include/asm/insn-def.h:212-258  
+  insn-def.h defines host-side Zalasr instruction macros (LB_AQ, LH_AQ, LW_AQ, LD_AQ, SB_RL, SH_RL, SW_RL, SD_RL and their _AQRL variants) using INSN_R(OPCODE_AMO, ...) with the correct funct3/funct7 encodings. However, there are no corresponding INSN_MATCH/INSN_MASK definitions in insn.h for any of these encodings. The KVM decoder in vcpu_insn.c cannot match or decode Zalasr instructions because the pattern-match infrastructure doesn't exist. If Zalasr emulation is planned, both the match patterns and the emulation handlers must be added to the KVM decoder.
+  | #define LW_AQ(dest, addr)
+  | 	INSN_R(OPCODE_AMO, FUNC3(2), FUNC7(26),
+  | 	       RD(dest), RS1(addr), __RS2(0))
+  | ...
+  | #define SW_RL(src, addr)
+  | 	INSN_R(OPCODE_AMO, FUNC3(2), FUNC7(29),
+  | 	       __RD(0), RS1(addr), RS2(src))
+
+[compliant] arch/riscv/kvm/vcpu_insn.c:373-470  kvm_riscv_vcpu_mmio_load
+  MMIO load emulation decodes only standard load patterns (LB/LH/LW/LD/LBU/LHU/LWU and C-extension variants). Zalasr load-acquire instructions (e.g. lw.aq) encode in the AMO opcode space, not the LOAD opcode space, and would trap as EXC_INST_ILLEGAL or EXC_VIRTUAL_INST_FAULT rather than EXC_LOAD_ACCESS/EXC_LOAD_GUEST_PAGE_FAULT. No path exists for Zalasr loads to reach this function, so the absence of Zalasr handling here is expected.
+  | (MMIO load pattern matching covers standard loads only - no AMO-space encodings)
+
