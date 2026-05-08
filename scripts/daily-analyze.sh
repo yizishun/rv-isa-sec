@@ -25,6 +25,22 @@ fi
 
 echo "New JSON files staged: $STAGED_COUNT"
 
+# ---- 步骤 1b: 同步 stage 对应的 spec/ 标记文件和 logs/ ----
+echo "=== Step 1b: Staging spec/ markers and logs for new outputs ==="
+
+echo "$STAGED" | while IFS= read -r f; do
+  # output/<spec>/pr-<N>/<target>.json -> spec/<spec>/pr-<N>/
+  spec_dir=$(echo "$f" | sed 's|^output/|spec/|' | xargs dirname)
+  if [ -d "$spec_dir" ]; then
+    git add "$spec_dir"/.spechunter_done "$spec_dir"/.spechunter_failed "$spec_dir"/.spechunter_running 2>/dev/null || true
+    if [ -d "$spec_dir/logs" ]; then
+      git add "$spec_dir/logs/"
+    fi
+  fi
+done
+
+echo "Spec markers and logs staged."
+
 # ---- 步骤 2: 生成新文件摘要 ----
 echo "=== Step 2: Building summary for Claude ==="
 
