@@ -1,0 +1,71 @@
+PR #2599  target=xiangshan  overall=compliant
+Spec: G-stage (guest-stage) page table walker must recognize and correctly decode Svnapot N bit in hypervisor-managed page tables: PPN must merge vpn[3:0] into ppn[3:0] when N=1, tag matching must truncate to pteNapotBits boundary, and all G-stage PTE entry containers (HptwResp, PtwMergeResp) must carry hasNapot=true, or else guest physical addresses will be silently miscomputed, causing cross-VM data corruption.
+Violation: In XiangShan RTL, if any G-stage-only PTW path (e.g., s2xlate === onlyStage2 or allStage G-stage walk) processes a G-stage PTE with the N bit set without treating it as an Svnapot 64KB page — specifically, failing to merge vpn[pteNapotBits-1:0] into the PPN lower bits — or if a PtwEntry/PtwSectorEntry instantiated for G-stage contexts omits hasNapot=true, or if the G-stage PTE tag comparison does not use the truncated tag match (pteNapotBits-based) when n=1, the hardware produces an incorrect guest physical address, violating the spec requirement that Svnapot is supported in G-stage translation.
+Consequence: data_corruption
+Pattern: PtwEntry\(.*hasNapot\s*=\s*false\)|s2xlate.*onlyStage2.*getPPN|s2xlate.*allStage.*getPPN|gStagePf.*isLeaf|ptes\(index\)\.n.*=!=.*0\.U|genPPNS2.*n\s*===\s*0\.U|tag_match\(0\).*entry\.n\.getOrElse|allStage_n\s*:=.*s1\.entry\.n|hptw_resp\.entry\.n\.getOrElse
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:1165-1166  HptwResp
+  HptwResp (G-stage PTW response) instantiates PtwEntry with hasNapot=true, ensuring the N bit is preserved for G-stage Svnapot 64KB page translation.
+  | class HptwResp(implicit p: Parameters) extends PtwBundle {
+  |   val entry = new PtwEntry(tagLen = gvpnLen, hasPerm = true, hasLevel = true, hasNapot = true)
+
+[compliant] src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:1176-1176  HptwResp.apply
+  HptwResp.apply() computes N field as (pte.n==1 && ppn[3:0]==8 && level==0), ensuring only valid Svnapot 64KB encodings set the napot bit. Invalid encodings (wrong PPN or non-0 level) are correctly zeroed.
+  | this.entry.n.map(_ := resp_pte.n === true.B && resp_pte.ppn(3, 0) === 8.U && level === 0.U)
+
+[compliant] src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:1186-1193  HptwResp.genPPNS2
+  genPPNS2() at level 0 merges vpn[pteNapotBits-1:0] into PPN low bits when N!=0, producing the correct guest physical address for Svnapot 64KB pages in G-stage translation.
+  | 0.U -> Mux(entry.n.getOrElse(0.U) === 0.U,
+  |   entry.ppn(entry.ppn.getWidth - 1, 0),
+  |   Cat(entry.ppn(entry.ppn.getWidth - 1, pteNapotBits), vpn(pteNapotBits - 1, 0)))
+
+[compliant] src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:1195-1214  HptwResp.hit
+  G-stage TLB hit check uses truncated tag comparison (vpn[vpnnLen-1:pteNapotBits] vs tag[vpnnLen-1:pteNapotBits]) when n!=0, correctly matching any vpn within the 64KB Svnapot region.
+  | tag_match(0) := Mux(entry.n.getOrElse(0.U) === 0.U,
+  |   entry.tag(vpnnLen - 1, 0) === gvpn(vpnnLen - 1, 0),
+  |   entry.tag(vpnnLen - 1, pteNapotBits) === gvpn(vpnnLen - 1, pteNapotBits))
+
+[compliant] src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:1345-1366  PtwRespS2.getVpn / PtwRespS2.hit
+  allStage_n logic correctly composes napot across two-stage translation: napot is valid when (S1=napot && S2=superpage) || (S2=napot && S1=superpage) || (both napot). The smaller of the two translations determines 64KB page granularity, and getVpn() uses inner_n for vpn reconstruction at level 0.
+  | val allStage_n = (s1.entry.n.getOrElse(0.U) =/= 0.U && s2.entry.level.getOrElse(0.U) =/= 0.U) ||
+  |   (s2.entry.n.getOrElse(0.U) =/= 0.U && s1.entry.level.getOrElse(0.U) =/= 0.U) ||
+  |   (s1.entry.n.getOrElse(0.U) =/= 0.U && s2.entry.n.getOrElse(0.U) =/= 0.U)
+
+[compliant] src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala:796-796  PTW entry-level PPN generation
+  last_hptw_req_ppn correctly merges vpn low 4 bits into PPN when N bit is set, producing the correct G-stage physical address for Svnapot pages during allStage PTW walks.
+  | val last_hptw_req_ppn = Mux(last_hptw_req_pte.n === 0.U, last_hptw_req_pte.getPPN(), Cat(last_hptw_req_pte.getPPN()(ptePPNLen - 1, pteNapotBits), io.in.bits.req_info.vpn(pteNapotBits - 1, 0)))
+
+[compliant] src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala:949-949  PTW mem_resp PPN generation
+  Memory response PPN generation in PTW entry applies the same napot-aware merge (vpn low bits into PPN), ensuring consistency across both last_hptw_req and normal PTW memory response paths.
+  | entries(i).ppn := Mux(ptes(index).n === 0.U, ptes(index).getPPN(), Cat(ptes(index).getPPN()(ptePPNLen - 1, pteNapotBits), entries(i).req_info.vpn(pteNapotBits - 1, 0)))
+
+[compliant] src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:361-370  TlbSectorEntry.apply (allStage_n)
+  TlbSectorEntry (sector TLB storage) uses identical allStage_n logic to PtwRespS2 for self-tracking the napot bit when merging two-stage translation results into TLB entries.
+  | val allStage_n = (item.s1.entry.n.getOrElse(0.U) =/= 0.U && item.s2.entry.level.getOrElse(0.U) =/= 0.U) ||
+  |   (item.s2.entry.n.getOrElse(0.U) =/= 0.U && item.s1.entry.level.getOrElse(0.U) =/= 0.U) ||
+  |   (item.s1.entry.n.getOrElse(0.U) =/= 0.U && item.s2.entry.n.getOrElse(0.U) =/= 0.U)
+
+[compliant] src/main/scala/xiangshan/cache/mmu/L2TLB.scala:740-766  contiguous_pte_to_merge_ptwResp
+  PtwMergeEntry created with hasNapot=true for contiguous PTE merging; N field computed as (n==1 && ppn[3:0]==8); napot entries correctly suppress not_super flag, ensuring proper TLB entry classification for G-stage napot pages.
+  | val ptw_resp = Wire(new PtwMergeEntry(tagLen = sectorvpnLen, hasPerm = true, hasLevel = true, hasNapot = true))
+  | ptw_resp.n.map(_ := pte_in.n === true.B && pte_in.getPPN()(3, 0) === 8.U)
+  | val napot = ptw_merge_resp.entry(vpn(sectortlbwidth - 1, 0)).n.getOrElse(0.U)
+  | ptw_merge_resp.not_super := not_super.B && !napot
+
+[compliant] src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:787-807  PteBundle.isGpf
+  G-stage page fault detection (isGpf) correctly validates Svnapot: N!=0 with wrong ppn[3:0] encoding triggers gpf; non-leaf PTEs with N!=0 are caught by isNext() check; unaligned() catches napot at wrong levels for leaf PTEs.
+  | }.elsewhen (n =/= 0.U && ppn(3, 0) =/= 8.U) {
+  |   gpf := true.B
+  | }.elsewhen (unaligned(level)) {
+  |   gpf := true.B
+  | }
+
+[compliant] src/main/scala/xiangshan/cache/mmu/TLB.scala:583-586  TLB resp (PTW response bypass)
+  TLB response path for onlyStage2 correctly uses genPPNS2(gvpn) to produce the G-stage physical address, which includes napot-aware VPN-to-PPN merging for 64KB pages.
+  | val s2_gvpn = Mux(s2xlate === onlyStage2, vpn, s1_ppn)
+  | val s2_ppn = stage2.genPPNS2(s2_gvpn)(ppnLen - 1, 0)
+
+[compliant] src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala:1250-1250  G-stage-only PTW (onlyStage2 path)
+  G-stage-only PTW uses isGpf() for page fault detection, which includes the Svnapot encoding validation and will correctly fault on invalid N/PPN combinations.
+  | val pageFault = pte.isGpf(level, mpbmte) || (!pte.isLeaf() && level === 0.U)
+

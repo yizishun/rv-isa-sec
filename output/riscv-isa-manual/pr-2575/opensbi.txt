@@ -1,0 +1,28 @@
+PR #2575  target=opensbi  overall=potential_risk
+Spec: Unconditional mseccfgh access on RV64 triggers an illegal instruction trap in M-mode, crashing OpenSBI irrecoverably because M-mode has no higher privilege to handle the fault.
+Violation: OpenSBI CSR save/restore code (e.g., HSM suspend/resume or domain context switch) accesses CSR mseccfgh on an RV64 hart where the CSR is not defined, or uses an XLEN-agnostic CSR_READ/CSR_WRITE macro for mseccfgh without a __riscv_xlen == 32 guard.
+Consequence: denial_of_service
+Pattern: CSR_READ(CSR_MSECCFGH) or CSR_WRITE(CSR_MSECCFGH) without #if __riscv_xlen == 32 preprocessor guard, or a generic __ASM_STR(mseccfgh) string in inline asm that compiles unconditionally for both RV32 and RV64 targets.
+------------------------------------------------------------
+[potential_risk] include/sbi/riscv_encoding.h:729-729  (CSR definitions)
+  CSR_MSECCFGH (0x757) is defined unconditionally without an __riscv_xlen==32 preprocessor guard. While the definition is currently unused by any code path, its unprotected presence means any future code that references CSR_MSECCFGH via CSR_READ/CSR_WRITE on an RV64 hart will assemble to an illegal CSR access (0x757 is RV32-only). The definition should either be guarded with #if __riscv_xlen == 32 or removed entirely since no code currently uses it.
+  | #define CSR_MSECCFG		0x747
+  | #define CSR_MSECCFGH		0x757
+
+[potential_risk] lib/sbi/sbi_hsm.c:427-433  __sbi_hsm_suspend_non_ret_save
+  HSM non-retentive suspend save only preserves mie, mip (SSIP/STIP), medeleg, mideleg, and menvcfg. CSR_MSECCFG (0x747) is not saved, meaning SSEED/USEED/RLB/MML/MMWP bits configured during init are lost across suspend/resume. On RV32, CSR_MSECCFGH would also need saving if the register is implemented. No saved_mseccfg field exists in struct sbi_hsm_data.
+  | hdata->saved_mie = csr_read(CSR_MIE);
+  | hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+  | hdata->saved_medeleg = csr_read(CSR_MEDELEG);
+  | hdata->saved_mideleg = csr_read(CSR_MIDELEG);
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+
+[potential_risk] lib/sbi/sbi_hsm.c:435-446  __sbi_hsm_suspend_non_ret_restore
+  HSM non-retentive suspend restore writes back menvcfg, mideleg, medeleg, mie, and mip but never writes CSR_MSECCFG. The mseccfg register retains whatever value the warm-boot init sequence assigns (via mstatus_init -> csr_set/clear on SSEED/USEED, and sbi_hart_protection_configure -> csr_set on RLB/MML). Any runtime modifications to mseccfg made after init by S-mode are silently discarded on resume.
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	csr_write64(CSR_MENVCFG, hdata->saved_menvcfg);
+  | csr_write(CSR_MIDELEG, hdata->saved_mideleg);
+  | csr_write(CSR_MEDELEG, hdata->saved_medeleg);
+  | csr_write(CSR_MIE, hdata->saved_mie);
+

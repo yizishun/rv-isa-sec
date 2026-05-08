@@ -1,0 +1,58 @@
+{
+  "pr_number": 629,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 629,
+    "violation_condition": "In the FreeBSD kernel, when bhyve's VMM emulates an ACLIC (Smaclic/Ssaclic) for a guest VM, the APLIC sourcecfg MMIO handler in sys/riscv/vmm/vmm_aplic.c (aplic_handle_sourcecfg, lines 120-136) unconditionally stores guest-written values via 'irq->sourcecfg = *val' and returns the raw stored value on read, without: (a) masking writes to read-only IE (bit 31) and IP (bit 30) mirror fields, and (b) synthesizing actual interrupt-pending and interrupt-enable state into these fields on read. The host APLIC driver in sys/riscv/riscv/aplic.c writes IPRIO via the target register (APLIC_TARGET, line 530) rather than sourcecfg[23:16], and on ACLIC hardware the target register's iprio portion is not implemented — priority writes would be silently ignored, leaving all interrupts at hardware-default priority instead of the kernel-intended APLIC_INTR_DEF_PRIO.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "bhyve APLIC sourcecfg MMIO handler that does not differentiate between standard APLIC (bits 31:30 reserved) and ACLIC (bits 31:30 = RO IE/IP hardware mirror) — specifically, write handlers that store guest values without masking RO fields, and read handlers that return software-stored values instead of synthesized hardware interrupt state",
+    "affected_entities": [
+      "sourcecfg[K] (ACLIC MMIO)",
+      "setienum",
+      "clrienum",
+      "setipnum",
+      "clripnum",
+      "target[K] (APLIC MMIO)"
+    ],
+    "summary": "ACLIC repurposes APLIC sourcecfg reserved bits 31:30 as RO IE/IP hardware mirrors — bhyve's APLIC MMIO emulation stores guest writes verbatim and returns them on read without synthesizing actual interrupt state, creating an info_leak of stale/faked interrupt state and a semantic gap between emulated ACLIC and real hardware behavior"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_aplic.c",
+        "function_name": "aplic_handle_sourcecfg",
+        "line_start": 120,
+        "line_end": 136,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Write path unconditionally stores all 32 bits of guest-written sourcecfg without masking bits 31:30. On ACLIC hardware, bit 31 (IE) and bit 30 (IP) are read-only hardware mirror fields that reflect current interrupt-enable and interrupt-pending state — writes to these bits are ignored by real hardware. On standard APLIC, bits 31:30 are reserved and should read zero. A malicious or buggy guest can write arbitrary values to these RO/reserved fields, and the stored values persist and are returned on subsequent reads, violating both APLIC reserved-bit semantics and ACLIC RO-mirror semantics.",
+      "snippet": "static int\naplic_handle_sourcecfg(struct aplic *aplic, int i, bool write, uint64_t *val)\n{\n\tstruct aplic_irq *irq;\n\tif (i <= 0 || i > aplic->nirqs)\n\t\treturn (ENOENT);\n\tmtx_lock_spin(&aplic->mtx);\n\tirq = &aplic->irqs[i];\n\tif (write)\n\t\tirq->sourcecfg = *val;\n\telse\n\t\t*val = irq->sourcecfg;\n\tmtx_unlock_spin(&aplic->mtx);\n\treturn (0);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_aplic.c",
+        "function_name": "aplic_handle_sourcecfg",
+        "line_start": 131,
+        "line_end": 132,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Read path returns raw software-stored sourcecfg value without synthesizing IE (bit 31) and IP (bit 30) from the actual interrupt state tracked in irq->state. On ACLIC hardware, bit 31 reflects APLIC_IRQ_STATE_ENABLED and bit 30 reflects APLIC_IRQ_STATE_PENDING — these are real-time hardware mirrors, not stored register fields. The read handler should OR in (irq->state & APLIC_IRQ_STATE_ENABLED ? BIT(31) : 0) and (irq->state & APLIC_IRQ_STATE_PENDING ? BIT(30) : 0) for ACLIC domains. Returning raw stored values gives the guest stale/incorrect interrupt state, constituting an info_leak of wrong IE/IP status that could cause missed interrupts or spurious interrupt handling in the guest.",
+      "snippet": "\tif (write)\n\t\tirq->sourcecfg = *val;\n\telse\n\t\t*val = irq->sourcecfg;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/aplic.c",
+        "function_name": "aplic_bind_intr",
+        "line_start": 530,
+        "line_end": 531,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Host APLIC driver writes interrupt priority (APLIC_INTR_DEF_PRIO=1) via the APLIC_TARGET register, which on standard APLIC encodes iprio in bits[7:0] combined with hart_index in bits[31:18]. On ACLIC hardware, the iprio field is programmed via sourcecfg[23:16] instead, and writes to the TARGET register's iprio portion may be silently ignored — leaving all interrupts at hardware-default priority (typically 0/lower) rather than the kernel-intended value. Currently this is only a potential risk because the host driver probes for 'riscv,aplic' compatibility (line 303) and would not attach to ACLIC hardware, but any future ACLIC host driver inheriting from this code path would silently break interrupt prioritization.",
+      "snippet": "\taplic_write(sc, APLIC_TARGET(src->irq),\n\t    APLIC_MK_IRQ_TARGET(sc, cpu, APLIC_INTR_DEF_PRIO));"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

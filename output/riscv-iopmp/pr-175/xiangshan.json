@@ -1,0 +1,141 @@
+{
+  "pr_number": 175,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 175,
+    "violation_condition": "In XiangShan IOPMP RTL, the wired interrupt output signal (iopmp_intr) and MSI write trigger are generated in the same cycle when MSI is enabled (err_cfg.msi_en=1 and imp_msi=1). The spec mandates mutual exclusion: wired interrupt must be deasserted when MSI is triggered. If the RTL's interrupt generation logic uses independent combinational paths for wired interrupt and MSI without proper mutual-exclusion gating, both fire simultaneously — a double-interrupt. Additionally, if the MSI write-error sticky bit (err_info.msi_werr) is not properly sampled and held across cycles, the RTL could re-attempt failed MSI writes indefinitely, flooding the system bus.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "assign io_intrpt = ie & ~suppress & ~msi_en; assign msi_trigger = ie & ~suppress & msi_en & ~msi_werr; // mutual exclusion missing or glitch-prone",
+    "affected_entities": [
+      "err_cfg.msi_en",
+      "err_cfg.ie",
+      "err_info.msi_werr",
+      "iopmp_intrpt_wire",
+      "MSI_write_FSM"
+    ],
+    "summary": "Wired interrupt and MSI generation must be mutually exclusive in hardware; simultaneous assertion causes duplicate interrupt delivery and potential MSI write-error DoS loop"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl (interrupt generation)",
+        "line_start": 1307,
+        "line_end": 1318,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Wired interrupt (io.int) is generated combinatorially from errinfo_v, errcfg_ie, and per-entry sire/siwe suppression attributes. There is zero reference to err_cfg.msi_en in this block — no '& ~msi_en' mutual-exclusion term. When MSI support is added in the future, both wired interrupt and MSI write will fire simultaneously, producing the exact double-interrupt DoS described in the vulnerability pattern.",
+      "snippet": "when(io.reg.o_reg_errinfo_v.asBool && io.reg.o_reg_errcfg_ie.asBool) {\n  when(io.reg.o_reg_errinfo_ttype === 1.U && !entry_attribute.sire) {\n    io.int := true.B\n  }.elsewhen(io.reg.o_reg_errinfo_ttype === 2.U && !entry_attribute.siwe) {\n    io.int := true.B"
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl (FSM state enum)",
+        "line_start": 1035,
+        "line_end": 1037,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The Ctrl FSM has 9 states (sIdle through sDone) for the check pipeline. No state exists for MSI write transaction initiation, address handshake, data handshake, response capture, or msi_werr error recording. The entire MSI delivery path has no FSM backbone to sequence bus writes.",
+      "snippet": "object State extends ChiselEnum {\n  val sIdle, sSrcmd, sMdcfg, sMdcfgPre, sEntry, sPriority, sMatching, sErr, sDone = Value\n}"
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl (IO bundle)",
+        "line_start": 1003,
+        "line_end": 1023,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Ctrl module outputs only int, flush, rs, enable. No MSI write request, MSI address bus, MSI data bus, or MSI write-complete input ports exist. There is no hardware path from the error-capture FSM to any bus master interface that could issue an MSI write.",
+      "snippet": "val stall = Input(Bool())\nval int = Output(Bool())\nval flush = Output(Bool())\nval rs = Output(Bool())\nval enable = Output(Bool())"
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegErrmsiaddr / RegErrmsiaddrh",
+        "line_start": 724,
+        "line_end": 730,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "RegErrmsiaddr and RegErrmsiaddrh class definitions exist only inside a /* not implemented ... not implemented end */ comment block (line ~601-616). These registers are never instantiated in RegMap. No MSI target address can be configured, making MSI mode non-functional even if software sets msi_en=1.",
+      "snippet": "class RegErrmsiaddr extends Bundle {\n  val msiaddr = UInt(32.W)\n}\nclass RegErrmsiaddrh extends Bundle {\n  val msiaddrh = UInt(32.W)\n}"
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMap (msi_werr W1C handler)",
+        "line_start": 848,
+        "line_end": 850,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The write-1-clear handler for ERR_INFO.msi_werr is commented out. Spec (RegErrinfo line 663 comment) mandates R/W1C behavior — software must be able to clear msi_werr by writing 1. With the handler disabled, msi_werr would be permanently sticky if any hardware logic ever set it to 1, forcing software into an unrecoverable state.",
+      "snippet": "// when(w.msi_werr === 1.U) {   // R/W1C\n//   reg_errinfo.msi_werr := 0.U\n// }"
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMap (msi_werr set logic)",
+        "line_start": 652,
+        "line_end": 667,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ERR_INFO.msi_werr (bit 3) is declared as a spec-mandated field that 'is asserted when the write access to trigger an IOPMP-originated MSI has failed.' However, a grep across the entire Ctrl module body (lines 1003-1329) returns zero hits for 'msi'. No hardware logic ever drives msi_werr to 1. The field is permanently 0 regardless of MSI write outcomes. Software reading ERR_INFO would see msi_werr=0 even if a hypothetical MSI write failed — a silent error.",
+      "snippet": "init_val.msi_werr := IopmpParams.msi_werr.U // 0.U\n...\nval msi_werr = UInt(1.W)  // [R/W1C] It's asserted when the write access to trigger an IOPMP-originated MSI has failed."
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMapIO (msi_en signal export)",
+        "line_start": 878,
+        "line_end": 879,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "msi_en and msidata are exported from RegMap into the RegMapIO bundle (wired at line 753-754 as Output fields) and connected to Ctrl's reg input port (line 1016: Flipped(new RegMapIO)). The Ctrl module reads the entire RegMapIO bundle but never references its msi_en or msidata sub-fields — they are dead wire connections. Software can write msi_en=1 via APB but the hardware Ctrl ignores the value entirely.",
+      "snippet": "io.bits.o_reg_errcfg_msi_en      := reg_errcfg.msi_en\nio.bits.o_reg_errcfg_msidata     := reg_errcfg.msidata"
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegErrcfg (msi_en default init comment)",
+        "line_start": 625,
+        "line_end": 625,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "ERR_CFG.msi_en initializes to IopmpParams.msi_en which is 0 (line 53: val msi_en = 0), but the inline comment reads '// 1.U'. This misleading comment could cause a developer to believe MSI is enabled by default at reset. The actual hardware correctly defaults to wired interrupt mode (msi_en=0).",
+      "snippet": "init_val.msi_en := IopmpParams.msi_en.U // 1.U"
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegHwcfg2 (missing msi_en capability bit)",
+        "line_start": 535,
+        "line_end": 549,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "RegHwcfg2 Bundle declares prio_entry and rrid_transl fields but has no msi_en capability/advertise field. Software has no standard way to discover whether the hardware supports MSI delivery. The IopmpParams.msi_en default is 0, which is correct (MSI not supported), but if MSI were added, the hwcfg register must advertise it.",
+      "snippet": "val prio_entry = UInt(16.W)\nval rrid_transl = 0.U\n// no msi_en capability field"
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl (combinational path architecture)",
+        "line_start": 1307,
+        "line_end": 1324,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The Ctrl module's output logic has four independent combinational paths: io.int (line 1307-1318), io.rs (line 1324), io.flush (line 1321), io.enable (line 1327). There is no Mux, priority encoder, or gating network that selects between wired interrupt assertion vs. MSI write trigger based on msi_en. The architectural precondition for the double-interrupt bug is already baked into the design — adding an MSI FSM without also gating the wired interrupt path guarantees simultaneous firing.",
+      "snippet": "when(io.reg.o_reg_errinfo_v.asBool && io.reg.o_reg_errcfg_ie.asBool) {\n  ... io.int := true.B ...\n}\nio.rs := io.reg.o_reg_errcfg_rs.asBool\nio.flush := EdgeDetect.falling(io.stall)\nio.enable := io.reg.o_reg_hwcfg0_enable.asBool"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

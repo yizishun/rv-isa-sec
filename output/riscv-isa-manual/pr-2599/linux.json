@@ -1,0 +1,90 @@
+{
+  "pr_number": 2599,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2599,
+    "violation_condition": "KVM G-stage PTE manipulation (write-protect, unmap, dirty/accessed tracking) iterates at PAGE_SIZE granularity and ignores the NAPOT PTE format in G-stage tables; a single NAPOT PTE covering 64 KiB is treated as a 4 KiB entry, so the remaining 60 KiB escape the intended protection change or invalidation",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "kvm_riscv_gstage_wp_range|kvm_riscv_gstage_unmap_range|kvm_riscv_gstage_set_pte|for.*addr.*PAGE_SIZE.*gstage",
+    "affected_entities": [
+      "hgatp",
+      "G-stage PTEs"
+    ],
+    "summary": "KVM G-stage PTE walkers unaware of Svnapot may incompletely write-protect or unmap NAPOT G-stage mappings, leaving a guest with writable access to memory the hypervisor intended to protect"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/gstage.c",
+        "function_name": "gstage_tlb_flush",
+        "line_start": 109,
+        "line_end": 122,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "TLB flush range derived from page-table level (gstage_level_to_page_order) only; if a level-0 NAPOT PTE covering 64 KiB were present, BIT(order)=4 KiB would be flushed instead of the NAPOT's 64 KiB, leaving 60 KiB of stale writable/valid TLB entries. Currently latent because KVM does not create NAPOT G-stage PTEs.",
+      "snippet": "static void gstage_tlb_flush(struct kvm_gstage *gstage, u32 level, gpa_t addr)\n{\n\tunsigned long order = PAGE_SHIFT;\n\tif (gstage_level_to_page_order(level, &order))\n\t\treturn;\n\taddr &= ~(BIT(order) - 1);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/gstage.c",
+        "function_name": "kvm_riscv_gstage_wp_range",
+        "line_start": 289,
+        "line_end": 314,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Iteration uses gstage_level_to_page_size(ptep_level) for step size and alignment check, treating every level-0 PTE as 4 KiB. A level-0 NAPOT PTE covering 64 KiB would be write-protected only once at the first 4 KiB sub-address, with TLB flush limited to 4 KiB. Remaining 60 KiB retain writable TLB entries. Currently latent — KVM does not create NAPOT G-stage PTEs.",
+      "snippet": "while (addr < end) {\n\tfound_leaf = kvm_riscv_gstage_get_leaf(gstage, addr, &ptep, &ptep_level);\n\tret = gstage_level_to_page_size(ptep_level, &page_size);\n\t...\n\tif (!(addr & (page_size - 1)) && ((end - addr) >= page_size))\n\t\tkvm_riscv_gstage_op_pte(gstage, addr, ptep, ptep_level, GSTAGE_OP_WP);\nnext:\n\taddr += page_size;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/gstage.c",
+        "function_name": "kvm_riscv_gstage_unmap_range",
+        "line_start": 254,
+        "line_end": 287,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same structural issue as wp_range: after clearing a level-0 NAPOT PTE on first iteration, addr advances by 4 KiB (level-derived page_size). Subsequent 15 iterations find no leaf (PTE already zeroed), skip TLB flush, and advance. The guest retains 60 KiB of stale valid TLB entries, allowing continued access to ostensibly unmapped GPA range. Currently latent.",
+      "snippet": "while (addr < end) {\n\tfound_leaf = kvm_riscv_gstage_get_leaf(gstage, addr, &ptep, &ptep_level);\n\tret = gstage_level_to_page_size(ptep_level, &page_size);\n\t...\n\tif (!(addr & (page_size - 1)) && ((end - addr) >= page_size))\n\t\tkvm_riscv_gstage_op_pte(gstage, addr, ptep, ptep_level, GSTAGE_OP_CLEAR);\nnext:\n\taddr += page_size;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/gstage.c",
+        "function_name": "kvm_riscv_gstage_op_pte",
+        "line_start": 212,
+        "line_end": 252,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "WARN_ON(addr & (page_size - 1)) on line 224 and the WP operation on line 248 both use level-derived page_size (e.g. 4 KiB) rather than NAPOT-contiguity size. A NAPOT PTE at level 0 would not trigger the warning even for misaligned sub-addresses within the NAPOT region, and the WP would correctly clear _PAGE_WRITE on the NAPOT PTE itself — but the subsequent gstage_tlb_flush would only flush 4 KiB.",
+      "snippet": "ret = gstage_level_to_page_size(ptep_level, &page_size);\n...\nWARN_ON(addr & (page_size - 1));\n...\nelse if (op == GSTAGE_OP_WP)\n\tset_pte(ptep, __pte(pte_val(ptep_get(ptep)) & ~_PAGE_WRITE));\nif (pte_val(*ptep) != pte_val(old_pte))\n\tgstage_tlb_flush(gstage, ptep_level, addr);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/gstage.c",
+        "function_name": "gstage_page_size_to_level",
+        "line_start": 43,
+        "line_end": 56,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Only recognizes page sizes at canonical Sv39/Sv48/Sv57 boundaries (4K, 2M, 1G, 512G, 256T). Returns -EINVAL for 64 KiB, which currently prevents NAPOT G-stage PTEs from being created. This gate is what keeps the latent NAPOT bugs from being reachable.",
+      "snippet": "for (i = 0; i < kvm_riscv_gstage_pgd_levels; i++) {\n\tif (page_size == (psz << (i * kvm_riscv_gstage_index_bits))) {\n\t\t*out_level = i;\n\t\treturn 0;\n\t}\n}\nreturn -EINVAL;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/mmu.c",
+        "function_name": "kvm_riscv_mmu_ioremap",
+        "line_start": 61,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Iterates with addr += PAGE_SIZE at level=0. Would share the same NAPOT-blindness as the gstage.c functions if NAPOT PTEs were introduced, but currently correct for the 4 KiB PTEs it creates.",
+      "snippet": "for (addr = gpa; addr < end; addr += PAGE_SIZE) {"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

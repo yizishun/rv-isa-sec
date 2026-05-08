@@ -1,0 +1,199 @@
+{
+  "pr_number": 700,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 700,
+    "violation_condition": "In the FreeBSD kernel, if a thread is context-switched out after CLIC trap entry saves x10-x15 on the interrupted thread's kernel stack (before cspspush), and the kernel later resumes that thread via cpu_switch() without having preserved both (a) the xsp CSR value in struct pcb and (b) the integrity of the stack region holding the hardware-saved x10-x15—for instance, if the kernel stack is partially reclaimed during swapout, or if the signal-delivery path overwrites those stack slots while setting up a sigframe trampoline—then cspspop followed by hardware register restore loads corrupted GPRs from the wrong stack location",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "cspspush|cspspop|xsp|smip|cpu_switch.*stack|savectx.*x\\d\\d|sigframe.*sp|pcb_regs",
+    "affected_entities": [
+      "cspspush",
+      "cspspop",
+      "xsp"
+    ],
+    "summary": "Smip reorders cspspush after GPR save: x10-x15 now land on the interrupted context's kernel stack; FreeBSD's cpu_switch and signal-delivery must treat that stack region as a hardware-written trapframe extension or risk register corruption on thread resume"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct pcb has no pcb_xsp field. The per-thread saved context block stores pcb_ra, pcb_sp, pcb_gp, pcb_tp, pcb_s[12], pcb_x[32][2], pcb_fcsr, pcb_fpflags, pcb_onfault — but no shadow stack pointer. Without this field, no context-switch path (cpu_switch, cpu_throw, savectx) can preserve the xsp CSR across thread deschedule/resume. If Smip were active, a thread switched out after cspspush would resume with a stale xsp from the incoming thread's prior execution, creating a mismatched (sp, xsp) pair.",
+      "snippet": "struct pcb {\n\tuint64_t\tpcb_ra;\n\tuint64_t\tpcb_sp;\n\tuint64_t\tpcb_gp;\n\tuint64_t\tpcb_tp;\n\tuint64_t\tpcb_s[12];"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 269,
+        "line_end": 270,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_switch saves only the architectural sp (sd sp, (PCB_SP)(x13)) but does not save the xsp CSR. When the old thread is later resumed, sp is restored from pcb_sp but xsp retains whatever value the intervening thread(s) left in the CSR — the (sp, xsp) pair is inconsistent. Any cspspop in the resumed thread would pop from a wrong shadow-stack location.",
+      "snippet": "\t/* Store ra, sp and the callee-saved registers */\n\tsd\tra, (PCB_RA)(x13)\n\tsd\tsp, (PCB_SP)(x13)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "savectx (used by ipi_stop for CPU state capture in dumps/debugging) saves ra, sp, tp, gp, s0-s11, and FPE state but does not save the xsp CSR. A kernel dump taken from a Smip-active context loses the shadow-stack pointer, making post-mortem analysis unable to reconstruct the full register state.",
+      "snippet": "\tsd\tra, (PCB_RA)(a0)\n\tsd\tsp, (PCB_SP)(a0)\n\tsd\ttp, (PCB_TP)(a0)\n\tsd\tgp, (PCB_GP)(a0)\n\t/* s[0-11] ... */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 219,
+        "line_end": 247,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "cpu_throw (first activation of a new thread) loads ra, sp, s0-s11 from PCB and optionally FPE state, but does not initialize the xsp CSR. A new thread would begin execution with undefined/stale xsp from the previous occupant. Any cspspush in the new thread would chain onto the wrong shadow stack. Additionally, the ret at line 247 does not perform cspspop, so if Smip tracking were active, the return address verification would fail or read garbage.",
+      "snippet": "\tld\tra, (PCB_RA)(x13)\n\tld\tsp, (PCB_SP)(x13)\n\t/* s[0-11] ... */\n\tret"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fork_trampoline",
+        "line_start": 365,
+        "line_end": 432,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fork_trampoline (newborn thread first entry to user space) saves tp to kernframe, loads user tp, saves kernel sp to sscratch, loads user sp, then sret. No cspspush/cspspop. A newborn thread would start user-space execution with no initialized shadow stack — any Smip use in the child process would begin with an uninitialized xsp CSR.",
+      "snippet": "\tsd\ttp, (TF_SIZE + KF_TP)(sp)\n\tld\ttp, (TF_TP)(sp)\n\taddi\tsp, sp, TF_SIZE\n\tcsrw\tsscratch, sp\n\tld\tsp, (TF_SP - TF_SIZE)(sp)\n\tsret"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "SSTATUS_XS definitions",
+        "line_start": 73,
+        "line_end": 74,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SSTATUS_XS_SHIFT (15) and SSTATUS_XS_MASK (0x3<<15) are defined but there are NO definitions for the xsp CSR itself (no CSR number, no CSR_XSP, no read/write macros). No code anywhere in the kernel reads XS to determine whether user-mode extension context is dirty before context switch or signal delivery. The XS field is passively carried in tf_sstatus but never acted upon — meaning the kernel would silently discard dirty Smip/shadow-stack context.",
+      "snippet": "#define\tSSTATUS_XS_SHIFT\t\t15\n#define\tSSTATUS_XS_MASK\t\t\t(0x3 << SSTATUS_XS_SHIFT)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sendsig",
+        "line_start": 394,
+        "line_end": 399,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "sendsig overwrites tf_a[0], tf_a[1], tf_a[2] in the trapframe with signal parameters (sig, &fp->sf_si, &fp->sf_uc), and overwrites tf_sepc and tf_sp for the signal handler trampoline. If CLIC hardware had pre-saved x10-x15 (a0-a5) onto the kernel stack at offsets that overlap with these trapframe slots, this overwrite corrupts the hardware-saved register values. When the signal handler returns and the original context resumes, cspspop followed by hardware register restore would load corrupted GPRs.",
+      "snippet": "\ttf->tf_a[0] = sig;\n\ttf->tf_a[1] = (register_t)&fp->sf_si;\n\ttf->tf_a[2] = (register_t)&fp->sf_uc;\n\ttf->tf_sepc = (register_t)catcher;\n\ttf->tf_sp = (register_t)fp;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_mcontext",
+        "line_start": 245,
+        "line_end": 258,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "set_mcontext (used by sigreturn) masks out SSTATUS_XS_MASK changes in the sstatus validation gate (lines 245-248: checks if non-ignored bits changed), treating XS as always-ignored. If user space uses Smip and sets XS to indicate valid shadow-stack context, the kernel silently discards it — no xsp synchronization occurs. User thread resumes after sigreturn with architectural sp restored but xsp unchanged, corrupting the Smip context.",
+      "snippet": "\tif (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &\n\t    ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_UPIE |\n\t    SSTATUS_UIE)) != 0)\n\t\treturn (EINVAL);\n\t...\n\ttf->tf_sp = mcp->mc_gpregs.gp_sp;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/machdep.c",
+        "function_name": "makectx",
+        "line_start": 278,
+        "line_end": 287,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "makectx constructs a PCB from a trapframe for backtracing. Copies s0-s11, maps sepc→pcb_ra, and copies sp/gp/tp directly. No xsp initialization. Backtraces through Smip-aware code (interrupted between cspspush and cspspop) would show an incorrect call chain because the shadow stack return-address chain is not represented in the reconstructed PCB.",
+      "snippet": "\tmemcpy(pcb->pcb_s, tf->tf_s, sizeof(tf->tf_s));\n\tpcb->pcb_ra = tf->tf_sepc;\n\tpcb->pcb_sp = tf->tf_sp;\n\tpcb->pcb_gp = tf->tf_gp;\n\tpcb->pcb_tp = tf->tf_tp;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/vm_machdep.c",
+        "function_name": "cpu_fork",
+        "line_start": 106,
+        "line_end": 109,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_fork copies parent's PCB and trapframe to child via bcopy. No xsp field is copied because struct pcb has no such field. The child inherits only the architectural sp; any Smip shadow-stack state from the parent is lost. The child starts with a cspspop-able state (if sstatus.XS indicates dirty) that has no corresponding valid cspspush chain, causing cspspop to pop from uninitialized or wrong stack locations.",
+      "snippet": "\tbcopy(td1->td_pcb, pcb2, sizeof(*pcb2));\n\ttf = td2->td_frame;\n\tbcopy(td1->td_frame, tf, sizeof(*tf));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/riscv.h",
+        "function_name": "struct hypcsr",
+        "line_start": 56,
+        "line_end": 68,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct hypcsr stores guest virtualized CSRs for save/restore during vmm_switch world-switch. Contains hvip, vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, vsatp, scounteren, senvcfg. MISSING: vxsp or any Smip-specific guest CSR. Without this, bhyve cannot virtualize Smip for guest VMs — guests would see an environment where xsp CSR does not exist and cspspush/cspspop instructions would raise illegal-instruction exceptions.",
+      "snippet": "struct hypcsr {\n\tuint64_t hvip;\n\tuint64_t vsstatus;\n\tuint64_t vsie;\n\tuint64_t vstvec;\n\tuint64_t vsscratch;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 67,
+        "line_end": 84,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "vmm_switch CSR swap sequence uses csrrw to atomically exchange host↔guest sstatus, hstatus, scounteren, sscratch, stvec, and sets sepc — but does not swap xsp or any Smip CSR. The guest's xsp is neither saved on exit nor restored on entry. If a guest OS uses Smip, its shadow-stack state is lost across VM exits, and the hypervisor context may leave its own xsp value in the CSR when entering the guest.",
+      "snippet": "\tcsrrw\tt0, sstatus, t0\n\tcsrrw\tt1, hstatus, t1\n\tcsrrw\tt2, scounteren, t2\n\tcsrrw\tt3, sscratch, a0\n\tcsrrw\tt4, stvec, t4\n\tcsrw\tsepc, t5"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "va (boot sequence)",
+        "line_start": 234,
+        "line_end": 236,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Early boot sequence clears sscratch to zero ('Ensure sscratch is zero') but does not clear the xsp CSR. If the SBI firmware or bootloader left xsp in a non-reset state, the kernel boots with an undefined shadow-stack pointer. Any subsequent cspspush (if Smip were enabled) would chain onto this undefined state.",
+      "snippet": "\t/* Ensure sscratch is zero */\n\tli\tt0, 0\n\tcsrw\tsscratch, t0"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/genassym.c",
+        "function_name": "PCB_* assyms",
+        "line_start": 66,
+        "line_end": 73,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "genassym.c defines assembler symbols for PCB field offsets: PCB_ONFAULT, PCB_SIZE, PCB_RA, PCB_SP, PCB_GP, PCB_TP, PCB_S, PCB_X, PCB_FCSR. Missing: PCB_XSP. No assembler symbol for a shadow-stack-pointer offset exists, which means no assembly code path (exception.S, swtch.S, vmm_switch.S) can reference an xsp field even if one were added to struct pcb.",
+      "snippet": "ASSYM(PCB_RA, offsetof(struct pcb, pcb_ra));\nASSYM(PCB_SP, offsetof(struct pcb, pcb_sp));\nASSYM(PCB_GP, offsetof(struct pcb, pcb_gp));\nASSYM(PCB_TP, offsetof(struct pcb, pcb_tp));\nASSYM(PCB_S, offsetof(struct pcb, pcb_s));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/frame.h",
+        "function_name": "struct trapframe",
+        "line_start": 46,
+        "line_end": 58,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "struct trapframe defines the kernel's trap save-area layout with tf_ra, tf_sp, tf_gp, tf_tp, tf_t[7], tf_s[12], tf_a[8], tf_sepc, tf_sstatus, tf_stval, tf_scause. No tf_xsp field. If CLIC hardware pre-saves x10-x15 at stack offsets that don't align with the software tf_a layout, the trapframe cannot correctly capture the full interrupted context. The XS field in tf_sstatus is stored but has no corresponding storage for the extension state it describes.",
+      "snippet": "struct trapframe {\n\tuint64_t tf_ra;\n\tuint64_t tf_sp;\n\tuint64_t tf_gp;\n\tuint64_t tf_tp;\n\tuint64_t tf_t[7];"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

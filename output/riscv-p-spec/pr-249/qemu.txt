@@ -1,0 +1,22 @@
+PR #249  target=qemu  overall=compliant
+Spec: Spec pseudocode had copy/paste errors using signed comparisons (>_s, <_s) for unsigned saturation bounds; QEMU helpers implementing the old pseudocode would produce incorrect saturation results for values with MSB=1, corrupting guest packed SIMD computation
+Violation: QEMU TCG helper for P-extension saturating shift instructions (PSSHL.HS, PSSHL.WS, PSSHLR.HS, PSSHLR.WS, SSHL) uses signed comparison (>_s / <_s) for unsigned saturation checks on the shifted result, causing values with the MSB set (e.g., 0x80000000) to be treated as negative and incorrectly saturate to signed min/max bounds instead of the unsigned max bound (0xFF...FF), or fail to saturate when the unsigned magnitude exceeds the unsigned max but the signed magnitude is within signed range
+Consequence: data_corruption
+Pattern: signed integer comparison against 0x7FFF... or 0x8000... in TCG helper for saturating packed shift, where the saturation target is an unsigned range; look for `>_s` or `<_s` semantics (C: `(int64_t)val > INT32_MAX` or `(int64_t)val < INT32_MIN`, or Rust-like `as i64` wrapping) where `>_u` / unsigned comparison against 0xFFFF...FFFF is required per corrected pseudocode
+------------------------------------------------------------
+[compliant] target/riscv/vector_helper.c:2890-2991  vssrl8/vssrl16/vssrl32/vssrl64, vssra8/vssra16/vssra32/vssra64
+  These are RISC-V V-extension (vector) saturating scaling shift helpers, not P-extension packed SIMD. vssrl* uses unsigned types (uint8_t/16/32/64) and vssra* uses signed types (int8_t/16/32/64), both matching their respective semantics. No signed/unsigned confusion bug present here.
+  | static inline uint8_t vssrl8(CPURISCVState *env, int vxrm, uint8_t a, uint8_t b) { ... }
+  | static inline int8_t  vssra8(CPURISCVState *env, int vxrm, int8_t a, int8_t b)  { ... }
+
+[compliant] N/A:0-0  PSSHL.HS / PSSHL.WS / PSSHLR.HS / PSSHLR.WS / SSHL TCG helpers
+  The RISC-V P-extension (packed SIMD/Zpn) saturating shift instructions (PSSHL.HS, PSSHL.WS, PSSHLR.HS, PSSHLR.WS, SSHL) and their TCG helpers are NOT implemented in this QEMU version. No packed SIMD helper files exist under target/riscv/ (only pmp.c and pmu.c exist; no insn_trans/trans_rvp*.c.inc). The vulnerability pattern (signed vs unsigned saturation comparison) is not applicable because the code simply does not exist in this codebase.
+
+[compliant] hw/riscv/riscv-iommu.c:750-756  riscv_iommu_validate_device_ctx
+  This is the only modified file in the current working tree (6-line addition adding a validation check for MSI translation when IOMMU mode is BARE). Unrelated to P-extension shift instructions.
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |     get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |     RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |     return false;
+  | }
+

@@ -1,0 +1,72 @@
+PR #2571  target=xiangshan  overall=bug_confirmed
+Spec: Failed to parse agent output as JSON
+Violation: 
+Consequence: function_loss
+Pattern: 
+------------------------------------------------------------
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala:181-199  SupervisorLevel trait
+  The scountinhibit CSR (address 0x120) is defined in CSRs.scala but has NO CSRModule implementation in the supervisorLevelCSRMods list. Any access to scountinhibit by S-mode software will result in an illegal-instruction trap, violating the Sscounterenw/Smcdeleg spec which requires this CSR to exist as a masked alias of mcountinhibit.
+  | val supervisorLevelCSRMods: Seq[CSRModule[_]] = Seq(
+  |   sie, stvec, scounteren, senvcfg, sscratch, sepc, scause, stval, sip,
+  |   stimecmp, satp, scountovf, sstateen0, sstateen1, sstateen2, sstateen3, scontext,
+  | )
+  | // NOTE: scountinhibit (0x120) is MISSING from this list
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:67-80  EnvCfg (abstract class)
+  The menvcfg.CDE (Counter Delegation Enable) bit at position 60 is completely missing from the EnvCfg bundle. The Smcdeleg extension requires menvcfg[60]=CDE as the master enable for scounteren-write delegation. Without this bit, S-mode software cannot determine whether counter delegation is active, and the hardware has no mechanism to gate the feature.
+  | abstract class EnvCfg extends CSRBundle {
+  |   val STCE  = RO(63)    // bit 63
+  |   val PBMTE = RO(62)    // bit 62
+  |   val ADUE  = RO(61)    // bit 61
+  |   val DTE   = RO(59)    // bit 59
+  |   // MISSING: CDE at bit 60
+  |   // bit 60 is completely absent from the field map
+  | }
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:125-128  MachineLevel trait
+  Explicit TODO comment acknowledges that the Sscounterenw extension is unsupported. This extension defines scounteren as writable (not read-only zero), and scountinhibit as a masked alias of mcountinhibit gated by mcounteren delegation bits. Neither behavior is implemented.
+  | // Todo: support "Stimecmp/Vstimecmp" Extension, Version 1.0.0
+  | // Todo: support Sscounterenw Extension
+  | val mcounteren = Module(new CSRModule("Mcounteren", new Counteren))
+  |   .setAddr(CSRs.mcounteren)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:226-227  MLevelPermitModule
+  The M-level permit module correctly traps HPM counter accesses (cycle to hpmcounter31) from non-M-mode when the corresponding mcounteren bit is 0. This access-control path correctly implements the counter-read permission check described in the privileged spec.
+  | private val accessHPM_EX_II = csrIsHPM && !privState.isModeM && !mcounteren(counterAddr)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:324-327  SLevelPermitModule
+  The S-level permit module correctly traps HPM counter accesses from HU-mode when scounteren counter bit is 0. This implements the standard scounteren read-prohibition correctly.
+  | private val csrIsHPM = addr >= CSRs.cycle.U && addr <= CSRs.hpmcounter31.U
+  | private val counterAddr = addr(4, 0)
+  | private val accessHPM_EX_II = csrIsHPM && privState.isModeHU && !scounteren(counterAddr)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:443-447  VirtualLevelPermitModule
+  The virtual-level permit module correctly implements the H-extension counter delegation chain: VU-mode access traps EX_VI if hcounteren[x]=0 OR scounteren[x]=0; VS-mode access traps EX_VI if hcounteren[x]=0. This matches the chained delegation semantics required by the privileged spec.
+  | private val accessHPM_EX_VI = csrIsHPM && (
+  |   privState.isModeVS && !hcounteren(counterAddr) ||
+  |   privState.isModeVU && (!hcounteren(counterAddr) || !scounteren(counterAddr))
+  | )
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1018-1023  NewCSR module (CSR lookup)
+  The noCSRIllegal detection concatenates all CSR addresses from keys of csrRwMap and emits an illegal-instruction trap when the requested address matches none. Since scountinhibit (0x120) has no entry in any CSR map, accesses correctly trap as illegal. However, this is a band-aid—the correct fix is to implement scountinhibit as a masked alias rather than trapping.
+  | private val noCSRIllegal = (ren || wen) && Cat(csrRwMap.keys.toSeq.sorted.map(csrAddr => !(addr === csrAddr.U))).andR
+  | private val noCSRIllegalReg = RegEnable(noCSRIllegal, ren || wen)
+
+[potential_risk] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:59-59  CSR address definitions
+  The scountinhibit address (0x120) is defined in the CSR address table and added to the write-mask table at line 516, but has no corresponding RTL module. This address-table-only definition is misleading—it suggests the CSR exists but at runtime any access silently traps as illegal instruction.
+  | val scountinhibit = 0x120
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala:276-281  HasMhpmeventOfBundle
+  The mcounteren/hcounteren inputs to scountovf correctly chain the delegation bits: in HS mode, only HPM counters delegated through mcounteren are visible; in VS mode, both mcounteren and hcounteren must grant delegation. This correctly prevents side-channel leakage through overflow bits.
+  | trait HasMhpmeventOfBundle { self: CSRModule[_] =>
+  |   val ofVec = IO(Input(UInt(perfCntNum.W)))
+  |   val privState = IO(Input(new PrivState))
+  |   val mcounteren = IO(Input(new Counteren))
+  |   val hcounteren = IO(Input(new Counteren))
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:186-188  MachineLevel trait (mcountinhibit)
+  The mcountinhibit CSR is correctly implemented as a writable M-mode CSR controlling inhibit bits for mcycle, minstret, and mhpmcounter3-31. This provides the backend state that scountinhibit would need to alias.
+  | val mcountinhibit = Module(new CSRModule("Mcountinhibit", new McountinhibitBundle))
+  |   .setAddr(CSRs.mcountinhibit)
+

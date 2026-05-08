@@ -1,0 +1,40 @@
+PR #2782  target=linux  overall=compliant
+Spec: SSPUSH store and ssp decrement are unordered and multiple SSPUSH can reorder; kernel save/restore of ssp during context switch or signal delivery may snapshot inconsistent (ssp, shadow-stack-memory) pairs
+Violation: Linux kernel reads ssp (via csrr) and subsequently accesses shadow stack memory at/above that address to save/restore/dump state, without a full barrier, while userspace SSPUSH operations may have updated ssp but not yet made their stores globally visible — or vice versa, stores visible but ssp not yet decremented.
+Consequence: data_corruption
+Pattern: csrr.*ssp|CSR_SSP|__read_ssp|write_ssp|ssp\s*=.*csrr|csrw.*ssp
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/entry.S:99-109  save_userssp
+  Uses atomic csrrw (read-and-zero in a single instruction) to capture CSR_SSP at the precise exception boundary. The subsequent store (REG_S) writes to kernel thread_info memory (TASK_TI_USER_SSP), NOT to shadow stack memory. The violation pattern requires'csrr ssp → access shadow stack memory at ssp', but the kernel never accesses shadow stack memory following this CSR read. Additionally, the precise exception boundary guarantees any in-flight SSPUSH has architecturally committed before the csrrw executes.
+  | csrrw \tmp, CSR_SSP, x0;    /* atomic read-and-zero */
+  | REG_S \tmp, TASK_TI_USER_SSP(tp);  /* write to kernel memory, not shadow stack */
+
+[compliant] arch/riscv/kernel/entry.S:112-123  restore_userssp
+  Restores CSR_SSP from the saved in-memory copy via blind csrw (write-only). No CSR read occurs, so there is no 'read SSP then access shadow stack' pattern. Compliant.
+  | REG_L \tmp, TASK_TI_USER_SSP(tp);
+  | csrw CSR_SSP, \tmp;  /* write-only, no read hazard */
+
+[compliant] arch/riscv/kernel/signal.c:145-172  save_cfiss_state
+  Saves shadow stack state to the signal frame. Uses get_active_shstk() which reads the in-memory SSP copy (user_cfi_state.user_shdw_stk) saved at exception entry — it NEVER re-reads CSR_SSP directly. The shadow stack memory is accessed via ssamoswap (atomic AMO) at (saved_ssp - 8). Since the ssp value comes from stable in-memory state, not a fresh CSR read, the ordering hazard (CSR read → shadow stack access without barrier) cannot arise.
+  | err |= save_user_shstk(current, &ss_ptr);  /* get_active_shstk() from memory */
+  | err |= __put_user(ss_ptr, &state->ss_ptr);
+
+[compliant] arch/riscv/kernel/signal.c:174-199  __restore_cfiss_state
+  Reads token pointer from the user signal frame (copy_from_user), then validates the token via ssamoswap (atomic AMO) in restore_user_shstk(). No CSR_SSP read is performed in the entire restore path. The actual CSR write back to SSP happens later at exception return via restore_userssp. Compliant.
+  | err = __copy_from_user(&ss_ptr, &state->ss_ptr, sizeof(unsigned long));
+  | return restore_user_shstk(current, ss_ptr);  /* ssamoswap, no CSR read */
+
+[compliant] arch/riscv/kernel/ptrace.c:303-372  riscv_cfi_get / riscv_cfi_set
+  Both ptrace get and set paths operate exclusively on the in-memory SSP copy (get_active_shstk / set_active_shstk). No CSR_SSP access occurs — the CSR is only updated on the next exception return. The two-phase design (in-memory now, CSR at exit boundary) cleanly avoids any ordering hazard.
+  | user_cfi.shstk_ptr = get_active_shstk(target);     /* get: from memory */
+  | set_active_shstk(target, user_cfi.shstk_ptr);       /* set: to memory only */
+
+[compliant] arch/riscv/kernel/process.c:96-275  copy_thread / show_regs
+  show_regs() prints SSP from in-memory state (get_active_shstk). copy_thread() allocates child shadow stack and sets in-memory SSP via set_active_shstk(). Neither path reads CSR_SSP or accesses shadow stack memory following such a read. Compliant.
+  | pr_cont(" ssp : " REG_FMT "\n", get_active_shstk(current));
+  | set_active_shstk(p, ssp);  /* copy_thread: memory-only */
+
+[potential_risk] arch/riscv/kvm/:0-0  (entire subsystem)
+  KVM RISC-V has zero references to CSR_SSP or shadow stack save/restore in the VCPU run loop. If a guest were to enable Zicfiss (SSE in senvcfg), the guest CSR_SSP would not be saved/restored across VM entries. Currently low practical severity because KVM does not advertise Zicfiss to guests, but this is a latent virtualization gap distinct from the SSP ordering bug under audit.
+  | (no CSR_SSP, ssp, or shadow_stack references anywhere under arch/riscv/kvm/)
+

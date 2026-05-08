@@ -1,0 +1,126 @@
+{
+  "pr_number": 629,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 629,
+    "violation_condition": "When XiangShan RTL implements ACLIC but retains the old spec's CSR-based indirect access path (xaclicsourcecfg[k] at xiselect indices 0x1000-0x1100 via xireg2/xireg3, xacliciprio[k] at the same index range) AND/OR the ACLIC-specific eidelivery=0x20000000 delivery mode in the IMSIC CSR routing logic, while software follows the new MMIO-only APLIC direct-delivery spec (DM=0, setipnum/clripnum/setienum/clrienum by IID, sourcecfg with IE/IP at bits 31:30)",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "CSR.*xaclic(sourcecfg|iprio)|xiselect.*0x1[01]\\d0|eidelivery.*0x20000000|domaincfg.*DM.*=.*\\(2|miregiprios.*sourcecfg|CSRAIA.*aclic",
+    "affected_entities": [
+      "xiselect",
+      "xireg2",
+      "xireg3",
+      "eidelivery",
+      "domaincfg",
+      "sourcecfg[1..1023]",
+      "setipnum",
+      "clripnum",
+      "setienum",
+      "clrienum",
+      "idelivery",
+      "ithreshold",
+      "topi",
+      "claimi"
+    ],
+    "summary": "Spec eliminates CSR-based ACLIC indirect register access and ACLIC-specific delivery mode (eidelivery=0x20000000, domaincfg.DM=2) in favor of MMIO APLIC direct-delivery subset — stale CSR-to-MMIO mismatch causes undeliverable external interrupts across all privilege modes"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "CSRAIA miselect isIllegal",
+        "line_start": 17,
+        "line_end": 26,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "miselect isIllegal gates all indices >= 0x100 as illegal. MISelectField maxValue=0xFF means the old ACLIC xaclicsourcecfg/xacliciprio indices at 0x1000-0x1100 are 16x beyond the reachable range. No CSR-based indirect access path to ACLIC sourcecfg/iprio registers exists.",
+      "snippet": "val miselect = Module(new CSRModule(\"Miselect\", new MISelectBundle) with HasISelectBundle {\n  private val value = reg.ALL.asUInt\n  inIMSICRange := value >= 0x70.U && value < 0x100.U\n  isIllegal :=\n    value < 0x30.U ||\n    value >= 0x30.U && value < 0x40.U && value(0) === 1.U ||\n    value >= 0x40.U && value < 0x70.U ||\n    value >= 0x100.U\n})"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "CSRAIA siselect isIllegal",
+        "line_start": 44,
+        "line_end": 53,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "siselect isIllegal gates all indices >= 0x100 as illegal. SISelectField reserves 0x100-0xFFF explicitly. Even though maxValue=0xFFF could theoretically reach 0x1000-0x1100, the isIllegal combinational logic blocks everything >= 0x100 before WARL truncation applies.",
+      "snippet": "val siselect = Module(new CSRModule(\"Siselect\", new SISelectBundle) with HasISelectBundle {\n  private val value = reg.ALL.asUInt\n  inIMSICRange := value >= 0x70.U && value < 0x100.U\n  isIllegal :=\n    value < 0x30.U ||\n    value >= 0x30.U && value < 0x40.U && value(0) === 1.U ||\n    value >= 0x40.U && value < 0x70.U ||\n    value >= 0x100.U\n})"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRIND.scala",
+        "function_name": "CSRIND indirect data registers mireg2-6, sireg2-6, vsireg2-6",
+        "line_start": 16,
+        "line_end": 90,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All reserved indirect data registers (mireg2-6, sireg2-6, vsireg2-6) are ZeroFieldBundle hardwired to read zero. These would be the accessors for xaclicsourcecfg/xacliciprio under the old spec, but they hold no ACLIC state. No xireg2/xireg3 registers exist at xiselect indices 0x1000-0x1100.",
+      "snippet": "val mireg2 = Module(new CSRModule(\"Mireg2\", new ZeroFieldBundle(...)) {\n  regOut := 0.U\n})\n...\nval mireg3..mireg6, sireg2..sireg6, vsireg2..vsireg6: all ZeroFieldBundle, all regOut := 0.U"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "CSRAIA miregRData/siregRData Mux1H",
+        "line_start": 183,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The mireg/sireg read data Mux1H only maps priority registers (iprio0, iprio2, iprios[4..15]) at addresses 0x30-0x3F. No xaclicsourcecfg or xacliciprio entries exist in the Mux1H tree, confirming the indirect read path has no ACLIC semantics.",
+      "snippet": "private val miregRData: UInt = Mux1H(\n  miregiprios.map(prio => (miselect.rdata.asUInt === prio.addr.U) -> prio.rdata)\n)\nprivate val siregRData: UInt = Mux1H(\n  siregiprios.map(prio => (siselect.rdata.asUInt === prio.addr.U) -> prio.rdata)\n)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/system/SoC.scala",
+        "function_name": "SoC PMA config",
+        "line_start": 70,
+        "line_end": 70,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PMAConfigEntry at 0x20000000 is a generic executable memory PMA region, NOT the ACLIC eidelivery CSR. Verified: zero RTL matches for 'eidelivery', 'eidelivery', or ACLIC delivery mode encoding. The numerical coincidence with the old ACLIC eidelivery CSR address is harmless.",
+      "snippet": "PMAConfigEntry(0x20000000L, a = 1, x = true, w = true, r = true),"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "CSRAIA vsiselect isIllegal",
+        "line_start": 71,
+        "line_end": 77,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vsiselect is the most restricted select register: isIllegal for values < 0x70 or >= 0x100 (IMSIC-only range). No virtual-machine path to ACLIC indices exists.",
+      "snippet": "val vsiselect = Module(new CSRModule(\"VSiselect\", new VSISelectBundle) with HasISelectBundle {\n  private val value = reg.ALL.asUInt\n  inIMSICRange := value >= 0x70.U && value < 0x100.U\n  isIllegal :=\n    value < 0x70.U ||\n    value >= 0x100.U\n})"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "CSRAIA MISelectField definition",
+        "line_start": 225,
+        "line_end": 231,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MISelectField WARL bounds are explicitly 0-0xFF with reserved ranges 0x00-0x2F and 0x40-0x6F. WARL conversion of an out-of-range write (e.g., 0x1000) maps to a legal value within 0-0xFF, not to any ACLIC index. No WARL bypass exists.",
+      "snippet": "object MISelectField extends ISelectField(\n  maxValue = 0xFF,\n  reserved = Seq(\n    Range.inclusive(0x00, 0x2F),\n    Range.inclusive(0x40, 0x6F),\n  ),\n)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "CSRAIA SISelectField definition",
+        "line_start": 233,
+        "line_end": 240,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SISelectField WARL bounds 0-0xFFF with 0x100-0xFFF explicitly reserved. The reserved range covers the ACLIC index space (0x1000-0x1100 is beyond even the maxValue), ensuring WARL conversion prevents access.",
+      "snippet": "object SISelectField extends ISelectField(\n  maxValue = 0xFFF,\n  reserved = Seq(\n    Range.inclusive(0x000, 0x02F),\n    Range.inclusive(0x040, 0x06F),\n    Range.inclusive(0x100, 0xFFF),\n  ),\n)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,82 @@
+{
+  "pr_number": 2660,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2660,
+    "violation_condition": "In the FreeBSD kernel, when Smcdeleg/Ssccfg delegates mcyclecfg/minstretcfg to S-mode, the kernel's context switch path (sys/riscv/riscv/swtch.S) does not save/restore these CSRs, allowing a thread to program mcyclecfg.___INH bits so that cycle/instret counters selectively skip counting during target execution, leaking timing information.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "mcyclecfg|minstretcfg|mcyclecfgh|minstretcfgh",
+    "affected_entities": [
+      "mcyclecfg",
+      "minstretcfg",
+      "mcyclecfgh",
+      "minstretcfgh",
+      "cycle",
+      "instret"
+    ],
+    "summary": "Smcntrpmf mcyclecfg/minstretcfg INH bits must be context-switched per thread, otherwise a thread can reprogram counter inhibition to time kernel or other processes via rdcycle/rdinstret"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_switch saves/restores GPRs (ra, sp, s0-s11) and FPE state, but does NOT save/restore mcyclecfg/minstretcfg/mcyclecfgh/minstretcfgh. When Smcdeleg delegates these CSRs from M-mode to S-mode, a thread setting ___INH bits in mcyclecfg will persist across context switches, selectively suppressing cycle/instret counting for subsequent threads. This leaks timing information across thread boundaries.",
+      "snippet": "ENTRY(cpu_switch)\n\tsd\ta1, PC_CURTHREAD(tp)\n\t/* ... GPR save/restore only; no mcyclecfg/minstretcfg handling */\n\t__fpe_state_save x13\n\t/* ... */\n\tret"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 206,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_throw (initial thread activation path) loads GPRs and optionally FPE state but does not initialize or sanitize mcyclecfg/minstretcfg for the new thread. A newly spawned thread inherits whatever filtering configuration the previous thread left in these CSRs.",
+      "snippet": "ENTRY(cpu_throw)\n\tcall\t_C_LABEL(pmap_activate_sw)\n\t/* Loads GPRs, optionally FPE; no mcyclecfg/minstretcfg init */\n\tret"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct pcb has no fields for mcyclecfg, minstretcfg, mcyclecfgh, or minstretcfgh. Without per-thread storage, the context-switch path has nowhere to save/restore these CSRs. This is a structural gap: even if swtch.S were updated, the PCB lacks the necessary slots.",
+      "snippet": "struct pcb {\n\tuint64_t\tpcb_ra;\n\tuint64_t\tpcb_sp;\n\t/* ... FPE fields ... */\n\t/* MISSING: mcyclecfg, minstretcfg, mcyclecfgh, minstretcfgh */\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/encoding.h",
+        "function_name": "(CSR definitions)",
+        "line_start": 1060,
+        "line_end": 1080,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "encoding.h defines scounteren (CSR_SCOUNTEREN, 0x106) and mcounteren (CSR_MCOUNTEREN, 0x306) but has NO definitions for mcyclecfg (0x321), minstretcfg (0x322), mcyclecfgh (0x721), or minstretcfgh (0x722). These CSRs are completely absent from FreeBSD's kernel headers, making any save/restore code impossible to write without first adding the definitions.",
+      "snippet": "DECLARE_CSR(scounteren, CSR_SCOUNTEREN)\nDECLARE_CSR(mcounteren, CSR_MCOUNTEREN)\n/* MISSING: mcyclecfg (0x321), minstretcfg (0x322) */\n/* MISSING: mcyclecfgh (0x721), minstretcfgh (0x722) */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 41,
+        "line_end": 203,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "vmm_switch atomically swaps sstatus, hstatus, scounteren, sscratch, stvec between host and guest but does NOT handle mcyclecfg/minstretcfg. If the host kernel sets ___INH bits, a guest VM exit does not restore host configuration. Conversely, a guest VM (if it could access these CSRs through nested virtualization) could poison the host's counter filtering state.",
+      "snippet": "csrrw\tt0, sstatus, t0\ncsrrw\tt1, hstatus, t1\ncsrrw\tt2, scounteren, t2\ncsrrw\tt3, sscratch, a0\ncsrrw\tt4, stvec, t4\n/* mcyclecfg/minstretcfg NOT swapped */"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

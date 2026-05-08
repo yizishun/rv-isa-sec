@@ -1,0 +1,134 @@
+{
+  "pr_number": 2868,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2868,
+    "violation_condition": "In XiangShan RTL, if the LR reservation monitor in the LSU does not snoop/invalidate on remote hart stores or AMO instructions targeting the reservation set address due to missing coherence probe response or incorrect address match logic in the reservation tracker, the constrained LR/SC loop on hart H will never observe the forward-progress event required by norm:constrained_lrsc_forward_progress_store_amo, causing permanent livelock",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "reservation.*valid.*clear|resv.*addr.*match|probe.*resv|lr.*monitor.*inval|SC_SUCCESS|reservationSet.*invalidate|store.*AMO.*reserv",
+    "affected_entities": [
+      "LR.W",
+      "LR.D",
+      "SC.W",
+      "SC.D",
+      "AMOSWAP.W",
+      "AMOSWAP.D",
+      "AMOADD.W",
+      "AMOADD.D",
+      "AMOXOR.W",
+      "AMOXOR.D",
+      "AMOAND.W",
+      "AMOAND.D",
+      "AMOOR.W",
+      "AMOOR.D",
+      "AMOMIN.W",
+      "AMOMIN.D",
+      "AMOMAX.W",
+      "AMOMAX.D",
+      "AMOMINU.W",
+      "AMOMINU.D",
+      "AMOMAXU.W",
+      "AMOMAXU.D"
+    ],
+    "summary": "Reservation monitor must independently invalidate on remote unconditional store/AMO to guarantee constrained LR/SC loop forward progress per each decomposed normative tag"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/dcache/mainpipe/MainPipe.scala",
+        "function_name": "MainPipe (lrsc reservation logic)",
+        "line_start": 623,
+        "line_end": 653,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "LR reservation implemented as a time-bounded decrementing counter (64 cycles, with 8-cycle backoff). Reservation is set on successful LR (s3_can_do_amo && s3_lr), cleared on any SC execution, cleared on WBQ release matching reserved address (io.invalid_resv_set), and auto-expires via counter decrement. The time-bounded design guarantees forward progress — remote stores cannot cause permanent livelock because the reservation lifetime is finite and block_lr prevents continuous re-acquisition.",
+      "snippet": "val lrsc_count = RegInit(0.U(log2Ceil(LRSCCycles).W))\nval lrsc_valid = lrsc_count > LRSCBackOff.U\nval lrsc_addr = Reg(UInt())\n...\nwhen (s3_valid && (s3_lr || s3_sc)) {\n  when (s3_can_do_amo && s3_lr) {\n    lrsc_count := (LRSCCycles - 1).U\n    lrsc_addr := get_block_addr(s3_req.addr)\n  } .otherwise {\n    lrsc_count := 0.U\n  }\n}.elsewhen (io.invalid_resv_set) {\n  lrsc_count := 0.U\n}.elsewhen (lrsc_count > 0.U) {\n  lrsc_count := lrsc_count - 1.U\n}"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/dcache/mainpipe/MainPipe.scala",
+        "function_name": "MainPipe (s3_lrsc_addr_match)",
+        "line_start": 631,
+        "line_end": 635,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SC failure condition uses lrsc_valid as a qualifier for address matching (s3_lrsc_addr_match = lrsc_valid && lrsc_addr === get_block_addr(s3_req.addr)). This means if the reservation has expired (lrsc_valid=false), the SC will always fail even if addressing the correct block. This is correct behavior per spec — expired reservations cause SC failure. However, there is a subtle race: when an LR misses the L1 cache (s3_req.miss=true, s3_can_do_amo=true), the reservation countdown starts immediately at line 642 before the cache line data arrives. If the miss takes >56 cycles to resolve, the reservation expires before the data returns, causing the subsequent SC to fail. While the constrained loop will retry (forward progress is preserved), this increases loop iterations and is a performance concern.",
+      "snippet": "val s3_lrsc_addr_match = lrsc_valid && lrsc_addr === get_block_addr(s3_req.addr)\nval debug_s3_sc_fail_addr_match = s3_sc && lrsc_addr === get_block_addr(s3_req.addr) && !lrsc_valid\n\ns3_sc_fail  := s3_sc && (!s3_lrsc_addr_match || !s3_hit)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/dcache/mainpipe/MainPipe.scala",
+        "function_name": "MainPipe (s3_can_do_amo / lrsc_count set on miss)",
+        "line_start": 637,
+        "line_end": 643,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "s3_can_do_amo is true when (s3_req.miss && !s3_req.probe && s3_req.isAMO) OR s3_amo_hit. For an LR that misses L1, s3_can_do_amo evaluates true, and the reservation countdown is set immediately (lrsc_count := LRSCCycles-1). The reservation is established before the cache fill completes. If the miss is handled via the miss queue and takes longer than 56 cycles, the reservation will have expired before the application even receives the loaded value. This is spec-compliant (exhausted reservations fail SC), but the design choice to set the reservation on a miss rather than on a hit means the effective reservation window is shorter than expected under L1 miss scenarios.",
+      "snippet": "val s3_can_do_amo = (s3_req.miss && !s3_req.probe && s3_req.isAMO) || s3_amo_hit\nval s3_can_do_amo_write = s3_can_do_amo && isWrite(s3_req.cmd) && !s3_sc_fail && !s3_cas_fail\n\nwhen (s3_valid && (s3_lr || s3_sc)) {\n  when (s3_can_do_amo && s3_lr) {\n    lrsc_count := (LRSCCycles - 1).U"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/dcache/mainpipe/Probe.scala",
+        "function_name": "ProbeEntry (lrsc_blocked)",
+        "line_start": 87,
+        "line_end": 97,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When a coherence probe arrives for the reserved cache block, the probe is deferred (lrsc_blocked) rather than the reservation being explicitly invalidated. The probe is blocked as long as the reservation is active. This means: (a) remote hart stores targeting the reservation block cannot complete until the local reservation expires or an SC clears it; (b) the remote hart's forward progress is temporarily stalled. This is a correct coherence ordering mechanism (the store must wait for the cache line to be released) but introduces a temporary denial-of-service window for the remote hart up to 56 cycles. The bounded reservation lifetime prevents deadlock. However, unlike some implementations that explicitly invalidate the reservation on probe and let the probe proceed immediately, this design prioritizes the local SC success probability over remote store latency.",
+      "snippet": "val lrsc_blocked = Mux(\n  io.req.fire,\n  io.lrsc_locked_block.valid && get_block(io.lrsc_locked_block.bits) === get_block(io.req.bits.addr),\n  io.lrsc_locked_block.valid && get_block(io.lrsc_locked_block.bits) === get_block(req.addr)\n)\nwhen (state === s_pipe_req) {\n  io.pipe_req.valid := !RegNext(lrsc_blocked)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/dcache/mainpipe/Probe.scala",
+        "function_name": "ProbeQueue (resvsetProbeBlock)",
+        "line_start": 188,
+        "line_end": 201,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The ProbeQueue implements a one-cycle global probe blocking window (resvsetProbeBlock) whenever the reservation set is updated (io.update_resv_set). This is a timing-closure optimization that avoids a combinational path from the probe address comparison to the reservation address. During this one cycle, ALL probes are blocked regardless of address. This is safe because: (a) it affects only one cycle per LR reservation acquisition; (b) probes are queued and not dropped; (c) the worst-case added latency is 1 cycle. The selected_lrsc_blocked mechanism also correctly uses RegNext for the same timing reason. This is a well-documented microarchitectural trade-off, not a spec violation.",
+      "snippet": "val resvsetProbeBlock = RegNext(io.update_resv_set || selected_lrsc_blocked)\n// When we update update_resv_set, block all probe req in the next cycle\n// It should give Probe reservation set addr compare an independent cycle,\n// which will lead to better timing\npipe_req_arb.io.out.ready := !selected_req_valid || io.pipe_req.fire\nio.pipe_req.valid := selected_req_valid && !resvsetProbeBlock"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/dcache/DCacheWrapper.scala",
+        "function_name": "DCacheWrapper (invalid_resv_set generation)",
+        "line_start": 1566,
+        "line_end": 1570,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The reservation invalidation triggered by writeback queue release (WBQ releasing a cache line matching the reserved address) uses exact address equality (wb.io.req.bits.addr === mainPipe.io.lrsc_locked_block.bits). Both sides use block-aligned addresses. This correctly invalidates the reservation when the reserved cache line is evicted. However, a probe that downgrades the cache line from Exclusive to Shared (or Shared to Invalid) WITHOUT triggering a writeback will NOT invalidate the reservation. In such a case, the reservation remains valid even though another hart may have stored to that address (the store was serialized through coherence by first downgrading this cache line). This is not a spec violation (the spec allows reservations to survive such events), but it means the reservation set validation is less conservative than it could be — an SC might succeed on a line that was downgraded by a remote store's coherence action.",
+      "snippet": "mainPipe.io.invalid_resv_set := RegNext(\n  wb.io.req.fire &&\n  wb.io.req.bits.addr === mainPipe.io.lrsc_locked_block.bits &&\n  mainPipe.io.lrsc_locked_block.valid\n)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/pipeline/AtomicsUnit.scala",
+        "function_name": "AtomicsUnit (dcache.req.valid with block_lr)",
+        "line_start": 539,
+        "line_end": 543,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "LR storm prevention: when the reservation is active (lrsc_count > 0), new LR requests are blocked via io.dcache.block_lr. This prevents a malicious or buggy program from continuously re-acquiring reservations and starving remote harts' coherence probes. Combined with the 8-cycle LRSCBackOff dead zone, this ensures that after the reservation expires, there is a mandatory gap before a new LR can be issued. This is critical for the forward-progress guarantee: without this mechanism, an infinite stream of LR instructions could extend the probe blocking window indefinitely, causing a true livelock. The implementation is correct.",
+      "snippet": "io.dcache.req.valid := Mux(\n  io.dcache.req.bits.cmd === M_XLR,\n  !io.dcache.block_lr, // block lr to survive in lr storm\n  data_valid // wait until src(1) is ready\n) && state === s_cache_req"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/dcache/mainpipe/MainPipe.scala",
+        "function_name": "MainPipe (block_lr generation)",
+        "line_start": 658,
+        "line_end": 658,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "block_lr uses GatedValidRegNext(lrsc_count > 0.U), meaning it is a registered (1-cycle delayed) version of the counter-is-nonzero signal. This introduces a 1-cycle lag: when lrsc_count decrements from 1 to 0, block_lr stays asserted for one additional cycle due to the register delay. This slightly extends the LR blocking window but is benign — it simply adds 1 cycle to the mandatory backoff period and does not affect correctness or forward progress.",
+      "snippet": "io.block_lr := GatedValidRegNext(lrsc_count > 0.U)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

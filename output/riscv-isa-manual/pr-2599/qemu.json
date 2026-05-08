@@ -1,0 +1,80 @@
+{
+  "pr_number": 2599,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2599,
+    "violation_condition": "In QEMU's get_physical_address() PTW loop, if the Svnapot N-bit check (PTE_N at cpu_helper.c:1449) or the NAPOT decode logic (cpu_helper.c:1645) is inadvertently gated on first_stage==true, G-stage PTEs with the N bit set would either be incorrectly rejected as reserved (denial_of_service) or silently treated as non-NAPOT entries, computing wrong physical addresses. Additionally, if ext_svnapot==true but the G-stage hgatp-configured levels/vm differ from VS-stage satp, the leaf-PTE napot_bits validation (i != levels-1, napot_bits != 4) could trigger spurious TRANSLATE_FAIL on valid hypervisor G-stage NAPOT superpages, causing unexpected G-stage page faults injected into the guest.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "search for any 'first_stage' boolean condition used as a guard around ext_svnapot, PTE_N, napot_bits, or napot_mask computation in target/riscv/cpu_helper.c get_physical_address(); also search for missing HENVCFG or hgatp-dependent gating that would prevent NAPOT decode in the two_stage && !first_stage G-stage walk path",
+    "affected_entities": [
+      "hgatp",
+      "PTE_N",
+      "ext_svnapot",
+      "get_physical_address"
+    ],
+    "summary": "QEMU must ensure ext_svnapot and PTE_N decode apply uniformly to both first_stage (VS-stage) and second_stage (G-stage/hgatp) page table walks; any first_stage gate on NAPOT handling would corrupt G-stage physical address computation and break hypervisor memory isolation"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address",
+        "line_start": 1449,
+        "line_end": 1456,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Svnapot N-bit reservation check at line 1449 is NOT gated on first_stage. It reads 'if (!riscv_cpu_cfg(env)->ext_svnapot && (pte & PTE_N))' — this guard applies uniformly to both VS-stage and G-stage PTEs. When ext_svnapot is enabled, G-stage PTEs with the N bit set will pass through to the leaf decode logic correctly. No denial-of-service risk: the first_stage variable is not used as a guard here.",
+      "snippet": "    if (!riscv_cpu_cfg(env)->ext_svnapot && (pte & PTE_N)) {\n        /* Reserved without Svnapot extension */\n        qemu_log_mask(LOG_GUEST_ERROR, \"%s: N bit set in PTE, \"\n                      \"and Svnapot extension is disabled: \"\n                      \"addr: 0x%\" HWADDR_PRIx \" pte: 0x\" TARGET_FMT_lx \"\\n\",\n                      __func__, pte_addr, pte);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address",
+        "line_start": 1645,
+        "line_end": 1650,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "NAPT decode logic at line 1645 is NOT gated on first_stage. It reads 'if (riscv_cpu_cfg(env)->ext_svnapot && (pte & PTE_N))' — this applies uniformly to both stages. When G-stage encounters a leaf PTE with N=1, napot_bits is correctly computed from ppn via ctzl(ppn)+1, and the NAPOT physical address reconstruction at line 1653 uses the computed napot_mask. No first_stage guard prevents G-stage NAPOT processing.",
+      "snippet": "    if (riscv_cpu_cfg(env)->ext_svnapot && (pte & PTE_N)) {\n        napot_bits = ctzl(ppn) + 1;\n        if ((i != (levels - 1)) || (napot_bits != 4)) {\n            return TRANSLATE_FAIL;\n        }\n    }"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address",
+        "line_start": 1287,
+        "line_end": 1315,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "G-stage hgatp level/mode handling is correctly scoped. At lines 1287-1315, when first_stage==false (G-stage), the base/levels/ptidxbits/ptesize are derived from env->hgatp (lines 1306-1314), while VS-stage uses env->satp/env->vsatp (lines 1287-1304). The NAPOT validation at line 1647 '(i != (levels - 1))' correctly uses the G-stage-specific levels when walking G-stage tables. G-stage NAPOT superpages with valid hgatp-configured levels will not trigger spurious TRANSLATE_FAIL due to level mismatch.",
+      "snippet": "    } else {\n        if (riscv_cpu_mxl(env) == MXL_RV32) {\n            base = (hwaddr)get_field(env->hgatp, SATP32_PPN) << PGSHIFT;\n            vm = get_field(env->hgatp, SATP32_MODE);\n        } else {\n            base = (hwaddr)get_field(env->hgatp, SATP64_PPN) << PGSHIFT;\n            vm = get_field(env->hgatp, SATP64_MODE);\n        }\n        widened = 2;\n    }"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address",
+        "line_start": 1358,
+        "line_end": 1367,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HENVCFG gating at lines 1364-1366 applies only to PBMTE and ADUE (pbmte and adue booleans), not to Svnapot. This is correct per the RISC-V privileged spec: Svnapot is a CPU ISA extension (ext_svnapot), not a menvcfg/henvcfg-controlled feature. No HENVCFG bit exists for NAPOT control, so there is no missing HENVCFG gating. The ext_svnapot CPU config flag alone correctly governs both stages.",
+      "snippet": "    if (first_stage && two_stage && env->virt_enabled) {\n        pbmte = pbmte && (env->henvcfg & HENVCFG_PBMTE);\n        adue = adue && (env->henvcfg & HENVCFG_ADUE);\n    }"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address",
+        "line_start": 1375,
+        "line_end": 1378,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The PTW loop at line 1378 'for (i = 0; i < levels; i++, ptshift -= ptidxbits)' is stage-agnostic. Variable 'i' and 'levels' are correctly partitioned: when first_stage==false, levels is from hgatp (e.g. Sv39x4=3 levels, Sv48x4=4 levels). The loop walks exactly the G-stage page table depth. There is no cross-contamination between VS-stage and G-stage level counters.",
+      "snippet": " restart:\n    ptshift = (levels - 1) * ptidxbits;\n    base = base_root;\n    for (i = 0; i < levels; i++, ptshift -= ptidxbits) {"
+    }
+  ],
+  "overall_severity": "compliant"
+}

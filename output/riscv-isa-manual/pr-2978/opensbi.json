@@ -1,0 +1,133 @@
+{
+  "pr_number": 2978,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 2978,
+    "violation_condition": "OpenSBI M-mode code writes to mstatus fields (MIE/MPIE/TVM/TW/TSR/MPRV/MXR/SUM) that the spec requires to be writable, but the underlying hardware implementation incorrectly implements them as read-only (WARL hardwired to 0 or constant), causing the CSR write to be silently ignored.",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "csr_write|csr_set|csr_clear\\s+CSR_MSTATUS.*(MIE|MPIE|TVM|TW|TSR|MPRV|MXR|SUM).*(?<!followed by csr_read to verify the write took effect)",
+    "affected_entities": [
+      "mstatus",
+      "MIE",
+      "MPIE",
+      "TVM",
+      "TW",
+      "TSR",
+      "MPRV",
+      "MXR",
+      "SUM"
+    ],
+    "summary": "Spec now mandates that MIE/MPIE/TVM/TW/TSR/MPRV/MXR/SUM bits must be writable under defined conditions; OpenSBI relies on these writes taking effect — if hardware silently ignores writes to these fields, M-mode interrupt gating (MIE), S-mode trap interception (TVM/TW/TSR), or memory-access emulation (MPRV/MXR/SUM) silently break without detection, leading to privilege enforcement gaps or unhandled traps."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "sbi_hart_switch_mode",
+        "line_start": 794,
+        "line_end": 807,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Writes MPIE=0 to CSR_MSTATUS (line 796) without subsequent csr_read verification. MPIE is in the spec's list of vulnerable WARL fields. If hardware incorrectly hardwires MPIE to 1 (read-only), MRET would enable interrupts (MIE ← MPIE) after the mode switch, leaving S-mode entered with interrupts unexpectedly enabled.",
+      "snippet": "val = INSERT_FIELD(val, MSTATUS_MPIE, 0);\n...\ncsr_write(CSR_MSTATUS, val);"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_unpriv.c",
+        "function_name": "DEFINE_UNPRIVILEGED_LOAD_FUNCTION / DEFINE_UNPRIVILEGED_STORE_FUNCTION",
+        "line_start": 33,
+        "line_end": 38,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Sets MSTATUS_MPRV via csrrs to perform unprivileged loads/stores, then restores via csrw. No verification read checks that MPRV actually took effect. If MPRV is hardwired to 0, the access silently runs with M-mode privileges, and the emulation layer misinterprets the result (no fault when one should have occurred). Used by all sbi_load_*/sbi_store_* helpers.",
+      "snippet": "\"csrrs %[mstatus], \" STR(CSR_MSTATUS) \", %[mprv]\\n\"\n...\n\"csrw \" STR(CSR_MSTATUS) \", %[mstatus]\\n\""
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_unpriv.c",
+        "function_name": "sbi_get_insn",
+        "line_start": 132,
+        "line_end": 140,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Sets MSTATUS_MPRV | MSTATUS_MXR via csrrs to fetch instructions from S/U-mode pages (MXR makes read-only execute pages readable). Same pattern as above—no read-back to verify MPRV and MXR took effect. If MXR is hardwired to 0, instruction fetches from execute-only pages would incorrectly fault.",
+      "snippet": "\"csrrs %[mstatus], \" STR(CSR_MSTATUS) \", %[mprv]\\n\"\n...\n\"2: csrw \" STR(CSR_MSTATUS) \", %[mstatus]\\n\"\n...\n: [mprv] \"r\"(MSTATUS_MPRV | MSTATUS_MXR)"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_illegal_atomic.c",
+        "function_name": "DEFINE_UNPRIVILEGED_LR_FUNCTION / DEFINE_UNPRIVILEGED_SC_FUNCTION",
+        "line_start": 39,
+        "line_end": 44,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Identical MPRV set/restore pattern as sbi_unpriv.c (csrrs to set MPRV, csrw to restore). Used for LR/SC emulation. Same risk: if MPRV is hardwired to 0, LR/SC emulation silently operates with M-mode privileges, potentially missing access faults or guest-page faults.",
+      "snippet": "\"csrrs %[mstatus], \" STR(CSR_MSTATUS) \", %[mprv]\\n\"\n...\n\"csrw \" STR(CSR_MSTATUS) \", %[mstatus]\\n\""
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_expected_trap.S",
+        "function_name": "__sbi_expected_trap / __sbi_expected_trap_hext",
+        "line_start": 26,
+        "line_end": 45,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Clears MSTATUS_MPRV via csrc (lines 27, 45) inside trap handlers that fire when MPRV-mediated unprivileged accesses trap. This is a safety-critical path; clearing MPRV prevents recursive traps. Since csrc atomically clears the bit, and a hardware-level MPRV==0 means the csrc is a no-op, no read-back is needed.",
+      "snippet": "li a4, MSTATUS_MPRV\ncsrc CSR_MSTATUS, a4"
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "TRAP_RESTORE_MEPC_MSTATUS",
+        "line_start": 647,
+        "line_end": 659,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Restores entire mstatus/mstatush from trap frame on trap exit. The restored value was previously read from hardware CSR (via TRAP_SAVE_INFO on trap entry), so any WARL effects are already baked into the saved value. Writes all mstatus fields but using a previously-read snapshot—no verification needed since the write is semantically restoring prior hardware state.",
+      "snippet": "REG_L t0, SBI_TRAP_REGS_OFFSET(mstatus)(a0)\ncsrw CSR_MSTATUS, t0"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "mstatus_init",
+        "line_start": 40,
+        "line_end": 48,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Writes only MSTATUS_FS and MSTATUS_VS based on misa checks (lines 41-46). Neither FS nor VS are in the spec's vulnerable-field list (MIE/MPIE/TVM/TW/TSR/MPRV/MXR/SUM). The code guards writes behind misa interrogation, so it never sets FS/VS on hardware lacking those extensions.",
+      "snippet": "if (misa_extension('D') || misa_extension('F'))\n    mstatus_val |= MSTATUS_FS;\nif (misa_extension('V'))\n    mstatus_val |= MSTATUS_VS;\ncsr_write(CSR_MSTATUS, mstatus_val);"
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "CLEAR_MDT",
+        "line_start": 34,
+        "line_end": 42,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Clears MSTATUS_MDT (or MSTATUSH_MDT on RV32) via csrc. MDT is an M-mode-only control bit, not in the spec's vulnerable-field list. Used at cold boot, warm boot, and trap save points—all appropriate locations.",
+      "snippet": "li \\tmp, MSTATUS_MDT\ncsrc CSR_MSTATUS, \\tmp"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "sbi_hart_switch_mode",
+        "line_start": 797,
+        "line_end": 801,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Writes MSTATUSH_MPV on RV32 (line 800-801) for hypervisor extension support. MPV is not in the spec's vulnerable-field list. The value is part of a read-modify-write sequence that includes a prior csr_read(CSR_MSTATUSH) at line 799.",
+      "snippet": "valH = csr_read(CSR_MSTATUSH);\nvalH = INSERT_FIELD(valH, MSTATUSH_MPV, next_virt);\ncsr_write(CSR_MSTATUSH, valH);"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

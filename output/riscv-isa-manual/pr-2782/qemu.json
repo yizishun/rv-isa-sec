@@ -1,0 +1,116 @@
+{
+  "pr_number": 2782,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2782,
+    "violation_condition": "QEMU TCG translates SSPUSH/C.SSPUSH as an atomic decrement-then-store sequence (old spec ordering), or serializes the ssp update and shadow-stack store with stronger ordering than the spec permits. In MTTCG mode, if SSPUSH is implemented as a single TCG helper that atomically updates ssp and performs the store without modeling the relaxed store/ssp-update ordering, QEMU enforces ordering guarantees that real RISC-V hardware does not provide.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "riscv_cfi_ssp_push|sspush|shadow_stack_push|gen_sspush|helper_sspush|ssp.*store|shadow.*stack.*store",
+    "affected_entities": [
+      "SSPUSH",
+      "C.SSPUSH",
+      "ssp",
+      "xSSE"
+    ],
+    "summary": "QEMU TCG may implement SSPUSH with stronger-than-spec ordering (atomic decrement-then-store), hiding race conditions in guest CFI shadow-stack code that real hardware's relaxed store/ssp-update ordering would expose, enabling shadow-stack bypass exploits to go undetected during emulation-based testing"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvzicfiss.c.inc",
+        "function_name": "trans_sspush",
+        "line_start": 53,
+        "line_end": 70,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "SSPUSH TCG translation emits the shadow-stack memory store (tcg_gen_qemu_st_tl, line 65-66) followed by the ssp CSR update (tcg_gen_st_tl, line 67) as sequential TCG ops within a single translation block. In MTTCG mode, other vCPUs observe both the store and the ssp update atomically with sequential consistency — there is no relaxed ordering between them. In real RISC-V hardware (RVWMO), the shadow-stack store and the ssp CSR update have relaxed ordering: another hart could observe the ssp update before the shadow-stack store becomes visible, or vice versa. QEMU TCG enforces strictly stronger ordering than real hardware permits, which can mask concurrency bugs that would manifest on silicon. Both the 32-bit SSPUSH (insn32.decode:1050-1051) and the compressed C.SSPUSH (insn16.decode:148) decode to this same trans_sspush function.",
+      "snippet": "tcg_gen_ld_tl(addr, tcg_env, offsetof(CPURISCVState, ssp));\ntcg_gen_addi_tl(addr, addr, tmp);\ntcg_gen_qemu_st_tl(data, addr, SS_MMU_INDEX(ctx),\n                   mxl_memop(ctx) | MO_ALIGN);\ntcg_gen_st_tl(addr, tcg_env, offsetof(CPURISCVState, ssp));"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvzicfiss.c.inc",
+        "function_name": "trans_sspopchk",
+        "line_start": 25,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SSPOPCHK follows the inverse pattern of SSPUSH: it loads from the shadow-stack memory (tcg_gen_qemu_ld_tl, line 37-38), compares against rs1, and then increments ssp (tcg_gen_addi_tl + tcg_gen_st_tl, lines 47-48). The load and ssp-increment are sequentially ordered within the same TB. Per the updated spec with relaxed ordering, the ssp increment and the shadow-stack load should have relaxed ordering — another hart could observe the ssp increment before the load is visible. QEMU's sequential ordering is too strong.",
+      "snippet": "tcg_gen_qemu_ld_tl(data, addr, SS_MMU_INDEX(ctx),\n                   mxl_memop(ctx) | MO_ALIGN);\n/* ... skip label and exception handling ... */\ntcg_gen_addi_tl(addr, addr, tmp);\ntcg_gen_st_tl(addr, tcg_env, offsetof(CPURISCVState, ssp));"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_ssp",
+        "line_start": 854,
+        "line_end": 859,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR read handler for SSP returns env->ssp directly with no WARL masking or side effects. In the relaxed-ordering model, a read of ssp on another hart should be able to observe the updated ssp even if the corresponding shadow-stack store has not yet completed (or vice versa). QEMU's sequential consistency means reads always observe a fully-completed SSPUSH sequence, eliminating the relaxed-ordering race window that exists on real hardware.",
+      "snippet": "static RISCVException read_ssp(CPURISCVState *env, int csrno,\n                               target_ulong *val)\n{\n    *val = env->ssp;\n    return RISCV_EXCP_NONE;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_ssp",
+        "line_start": 861,
+        "line_end": 866,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR write handler for SSP directly stores val into env->ssp with no WARL masking or TLB/cache side effects. A direct CSR write to ssp (csrrw) has no ordering relationship with concurrent shadow-stack memory operations from SSPUSH/SSPOPCHK on other harts. In MTTCG, the write is instantaneously visible — real hardware would have relaxed visibility semantics.",
+      "snippet": "static RISCVException write_ssp(CPURISCVState *env, int csrno,\n                                target_ulong val, uintptr_t ra)\n{\n    env->ssp = val;\n    return RISCV_EXCP_NONE;\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_ssp",
+        "line_start": 384,
+        "line_end": 400,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VMState migration subsection for ssp serializes env.ssp as a plain UINTTL field. During live migration, ssp is captured at TB boundaries. While migration happens between TBs (not mid-instruction), there is no cross-field consistency validation between the migrated ssp value and shadow-stack memory contents on the destination side. If a source QEMU has an in-flight SSPUSH race (even if masked by QEMU's strong ordering), the destination has no way to detect inconsistency between ssp and shadow-stack memory.",
+      "snippet": "static const VMStateDescription vmstate_ssp = {\n    .name = \"cpu/ssp\",\n    .version_id = 1,\n    .minimum_version_id = 1,\n    .needed = ssp_needed,\n    .fields = (const VMStateField[]) {\n        VMSTATE_UINTTL(env.ssp, RISCVCPU),\n        VMSTATE_END_OF_LIST()\n    }\n};"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "cpu_get_bcfien",
+        "line_start": 92,
+        "line_end": 119,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Returns whether backward CFI (shadow stack) is enabled for the current privilege mode. Uses the correct privilege-level hierarchy (M-mode always enabled, S/U-mode require BCFI bit in corresponding *envcfg register). The function is structurally sound. It gates the BCFI_ENABLED TB flag that controls trans_sspush execution. No ordering-model issues introduced here.",
+      "snippet": "case PRV_U:\n    return env->senvcfg & SENVCFG_SSE;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_reset_hold",
+        "line_start": 775,
+        "line_end": 776,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CPU reset initializes ssp to 0, which is the architecturally-defined reset value per the Zicfiss spec. No ordering issues at reset — all harts start with ssp=0 before any SSPUSH execution begins.",
+      "snippet": "/* on reset ssp is set to 0 */\nenv->ssp = 0;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/tcg/tcg-cpu.c",
+        "function_name": "cpu_get_tb_cpu_state",
+        "line_start": 153,
+        "line_end": 155,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TB flags computation sets BCFI_ENABLED based on cpu_get_bcfien(). The flag is per-TB and properly triggers TB flush on senvcfg changes via the envcfg write path. No ordering-model issues — this correctly controls instruction legality but does not participate in memory ordering.",
+      "snippet": "if (cpu_get_bcfien(env)) {\n    flags = FIELD_DP32(flags, TB_FLAGS, BCFI_ENABLED, 1);\n}"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

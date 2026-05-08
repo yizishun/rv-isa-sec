@@ -1,0 +1,55 @@
+PR #2501  target=linux  overall=potential_risk
+Spec: menvcfg→senvcfg→henvcfg CBIE override chain: higher privilege mode can silently downgrade CBO.INVAL from invalidate to flush; kernel must not assume senvcfg write grants the semantic it requested
+Violation: Linux kernel (S-mode) configures senvcfg.CBIE=11 to grant U-mode or self CBO.INVAL invalidate semantics, but M-mode firmware has menvcfg.CBIE=01, forcing flush-only behavior. Kernel code then executes CBO.INVAL expecting cache-line invalidation (dirty lines silently dropped), but hardware performs only a flush (dirty lines written back and remain valid), leaving kernel data structures with stale cache lines that were supposed to be discarded.
+Consequence: data_corruption
+Pattern: csr_write.*senvcfg.*CBIE|riscv_cbo_inval|CBO.INVAL.*senvcfg|__riscv_cbo_inval|KVM.*senvcfg.*save|KVM.*senvcfg.*restore
+------------------------------------------------------------
+[potential_risk] arch/riscv/mm/dma-noncoherent.c:31-43  arch_dma_cache_inv
+  S-mode kernel executes CBO.INVAL via ALT_CMO_OP(INVAL, ...) without verifying menvcfg.CBIE. If M-mode firmware sets menvcfg.CBIE=01 (FLUSH only), the CPU performs write-back-then-invalidate instead of pure invalidate. For current DMA use (FROM_DEVICE path), this is functionally safe since lines still end up invalidated after flush, but kernel assumption that CBO.INVAL silently drops dirty lines is unverified. A future security-sensitive use (e.g., wiping crypto keys from cache) would silently write back sensitive data instead of destroying it.
+  | ALT_CMO_OP(INVAL, vaddr, size, riscv_cbom_block_size);
+
+[potential_risk] arch/riscv/mm/pmem.c:24-33  arch_invalidate_pmem
+  Same pattern as dma-noncoherent.c — S-mode kernel executes CBO.INVAL for persistent memory cache invalidation without checking menvcfg.CBIE. No SBI call or CSR probe confirms that menvcfg permits invalidate semantics. On firmware with menvcfg.CBIE=FLUSH, dirty PMEM lines are written back instead of discarded.
+  | ALT_CMO_OP(INVAL, addr, size, riscv_cbom_block_size);
+
+[potential_risk] arch/riscv/kvm/vcpu.c:554-555  kvm_riscv_vcpu_setup_config
+  KVM unconditionally sets henvcfg.CBIE=0x3 (INV, grant both invalidate and flush) plus henvcfg.CBCFE=1 when guest ISA includes ZICBOM. There is no check against menvcfg.CBIE to determine what M-mode firmware actually permits. If menvcfg.CBIE=01 (FLUSH-only), the hardware will AND the effective CBIE down to FLUSH, but KVM advertises full INV capability to the guest via henvcfg. The guest's subsequent senvcfg.CBIE writes would also be capped by menvcfg, so no actual privilege escalation occurs, but the mismatched advertisement could confuse guest logic.
+  | if (riscv_isa_extension_available(isa, ZICBOM))
+  |     cfg->henvcfg |= (ENVCFG_CBIE | ENVCFG_CBCFE);
+
+[potential_risk] arch/riscv/kvm/vcpu_onereg.c:529-530  kvm_riscv_vcpu_general_get_csr
+  ONE_REG getter for senvcfg returns the raw in-memory value with no masking of CBIE or other reserved/read-only bits. A guest reading KVM_REG_RISCV_CSR_REG(senvcfg) may observe CBIE=0x3 even when menvcfg.CBIE is 0x1, because the value was populated from a previous setter or from the guest's own CSR write via swap_in_guest_state, which reflects what the guest wrote (not what was actually committed to hardware after menvcfg AND-masking).
+  | *out_val = ((unsigned long *)csr)[reg_num];
+
+[potential_risk] arch/riscv/kvm/vcpu_onereg.c:548-552  kvm_riscv_vcpu_general_set_csr
+  ONE_REG setter for senvcfg stores the VMM-supplied value directly into the in-memory csr->senvcfg with no validation or masking of the CBIE field (bits 5:4), CBZE (bit 7), or CBCFE (bit 6). A VMM can write CBIE=0x0 (ILL, disabling CBO.INVAL for guest U-mode), CBIE=0x1 (FLUSH), or CBIE=0x3 (INV) without the kernel checking consistency against henvcfg.CBIE. The value will be written to hardware CSR_SENVCFG on the next VCPU entry via csr_swap(). While hardware ultimately caps CBIE by menvcfg, the guest may be confused by a VMM-inserted senvcfg value that conflicts with henvcfg.
+  | ((unsigned long *)csr)[reg_num] = reg_val;
+
+[compliant] arch/riscv/kernel/cpufeature.c:1171-1186  riscv_user_isa_enable
+  Host kernel correctly sets only ENVCFG_CBZE (grant U-mode CBO.ZERO) and ENVCFG_CBCFE (grant U-mode CBO.FLUSH/CLEAN), while leaving CBIE at its default 0x0 (ILL). U-mode CBO.INVAL is NOT enabled, so the delegation-chain mismatch described in the spec (senvcfg.CBIE=11 vs menvcfg.CBIE=01) does not occur on the host kernel path. This is defensive and correct.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOZ))
+  |     current->thread.envcfg |= ENVCFG_CBZE;
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOM))
+  |     current->thread.envcfg |= ENVCFG_CBCFE;
+
+[compliant] arch/riscv/include/asm/switch_to.h:84-89  __switch_to_envcfg
+  envcfg (including CBIE, CBZE, CBCFE bits) is saved/restored per-thread on every context switch via ALTERNATIVE-patched CSRW. The host kernel correctly preserves each task's senvcfg state across scheduling, so threads that have CBZE/CBCFE enabled via riscv_user_isa_enable() retain U-mode CBO access after being switched out and back in.
+  | asm volatile (ALTERNATIVE("nop", "csrw " __stringify(CSR_ENVCFG) ", %0",
+  |                 0, RISCV_ISA_EXT_XLINUXENVCFG, 1)
+  |         :: "r" (next->thread.envcfg) : "memory");
+
+[compliant] arch/riscv/kernel/suspend.c:15-18  suspend_save_csrs
+  Suspend path correctly saves CSR_ENVCFG (including CBIE, CBZE, CBCFE bits) before suspend and restores it after resume (line 47-48). The restore happens after the hart returns from firmware, so any firmware modifications to menvcfg/senvcfg during the suspend period are overwritten by the kernel's saved value. No stale or firmware-modified CBIE state persists across suspend/resume cycles.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_XLINUXENVCFG))
+  |     context->envcfg = csr_read(CSR_ENVCFG);
+
+[compliant] arch/riscv/kvm/vcpu.c:755-756  kvm_riscv_vcpu_swap_in_guest_state
+  KVM guest/host senvcfg swap is correctly implemented with atomic csr_swap(). Host senvcfg is saved into vcpu->arch.host_senvcfg and guest senvcfg (csr->senvcfg) is written to CSR_SENVCFG atomically. The reverse is done in swap_in_host_state (line 770). Race-free per-VCPU CSR management.
+  | vcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);
+
+[compliant] arch/riscv/kvm/vcpu_onereg.c:162-168  kvm_riscv_vcpu_ext_disallowed
+  KVM correctly gates SVADU guest-ISA visibility on arch_has_hw_pte_young(), which probes menvcfg.ADUE. This shows awareness that menvcfg bits can restrict henvcfg features. However, no equivalent menvcfg.CBIE check exists for ZICBOM guest enablement. This asymmetry is notable but the henvcfg.CBIE write is hardware-capped by menvcfg, so no actual violation occurs.
+  | case KVM_RISCV_ISA_EXT_SVADU:
+  |     /* The henvcfg.ADUE is read-only zero if menvcfg.ADUE is zero. */
+  |     return arch_has_hw_pte_young();
+

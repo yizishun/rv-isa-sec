@@ -1,0 +1,102 @@
+PR #134  target=xiangshan  overall=bug_confirmed
+Spec: HWCFG2 field bit positions reorganized (chk_x 24→26, peis 26→27, pees 27→28, prio_ent_prog 25→16, new non_prio_en@17); RTL using stale bit indices will misreport instruction-fetch-check capability, per-entry suppression support, and priority-entry programmability — all silently corrupting the IOPMP permission model without any architectural trap
+Violation: XiangShan RTL implements HWCFG2 CSR bit assignments from the pre-PR#134 spec where chk_x is at bit 24, peis at bit 26, pees at bit 27, and prio_ent_prog at bit 25, but the updated spec moves chk_x to bit 26, peis to bit 27, pees to bit 28, and prio_ent_prog to bit 16 — causing the hardware to decode/return WRONG permission-check and suppression-enable flags for every RRID access evaluation
+Consequence: privilege_escape
+Pattern: HWCFG2.*chk_x.*\[24\]|HWCFG2.*peis.*\[26\]|HWCFG2.*pees.*\[27\]|prio_ent_prog.*\[25\]|HWCFG2\.chk_x\(24\)|HWCFG2\.peis\(26\)|HWCFG2\.non_prio_en|HWCFG2.*entry_num.*HWCFG2.*prio
+------------------------------------------------------------
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:495-517  RegHwcfg0 Bundle — capability bits at wrong CSR offset
+  IOPMP capability-discovery bits (chk_x, peis, pees, prient_prog) are defined in RegHwcfg0 (HWCFG0, CSR offset 0x0008) at bit positions 10, 14, 15, 7 respectively, instead of RegHwcfg2 (HWCFG2, CSR offset 0x0010) where the updated spec mandates them at bits 26, 27, 28, 16. Software reading HWCFG2 for capability discovery gets all-zero at those bit positions, causing the software to believe instruction-fetch check and per-entry suppression features are unsupported even when the hardware implements them.
+  | class RegHwcfg0 extends Bundle {
+  |   val enable            = UInt(1.W)  // bit 31
+  |   val addrh_en          = UInt(1.W)  // bit 30
+  |   val md_num            = UInt(6.W)  // bits 29:24
+  |   val md_entry_num      = UInt(7.W)  // bits 23:17
+  |   val mfr_en            = UInt(1.W)  // bit 16
+  |   val pees              = UInt(1.W)  // bit 15
+  |   val peis              = UInt(1.W)  // bit 14
+  |   ...
+  |   val chk_x             = UInt(1.W)  // bit 10
+  |   ...
+  |   val prient_prog       = UInt(1.W)  // bit 7
+  |   ...
+  |   def toUInt: UInt = Cat(enable, addrh_en, md_num, md_entry_num, mfr_en, pees, peis, stall_en, no_w, no_x, chk_x, rrid_transl_prog, rrid_transl_en, prient_prog, user_cfg_en, sps_en, tor_en, srcmd_fmt, mdcfg_fmt)
+  | }
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:544-549  RegHwcfg2 Bundle — missing capability-reporting fields entirely
+  RegHwcfg2 (HWCFG2 at offset 0x0010) contains only rrid_transl[31:16] and prio_entry[15:0]. It has NO chk_x, peis, pees, or prient_prog fields. Bits 26, 27, 28 fall within rrid_transl[10:8] (hardwired to 0, write path dead). Bit 16 is prio_entry[0] which holds the priority-entry count, not the prient_prog capability bit. Any updated-spec software reading HWCFG2 at offset 0x0010 sees all-zero capability bits, misinterpreting the hardware as lacking instruction-fetch-check and per-entry-suppression support.
+  | class RegHwcfg2 extends Bundle {
+  |   val rrid_transl       = UInt(16.W) // bits 31:16
+  |   val prio_entry        = UInt(16.W) // bits 15:0
+  |   def toUInt: UInt = Cat(rrid_transl, prio_entry)
+  | }
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:536-543  RegHwcfg2.apply — no initialization path for capability bits
+  RegHwcfg2 initialization only assigns prio_entry and rrid_transl from IopmpParams. No init_val assignments exist for chk_x, peis, pees, or prient_prog — so even if these fields were added to the RegHwcfg2 Bundle, they would be uninitialized/zero. The correct defaults (peis=1 meaning HW supports interrupt suppression, prient_prog=1 for W1CS sticky-init) are lost.
+  | object RegHwcfg2 {
+  |   def apply(): RegHwcfg2 = {
+  |     val init_val = Wire(new RegHwcfg2)
+  |     init_val.prio_entry  := IopmpParams.prio_entry.U
+  |     init_val.rrid_transl := IopmpParams.rrid_transl.U
+  |     RegInit(init_val)
+  |   }
+  | }
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:809-820  RegMap — HWCFG2 write logic cross-references HWCFG0
+  HWCFG2.prio_entry writeability is gated on reg_hwcfg0.prient_prog (line 813). In the updated spec, prient_prog is a W1CS field inside HWCFG2 itself at bit 16, not in HWCFG0. This cross-register write-gating is architecturally broken: the gating condition can never be updated by the HWCFG2-targeted write itself. After reset, prient_prog=1 in HWCFG0 allows prio_entry writes, but a write-1-to-clear on the new-spec HWCFG2 bit 16 cannot affect HWCFG0, so the gating stays permanently open.
+  | when(io.regcfg.v && io.regcfg.rw && addrhit_hwcfg2) {
+  |   val w = io.regcfg.din.asTypeOf(new RegHwcfg2)
+  |   when(reg_hwcfg0.prient_prog === 1.U) {
+  |     reg_hwcfg2.prio_entry := w.prio_entry  // WARL
+  |   }
+  |   // unsupported rrid_transl_en and related features
+  |   // when(reg_hwcfg0.rrid_transl_prog === 1.U) {
+  |   //   reg_hwcfg2.rrid_transl := w.rrid_transl
+  |   // } 
+  | }
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:854-860  RegMap — HWCFG2 read MuxLookup returns wrong bit layout
+  The read path at HWCFG2 offset 0x0010 returns Cat(rrid_transl, prio_entry). For new-spec software, bits 26/27/28 (chk_x/peis/pees) return rrid_transl[10:8]=0, and bit 16 (prient_prog) returns prio_entry[0] which reflects the priority-entry-count LSB, not the W1CS capability bit. Software gets 0 for all four capability-indication bit positions.
+  | regcfg_dout := MuxLookup(addr_offset, 0.U)(Seq(
+  |   ...
+  |   IopmpParams.reg_hwcfg2_addr_offset         -> reg_hwcfg2.toUInt,
+  |   ...
+  | ))
+
+[potential_risk] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1254-1259  Ctrl.sPriority — prio_entry consumption at runtime
+  pri_part_hit detection compares j_indx_d against io.reg.o_reg_hwcfg2_prio_entry. This wire drives correct runtime priority-boundary behavior since prio_entry field position (bits 15:0) is unchanged between old and new spec. However, write-path gating on HWCFG0.prient_prog means the prio_entry value may be stale or unwritable once prient_prog is cleared (though RTL has commented-out the W1CS clearing path at lines 802-803). Currently low risk because the W1CS path is inactive, but the architectural coupling is fragile.
+  | when(j_indx_d < io.reg.o_reg_hwcfg2_prio_entry) {
+  |   pri_part_hit := true.B
+  | }.otherwise {
+  |   pri_part_hit := false.B
+  | }
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:35-51  IopmpParams — chk_x/peis/pees/prient_prog constants feed wrong register
+  IopmpParams defines prient_prog=1, chk_x=0, peis=1, pees=0 (correct capability values: HW supports prio_entry programming and interrupt suppression, does not support instruction-fetch check or error suppression). But these constants feed RegHwcfg0 initialization (lines 478-486), not RegHwcfg2. No corresponding HWCFG2-targeted constants exist, making it impossible to populate the correct register with the correct values.
+  | val prient_prog        = 1    // [W1CS] if prio_entry programmable, reset to 1
+  | val chk_x              = 0    // [R   ] unsupport instruction fetch check
+  | val peis               = 1    // [R   ] PEIS enabled
+  | val pees               = 0    // [R   ] PEES enabled
+  | val prio_entry         = 0    // [WARL] Indicate the number of entries matched with priority
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:478-492  RegHwcfg0.apply — initialization loads constants into wrong CSR
+  RegHwcfg0.apply initializes prient_prog:=1, chk_x:=0, peis:=1, pees:=0 into HWCFG0 (offset 0x0008). Same values should instead initialize HWCFG2 fields at bits 16, 26, 27, 28. The correct reset values exist but at the wrong CSR offset, so new-spec SW reading HWCFG2 gets 0 instead of the true hardware capability bitmap.
+  | init_val.prient_prog        := IopmpParams.prient_prog.U         // 1.U
+  | init_val.chk_x              := IopmpParams.chk_x.U               // 0.U
+  | init_val.peis               := IopmpParams.peis.U                // 1.U
+  | init_val.pees               := IopmpParams.pees.U                // 1.U  (note: IopmpParams.pees=0 per line 43)
+
+[potential_risk] ChiselIOPMP/src/main/scala/IopmpChecker.scala:427-436  EntryAttribute — per-entry suppression flags wired to SRAM bits 5-10
+  ENTRY_CFG 11-bit SRAM word bit assignments: sire=bit5, siwe=bit6, sixe=bit7, sere=bit8, sewe=bit9, sexe=bit10. These are the PEIS/PEES mechanism the HWCFG2 capability bits should advertise. If the updated IOPMP spec also reassigns entry_cfg bit positions for suppression flags, these hardcoded bit indices would cause software to write suppression config at wrong locations. Requires cross-referencing with any entry_cfg layout changes in the updated spec.
+  | io.bits.attribute.sire   := tmp_entry_cfg(5)
+  | io.bits.attribute.siwe   := tmp_entry_cfg(6)
+  | io.bits.attribute.sixe   := tmp_entry_cfg(7)
+  | io.bits.attribute.sere   := tmp_entry_cfg(8)
+  | io.bits.attribute.sewe   := tmp_entry_cfg(9)
+  | io.bits.attribute.sexe   := tmp_entry_cfg(10)
+
+[compliant] src/main/scala/xiangshan/backend/fu/wrapper/CSR.scala:224-226  CSR.scala — topeis wiring (AIA IMSIC, unrelated to IOPMP PEIS)
+  The topeis wires in XiangShan main core CSR.scala connect AIA IMSIC top-level external interrupt-priority signals (mtopei/stopei/vstopei) to the CSR module. These are IMSIC interrupt controller signals, unrelated to the IOPMP PEIS (per-entry interrupt suppression) capability bit at issue. No false-positive here — different subsystem.
+  | csrMod.fromAIA.mtopei  := imsic.toCSR.topeis(0)
+  | csrMod.fromAIA.stopei  := imsic.toCSR.topeis(1)
+  | csrMod.fromAIA.vstopei := imsic.toCSR.topeis(2)
+

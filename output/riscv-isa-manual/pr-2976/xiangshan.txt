@@ -1,0 +1,64 @@
+PR #2976  target=xiangshan  overall=compliant
+Spec: mscratch/mepc/mcause/mtval are now spec-mandatory M-mode CSRs; if any is missing or non-updating in XiangShan CSR RTL, M-mode trap handling collapses: MRET returns to garbage PC, trap dispatch breaks, page faults become unrecoverable, and M-mode context switching fails — functionally bricking M-mode and enabling privilege-boundary violations
+Violation: In XiangShan RTL, if any of mscratch, mepc, mcause, or mtval CSR registers is not instantiated in the CSR module (CSRFile/CSRMap), or is instantiated but hardwired to zero/unimplemented without trap-side write logic (e.g., missing mcause/mepc/mtval update on exception entry, missing mscratch read/write path), the hardware fails to provide mandatory M-mode trap infrastructure. Specifically: (a) mscratch absent → M-mode handler loses context-swap capability; (b) mepc absent or not updated on trap entry → MRET returns to wrong/undefined address, breaking all trap return paths; (c) mcause absent or not updated on trap entry → M-mode handler cannot determine trap reason, making traps undispatched or misdispatched; (d) mtval absent or not updated on exception → page fault handlers lose faulting virtual address, breaking demand paging and memory management.
+Consequence: privilege_escape
+Pattern: (csr_map\[0x(340|341|342|343)\]|CSRs\.(mscratch|mepc|mcause|mtval)|"mscratch"|"mepc"|"mcause"|"mtval"|writeMepc|writeMcause|writeMtval|MSCRATCH|MEPC|MCAUSE|MTVAL)
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:201-211  MachineLevelCSR
+  All four mandatory M-mode trap CSRs (mscratch, mepc, mcause, mtval) are instantiated as proper CSRModule instances with correct addresses (0x340-0x343) matching the RISC-V privileged spec. Each has a full read/write path through the CSRModule framework.
+  | val mscratch = Module(new CSRModule("Mscratch", new ScratchBundle(...)).setAddr(CSRs.mscratch)
+  | val mepc = Module(new CSRModule("Mepc", new Epc) with TrapEntryMEventSinkBundle).setAddr(CSRs.mepc)
+  | val mcause = Module(new CSRModule("Mcause", new CauseBundle) with TrapEntryMEventSinkBundle).setAddr(CSRs.mcause)
+  | val mtval = Module(new CSRModule("Mtval", new XtvalBundle) with TrapEntryMEventSinkBundle).setAddr(CSRs.mtval)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMEvent.scala:104-120  TrapEntryMEventModule
+  Trap entry correctly updates all three trap-capture CSRs: mepc (PC of trapped instruction, bit 0 cleared), mcause (Interrupt bit + ExceptionCode), and mtval (faulting address or additional info). All writes are guarded by the valid signal.
+  | out.mepc.valid := valid
+  | out.mcause.valid := valid
+  | out.mtval.valid := valid
+  | out.mepc.bits.epc := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))
+  | out.mcause.bits.Interrupt := isInterrupt && !isDTExcp
+  | out.mcause.bits.ExceptionCode := Mux(isDTExcp, ExceptionNO.EX_DT.U, highPrioTrapNO)
+  | out.mtval.bits.ALL := Mux(isFetchMalAddrExcp, in.fetchMalTval, tval)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/MretEvent.scala:78-81  MretEventModule
+  MRET correctly reads mepc as the return target PC, ensuring the trap return path is functional. Address translation checks (IPF, IAF, IGPF) are applied to the return target.
+  | out.targetPc.bits.pc := in.mepc.asUInt
+  | out.targetPc.bits.raiseIPF := instrAddrTransType.checkPageFault(in.mepc.asUInt)
+  | out.targetPc.bits.raiseIAF := instrAddrTransType.checkAccessFault(in.mepc.asUInt)
+  | out.targetPc.bits.raiseIGPF := instrAddrTransType.checkGuestPageFault(in.mepc.asUInt)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:698-700  MachineLevelCSR
+  mepc Epc bundle defines field at bits 63:1 (bit 0 hardwired to zero), matching the RISC-V spec requirement that mepc[0] is always zero (traps target aligned instruction addresses, and mret with mepc[0]=1 would raise an instruction-address-misaligned exception).
+  | class Epc extends CSRBundle {
+  |   val epc = RW(63, 1).withReset(0.U).withDescription("Exception program counter.")
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:23-28  CSRBundles
+  mcause CauseBundle correctly encodes Interrupt at bit 63 and ExceptionCode at bits 62:0, matching RISC-V privileged spec encoding (WLRL field where bit 63 distinguishes interrupts from exceptions).
+  | class CauseBundle extends CSRBundle {
+  |   val Interrupt = RW(63).withReset(0.U)
+  |   val ExceptionCode = RW(62, 0).withReset(0.U)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:155-158  CSRs
+  CSR address map correctly assigns spec-mandated addresses: mscratch=0x340, mepc=0x341, mcause=0x342, mtval=0x343. These match the RISC-V privileged architecture CSR address assignments exactly.
+  | val mscratch = 0x340
+  | val mepc = 0x341
+  | val mcause = 0x342
+  | val mtval = 0x343
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:455-458  MachineLevelCSR
+  All four CSRs are registered in machineLevelCSRMods sequence, ensuring they are included in the csrOutMap for CSR read instructions, exported to difftest state, and participate in the full CSR infrastructure.
+  | mscratch,
+  | mepc,
+  | mcause,
+  | mtval,
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1607-1618  NewCSR
+  All four CSRs are exported to difftest DiffCSRState for architectural state verification (used by difftest framework to check against golden model), confirming they hold live architectural state.
+  | diffCSRState.mepc := mepc.rdata.asUInt
+  | diffCSRState.mtval := mtval.rdata.asUInt
+  | diffCSRState.mcause := mcause.rdata.asUInt
+  | diffCSRState.mscratch := mscratch.rdata.asUInt
+

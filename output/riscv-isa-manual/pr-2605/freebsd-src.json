@@ -1,0 +1,158 @@
+{
+  "pr_number": 2605,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2605,
+    "violation_condition": "When Sscofpmf hardware is present (has_sscofpmf=1), the FreeBSD kernel never writes scounteren or mcounteren to enable HPM-counter access from S-mode, never saves/restores hpmcounter/mhpmevent state across context switches in swtch.S, and has no trap handler for the count-overflow interrupt (LCOFI) if delegated to S-mode via mideleg — counter state from M-mode firmware (OpenSBI) or prior kernel operations persists unswitched across thread boundaries, and an undelivered LCOFI interrupt may cause an unhandled-trap panic.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "swtch.S context-switch path missing hpmcounter/mhpmevent save/restore; no csr_write(scounteren, *) in kernel; no LCOFI trap handler registered; has_sscofpmf checked but never acted upon",
+    "affected_entities": [
+      "scountovf",
+      "hpmcounter3-31",
+      "mhpmevent3-31",
+      "scounteren",
+      "mcounteren",
+      "mip.LCOFIP",
+      "sip.LCOFIP",
+      "mie.LCOFIE",
+      "sie.LCOFIE",
+      "mideleg[13]"
+    ],
+    "summary": "FreeBSD detects Sscofpmf but never manages HPM counter state — swtch.S leaks counter values across threads, scounteren stays zero blocking legitimate access, and no LCOFI handler exists, violating thread-isolation invariants when M-mode firmware has counters running"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/identcpu.c",
+        "function_name": "identify_cpu",
+        "line_start": 79,
+        "line_end": 79,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "has_sscofpmf is declared as a global flag but never read by any kernel code. The CPU announces Sscofpmf support (detected via ISA string parsing at line 467), but the kernel takes zero action — no scounteren init, no context-switch hooks, no LCOFI handler registration. Dead-capability flag.",
+      "snippet": "bool __read_frequently has_sscofpmf;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 268,
+        "line_end": 284,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_switch() saves/restores only GPRs (ra, sp, s0-s11) and optionally FPU state. No hpmcounter3–31 or mhpmevent3–31 CSR save/restore exists anywhere in the context-switch path. When M-mode firmware has configured mcounteren to grant S-mode HPM access, the 29 counter CSRs and their event-selector CSRs carry stale values from the previous thread into the next — a cross-thread information leak through performance-monitor state.",
+      "snippet": "sd  ra, (PCB_RA)(x13)\nsd  sp, (PCB_SP)(x13)\nsd  s0, (PCB_S + 0 * 8)(x13)\n...\nsd  s11, (PCB_S + 11 * 8)(x13)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 220,
+        "line_end": 235,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_throw() — the fast-path context switch for a new thread — likewise only restores GPRs and optionally FPU state. No hpmcounter/mhpmevent save/restore. The new thread inherits whatever HPM counter values the previous thread (or M-mode firmware) left in hardware.",
+      "snippet": "ld  ra, (PCB_RA)(x13)\nld  sp, (PCB_SP)(x13)\nld  s0, (PCB_S + 0 * 8)(x13)\n...\nld  s11, (PCB_S + 11 * 8)(x13)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers",
+        "line_start": 41,
+        "line_end": 114,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The trap-entry save_registers macro saves all GPRs plus sepc, sstatus, stval, scause — but does not read or snapshot scounteren or any hpmcounter CSR. If the kernel ever uses HPM counters for profiling, trap entries will corrupt counter values (e.g., counting trap-handling instructions as user/kernel work). This is currently latent since hwpmc is disabled on RISC-V.",
+      "snippet": "csrr  t0, sepc\nsd    t0, (TF_SEPC)(sp)\ncsrr  t0, sstatus\nsd    t0, (TF_SSTATUS)(sp)\ncsrr  t0, stval\nsd    t0, (TF_STVAL)(sp)\ncsrr  t0, scause\nsd    t0, (TF_SCAUSE)(sp)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 372,
+        "line_end": 376,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "do_trap_supervisor() switch on scause has a default case that panics. If M-mode firmware sets mideleg[13] to delegate the local-counter-overflow interrupt (LCOFI) to S-mode, the kernel receives scause=0x800000000000000d (interrupt bit | 13). SCAUSE_CODE masks this to 13, which matches no case label, falls to default, and triggers panic(\"Unknown kernel exception\") — a guaranteed denial-of-service on counter overflow.",
+      "snippet": "default:\n  dump_regs(frame);\n  panic(\"Unknown kernel exception %#lx trap value %#lx\",\n      exception, frame->tf_stval);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 455,
+        "line_end": 459,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ditto for do_trap_user(): LCOFI (interrupt 13) falls to default → panic. If LCOFI fires while in U-mode and is delegated to S-mode by mideleg, the kernel panics identically. No graceful signal delivery (SIGEMT or similar) exists.",
+      "snippet": "default:\n  dump_regs(frame);\n  panic(\"Unknown userland exception %#lx, trap value %#lx\",\n      exception, frame->tf_stval);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/intr.h",
+        "function_name": "(enum definition)",
+        "line_start": 43,
+        "line_end": 56,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The IRQ enum defines slots for software (bits 0–3), timer (bits 4–7), and external (bits 8–11) interrupts, but no IRQ_COUNT_OVERFLOW entry for bit 13. Without this enum value, no interrupt handler can be registered for LCOFI even if kernel code wanted to.",
+      "snippet": "enum {\n  IRQ_SOFTWARE_USER,        /* bit 0 */\n  ...\n  IRQ_EXTERNAL_MACHINE,     /* bit 11 */\n  /* missing: bit 13 count-overflow */\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "(CSR bit definitions)",
+        "line_start": 136,
+        "line_end": 175,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "MIP, MIE, SIP, and SIE bit definitions cover bits 0–12 but stop before bit 13 (LCOFI). MIP_LCOFIP, SIP_LCOFIP, MIE_LCOFIE, and SIE_LCOFIE are all absent. The kernel cannot mask, check, or acknowledge the count-overflow interrupt via the standard interrupt-pending/enable CSRs.",
+      "snippet": "MIE_MTIE  (1 << 7)   /* last MIE bit defined */\nMIP_MTIP  (1 << 7)   /* last MIP bit defined */\nSIE_SEIE  (1 << 9)   /* last SIE bit defined */\n/* bit 13 LCOFI: undefined */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "(boot sequence)",
+        "line_start": 230,
+        "line_end": 265,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The boot sequence sets stvec and sscratch, then jumps to initriscv() → mi_startup without writing scounteren. The scounteren CSR remains at its reset value (likely 0, blocking all U-mode HPM-counter access). While this prevents user info leaks, it also means the kernel has no deliberate policy for scounteren — it passively inherits whatever M-mode left, and adds no initialization.",
+      "snippet": "la   t0, cpu_exception_handler\ncsrw stvec, t0\nli   t0, 0\ncsrw sscratch, t0\n...\ncall _C_LABEL(initriscv)\ncall _C_LABEL(mi_startup)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/machdep.c",
+        "function_name": "initriscv",
+        "line_start": 558,
+        "line_end": 654,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "initriscv() calls identify_cpu() which sets has_sscofpmf=1 when the ISA string includes 'sscofpmf', but then proceeds through pmap_bootstrap, cninit, init_proc0, mutex_init, etc. without ever writing scounteren or initializing HPM counter state. The entire boot path has no Sscofpmf-aware initialization.",
+      "snippet": "identify_cpu(0);\n...\npmap_bootstrap(rvbp->kern_phys, kernlen);\n...\ninit_proc0(rvbp->kern_stack);\n/* scounteren never written */"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/encoding.h",
+        "function_name": "(CSR definitions)",
+        "line_start": 569,
+        "line_end": 586,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR_SCOUNTEREN (0x106) and CSR_MCOUNTEREN (0x306) are defined with DECLARE_CSR macros, making csr_read(scounteren, ...) / csr_write(scounteren, ...) syntactically valid. However, the Sscofpmf-spec SCOUNTOVF CSR (0xda0) is not defined anywhere in encoding.h, so even a correctly-implemented handler could not poll overflow status via the standard csr_read interface.",
+      "snippet": "#define CSR_SCOUNTEREN 0x106\n#define CSR_MCOUNTEREN 0x306\n/* CSR_SCOUNTOVF (0xda0): NOT DEFINED */"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

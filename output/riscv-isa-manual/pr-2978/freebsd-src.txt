@@ -1,0 +1,54 @@
+PR #2978  target=freebsd-src  overall=potential_risk
+Spec: Spec now requires mstatus control bits (SUM, MXR, TVM, TSR, TW, MPRV, MIE/MPIE) to be writable when the corresponding feature is supported — a non-conformant implementation that makes these bits read-only 0 despite supporting the feature would silently break FreeBSD's memory protection model and trap virtualization controls
+Violation: FreeBSD kernel (running in S-mode) writes to sstatus.SUM, sstatus.MXR, or the M-mode firmware writes to mstatus.TVM/TSR/TW/MPRV expecting the bit to take effect, but the RISC-V implementation incorrectly makes the bit read-only 0 despite the spec-required condition for writability being met (e.g., S-mode supported with satp.MODE writable for SUM/MXR/TVM, U-mode supported for MPRV, modes less privileged than M exist for TW)
+Consequence: function_loss
+Pattern: csrw sstatus.*SSTATUS_SUM|csrs sstatus.*SSTATUS_MXR|writing mstatus CSR with TVM|TSR|TW|MPRV bits set without checking WARL readback
+------------------------------------------------------------
+[potential_risk] sys/riscv/include/asm.h:64-70  ENTER_USER_ACCESS macro
+  ENTER_USER_ACCESS/EXIT_USER_ACCESS macros use csrs/csrc on sstatus.SUM without WARL readback verification. If a RISC-V implementation incorrectly makes SUM read-only 0 (despite the spec-required condition of S-mode with writable satp.MODE being met), all copyin/copyout/fueword/suword operations would fail, resulting in function_loss. The kernel blindly trusts the CSR write succeeded with no readback check.
+  | #define	ENTER_USER_ACCESS(tmp)						\
+  | 	li	tmp, SSTATUS_SUM;					\
+  | 	csrs	sstatus, tmp
+  | 
+  | #define	EXIT_USER_ACCESS(tmp)						\
+  | 	li	tmp, SSTATUS_SUM;					\
+  | 	csrc	sstatus, tmp
+
+[compliant] sys/riscv/riscv/exception.S:105-109  save_registers (macro, mode=1 branch)
+  On S-mode exception entry, SUM is explicitly cleared via csrc sstatus,SSTATUS_SUM before the saved sstatus is stored to the trapframe. This is correct defensive practice ensuring SUM is never left set across exception handlers. The KASSERTs in trap.c:315 and trap.c:396 further verify SUM is always 0 on trap entry for both S-mode and U-mode exceptions.
+  | .if \mode == 1
+  | 	/* Disable user address access for supervisor mode exceptions. */
+  | 	li	t0, SSTATUS_SUM
+  | 	csrc	sstatus, t0
+  | .endif
+
+[compliant] sys/riscv/riscv/swtch.S:371-376  fork_trampoline
+  fork_trampoline restores sstatus from the trapframe via csrw sstatus,t0. The restored value comes from TF_SSTATUS which was saved during save_registers, where SUM was already cleared for S-mode entries. For newly forked user processes, the sstatus in the frame should also have SUM=0 initialized. No risk of restoring SUM=1 inadvertently.
+  | /* Restore sstatus */
+  | ld	t0, (TF_SSTATUS)(sp)
+  | /* Ensure interrupts disabled */
+  | li	t1, ~SSTATUS_SIE
+  | and	t0, t0, t1
+  | csrw	sstatus, t0
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:227-229  vmmops_vcpu_init
+  vmmops_vcpu_init sets HSTATUS_VTW in the guest hstatus for hypervisor context. This is correct hypervisor behavior: VTW controls whether WFI from VS-mode traps to HS-mode. This is not a write to mstatus.TW - the hypervisor uses hstatus CSR (HS-level) to virtualize the TW constraint for guests. The kernel never writes mstatus.TW directly.
+  | /* hstatus */
+  | hypctx->guest_regs.hyp_hstatus = HSTATUS_SPV | HSTATUS_VTW;
+  | hypctx->guest_regs.hyp_hstatus |= HSTATUS_SPVP;
+
+[compliant] sys/riscv/include/riscvreg.h:82-105  (definitions only)
+  The kernel defines MSTATUS_MPRV (bit 17) but never writes mstatus CSR from S-mode (confirmed: zero csrw/csrs/csrc on mstatus). MPRV and TVM/TSR/TW are M-mode-only fields; FreeBSD kernel runs in S-mode and cannot directly modify them. M-mode firmware (OpenSBI) is responsible for mstatus.TW, and the kernel interacts with firmware via SBI calls that do not expose mstatus manipulation.
+  | #define	MSTATUS_MPRV			(1 << 17)
+  | #define	MSTATUS_PUM			(1 << 18)
+  | #define	MSTATUS_VM_MASK			0x1f
+  | #define	MSTATUS_VM_SHIFT		24
+
+[compliant] sys/riscv/include/riscvreg.h:60-80  (definitions only)
+  No SSTATUS_MXR definition exists anywhere in the RISC-V port. The kernel does not use MXR (bit 19 of sstatus) for execute-only page support. The absense of MXR usage means there is no risk of the kernel relying on an incorrectly-WARL'd MXR bit. This is a known limitation (the kernel lacks execute-only support) but not a security violation per this spec.
+  | #define	SSTATUS_UIE			(1 << 0)
+  | #define	SSTATUS_SIE			(1 << 1)
+  | ...
+  | #define	SSTATUS_SUM			(1 << 18)
+  | /* No SSTATUS_MXR defined */
+

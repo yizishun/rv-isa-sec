@@ -1,0 +1,49 @@
+PR #2571  target=linux  overall=compliant
+Spec: scountinhibit is a masked alias that hides M-mode inhibit state for non-delegated counters; kernel PMU code reading scountinhibit may observe false 'not-inhibited' and base profiling/sampling decisions on stale counter values
+Violation: Linux kernel PMU driver reads scountinhibit to check whether a counter is running, but for counters not delegated via mcounteren, the corresponding scountinhibit bits are hardwired to read-as-zero regardless of the actual mcountinhibit state set by M-mode firmware. The kernel therefore cannot distinguish 'counter is running' from 'counter is inhibited by M-mode but not visible to S-mode,' leading to incorrect assumptions about counter liveness during context switch or PMU state save/restore.
+Consequence: info_leak
+Pattern: csr_read.*CSR_SCOUNTINHIBIT|read.*scountinhibit|scountinhibit.*context|scountinhibit.*save|scountinhibit.*restore
+------------------------------------------------------------
+[compliant] drivers/perf/riscv_pmu_sbi.c:739-779  pmu_sbi_ctr_read
+  Counter read path checks hwc->state (PERF_HES_STOPPED) and snapshot shared memory for stopped counters, or reads via riscv_pmu_ctr_read_csr() for running ones. No scountinhibit read is performed. Counter liveness is derived from software state flags, not hardware inhibit registers.
+  | if (sbi_pmu_snapshot_available() && (hwc->state & PERF_HES_STOPPED)) {
+  |     val = sdata->ctr_values[idx];
+  |     return val;
+  | }
+  | ...
+  | val = riscv_pmu_ctr_read_csr(info.csr);
+
+[compliant] drivers/perf/riscv_pmu_sbi.c:822-856  pmu_sbi_ctr_stop
+  Counter stop path uses SBI ecall (SBI_EXT_PMU_COUNTER_STOP) delegating to M-mode firmware. No direct scountinhibit write or read. Software state (used_hw_ctrs, PERF_EVENT_FLAG_USER_ACCESS) tracks counter status.
+  | ret = sbi_ecall(SBI_EXT_PMU, SBI_EXT_PMU_COUNTER_STOP, hwc->idx, 1, flag, 0, 0, 0);
+
+[compliant] drivers/perf/riscv_pmu_sbi.c:910-946  pmu_sbi_stop_hw_ctrs
+  Batch counter stop during overflow handling also uses SBI ecalls. Counter values saved/restored from snapshot shared memory (sdata->ctr_values), not by reading inhibit registers. No scountinhibit access.
+  | ret = sbi_ecall(SBI_EXT_PMU, SBI_EXT_PMU_COUNTER_STOP, i * BITS_PER_LONG,
+  |         cpu_hw_evt->used_hw_ctrs[i], flag, 0, 0, 0);
+
+[compliant] drivers/perf/riscv_pmu_sbi.c:1148-1170  pmu_sbi_starting_cpu
+  CPU hotplug startup writes SCOUNTEREN (user-mode access control), not scountinhibit. All counters stopped via pmu_sbi_stop_all() using SBI ecall. Correct delegation through M-mode.
+  | csr_write(CSR_SCOUNTEREN, 0x7);
+  | ...
+  | pmu_sbi_stop_all(pmu);
+
+[compliant] drivers/perf/riscv_pmu_sbi.c:1041-1146  pmu_sbi_ovf_handler
+  Overflow handler reads SCOUNTOVF (not scountinhibit) to detect which counters overflowed. Stops counters via pmu_sbi_stop_hw_ctrs() (SBI ecalls), then restarts overflowed counters with updated init values via SBI. No scountinhibit dependency.
+  | pmu_sbi_stop_hw_ctrs(pmu);
+  | ...
+  | ALT_SBI_PMU_OVERFLOW(overflow);
+  | ...
+  | pmu_sbi_start_overflow_mask(pmu, overflowed_ctrs);
+
+[compliant] arch/riscv/kernel/entry.S:421-471  __switch_to
+  Context switch saves/restores only GPRs (ra, sp, s0-s11) and the SUM bit from sstatus. No PMU counter or inhibit register save/restore. PMU counter ownership is managed by the perf subsystem via event scheduling, not context-switch-level snapshotting.
+  | REG_S ra,  TASK_THREAD_RA_RA(a0)
+  | REG_S sp,  TASK_THREAD_SP_RA(a0)
+  | ...
+  | REG_L s11, TASK_THREAD_S11_RA(a1)
+
+[compliant] arch/riscv/include/asm/csr.h:322-322  (CSR definitions)
+  CSR_SCOUNTEREN is defined (0x106) for user-mode access control, but no CSR_SCOUNTINHIBIT (0x120) or CSR_MCOUNTINHIBIT (0x320) definitions exist. The kernel has no mechanism to read hardware counter inhibit state, which is architecturally correct since S-mode should not directly manipulate inhibit registers without M-mode cooperation via SBI.
+  | #define CSR_SCOUNTEREN  0x106
+

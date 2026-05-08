@@ -1,0 +1,48 @@
+PR #429  target=linux  overall=potential_risk
+Spec: FDPIC signal delivery requires kernel to dereference function descriptors to load both PC and gp before entering handler; without this, handler executes with attacker-controlled gp causing all GOT-relative data accesses to alias arbitrary memory
+Violation: In arch/riscv/kernel/signal.c, when the target process has an FDPIC personality (EF_RISCV_FUNCDESC set), the kernel reads sa_handler or sa_sigaction as a raw code address and restores only sepc without also dereferencing the function descriptor to extract both the entry PC and the gp value, then loading gp into the user x3 register before returning to userspace.
+Consequence: privilege_escape
+Pattern: setup_return or setup_sigframe paths in arch/riscv/kernel/signal.c that write regs->epc from ka->sa.sa_handler without checking for EF_RISCV_FUNCDESC and without loading gp from the function descriptor
+------------------------------------------------------------
+[potential_risk] arch/riscv/kernel/signal.c:468-469  setup_rt_frame
+  Signal handler PC is set from ksig->ka.sa.sa_handler as a raw code address without checking for FDPIC personality (FDPIC_FUNCPTRS) and without dereferencing a function descriptor to extract the entry PC and gp value. On FDPIC processes, sa_handler points to a function descriptor (entry PC + gp), not raw code. Writing the descriptor address directly to sepc causes the handler to execute descriptor data as code with an incorrect gp, enabling privilege escalation.
+  | regs->epc = (unsigned long)ksig->ka.sa.sa_handler;
+  | regs->sp = (unsigned long)frame;
+  | regs->a0 = ksig->sig;                     /* a0: signal number */
+  | regs->a1 = (unsigned long)(&frame->info); /* a1: siginfo pointer */
+  | regs->a2 = (unsigned long)(&frame->uc);   /* a2: ucontext pointer */
+
+[potential_risk] arch/riscv/kernel/compat_signal.c:230-231  compat_setup_rt_frame
+  Same FDPIC-unaware signal delivery in the compat (32-bit) path. regs->epc is set directly from sa_handler with no FDPIC_FUNCPTRS personality check, no function descriptor dereference, and no gp (x3) register loading. This is the same vulnerability pattern as the native 64-bit path.
+  | regs->epc = (unsigned long)ksig->ka.sa.sa_handler;
+  | regs->sp = (unsigned long)frame;
+  | regs->a0 = ksig->sig;                     /* a0: signal number */
+  | regs->a1 = (unsigned long)(&frame->info); /* a1: siginfo pointer */
+  | regs->a2 = (unsigned long)(&frame->uc);   /* a2: ucontext pointer */
+
+[potential_risk] arch/riscv/kernel/signal.c:436-472  setup_rt_frame
+  No gp (x3) register is set before returning to the signal handler. In FDPIC ABI, gp must be loaded from the function descriptor (descriptor[1]) before entering the signal handler, so the handler can access its GOT. Neither setup_rt_frame() nor compat_setup_rt_frame() writes regs->gp. Compare with ARM which sets ARM_r9 (the FDPIC GOT register) at signal.c:441 and xtensa which sets areg[base+11] at signal.c:436.
+  | regs->epc = (unsigned long)ksig->ka.sa.sa_handler;
+  | regs->sp = (unsigned long)frame;
+  | regs->a0 = ksig->sig;
+  | regs->a1 = (unsigned long)(&frame->info);
+  | regs->a2 = (unsigned long)(&frame->uc);
+
+[potential_risk] arch/riscv/include/asm/elf.h:1-156  elf.h (global)
+  RISC-V has FDPIC scaffolding (PTRACE_GETFDPIC, ELF_FDPIC_PLAT_INIT, ELF_FDPIC_CORE_EFLAGS, exec_fdpic_loadmap/interp_fdpic_loadmap in mmu.h) but no elf_check_fdpic() definition and no EF_RISCV_FUNCDESC flag. The fallback 'elf_check_fdpic(x) == 0' in binfmt_elf_fdpic.c:118 means FDPIC binaries cannot be loaded today. However, this scaffolding signals intent to enable FDPIC, and when it is enabled, the signal delivery paths will be silently broken.
+  | #define ELF_FDPIC_CORE_EFLAGS 0
+  | #define ELF_FDPIC_PLAT_INIT(_r, _exec_map_addr, _interp_map_addr, dynamic_addr) \
+  |   do { (_r)->a1 = _exec_map_addr; (_r)->a2 = _interp_map_addr; (_r)->a3 = dynamic_addr; } while (0)
+
+[potential_risk] arch/riscv/kernel/signal.c:483-497  handle_signal
+  The handle_signal() dispatch path branches on is_compat_task() to select compat_setup_rt_frame vs setup_rt_frame, but neither path checks for FDPIC personality. An FDPIC process (current->personality & FDPIC_FUNCPTRS) would flow through the same code as a non-FDPIC process, with sa_handler treated as a raw code address in both branches.
+  | if (is_compat_task())
+  |   ret = compat_setup_rt_frame(ksig, oldset, regs);
+  | else
+  |   ret = setup_rt_frame(ksig, oldset, regs);
+  | signal_setup_done(ret, ksig, 0);
+
+[compliant] arch/riscv/kernel/signal.c:219-228  restore_sigcontext
+  restore_sigcontext() does a blind copy of the full user_regs_struct from the signal frame back into pt_regs (including pc and gp). On rt_sigreturn, this correctly restores whatever pc and gp were saved at signal delivery time. This is not the vulnerable path — the vulnerability is at signal delivery (setup_rt_frame), not signal return.
+  | err = __copy_from_user(regs, &sc->sc_regs, sizeof(sc->sc_regs));
+

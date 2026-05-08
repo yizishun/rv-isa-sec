@@ -1,0 +1,32 @@
+PR #2660  target=xiangshan  overall=potential_risk
+Spec: EventInhibitBundle unconditionally implements all xINH bits as RW flops without WARL-zero gating for unimplemented privilege modes, violating norm:unimplemented_mode_bits and allowing software to set inhibit bits for non-existent modes, potentially leaking the counter configuration state or causing counter divergence across harts.
+Violation: In XiangShan RTL, the EventInhibitBundle (MachineLevel.scala:769-775) unconditionally defines all five inhibit bits MINH(bit62), SINH(bit61), UINH(bit60), VSINH(bit59), VUINH(bit58) as RW fields via CSRBundle RW() method, without any WARL gating to force read-only zero for bits 61:58 corresponding to unimplemented privilege modes. When the core is synthesized without the H-extension (no VS/VU modes), VSINH(bit59) and VUINH(bit58) remain writable, violating the normative rule norm:unimplemented_mode_bits that requires 'For each bit in 61:58, if the associated privilege mode is not implemented, the bit is read-only zero.' Similarly, if the core lacks U-mode, UINH(bit60) would be illegally writable. The RW() wrapper in CSRBundle generates read-write hardware flops with no legal-value enforcement at write time—any CSR write to mcyclecfg or minstretcfg can set these bits regardless of whether the corresponding privilege modes exist in the microarchitecture.
+Consequence: info_leak
+Pattern: EventInhibitBundle.*RW\((59|60)\)|RW\(58\)|class EventInhibitBundle|unimplemented.*mode.*inhibit|[VSU]INH.*RW|SINH.*RW
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:769-775  class EventInhibitBundle
+  EventInhibitBundle unconditionally defines all five inhibit bits MINH(bit62), SINH(bit61), UINH(bit60), VSINH(bit59), VUINH(bit58) as RW()—a pure read-write type with zero WARL gating. CSRModule.scala:36-37 treats RWType() writes as unconditional (no isLegal check), meaning any CSR write to mcyclecfg or minstretcfg stores the exact written value across bits 62:58. The Smcntrpmf spec norm:unimplemented_mode_bits requires: 'For each bit in 61:58, if the associated privilege mode is not implemented, the bit is read-only zero.' When XiangShan is synthesized with HasHExtension=false (VS/VU modes absent) or without U-mode, VSINH, VUINH, or UINH remain writable. In the default config (HasHExtension=true), all five modes are implemented so this is compliant, but the RTL lacks any Parameter-driven WARL gating (e.g., conditionally switching to RO() based on a mode-implemented predicate) to enforce read-only-zero for unimplemented-mode bits. The runtime counting-enable logic in NewCSR.scala:1331-1335 does correctly gate on privState.isModeX, preventing counting in unimplemented modes regardless of inhibit bit state, so the practical exploit surface is limited to configuration-dependent spec non-compliance rather than a functional counting bypass.
+  | class EventInhibitBundle extends CSRBundle {
+  |   val MINH    = RW(62).withReset(0.U)
+  |   val SINH    = RW(61).withReset(0.U)
+  |   val UINH    = RW(60).withReset(0.U)
+  |   val VSINH   = RW(59).withReset(0.U)
+  |   val VUINH   = RW(58).withReset(0.U)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRModule.scala:29-41  class CSRModule (write path for RWType fields)
+  The CSRModule write logic correctly routes writes through field.rwType pattern matching. For WARLType/WLRLType fields, it gates writes on wfield.isLegal; for RWType fields, writes are unconditional (line 36-37). This is the intended behavior: RW() is the 'trust the writer' access type, and if EventInhibitBundle fields were correctly defined as WARL for unimplemented-mode bits, the CSRModule infrastructure would correctly enforce legality. The bug is not in CSRModule but in EventInhibitBundle's choice to use RW() instead of WARL() for mode-dependent inhibit bits.
+  | field.rwType match {
+  |   case WARLType(wfn, _) =>
+  |     field.addOtherUpdate(wen && wfield.isLegal, ...)
+  |   case RWType() =>
+  |     field.addOtherUpdate(wen, ...)  // unconditional write
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1328-1347  countingEn computation (Smcntrpmf wiring)
+  The counting-enable logic correctly computes countingEn as a disjunction across all five privilege modes, each gated by the corresponding inhibit bit from mcyclecfg.regOut / minstretcfg.regOut. Even if an inhibit bit for an unimplemented mode is spuriously set (e.g., VUINH=1 on a non-H-extension core), the privState.isModeVU term ensures counting does not activate for that mode, so the counter is not erroneously inhibited. This confirms the runtime counting behavior is correct regardless of inhibit-bit writability bugs—the security impact of writable unimplemented-mode bits is limited to spec non-compliance at the CSR readback level, not a functional counting error.
+  | m.countingEn := (privState.isModeM && !mcyclecfg.regOut.MINH) ||
+  |   (privState.isModeHS && !mcyclecfg.regOut.SINH)  ||
+  |   (privState.isModeHU && !mcyclecfg.regOut.UINH)  ||
+  |   (privState.isModeVS && !mcyclecfg.regOut.VSINH) ||
+  |   (privState.isModeVU && !mcyclecfg.regOut.VUINH)
+

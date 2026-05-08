@@ -1,0 +1,40 @@
+PR #199  target=qemu  overall=compliant
+Spec: WMACC/WMACCU are RV32-only but reuse OP-IMM-32 opcode space owned by RV64 ADDIW-family; missing XLEN gating in QEMU TCG decode causes instruction confusion between widening MAC and 32-bit integer ops, corrupting guest register state and enabling guest-to-host escape via wrong-code execution
+Violation: QEMU TCG translates WMACC/WMACCU on RV64 without enforcing XLEN==32 check (REQUIRE_32BIT), causing OP-IMM-32 opcode collision with RV64 ADDIW/SLLIW/SRLIW/SRAIW — an illegal instruction on RV64 per spec is executed as a valid widening multiply-accumulate, or vice versa, producing wrong register state
+Consequence: function_loss
+Pattern: trans_wmacc.*\.c.*gen_illegal|decode_wmacc.*insn32\.decode.*RV32|OP-IMM-32.*wmacc|REQUIRE_32BIT.*wmacc|get_xl.*MXL_RV32.*wmacc
+------------------------------------------------------------
+[compliant] target/riscv/insn32.decode:195-198  OP-IMM-32 decode block
+  OP-IMM-32 decode table (addiw/slliw/srliw/sraiw) contains no P-ext WMACC entries. No collision exists between standard RV64 word instructions and any widening multiply-accumulate instructions, because P-ext wmacc is not implemented at all.
+  | addiw    ............   ..... 000 ..... 0011011 @i
+  | slliw    0000000 .....  ..... 001 ..... 0011011 @sh5
+  | srliw    0000000 .....  ..... 101 ..... 0011011 @sh5
+  | sraiw    0100000 .....  ..... 101 ..... 0011011 @sh5
+
+[compliant] target/riscv/insn32.decode:554-560  vector wmacc decode entries
+  All vwmacc/vwmaccsu/vwmaccus instructions use opcode space 1010111 (OP-V), not 0011011 (OP-IMM-32). No encoding collision with RV64 ADDIW/SLLIW/SRLIW/SRAIW. The vector check functions (require_rvv + vext_check_isa_ill) correctly gate execution.
+  | vwmaccu_vv      111100 . ..... ..... 010 ..... 1010111 @r_vm
+  | vwmacc_vv       111101 . ..... ..... 010 ..... 1010111 @r_vm
+  | vwmaccsu_vv     111111 . ..... ..... 010 ..... 1010111 @r_vm
+
+[compliant] target/riscv/translate.c:807-811  REQUIRE_32BIT macro
+  REQUIRE_32BIT macro exists and correctly returns false when get_xl(ctx) != MXL_RV32. It is currently used by rev8_32, fmvh_x_d/fmvp_d_x, and Zilsd instructions. Not applicable to wmacc because no P-ext wmacc translator functions exist to use it.
+  | #define REQUIRE_32BIT(ctx) do {    \
+  |     if (get_xl(ctx) != MXL_RV32) { \
+  |         return false;              \
+  |     }                              \
+  | } while (0)
+
+[potential_risk] target/riscv/tcg/tcg-cpu.c:0-0  N/A (P-ext config flags)
+  No P-ext (Zpn/Zpsfoperand) config flags exist. If a PR adds P-ext WMACC instructions decoded via OP-IMM-32 without REQUIRE_32BIT + REQUIRE_EXT(Zpn), RV64 guests would execute these as valid when they should trigger illegal-instruction. The hypothetical risk is real but has no current code to exploit.
+  | // No P-extension cfg_ptr flags exist (no ext_zpn, ext_zpsfoperand)
+  | // No decode_rvp entry in decoder_table[]
+  | // No trans_wmacc* outside of trans_rvv.c.inc
+
+[compliant] target/riscv/insn_trans/trans_rvv.c.inc:2126-2132  GEN_OPIVV_WIDEN_TRANS/GEN_OPIVX_WIDEN_TRANS for wmacc
+  Vector wmacc translator functions properly use require_rvv() + vext_check_isa_ill() gates, which check RVV is enabled. These use OP-V opcode space and have no encoding overlap with OP-IMM-32. No XLEN enforcement is needed because the vector opcode space is distinct.
+  | GEN_OPIVV_WIDEN_TRANS(vwmaccu_vv, opivv_overwrite_widen_check)
+  | GEN_OPIVV_WIDEN_TRANS(vwmacc_vv, opivv_overwrite_widen_check)
+  | GEN_OPIVV_WIDEN_TRANS(vwmaccsu_vv, opivv_overwrite_widen_check)
+  | GEN_OPIVX_WIDEN_TRANS(vwmaccu_vx, opivx_overwrite_widen_check)
+

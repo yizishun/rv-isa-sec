@@ -1,0 +1,91 @@
+{
+  "pr_number": 189,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 189,
+    "violation_condition": "XiangShan decoder has no entry for REV (funct12=0x69f RV32 / 0x6bf RV64 under OP-IMM+funct3=0x5). The existing ALU datapath only supports byte-level bit-reverse (revb/BREV8 at ALUOpType.revb) and byte-level byte-swap (rev8/REV8 at ALUOpType.rev8), but has no full-XLEN bit-reverse operation. When the decoder encounters these funct12 values, either an illegal-instruction exception fires where it should not (DoS for P-ext software) or the pattern collides with a different instruction due to undriven decode defaults, silently producing wrong results. Additionally, no XLEN-aware encoding selection logic exists to distinguish the RV32-only funct12 (0x69f) from the RV64-only funct12 (0x6bf), so a misconfigured or incorrectly-constrained Chisel decode table could map both to the same (wrong) micro-op.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "funct12 == 0x69f || funct12 == 0x6bf || REV || full bit reverse XLEN || Cat(Reverse(src1))",
+    "affected_entities": [
+      "REV",
+      "BREV8",
+      "REV8"
+    ],
+    "summary": "P-ext REV (full-XLEN bit-reverse) has no decoder entry and no ALU datapath in XiangShan; RV32 (funct12=0x69f) and RV64 (funct12=0x6bf) encodings differ but no XLEN-aware decode logic exists, risking illegal-exception DoS or silent wrong-result execution."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/DecodeUnit.scala",
+        "function_name": "BitmanipDecode",
+        "line_start": 290,
+        "line_end": 371,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "BitmanipDecode table has no entry for P-ext REV (funct12=0x69f RV32 / 0x6bf RV64). REV8 (Zbb byte-swap, funct12=0x6b8) is decoded at line 339, and BREV8 (Zbkb byte-bit-reverse, funct12=0x687) at line 361, but the full-XLEN bit-reverse instruction is absent. When P-ext software issues REV, the decoder falls through to decodeDefault (line 50-61), which sets SelImm.INVALID_INSTR, triggering illegalInstr. This is a confirmed DoS for any software ported to the P-ext REV instruction — correct programs will crash. However, there is NO silent data corruption because the decoder's default path is properly wired to fire an illegal-instruction exception rather than producing wrong results.",
+      "snippet": "REV8      -> XSDecode(SrcType.reg, SrcType.DC,  SrcType.X, FuType.alu, ALUOpType.rev8    , SelImm.X    , xWen = T, canRobCompress = T),\n// ...\nBREV8     -> XSDecode(SrcType.reg, SrcType.DC,  SrcType.X, FuType.alu, ALUOpType.revb    , SelImm.X    , xWen = T, canRobCompress = T),\n// NO entry for REV (0x69f/0x6bf)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/package.scala",
+        "function_name": "ALUOpType",
+        "line_start": 347,
+        "line_end": 350,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "ALUOpType defines revb (BREV8, per-byte bit-reverse), rev8 (REV8, byte-swap), pack, and orh48 in the 'b101_xxxx' group. No 'rev' operation exists for full-XLEN bit-reverse. Open encoding slots at 'b101_0100' through 'b101_0111' are available for adding a rev opcode without restructuring the encoding space.",
+      "snippet": "def revb       = \"b101_0000\".U\ndef rev8       = \"b101_0001\".U\ndef pack       = \"b101_0010\".U\ndef orh48      = \"b101_0011\".U\n// no rev at \"b101_0100\""
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Alu.scala",
+        "function_name": "Alu (misc compute)",
+        "line_start": 355,
+        "line_end": 357,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The ALU computes revb (per-byte bit-reverse: Cat of 8 Reverse operations, one per byte, re-assembled in MSB-to-LSB order) and rev8 (byte-swap: Cat of 8 byte-slices reordered LSB-to-MSB). No full-XLEN bit-reverse (Cat(Reverse(src1)) or similar across all 64 bits) is computed. Even if a decode entry were added, the datapath does not produce the correct result.",
+      "snippet": "val revb = Cat((0 until 8).map(i => Reverse(src1(8 * i + 7, 8 * i))).reverse)\nval pack = Cat(src2(31, 0), src1(31, 0))\nval rev8 = Cat((0 until 8).map(i => src1(8 * i + 7, 8 * i)))\n// no val rev = Reverse(src1) for P-ext REV"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Alu.scala",
+        "function_name": "MiscResultSelect",
+        "line_start": 146,
+        "line_end": 146,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "MiscResultSelect.revRes is a 4-entry VecInit using func(1,0) to select among (revb, rev8, pack, orh48). No 5th entry for a full-bit-reverse operation. Adding a rev opcode requires widening this selection or using a different select mechanism.",
+      "snippet": "val revRes = VecInit(Seq(io.revb, io.rev8, io.pack, io.orh48))(io.func(1, 0))"
+    },
+    {
+      "location": {
+        "file_path": "rocket-chip/src/main/scala/rocket/Instructions.scala",
+        "function_name": "Instructions object",
+        "line_start": 334,
+        "line_end": 334,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "REV8 BitPat (line 334: b011010111000) encodes Zbb REV8 byte-swap at funct12=0x6b8, not P-ext REV at funct12=0x6bf. P-ext REV's RV64 encoding at funct12=0x6bf (b011010111111) and RV32 encoding at funct12=0x69f (b011010011111) are not defined anywhere in Scala sources. No 'REV' BitPat identifier exists in the codebase.",
+      "snippet": "def REV8 = BitPat(\"b011010111000?????101?????0010011\")  // funct12=0x6b8 (REV8, not P-ext REV at 0x6bf)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/DecodeUnit.scala",
+        "function_name": "DecodeConstants.decodeDefault",
+        "line_start": 50,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The decoder's fallback path (decodeDefault) correctly flags unmatched instructions as illegal by setting SelImm.INVALID_INSTR. This default is propagated to exceptionII (line 877-878) which triggers illegalInstr. This is the correct RISC-V behavior for unimplemented instructions and prevents silent wrong-result execution. The silent-corruption scenario hypothesized in the security spec (undriven decode defaults mapping to wrong micro-ops) is NOT present in this RTL.",
+      "snippet": "def decodeDefault: List[BitPat] = // illegal instruction\n  List(SrcType.X, SrcType.X, SrcType.X, FuType.X, FuOpType.X, N, N, N, N, N, N, N, UopSplitType.X, SelImm.INVALID_INSTR)"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

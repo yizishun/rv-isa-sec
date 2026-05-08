@@ -1,0 +1,167 @@
+{
+  "pr_number": 2599,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2599,
+    "violation_condition": "In XiangShan RTL, if any G-stage-only PTW path (e.g., s2xlate === onlyStage2 or allStage G-stage walk) processes a G-stage PTE with the N bit set without treating it as an Svnapot 64KB page — specifically, failing to merge vpn[pteNapotBits-1:0] into the PPN lower bits — or if a PtwEntry/PtwSectorEntry instantiated for G-stage contexts omits hasNapot=true, or if the G-stage PTE tag comparison does not use the truncated tag match (pteNapotBits-based) when n=1, the hardware produces an incorrect guest physical address, violating the spec requirement that Svnapot is supported in G-stage translation.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "PtwEntry\\(.*hasNapot\\s*=\\s*false\\)|s2xlate.*onlyStage2.*getPPN|s2xlate.*allStage.*getPPN|gStagePf.*isLeaf|ptes\\(index\\)\\.n.*=!=.*0\\.U|genPPNS2.*n\\s*===\\s*0\\.U|tag_match\\(0\\).*entry\\.n\\.getOrElse|allStage_n\\s*:=.*s1\\.entry\\.n|hptw_resp\\.entry\\.n\\.getOrElse",
+    "affected_entities": [
+      "PtwEntry",
+      "PtwSectorEntry",
+      "HptwResp",
+      "PtwResp",
+      "PtwMergeResp",
+      "L2TLB",
+      "PageTableWalker"
+    ],
+    "summary": "G-stage (guest-stage) page table walker must recognize and correctly decode Svnapot N bit in hypervisor-managed page tables: PPN must merge vpn[3:0] into ppn[3:0] when N=1, tag matching must truncate to pteNapotBits boundary, and all G-stage PTE entry containers (HptwResp, PtwMergeResp) must carry hasNapot=true, or else guest physical addresses will be silently miscomputed, causing cross-VM data corruption."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "HptwResp",
+        "line_start": 1165,
+        "line_end": 1166,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HptwResp (G-stage PTW response) instantiates PtwEntry with hasNapot=true, ensuring the N bit is preserved for G-stage Svnapot 64KB page translation.",
+      "snippet": "class HptwResp(implicit p: Parameters) extends PtwBundle {\n  val entry = new PtwEntry(tagLen = gvpnLen, hasPerm = true, hasLevel = true, hasNapot = true)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "HptwResp.apply",
+        "line_start": 1176,
+        "line_end": 1176,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HptwResp.apply() computes N field as (pte.n==1 && ppn[3:0]==8 && level==0), ensuring only valid Svnapot 64KB encodings set the napot bit. Invalid encodings (wrong PPN or non-0 level) are correctly zeroed.",
+      "snippet": "this.entry.n.map(_ := resp_pte.n === true.B && resp_pte.ppn(3, 0) === 8.U && level === 0.U)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "HptwResp.genPPNS2",
+        "line_start": 1186,
+        "line_end": 1193,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "genPPNS2() at level 0 merges vpn[pteNapotBits-1:0] into PPN low bits when N!=0, producing the correct guest physical address for Svnapot 64KB pages in G-stage translation.",
+      "snippet": "0.U -> Mux(entry.n.getOrElse(0.U) === 0.U,\n  entry.ppn(entry.ppn.getWidth - 1, 0),\n  Cat(entry.ppn(entry.ppn.getWidth - 1, pteNapotBits), vpn(pteNapotBits - 1, 0)))"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "HptwResp.hit",
+        "line_start": 1195,
+        "line_end": 1214,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "G-stage TLB hit check uses truncated tag comparison (vpn[vpnnLen-1:pteNapotBits] vs tag[vpnnLen-1:pteNapotBits]) when n!=0, correctly matching any vpn within the 64KB Svnapot region.",
+      "snippet": "tag_match(0) := Mux(entry.n.getOrElse(0.U) === 0.U,\n  entry.tag(vpnnLen - 1, 0) === gvpn(vpnnLen - 1, 0),\n  entry.tag(vpnnLen - 1, pteNapotBits) === gvpn(vpnnLen - 1, pteNapotBits))"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "PtwRespS2.getVpn / PtwRespS2.hit",
+        "line_start": 1345,
+        "line_end": 1366,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "allStage_n logic correctly composes napot across two-stage translation: napot is valid when (S1=napot && S2=superpage) || (S2=napot && S1=superpage) || (both napot). The smaller of the two translations determines 64KB page granularity, and getVpn() uses inner_n for vpn reconstruction at level 0.",
+      "snippet": "val allStage_n = (s1.entry.n.getOrElse(0.U) =/= 0.U && s2.entry.level.getOrElse(0.U) =/= 0.U) ||\n  (s2.entry.n.getOrElse(0.U) =/= 0.U && s1.entry.level.getOrElse(0.U) =/= 0.U) ||\n  (s1.entry.n.getOrElse(0.U) =/= 0.U && s2.entry.n.getOrElse(0.U) =/= 0.U)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala",
+        "function_name": "PTW entry-level PPN generation",
+        "line_start": 796,
+        "line_end": 796,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "last_hptw_req_ppn correctly merges vpn low 4 bits into PPN when N bit is set, producing the correct G-stage physical address for Svnapot pages during allStage PTW walks.",
+      "snippet": "val last_hptw_req_ppn = Mux(last_hptw_req_pte.n === 0.U, last_hptw_req_pte.getPPN(), Cat(last_hptw_req_pte.getPPN()(ptePPNLen - 1, pteNapotBits), io.in.bits.req_info.vpn(pteNapotBits - 1, 0)))"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala",
+        "function_name": "PTW mem_resp PPN generation",
+        "line_start": 949,
+        "line_end": 949,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Memory response PPN generation in PTW entry applies the same napot-aware merge (vpn low bits into PPN), ensuring consistency across both last_hptw_req and normal PTW memory response paths.",
+      "snippet": "entries(i).ppn := Mux(ptes(index).n === 0.U, ptes(index).getPPN(), Cat(ptes(index).getPPN()(ptePPNLen - 1, pteNapotBits), entries(i).req_info.vpn(pteNapotBits - 1, 0)))"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "TlbSectorEntry.apply (allStage_n)",
+        "line_start": 361,
+        "line_end": 370,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TlbSectorEntry (sector TLB storage) uses identical allStage_n logic to PtwRespS2 for self-tracking the napot bit when merging two-stage translation results into TLB entries.",
+      "snippet": "val allStage_n = (item.s1.entry.n.getOrElse(0.U) =/= 0.U && item.s2.entry.level.getOrElse(0.U) =/= 0.U) ||\n  (item.s2.entry.n.getOrElse(0.U) =/= 0.U && item.s1.entry.level.getOrElse(0.U) =/= 0.U) ||\n  (item.s1.entry.n.getOrElse(0.U) =/= 0.U && item.s2.entry.n.getOrElse(0.U) =/= 0.U)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/L2TLB.scala",
+        "function_name": "contiguous_pte_to_merge_ptwResp",
+        "line_start": 740,
+        "line_end": 766,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PtwMergeEntry created with hasNapot=true for contiguous PTE merging; N field computed as (n==1 && ppn[3:0]==8); napot entries correctly suppress not_super flag, ensuring proper TLB entry classification for G-stage napot pages.",
+      "snippet": "val ptw_resp = Wire(new PtwMergeEntry(tagLen = sectorvpnLen, hasPerm = true, hasLevel = true, hasNapot = true))\nptw_resp.n.map(_ := pte_in.n === true.B && pte_in.getPPN()(3, 0) === 8.U)\nval napot = ptw_merge_resp.entry(vpn(sectortlbwidth - 1, 0)).n.getOrElse(0.U)\nptw_merge_resp.not_super := not_super.B && !napot"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "PteBundle.isGpf",
+        "line_start": 787,
+        "line_end": 807,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "G-stage page fault detection (isGpf) correctly validates Svnapot: N!=0 with wrong ppn[3:0] encoding triggers gpf; non-leaf PTEs with N!=0 are caught by isNext() check; unaligned() catches napot at wrong levels for leaf PTEs.",
+      "snippet": "}.elsewhen (n =/= 0.U && ppn(3, 0) =/= 8.U) {\n  gpf := true.B\n}.elsewhen (unaligned(level)) {\n  gpf := true.B\n}"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/TLB.scala",
+        "function_name": "TLB resp (PTW response bypass)",
+        "line_start": 583,
+        "line_end": 586,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TLB response path for onlyStage2 correctly uses genPPNS2(gvpn) to produce the G-stage physical address, which includes napot-aware VPN-to-PPN merging for 64KB pages.",
+      "snippet": "val s2_gvpn = Mux(s2xlate === onlyStage2, vpn, s1_ppn)\nval s2_ppn = stage2.genPPNS2(s2_gvpn)(ppnLen - 1, 0)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala",
+        "function_name": "G-stage-only PTW (onlyStage2 path)",
+        "line_start": 1250,
+        "line_end": 1250,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "G-stage-only PTW uses isGpf() for page fault detection, which includes the Svnapot encoding validation and will correctly fault on invalid N/PPN combinations.",
+      "snippet": "val pageFault = pte.isGpf(level, mpbmte) || (!pte.isLeaf() && level === 0.U)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,43 @@
+PR #1922  target=linux  overall=potential_risk
+Spec: JSON decode error
+Violation: 
+Consequence: function_loss
+Pattern: 
+------------------------------------------------------------
+[potential_risk] arch/riscv/include/asm/hwcap.h:99-107  N/A (ISA extension ID enum)
+  Zabhlrsc extension ID is absent from the riscv_isa_ext_id enum. Integration requires adding a new ID (e.g., 106 or next available) alongside existing ZABHA (ID 90) and ZALRSC (ID 98). If a PR adds this without allocating a proper extension ID, hwprobe, KVM, and cpufeature dispatch will silently fail to recognize the extension, causing function_loss: userspace sees no Zabhlrsc support even when hardware has it.
+  | #define RISCV_ISA_EXT_ZABHA		90
+  | ...
+  | #define RISCV_ISA_EXT_ZALRSC		98
+  | #define RISCV_ISA_EXT_ZICFISS		105
+  | /* Zabhlrsc ID would go here but is missing */
+
+[potential_risk] arch/riscv/kernel/cpufeature.c:320-323  riscv_isa_ext_data[] table
+  ZALRSC is listed as a dependency of 'A' in riscv_a_exts[], but Zabhlrsc (byte/halfword LR/SC) is not present. If Zabhlrsc is integrated, it should be considered whether it is a sub-extension of A or ZALRSC, or an independent optional extension. Missing this dependency chain means the kernel may advertise 'A' compliance without Zabhlrsc support, yet CHERI requires Zabhlrsc. This creates a semantic gap where CHERI-capable hardware would appear to support 'A' but lack byte/halfword LR/SC needed for capability atomics.
+  | static const unsigned int riscv_a_exts[] = {
+  | 	RISCV_ISA_EXT_ZAAMO,
+  | 	RISCV_ISA_EXT_ZALRSC,
+  | };
+
+[potential_risk] arch/riscv/include/asm/cmpxchg.h:19-55  __arch_xchg_masked
+  The masked xchg fallback for byte and halfword sizes uses lr.w/sc.w with masking (lines 32-53), emulating byte/halfword atomics within word-aligned bounds. Zabhlrsc provides native lr.b/lr.h and sc.b/sc.h, which would eliminate the need for this masking emulation and provide better forward-progress guarantees. If Zabhlrsc is integrated but the alternative dispatch in cmpxchg.h is updated incorrectly (e.g., the ZABHA-only fast path at lines 22-30 is expanded for Zabhlrsc without proper ordering wrt fences), it could introduce subtle memory ordering bugs in capability atomic operations on CHERI hardware.
+  | #define __arch_xchg_masked(sc_sfx, swap_sfx, prepend, sc_append, ...
+  | 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZABHA) &&
+  | 	    riscv_has_extension_unlikely(RISCV_ISA_EXT_ZABHA)) { ...
+  | 	} else {
+  | 	    /* Zabhlrsc would add lr.b/lr.h fast path here, currently missing */
+
+[potential_risk] arch/riscv/kvm/vcpu_onereg.c:52-55  kvm_riscv_vcpu_isa_ext_allowed
+  KVM ISA extension allowlist includes ZABHA and ZALRSC but no Zabhlrsc entry. If a guest tries to use Zabhlrsc, KVM must either trap-and-emulate or pass through the extension. Without Zabhlrsc in the KVM allowlist, guests cannot discover or use byte/halfword LR/SC, which CHERI guests would require for capability atomics. This is a virtualization gap: function_loss for CHERI VMs.
+  | KVM_ISA_EXT_ARR(ZABHA),
+  | KVM_ISA_EXT_ARR(ZALRSC),
+  | /* Zabhlrsc entry missing */
+
+[potential_risk] arch/riscv/kernel/setup.c:287-294  setup_smp (or riscv_fill_hwcap)
+  ZABHA has a boot-time setup check (enable/disable ELF hwcap) and a Kconfig TOOLCHAIN_HAS_ZABHA gate. Zabhlrsc would need a similar TOOLCHAIN_HAS_ZABHLRSC Kconfig entry plus a setup.c ELF hwcap enablement block. Without this, CHERI-aware userspace cannot detect Zabhlrsc via hwcap/ELF, causing function_loss for CHERI userspace that needs byte/halfword capability atomics.
+  | if (IS_ENABLED(CONFIG_RISCV_ISA_ZABHA) &&
+  |     ...
+  |     riscv_isa_extension_available(NULL, ZABHA) &&
+  |     ...)
+  | /* Zabhlrsc equivalent check is missing */
+

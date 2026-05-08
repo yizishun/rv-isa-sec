@@ -1,0 +1,55 @@
+PR #2494  target=freebsd-src  overall=potential_risk
+Spec: bhyve must fence GVMA on henvcfg.PMM transitions when PMLEN < GPA width, and must mirror senvcfg.PMM→hstatus.HUPMM before HLV/HSV in U-mode, else guest memory accesses resolve to wrong physical pages causing cross-VM info leak
+Violation: In FreeBSD's bhype hypervisor, when henvcfg.PMM is changed from/to a value where (XLEN-PMLEN) < GPA width (PMLEN=7 with hgatp.MODE=sv57x4, or PMLEN=16 with hgatp.MODE=sv48x4/sv57x4) without subsequently executing HFENCE.GVMA(x0), stale TLB entries may map masked GPAs to wrong supervisor physical addresses. Additionally, if bhyve invokes HLV.*/HSV.* in U-mode without first copying the guest's senvcfg.PMM to hstatus.HUPMM, pointer masking will be applied at the wrong privilege level, causing loads/stores to target incorrect guest physical addresses.
+Consequence: info_leak
+Pattern: henvcfg.*PMM|hstatus.*HUPMM|HFENCE\.GVMA|HLV\.|HSV\.|vsatp.*BARE|hgatp|pointer_mask
+------------------------------------------------------------
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:628-632  vmmops_run
+  HFENCE.GVMA is executed at line 628, but henvcfg is written at line 632 AFTER the fence. If henvcfg.PMM were ever changed from the always-zero value (e.g. future non-zero PMM for pointer-masking guests), stale stage-2 TLB entries could map masked GPAs to wrong supervisor physical addresses because no HFENCE.GVMA follows the henvcfg write. Currently safe only because PMM=0 is always written, but the ordering is fragile.
+  | hfence_gvma();
+  | 
+  |     csr_write(hgatp, pmap->pm_satp);
+  |     if (has_sstc)
+  |         csr_write(henvcfg, HENVCFG_STCE);
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:180-195  vmmops_vcpu_save_csrs
+  senvcfg (which holds the guest's PMM pointer-masking configuration) is declared in struct hypcsr (riscv.h:67) but is never saved or restored across VM entries/exits. vmmops_vcpu_save_csrs saves vsstatus/vsie/vstvec/vsscratch/vsepc/vscause/vstval/hvip/vsatp but omits senvcfg. vmmops_vcpu_restore_csrs has the same gap. If a guest writes senvcfg.PMM to enable pointer masking, the value will be lost.
+  | csrs->vsstatus = csr_read(vsstatus);
+  |     csrs->vsie = csr_read(vsie);
+  |     ...
+  |     csrs->vsatp = csr_read(vsatp);
+  |     /* senvcfg NOT saved */
+
+[potential_risk] sys/riscv/include/riscvreg.h:125-134  
+  No HSTATUS_HUPMM bit is defined. The RISC-V privileged spec requires hstatus.HUPMM to be set from the guest's senvcfg.PMM when a hypervisor executes HLV.*/HSV.* instructions in U-mode, so pointer masking is applied at the correct privilege level. Currently FreeBSD bhyve executes HLV.* (hlvx.hu at vmm_riscv.c:296) from HS-mode, not U-mode, so this is not immediately exploitable. However, the missing definition means any U-mode HLV usage would apply pointer masking with the wrong privilege context.
+  | #define HSTATUS_VSBE  (1 << 5)
+  |     #define HSTATUS_GVA   (1 << 6)
+  |     #define HSTATUS_SPV   (1 << 7)
+  |     /* HSTATUS_HUPMM NOT DEFINED */
+  |     #define HSTATUS_SPVP  (1 << 8)
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:267-324  riscv_unpriv_read
+  hlvx.hu is executed in HS-mode context (bhyve runs as a kernel module in S/HS-mode, never U-mode). The hstatus swap at line 283 loads the guest's hyp_hstatus (with SPV|SPVP|VTW but no HUPMM), which is the correct behavior for HS-mode HLV execution. The violation condition about HUPMM copying from senvcfg.PMM only applies to U-mode HLV.*/HSV.* invocations, which FreeBSD does not perform.
+  | old_hstatus = csr_swap(hstatus, hypctx->guest_regs.hyp_hstatus);
+  |     ...
+  |     __asm __volatile("hlvx.hu %[val], (%[addr])" ...);
+  |     ...
+  |     csr_write(hstatus, old_hstatus);
+
+[compliant] sys/riscv/vmm/vmm_switch.S:67-75  vmm_switch
+  Guest hstatus is properly saved and restored during world-switch via csrrw. At entry (line 74), guest hstatus is atomically swapped into hardware hstatus; at exit (line 168), host hstatus is restored. This correctly tracks the SPV/SPVP/VTW/HU bits. However, note that HUPMM would also be tracked if defined, as the csrrw swaps the full register value.
+  | csrrw   t0, sstatus, t0
+  |     csrrw   t1, hstatus, t1
+  |     csrrw   t2, scounteren, t2
+  |     ...
+  |     csrrw   t4, hstatus, t4
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:626-635  vmmops_run
+  hfence_gvma() is properly invoked before writing hgatp (line 630), following the RISC-V spec requirement for TLB invalidation when guest physical page tables may have been modified. The code even includes the architecturally-correct comment citing the spec. hgatp is then written, followed by henvcfg, hie, and hcounteren configuration.
+  | hfence_gvma();
+  | 
+  |     csr_write(hgatp, pmap->pm_satp);
+  |     if (has_sstc)
+  |         csr_write(henvcfg, HENVCFG_STCE);
+  |     csr_write(hie, HIE_VSEIE | HIE_VSSIE | HIE_SGEIE);
+

@@ -1,0 +1,57 @@
+{
+  "pr_number": 2575,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 2575,
+    "violation_condition": "OpenSBI CSR save/restore code (e.g., HSM suspend/resume or domain context switch) accesses CSR mseccfgh on an RV64 hart where the CSR is not defined, or uses an XLEN-agnostic CSR_READ/CSR_WRITE macro for mseccfgh without a __riscv_xlen == 32 guard.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "CSR_READ(CSR_MSECCFGH) or CSR_WRITE(CSR_MSECCFGH) without #if __riscv_xlen == 32 preprocessor guard, or a generic __ASM_STR(mseccfgh) string in inline asm that compiles unconditionally for both RV32 and RV64 targets.",
+    "affected_entities": [
+      "mseccfgh",
+      "mseccfg",
+      "CSRRW",
+      "CSRRS",
+      "CSRRC"
+    ],
+    "summary": "Unconditional mseccfgh access on RV64 triggers an illegal instruction trap in M-mode, crashing OpenSBI irrecoverably because M-mode has no higher privilege to handle the fault."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "include/sbi/riscv_encoding.h",
+        "function_name": "(CSR definitions)",
+        "line_start": 729,
+        "line_end": 729,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR_MSECCFGH (0x757) is defined unconditionally without an __riscv_xlen==32 preprocessor guard. While the definition is currently unused by any code path, its unprotected presence means any future code that references CSR_MSECCFGH via CSR_READ/CSR_WRITE on an RV64 hart will assemble to an illegal CSR access (0x757 is RV32-only). The definition should either be guarded with #if __riscv_xlen == 32 or removed entirely since no code currently uses it.",
+      "snippet": "#define CSR_MSECCFG\t\t0x747\n#define CSR_MSECCFGH\t\t0x757"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_save",
+        "line_start": 427,
+        "line_end": 433,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "HSM non-retentive suspend save only preserves mie, mip (SSIP/STIP), medeleg, mideleg, and menvcfg. CSR_MSECCFG (0x747) is not saved, meaning SSEED/USEED/RLB/MML/MMWP bits configured during init are lost across suspend/resume. On RV32, CSR_MSECCFGH would also need saving if the register is implemented. No saved_mseccfg field exists in struct sbi_hsm_data.",
+      "snippet": "hdata->saved_mie = csr_read(CSR_MIE);\nhdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);\nhdata->saved_medeleg = csr_read(CSR_MEDELEG);\nhdata->saved_mideleg = csr_read(CSR_MIDELEG);\nif (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)\n\thdata->saved_menvcfg = csr_read64(CSR_MENVCFG);"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_restore",
+        "line_start": 435,
+        "line_end": 446,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "HSM non-retentive suspend restore writes back menvcfg, mideleg, medeleg, mie, and mip but never writes CSR_MSECCFG. The mseccfg register retains whatever value the warm-boot init sequence assigns (via mstatus_init -> csr_set/clear on SSEED/USEED, and sbi_hart_protection_configure -> csr_set on RLB/MML). Any runtime modifications to mseccfg made after init by S-mode are silently discarded on resume.",
+      "snippet": "if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)\n\tcsr_write64(CSR_MENVCFG, hdata->saved_menvcfg);\ncsr_write(CSR_MIDELEG, hdata->saved_mideleg);\ncsr_write(CSR_MEDELEG, hdata->saved_medeleg);\ncsr_write(CSR_MIE, hdata->saved_mie);"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

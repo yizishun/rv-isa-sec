@@ -1,0 +1,117 @@
+{
+  "pr_number": 2976,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2976,
+    "violation_condition": "In XiangShan RTL, if any of mscratch, mepc, mcause, or mtval CSR registers is not instantiated in the CSR module (CSRFile/CSRMap), or is instantiated but hardwired to zero/unimplemented without trap-side write logic (e.g., missing mcause/mepc/mtval update on exception entry, missing mscratch read/write path), the hardware fails to provide mandatory M-mode trap infrastructure. Specifically: (a) mscratch absent → M-mode handler loses context-swap capability; (b) mepc absent or not updated on trap entry → MRET returns to wrong/undefined address, breaking all trap return paths; (c) mcause absent or not updated on trap entry → M-mode handler cannot determine trap reason, making traps undispatched or misdispatched; (d) mtval absent or not updated on exception → page fault handlers lose faulting virtual address, breaking demand paging and memory management.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "(csr_map\\[0x(340|341|342|343)\\]|CSRs\\.(mscratch|mepc|mcause|mtval)|\"mscratch\"|\"mepc\"|\"mcause\"|\"mtval\"|writeMepc|writeMcause|writeMtval|MSCRATCH|MEPC|MCAUSE|MTVAL)",
+    "affected_entities": [
+      "mscratch",
+      "mepc",
+      "mcause",
+      "mtval",
+      "mret"
+    ],
+    "summary": "mscratch/mepc/mcause/mtval are now spec-mandatory M-mode CSRs; if any is missing or non-updating in XiangShan CSR RTL, M-mode trap handling collapses: MRET returns to garbage PC, trap dispatch breaks, page faults become unrecoverable, and M-mode context switching fails — functionally bricking M-mode and enabling privilege-boundary violations"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MachineLevelCSR",
+        "line_start": 201,
+        "line_end": 211,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All four mandatory M-mode trap CSRs (mscratch, mepc, mcause, mtval) are instantiated as proper CSRModule instances with correct addresses (0x340-0x343) matching the RISC-V privileged spec. Each has a full read/write path through the CSRModule framework.",
+      "snippet": "val mscratch = Module(new CSRModule(\"Mscratch\", new ScratchBundle(...)).setAddr(CSRs.mscratch)\nval mepc = Module(new CSRModule(\"Mepc\", new Epc) with TrapEntryMEventSinkBundle).setAddr(CSRs.mepc)\nval mcause = Module(new CSRModule(\"Mcause\", new CauseBundle) with TrapEntryMEventSinkBundle).setAddr(CSRs.mcause)\nval mtval = Module(new CSRModule(\"Mtval\", new XtvalBundle) with TrapEntryMEventSinkBundle).setAddr(CSRs.mtval)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMEvent.scala",
+        "function_name": "TrapEntryMEventModule",
+        "line_start": 104,
+        "line_end": 120,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Trap entry correctly updates all three trap-capture CSRs: mepc (PC of trapped instruction, bit 0 cleared), mcause (Interrupt bit + ExceptionCode), and mtval (faulting address or additional info). All writes are guarded by the valid signal.",
+      "snippet": "out.mepc.valid := valid\nout.mcause.valid := valid\nout.mtval.valid := valid\nout.mepc.bits.epc := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))\nout.mcause.bits.Interrupt := isInterrupt && !isDTExcp\nout.mcause.bits.ExceptionCode := Mux(isDTExcp, ExceptionNO.EX_DT.U, highPrioTrapNO)\nout.mtval.bits.ALL := Mux(isFetchMalAddrExcp, in.fetchMalTval, tval)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/MretEvent.scala",
+        "function_name": "MretEventModule",
+        "line_start": 78,
+        "line_end": 81,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MRET correctly reads mepc as the return target PC, ensuring the trap return path is functional. Address translation checks (IPF, IAF, IGPF) are applied to the return target.",
+      "snippet": "out.targetPc.bits.pc := in.mepc.asUInt\nout.targetPc.bits.raiseIPF := instrAddrTransType.checkPageFault(in.mepc.asUInt)\nout.targetPc.bits.raiseIAF := instrAddrTransType.checkAccessFault(in.mepc.asUInt)\nout.targetPc.bits.raiseIGPF := instrAddrTransType.checkGuestPageFault(in.mepc.asUInt)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MachineLevelCSR",
+        "line_start": 698,
+        "line_end": 700,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mepc Epc bundle defines field at bits 63:1 (bit 0 hardwired to zero), matching the RISC-V spec requirement that mepc[0] is always zero (traps target aligned instruction addresses, and mret with mepc[0]=1 would raise an instruction-address-misaligned exception).",
+      "snippet": "class Epc extends CSRBundle {\n  val epc = RW(63, 1).withReset(0.U).withDescription(\"Exception program counter.\")\n}"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala",
+        "function_name": "CSRBundles",
+        "line_start": 23,
+        "line_end": 28,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mcause CauseBundle correctly encodes Interrupt at bit 63 and ExceptionCode at bits 62:0, matching RISC-V privileged spec encoding (WLRL field where bit 63 distinguishes interrupts from exceptions).",
+      "snippet": "class CauseBundle extends CSRBundle {\n  val Interrupt = RW(63).withReset(0.U)\n  val ExceptionCode = RW(62, 0).withReset(0.U)\n}"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "CSRs",
+        "line_start": 155,
+        "line_end": 158,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR address map correctly assigns spec-mandated addresses: mscratch=0x340, mepc=0x341, mcause=0x342, mtval=0x343. These match the RISC-V privileged architecture CSR address assignments exactly.",
+      "snippet": "val mscratch = 0x340\nval mepc = 0x341\nval mcause = 0x342\nval mtval = 0x343"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MachineLevelCSR",
+        "line_start": 455,
+        "line_end": 458,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All four CSRs are registered in machineLevelCSRMods sequence, ensuring they are included in the csrOutMap for CSR read instructions, exported to difftest state, and participate in the full CSR infrastructure.",
+      "snippet": "mscratch,\nmepc,\nmcause,\nmtval,"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR",
+        "line_start": 1607,
+        "line_end": 1618,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All four CSRs are exported to difftest DiffCSRState for architectural state verification (used by difftest framework to check against golden model), confirming they hold live architectural state.",
+      "snippet": "diffCSRState.mepc := mepc.rdata.asUInt\ndiffCSRState.mtval := mtval.rdata.asUInt\ndiffCSRState.mcause := mcause.rdata.asUInt\ndiffCSRState.mscratch := mscratch.rdata.asUInt"
+    }
+  ],
+  "overall_severity": "compliant"
+}

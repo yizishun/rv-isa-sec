@@ -1,0 +1,60 @@
+PR #700  target=qemu  overall=compliant
+Spec: SMIP reorders cspspush/cspspop relative to register save/restore in trap entry/exit; QEMU TCG using the old ordering corrupts handler stack on entry and leaks interrupted-context state on exit
+Violation: QEMU TCG implements the SMIP trap entry/exit sequence with the pre-PR ordering (cspspush/cspspop at the old positions). On trap entry, saving x10-x15 after cspspush means registers land on the handler stack instead of the interrupted context's stack, corrupting the handler stack. On trap exit, restoring x10-x15 before cspspop means registers are loaded from the handler stack instead of the interrupted context's stack, leaking or corrupting context state.
+Consequence: data_corruption
+Pattern: cspspush.*save.*x1[0-5]|save.*adjust.*cspspush|cspspop.*restore.*x1[0-5]|lr.*OF.*cspspop|cspspop.*adjust.*stack
+------------------------------------------------------------
+[compliant] target/riscv/cpu_helper.c:2531-2547  riscv_cpu_do_interrupt
+  SMIP trap-entry stack-pointer swap (SP↔XSP) is NOT implemented. This code only clears ELP per Zicfilp. The vulnerability pattern 'cspspush before save x10-x15' cannot manifest because cspspush/cspspop do not exist in this codebase.
+  | /*
+  |      * Interrupt/exception/trap delivery is asynchronous event and as per
+  |      * zicfilp spec CPU should clear up the ELP state. No harm in clearing
+  |      * unconditionally.
+  |      */
+  |     env->elp = false;
+
+[compliant] target/riscv/op_helper.c:352-362  helper_sret
+  SRET return path does not contain SMIP SP↔XSP swap logic. Only Zicfilp ELP restore is present. The vulnerability pattern 'cspspop before restore x10-x15' cannot be triggered because SMIP is not implemented.
+  | riscv_cpu_set_mode(env, prev_priv, prev_virt);
+  |     if (cpu_get_fcfien(env)) {
+  |         env->elp = get_field(env->mstatus, MSTATUS_SPELP);
+  |     }
+  |     env->mstatus = set_field(env->mstatus, MSTATUS_SPELP, 0);
+
+[compliant] target/riscv/op_helper.c:439-447  helper_mret
+  MRET return path does not contain SMIP SP↔XSP swap logic. Only Zicfilp ELP restore is present. The vulnerability pattern cannot be triggered because SMIP is not implemented.
+  | riscv_cpu_set_mode(env, prev_priv, prev_virt);
+  |     if (cpu_get_fcfien(env)) {
+  |         env->elp = get_field(env->mstatus, MSTATUS_MPELP);
+  |     }
+  |     env->mstatus = set_field(env->mstatus, MSTATUS_MPELP, 0);
+
+[compliant] target/riscv/cpu.h:256-262  CPURISCVState
+  No XSP (alternate stack pointer) field exists in CPURISCVState. The struct contains ssp (Zicfiss) and elp (Zicfilp) but no SMIP state. No data-corruption vector exists without SMIP state.
+  | (no smip/xsp fields present in struct)
+
+[compliant] target/riscv/csr.c:3188-3194  rmw_menvcfg
+  MENVCFG write-path validates Zicfilp LPE and Zicfiss SSE bits but has no SMIP enablement bit. The mask correctly guards only implemented extensions. No SMIP vulnerability can arise from MENVCFG writes.
+  | if (env_archcpu(env)->cfg.ext_zicfilp) {
+  |             mask |= MENVCFG_LPE;
+  |         }
+  |         if (env_archcpu(env)->cfg.ext_zicfiss) {
+  |             mask |= MENVCFG_SSE;
+  |         }
+
+[compliant] target/riscv/csr.c:853-866  read_ssp / write_ssp
+  CSR SSP (Zicfiss shadow-stack pointer) accessors exist but no XSP CSR handlers exist. SMIP has no CSR footprint in this codebase, so no CSR read/write vulnerabilities are possible.
+  | (xsp csr handlers not present)
+
+[compliant] target/riscv/cpu_cfg_fields.h.inc:39-40  (bool field declarations)
+  Only ext_zicfilp and ext_zicfiss CFI extension flags are declared. No ext_smip flag exists. Without an enable flag, SMIP cannot be activated, so no vulnerability path exists.
+  | (ext_smip field not present)
+
+[compliant] target/riscv/tcg/tcg-cpu.c:822-870  riscv_tcg_cpu_validate_extensions
+  Extension validation covers existing CFI extensions (Zicfiss, Zicfilp) with correct dependency chains. No SMIP validation exists because the extension is not implemented. No misconfiguration vector exists.
+  | (smip dependency validation not present)
+
+[compliant] target/riscv/cpu_helper.c:92-119  cpu_get_bcfien
+  Backward-CFI enablement helper gates only Zicfiss SSE bits. SMIP has no enablement check here because it is not implemented. No privilege-escalation or bypass vector exists via this path.
+  | (smip enablement check not present)
+

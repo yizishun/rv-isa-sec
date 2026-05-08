@@ -1,0 +1,265 @@
+{
+  "pr_number": 730,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 730,
+    "violation_condition": "OpenSBI M-mode interrupt handler executes Smip/Smaia context save/restore (stack pointer swap, selective register save) on hardware lacking the double-trap or Smrnmi extension, OR saves/restores registers after adjusting the stack pointer—making synchronous exceptions during trap side effects unrecoverable.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "(mnepc|mepc|mstatus\\.mpp|mscratch|sscratch|sp\\s*<-|sp\\s*=).*save|restore|swap|csrw.*mstatus|csrw.*mepc",
+    "affected_entities": [
+      "xepc",
+      "mnepc",
+      "mepc",
+      "sp",
+      "mscratch",
+      "mtval",
+      "mstatus",
+      "mideleg",
+      "sscratch"
+    ],
+    "summary": "M-mode interrupt save/restore must complete register saves before sp adjustment and guard on double-trap (Smrnmi for M-mode) availability, or unrecoverable faults will corrupt trap state in OpenSBI."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "TRAP_SAVE_AND_SETUP_SP_T0",
+        "line_start": 489,
+        "line_end": 529,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "SP is adjusted (line 519) BEFORE all CSRs are saved. Between swapping mscratch (line 491) and swapping it back (line 528), mscratch holds the original tp value instead of the sbi_scratch pointer. If a synchronous exception fires anywhere in this 38-instruction window, _trap_handler cannot re-enter safely because mscratch doesn't point to valid scratch. Original SP is saved at line 516 above the trap context area, then sp is set to that address minus SBI_TRAP_CONTEXT_SIZE at line 519. Without SSDBLTRP (DTE=0, verified at sbi_hart.c:141) or Smrnmi, this is unrecoverable corruption.",
+      "snippet": "csrrw tp, CSR_MSCRATCH, tp\nREG_S sp, (SBI_TRAP_REGS_OFFSET(sp) - SBI_TRAP_CONTEXT_SIZE)(t0)\nadd sp, t0, -(SBI_TRAP_CONTEXT_SIZE)\ncsrrw tp, CSR_MSCRATCH, tp"
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "TRAP_RESTORE_MEPC_MSTATUS",
+        "line_start": 647,
+        "line_end": 660,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Comment at line 649-650 explicitly acknowledges the vulnerability: 'we can not take a trap now or MEPC would be cloberred'. The macro restores mstatus(H) first to set MDT, then restores mepc. Between mstatus write (line 654/657) and mepc write (line 659), any synchronous exception causes hardware to write a new mepc, which is then overwritten by the csrw at line 659 with the saved old value. The double trap is signaled (MDT set by restored mstatus) but DTE=0 means hardware ignores MDT, making the crash undebuggable.",
+      "snippet": "csrw CSR_MSTATUS, t0\nREG_L t0, SBI_TRAP_REGS_OFFSET(mepc)(a0)\ncsrw CSR_MEPC, t0"
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "_trap_handler",
+        "line_start": 673,
+        "line_end": 690,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The entire _trap_handler sequence is an unprotected critical section on hardware lacking both SSDBLTRP and Smrnmi. The sequence depends on CLEAR_MDT in TRAP_SAVE_INFO (line 605) to re-enable nested trap recognition, and on the MDT bit in restored mstatus (line 657) to detect double traps during restore. But with DTE=0 (sbi_hart.c:141), the hardware ignores MDT. Any synchronous exception during C handler execution (sbi_trap_handler at line 611) silently overwrites mepc/mcause/mtval, corrupting the S-mode trap state.",
+      "snippet": "_trap_handler:\n  TRAP_SAVE_AND_SETUP_SP_T0\n  TRAP_SAVE_MEPC_MSTATUS 0\n  TRAP_SAVE_GENERAL_REGS_EXCEPT_SP_T0\n  TRAP_SAVE_INFO 0 0\n  TRAP_CALL_C_ROUTINE\n  TRAP_RESTORE_MEPC_MSTATUS 0\n  mret"
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "_trap_handler_hyp",
+        "line_start": 695,
+        "line_end": 724,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Same vulnerability as _trap_handler but with additional CSR exposure. TRAP_SAVE_INFO saves mtval2 (line 585), mtinst (line 587), and the GVA bit (lines 589-596) after SP adjustment, extending the critical window. On RV32 with H-extension and mstatush, there are even more CSR reads in the save path. A synchronous exception during these CSR accesses corrupts mtval2/mtinst in addition to mepc/mcause/mtval—hypervisor-specific trap information critical for correct virtualization fault handling.",
+      "snippet": "_trap_handler_hyp:\n  TRAP_SAVE_AND_SETUP_SP_T0\n  TRAP_SAVE_MEPC_MSTATUS <0 or 1>\n  TRAP_SAVE_INFO <0 or 1> 1\n  TRAP_CALL_C_ROUTINE\n  TRAP_RESTORE_MEPC_MSTATUS <0 or 1>\n  mret"
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "TRAP_SAVE_INFO",
+        "line_start": 579,
+        "line_end": 606,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Saves mcause (line 580), mtval (line 582), and conditionally mtval2 (line 585), mtinst (line 587), and GVA (lines 589-596) to stack. After saving all trap info, CLEAR_MDT (line 605) clears MDT. On hardware lacking SSDBLTRP where menvcfg.DTE=0 (verified at sbi_hart.c:141), MDT was never set by hardware on the first trap from S-mode. CLEAR_MDT is thus a no-op that masks the fact hardware provides no double-trap protection. A trap during the csrr sequences at lines 580-596 loses the original mcause/mtval before they are saved.",
+      "snippet": "csrr t0, CSR_MCAUSE\nREG_S t0, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(cause))(sp)\ncsrr t0, CSR_MTVAL\nREG_S t0, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(tval))(sp)\nCLEAR_MDT t0"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "sbi_hart_switch_mode",
+        "line_start": 794,
+        "line_end": 828,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Writes mstatus (line 807) before mepc (line 808), creating the same inter-CSR-write vulnerability as TRAP_RESTORE_MEPC_MSTATUS. Additionally writes sscratch (line 818) or vsscratch (line 813) after the mstatus/mepc pair. On hardware without SSDBLTRP, a synchronous exception between lines 807-808 corrupts mepc. Called from sbi_domain_context_switch (line 160) during domain switching and from HSM resume (sbi_hsm.c:511)—both adjacent to cold/warm boot paths where trap infrastructure may be partially initialized.",
+      "snippet": "csr_write(CSR_MSTATUS, val);\ncsr_write(CSR_MEPC, next_addr);"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_expected_trap.S",
+        "function_name": "__sbi_expected_trap",
+        "line_start": 24,
+        "line_end": 38,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Lightweight trap handler for CSR detection and unprivileged load/store emulation. Only captures mcause (line 28) and mtval (line 30) into a struct via a3. Writes mepc+4 (line 37) directly without saving the original. Clears MPRV on mstatus (line 27). If a synchronous exception fires inside this handler (e.g., bus error on stack write), the nested trap overwrites mepc/mcause/mtval. On hardware without SSDBLTRP, the handler's mepc+4 advancement is lost and mret returns to an arbitrary pc. Installed as mtvec transiently by sbi_unpriv.c, sbi_illegal_atomic.c, sbi_csr_detect—all during M-mode trap handling.",
+      "snippet": "csrc CSR_MSTATUS, a4\ncsrr a4, CSR_MCAUSE\nREG_S a4, SBI_TRAP_INFO_OFFSET(cause)(a3)\ncsrr a4, CSR_MEPC\naddi a4, a4, 4\ncsrw CSR_MEPC, a4\nmret"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_expected_trap.S",
+        "function_name": "__sbi_expected_trap_hext",
+        "line_start": 42,
+        "line_end": 69,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "H-extension variant with wider CSR touch surface: additionally reads mtval2 (line 50), mtinst (line 52), and mstatush (line 57) or mstatus (line 60) for GVA extraction. More CSR reads means more instructions where a nested synchronous exception could fire. On hardware without SSDBLTRP, this is an extended vulnerability window compared to the non-H variant.",
+      "snippet": "csrr a4, CSR_MTVAL2\nREG_S a4, SBI_TRAP_INFO_OFFSET(tval2)(a3)\ncsrr a4, CSR_MTINST\nREG_S a4, SBI_TRAP_INFO_OFFSET(tinst)(a3)\ncsrr a4, CSR_MEPC\naddi a4, a4, 4\ncsrw CSR_MEPC, a4\nmret"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap.c",
+        "function_name": "sbi_trap_aia_irq",
+        "line_start": 256,
+        "line_end": 286,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The AIA interrupt handler (requiring Smaia) executes a polling loop on MTOPI CSR (line 261) within M-mode trap handler context. Each iteration dispatches to irqchip processing, PMU, or external interrupt handling. The loop body includes CSR reads (MTOPI), external function calls (sbi_irqchip_process, sbi_pmu_ovf_irq), and memory accesses (IMSIC register file). On hardware without SSDBLTRP, any synchronous exception during this processing (page fault from corrupted IMSIC address, bus error on MMIO access) fires a nested trap that overwrites the original S-mode trap's mepc/mcause/mtval. CLEAR_MDT should make this safe, but DTE=0 means hardware ignores MDT.",
+      "snippet": "while ((mtopi = csr_read(CSR_MTOPI))) {\n  mtopi = mtopi >> TOPI_IID_SHIFT;\n  switch (mtopi) {\n    case IRQ_M_EXT: rc = sbi_irqchip_process(); break;\n    default: if (mtopi == sbi_pmu_irq_bit()) { sbi_pmu_ovf_irq(); break; }\n  }\n}"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "sbi_hart_init",
+        "line_start": 137,
+        "line_end": 141,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Explicitly disables double-trap by clearing menvcfg.DTE at line 141: 'menvcfg_val &= ~ENVCFG_DTE'. Even on hardware that DOES support SSDBLTRP, DTE is cleared by default. The MDT bit in mstatus still operates per the priv spec (latches on first trap from less-privileged mode), but without DTE=1 the hardware does NOT generate CAUSE_DOUBLE_TRAP. This creates false security: CLEAR_MDT and mstatus save/restore code operate as if MDT protection is meaningful, but hardware never generates the double-trap cause. A synchronous exception during trap handling silently overwrites trap CSRs.",
+      "snippet": "menvcfg_val = csr_read64(CSR_MENVCFG);\n/* Disable double trap by default */\nmenvcfg_val &= ~ENVCFG_DTE;"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain_context.c",
+        "function_name": "sbi_domain_context_switch",
+        "line_start": 130,
+        "line_end": 164,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "During domain context switch, S-mode CSR state is swapped (sstatus through satp, lines 131-139), and the trap context is copied via sbi_memcpy (lines 150-151). Critical window: between CSR swaps and trap context copy, S-mode CSRs belong to the new domain, but the M-mode trap context still belongs to the old domain. On hardware without SSDBLTRP, a synchronous exception during the memcpy at line 150 enters _trap_handler, which saves the new domain's trap context. When the double trap returns, the domain switch overwrites this with the old domain's saved trap context (line 151), losing the nested trap entirely—an invariants violation.",
+      "snippet": "ctx->sscratch = csr_swap(CSR_SSCRATCH, dom_ctx->sscratch);\nctx->satp = csr_swap(CSR_SATP, dom_ctx->satp);\ntrap_ctx = sbi_trap_get_context(scratch);\nsbi_memcpy(&ctx->trap_ctx, trap_ctx, sizeof(*trap_ctx));\nsbi_memcpy(trap_ctx, &dom_ctx->trap_ctx, sizeof(*trap_ctx));"
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "CLEAR_MDT",
+        "line_start": 34,
+        "line_end": 42,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "CLEAR_MDT macro is used at three critical points: cold boot _start (line 144), warm boot _start_warm (line 404), and TRAP_SAVE_INFO during trap entry (line 605). On hardware without SSDBLTRP, this macro operates on a bit hardware ignores (DTE=0), creating security theater where the code believes it manages double-trap state but hardware provides no actual protection. The CLEAR_MDT at line 605 is particularly dangerous: it asserts 'we are ready to take another trap' when in fact no mechanism exists to safely take one.",
+      "snippet": ".macro CLEAR_MDT tmp\n  li \\tmp, MSTATUS_MDT\n  csrc CSR_MSTATUS, \\tmp\n.endm"
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "_start",
+        "line_start": 134,
+        "line_end": 144,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "During cold boot, a temporary trap handler pointing to _start_hang is installed (line 136). Comment at lines 139-143 explicitly acknowledges limited trap handling: 'if a trap happens, it will end up in _start_hang which is enough to hook up a GDB.' CLEAR_MDT at line 144 prevents critical error state. On hardware without SSDBLTRP, any trap during the boot sequence before _start_warm sets up the real trap handler results in _start_hang—silent hart death. The temporary window spans relocation processing, BSS clearing, scratch space initialization, and FDT parsing, all of which access memory. Without Smrnmi, NMI events (e.g., machine-check exceptions) during boot enter _start_hang instead of being properly handled.",
+      "snippet": "lla s4, _start_hang\ncsrw CSR_MTVEC, s4\n/* While at this point, trap handling is rudimentary */\nCLEAR_MDT t0"
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "_start_warm",
+        "line_start": 340,
+        "line_end": 408,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Warm boot sets mscratch (line 388), stack pointer from scratch (line 391), and mtvec (line 401) before calling sbi_init (line 408). CLEAR_MDT at line 404 tries to sanitize double-trap state. Critical vulnerability: between mtvec installation (line 401) and completion of sbi_init() initialization (which configures delegation, PMP, full trap handling), a synchronous exception enters _trap_handler with partially initialized state. If sbi_init's early code triggers a trap before delegation is configured, the handler may see stale or zeroed delegation CSRs, causing incorrect trap routing. Without SSDBLTRP, this window is entirely unprotected.",
+      "snippet": "csrw CSR_MSCRATCH, tp\ncsrw CSR_MTVEC, a4\nCLEAR_MDT t0\ncsrr a0, CSR_MSCRATCH\ncall sbi_init"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_save",
+        "line_start": 427,
+        "line_end": 446,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "During non-retentive suspend, saves mie (line 427), mip (line 428), medeleg (line 429), mideleg (line 430), menvcfg (line 432) to per-hart data. Restore writes menvcfg before mideleg/medeleg (lines 440-445). Consistency gaps: (1) save writes CSRs individually—exception between saving mideleg and menvcfg enters _trap_handler with mideleg saved but menvcfg not yet saved; (2) restore writes menvcfg first (possibly re-enabling features disabled before suspend) then mideleg—trap handler runs with inconsistent delegation state. Without SSDBLTRP, these inter-CSR-write windows are unprotected.",
+      "snippet": "hdata->saved_mideleg = csr_read(CSR_MIDELEG);\nhdata->saved_menvcfg = csr_read64(CSR_MENVCFG);\n// ... restore ...\ncsr_write64(CSR_MENVCFG, hdata->saved_menvcfg);\ncsr_write(CSR_MIDELEG, hdata->saved_mideleg);"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap.c",
+        "function_name": "sbi_trap_redirect",
+        "line_start": 103,
+        "line_end": 231,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Redirects traps to S/VS-mode by writing sepc (line 203), scause, stval, and modifying regs->mstatus fields (MPP, MPV, SPIE, SPP, SIE, SPELP) via bitwise operations. The redirect also reads/writes hstatus (line 148-159), htval, htinst, vsstatus, vsepc, vscause, vstval CSRs. On hardware without SSDBLTRP, any synchronous exception during these CSR accesses corrupts the original trap state. Modifications are on saved regs->mstatus (not hardware CSR), which is good, but the mix of hardware CSR writes and saved-context modifications during a live handler creates a fragile state.",
+      "snippet": "csr_write(CSR_SEPC, regs->mepc);\ncsr_write(CSR_SCAUSE, trap->cause);\ncsr_write(CSR_STVAL, trap->tval);\nregs->mstatus &= ~MSTATUS_MPP;\nregs->mstatus |= (PRV_S << MSTATUS_MPP_SHIFT);"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_sse.c",
+        "function_name": "sse_event_inject",
+        "line_start": 544,
+        "line_end": 605,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SSE event injection modifies saved trap context to redirect execution to an SSE handler. Writes sepc (line 582), modifies regs->mstatus (lines 593-595), interacts with hstatus for virtualization (lines 564-580). Happens during sbi_trap_handler execution after CLEAR_MDT, so a trap here is a legitimate nested trap. On hardware without SSDBLTRP, a synchronous exception during these CSR writes (e.g., page fault on the stack where regs is stored) would be unrecoverable—SSE event injection would be half-complete with trap context partially modified for the new event.",
+      "snippet": "csr_write(CSR_SEPC, regs->mepc);\nregs->mepc = e->attrs.entry.pc;\nregs->mstatus |= (PRV_S << MSTATUS_MPP_SHIFT);\nregs->mstatus |= MSTATUS_SDT;"
+    },
+    {
+      "location": {
+        "file_path": "lib/utils/serial/semihosting.c",
+        "function_name": "_semihost_test_vector",
+        "line_start": 62,
+        "line_end": 67,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Inline assembly trap handler for semihosting that directly reads and writes mepc: 'csrr %[en], mepc; addi %[en], %[en], 4; csrw mepc, %[en]'. This handler is installed as mtvec temporarily (via csrrw at line 71). On hardware without SSDBLTRP, if any synchronous exception fires within this handler (e.g., bus error during the ebreak instruction that triggers semihosting), the nested trap overwrites mepc before the handler can save it, and the subsequent mepc+4 write returns to the wrong address.",
+      "snippet": "csrr %[en], mepc\naddi %[en], %[en], 4\ncsrw mepc, %[en]\nmret"
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "delegate_traps",
+        "line_start": 248,
+        "line_end": 249,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Writes mideleg and medeleg CSRs to delegate interrupts/exceptions to S-mode. Write order is mideleg first (line 248), then medeleg (line 249). If a synchronous exception fires between these two writes on hardware without SSDBLTRP, _trap_handler runs with interrupts delegated but exceptions not yet delegated—a partially-delegated state. This is a cold boot path called from sbi_hart_init during sbi_init, where the trap handler is already installed, so any exception here enters _trap_handler with inconsistent delegation.",
+      "snippet": "csr_write(CSR_MIDELEG, interrupts);\ncsr_write(CSR_MEDELEG, exceptions);"
+    },
+    {
+      "location": {
+        "file_path": "platform/generic/thead/thead_c9xx_tlb_trap_handler.S",
+        "function_name": "_thead_tlb_flush_fixup_trap_handler",
+        "line_start": 11,
+        "line_end": 13,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "T-Head C9xx alternate trap entry executes sfence.vma (line 12) BEFORE any context save, then jumps to _trap_handler (line 13). The sfence.vma uses t0 register from the trapped context (may hold a stale/arbitrary value). If sfence.vma triggers a synchronous exception (e.g., on hardware with PMP restrictions on the TLB flush), this creates a trap-on-trap before _trap_handler's context save machinery executes. Without SSDBLTRP, this double trap is unrecoverable: mepc/mcause from the S-mode trap are already in CSRs, sfence.vma exception overwrites them, and _trap_handler never gets to save the original state.",
+      "snippet": "_thead_tlb_flush_fixup_trap_handler:\n  sfence.vma zero, t0\n  j _trap_handler"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

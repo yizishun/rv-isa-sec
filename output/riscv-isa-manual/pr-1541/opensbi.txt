@@ -1,0 +1,74 @@
+PR #1541  target=opensbi  overall=potential_risk
+Spec: Memory-mapped MSIP writes are not guaranteed immediately visible in mip.MSIP; OpenSBI IPI send-and-check paths risk stale-read races without a fence or polling loop
+Violation: OpenSBI writes a hart's memory-mapped MSIP register (e.g., via CLINT/ACLINT MMIO) to send an IPI, then immediately reads mip.MSIP via CSR instruction to confirm delivery — the read may return a stale value because the spec only guarantees eventual (not immediate) reflection from the MMIO register to mip.MSIP, causing the firmware to falsely conclude the IPI was not delivered and retry or take a wrong control-flow decision.
+Consequence: race_condition
+Pattern: MMIO write to CLINT/ACLINT MSIP offset (base+0x0000 or similar), immediately followed by csrr/csrsi/csrci on mip without an intervening fence.w.w.o (fence w,w) or delay/poll loop checking mip.MSIP
+------------------------------------------------------------
+[compliant] lib/utils/ipi/aclint_mswi.c:28-46  mswi_ipi_send
+  mswi_ipi_send() writes MSIP via writel_relaxed() MMIO but does NOT subsequently read mip.MSIP CSR to confirm delivery. The caller sbi_ipi_raw_send() issues wmb() (fence ow,ow) before the MMIO write but no post-send CSR read of mip exists anywhere in the send chain. The vulnerability pattern (MMIO MSIP write → immediate CSR read of mip.MSIP to verify delivery) is absent.
+  | msip = (void *)mswi->addr;
+  | writel_relaxed(1, &msip[sbi_hartindex_to_hartid(hart_index) -
+  |         mswi->first_hartid]);
+
+[compliant] lib/utils/ipi/aclint_mswi.c:48-61  mswi_ipi_clear
+  mswi_ipi_clear() writes 0 to MMIO MSIP via writel_relaxed() to clear the IPI for the current hart. This is an explicit clear operation, not a delivery-confirmation read. No subsequent csr_read(CSR_MIP) is performed in this function or its caller sbi_ipi_raw_clear().
+  | msip = (void *)mswi->addr;
+  | writel_relaxed(0, &msip[current_hartid() - mswi->first_hartid]);
+
+[compliant] lib/sbi/sbi_ipi.c:274-302  sbi_ipi_raw_send
+  sbi_ipi_raw_send() issues wmb() (fence ow,ow) before delegating to the device-level ipi_send callback. The fence orders prior memory stores against the MMIO write, enabling relaxed MMIO writes in device callbacks. However, no CSR read of mip.MSIP follows — the function simply returns 0 after the MMIO write. No delivery-confirmation race exists.
+  | wmb();
+  | if (all_devices) {
+  |     sbi_list_for_each_entry(entry, &ipi_dev_node_list, head) {
+  |         if (entry->dev->ipi_send)
+  |             entry->dev->ipi_send(hartindex);
+  |     }
+  | } else {
+  |     ipi_dev->ipi_send(hartindex);
+  | }
+  | return 0;
+
+[compliant] lib/sbi/sbi_ipi.c:249-272  sbi_ipi_process
+  sbi_ipi_process() handles IPI receipt. It calls sbi_ipi_raw_clear(false) to clear the MMIO MSIP, then reads ipi_type from scratch memory (atomic xchg), NOT from CSR_MIP. The receive path correctly uses shared-memory flags for IPI event dispatch rather than polling mip.MSIP CSR. No MMIO-write-to-CSR-read race on mip.MSIP.
+  | sbi_ipi_raw_clear(false);
+  | ipi_type = atomic_raw_xchg_ulong(&ipi_data->ipi_type, 0);
+  | ipi_event = 0;
+  | while (ipi_type) {
+  |     if (ipi_type & 1UL) {
+  |         ipi_ops = ipi_ops_array[ipi_event];
+  |         if (ipi_ops)
+  |             ipi_ops->process(scratch);
+  |     }
+  |     ipi_type = ipi_type >> 1;
+  |     ipi_event++;
+  | }
+
+[compliant] lib/utils/ipi/andes_plicsw.c:21-42  plicsw_ipi_send
+  plicsw_ipi_send() writes the PLICSW pending register via writel_relaxed() to set target hart's mip.MSIP. No subsequent CSR read of mip.MSIP is performed. The function exits immediately after the relaxed MMIO write. Same compliant pattern as mswi_ipi_send().
+  | pending_reg  = plicsw.addr + PLICSW_PENDING_BASE + word_index * 4;
+  | /* Set target hart's mip.MSIP */
+  | writel_relaxed(BIT(pending_bit), (void *)pending_reg);
+
+[potential_risk] lib/sbi/sbi_ipi.c:47-96  sbi_ipi_send
+  sbi_ipi_send() uses __atomic_fetch_or with __ATOMIC_RELAXED on the remote hart's ipi_type scratch field to decide whether to call sbi_ipi_raw_send(). This is inter-hart shared-memory communication without release/acquire semantics. While not the specific MMIO→CSR race described in the spec, the relaxed atomic combined with the wmb() in sbi_ipi_raw_send() (fence ow,ow = I/O-only write ordering) does not form a full release-acquire pair. The wmb() only orders MMIO stores; it does NOT guarantee that the scratch ipi_type store is visible to the remote hart before the MSIP MMIO write arrives. If the remote hart's MSIP interrupt fires before the ipi_type scratch store is visible, sbi_ipi_process() would read ipi_type=0 and drop the IPI.
+  | if (!__atomic_fetch_or(&ipi_data->ipi_type,
+  |                     BIT(event), __ATOMIC_RELAXED))
+  |     ret = sbi_ipi_raw_send(remote_hartindex, false);
+
+[compliant] lib/sbi/sbi_hsm.c:363-368  sbi_hsm_hart_start
+  HSM hart_start fallback path calls sbi_ipi_raw_send(hartindex, true) to wake a stopped hart. Same analysis as sbi_ipi_raw_send() — no post-send mip.MSIP CSR read exists. The wakeup IPI delivery is confirmed indirectly by the remote hart entering HSM_STATE_START_PENDING and clearing the IPI, not by the sender polling mip.MSIP.
+  | if ((hsm_device_has_hart_hotplug() && (entry_count == init_count)) ||
+  |    (hsm_device_has_hart_secondary_boot() && !init_count)) {
+  |     rc = hsm_device_hart_start(hartid, scratch->warmboot_addr);
+  | } else {
+  |     rc = sbi_ipi_raw_send(hartindex, true);
+  | }
+
+[compliant] lib/utils/hsm/fdt_hsm_sifive_tmc0.c:256-265  sifive_tmc0_start
+  SiFive TMC0 hsm start callback calls sbi_ipi_raw_send(hartid, true) to send a wakeup IPI via CLINT. The comment explicitly says 'use the CLINT IPI as the wake event.' No post-send mip.MSIP CSR read. Compliant.
+  | /* In system suspend, the IMSIC will be reset in SiFive platform so
+  |  * we use the CLINT IPI as the wake event.
+  |  */
+  | sbi_ipi_raw_send(sbi_hartid_to_hartindex(hartid), true);
+  | return SBI_OK;
+

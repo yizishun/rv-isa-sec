@@ -1,0 +1,44 @@
+PR #2637  target=xiangshan  overall=compliant
+Spec: Spec removes Smstateen control over jvt CSR and cm.jalt/cm.jt; XiangShan RTL must remove stateen0 bit 2 gating from jvt access and instruction decode trap logic, or legacy hardware will spuriously deny access when stateen0 bit 2 is 0
+Violation: When Smstateen is implemented in XiangShan RTL and the CSR access control module (CSR/PrivilegeUnit) still gates jvt CSR read/write and cm.jalt/cm.jt instruction execution on mstateen0/sstateen0/hstateen0 bit 2 being set. After this spec change, stateen0 bit 2 no longer controls jvt; if the hardware retains the old gating logic, a stateen0 CSR with bit 2 = 0 causes the RTL to raise an illegal-instruction trap on legitimate jvt accesses or cm.jalt/cm.jt execution at lower privilege levels, violating the updated spec.
+Consequence: denial_of_service
+Pattern: stateen0[2] signal routed to jvt CSR access enable or cm_jalt/cm_jt instruction decode trap logic; any Chisel when()/Mux() condition referencing stateen0 bits AND jvt or cm.jalt/cm.jt; Verilog wire connecting smstateen stateen0 bit 2 to jvt access valid signal
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/StateEnBundle.scala:10-10  Sstateen0Bundle
+  JVT field is defined as RO(2).withReset(0.U) — read-only, hardwired to 0. This field is never consumed by any CSR access control or instruction decode logic anywhere in the RTL. The JVT bit is always 0 in reg.asUInt, so the (mstateen0 & sstateen0) AND-reduction in sstateen0 regOut also produces bit 2 = 0, but no downstream logic reads this bit.
+  | val JVT  = RO(2).withReset(0.U).withDescription("Enable jump-vector-table state from the Zcmt extension.")
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:236-292  MLevelPermitModule
+  MLevelPermitModule checks stateen0 bits 63 (SE0), 62 (ENVCFG), 60 (CSRIND), 59 (AIA), 58 (IMSIC), 57 (CONTEXT), and 0 (C) for CSR access gating. No check for bit 2 (JVT) exists. The illegal-instruction trap on jvt CSR access (addr 0x17) at lower privilege is impossible via this path because jvt is not among the gated addresses.
+  | // SE bit 63
+  | private val accessStateen_EX_II = (...)
+  | // ENVCFG bit 62
+  | // CSRIND bit 60
+  | // AIA bit 59
+  | // IMSIC bit 58
+  | // CONTEXT bit 57
+  | // Custom bit 0
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:454-493  VirtualLevelPermitModule
+  VirtualLevelPermitModule checks hstateen0 bits 63, 62, 60, 59, 58, 57, and 0 for CSR access gating in virtualized contexts. No check for bit 2 (JVT). No stateen-based illegal-instruction trap can fire on jvt CSR access from VS/VU modes.
+  | //  SE0 bit 63
+  | private val accessStateen_EX_VI = (...)
+  | // ENVCFG bit 62
+  | // CSRIND bit 60
+  | // AIA bit 59
+  | // IMSIC bit 58
+  | // CONTEXT bit 57
+  | // Custom bit 0
+
+[compliant] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:14-14  (CSR address constants)
+  jvt CSR address constant (0x17) is defined but no corresponding JvtModule is registered in any CSR module sequence (NewCSR.scala). No jvt CSR module exists to be accessed, so no trap logic for jvt reads/writes can be triggered by any stateen bit.
+  | val jvt = 0x17
+
+[compliant] src/main/scala/xiangshan/backend/decode/:0-0  (instruction decoder)
+  The Zcmt extension is not implemented in XiangShan. No cm.jalt or cm.jt instruction decode entries exist anywhere in the decode directory. Therefore there is no instruction execution path that could be gated by stateen0 bit 2. The security spec's vulnerability pattern (stateen0[2] routed to cm_jalt/cm_jt decode trap logic) cannot exist.
+  | (No Zcmt/cm.jalt/cm.jt decode entries found in entire decode/ directory)
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/StateEnBundle.scala:10-10  Sstateen0Bundle.JVT field
+  The JVT field definition with description 'Enable jump-vector-table state from the Zcmt extension' is stale/misleading. Per the PR title, the spec no longer associates stateen0 bit 2 with JVT. While functionally harmless (RO(0), never consumed), the stale field is dead code that could confuse future developers who might wire it up incorrectly. This is a code-cleanliness issue, not a functional security bug.
+  | val JVT  = RO(2).withReset(0.U).withDescription("Enable jump-vector-table state from the Zcmt extension.")
+

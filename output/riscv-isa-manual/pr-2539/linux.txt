@@ -1,0 +1,77 @@
+PR #2539  target=linux  overall=potential_risk
+Spec: Kernel PMU code may misinterpret silently-failing misconfigured counters as valid measurements, breaking perf-based security monitoring without detection.
+Violation: Linux kernel PMU driver (riscv_pmu) writes an event selector that is not implemented by the microarchitecture into a counter's event configuration CSR (e.g., mhpmeventN via SBI or direct CSR write), then reads the counter value (hpmcounterN) and treats the returned constant value as legitimate performance data, because the kernel either assumes misconfigured counters will trap or fails to validate that the configured event is implemented on the specific hart.
+Consequence: function_loss
+Pattern: riscv_pmu.*event_idx|riscv_pmu.*ctr_read|sbi_ext_pmu.*counter_start|mhpmevent|hpmcounter|mcounteren|mcountinhibit|snps_pmu|thead_pmu|andes_pmu
+------------------------------------------------------------
+[potential_risk] drivers/perf/riscv_pmu_sbi.c:440-454  riscv_pmu_get_event_info
+  Raw hardware events (PERF_TYPE_RAW with config[63:62]=00) are validated only for bit-range format (masking upper bits per SBI spec version), but the kernel never queries the SBI firmware whether the raw event encoding is actually implemented by the microarchitecture on this specific hart. A raw event with a valid-format but unimplemented event code will pass through to the SBI COUNTER_CFG_MATCH/COUNTER_START, where the firmware may write it to mhpmeventN. Per the RISC-V privileged spec mhpmeventN is WARL, so the hardware may silently map it to event 0, producing a constant-zero counter that the kernel treats as legitimate performance data.
+  | case 0:
+  |   if (sbi_v3_available) {
+  |     if (!(config & ~RISCV_PMU_RAW_EVENT_V2_MASK)) {
+  |       *econfig = config & RISCV_PMU_RAW_EVENT_V2_MASK;
+  |       ret = RISCV_PMU_RAW_EVENT_V2_IDX;
+
+[potential_risk] drivers/perf/riscv_pmu_sbi.c:739-779  pmu_sbi_ctr_read
+  Counter read path treats the raw CSR value as legitimate performance data without any validation that the configured event is actually producing meaningful counts. For a hardware counter configured with an unimplemented event selector, the hpmcounterN CSR may return a constant value (typically 0). The kernel passes this through riscv_pmu_ctr_read_csr() -> csr_read_num() to the perf core's riscv_pmu_event_update(), which computes a delta and adds it to event->count. No sanity check (e.g., detecting a constantly-zero counter despite the counter being enabled/running) is performed.
+  | } else {
+  |   val = riscv_pmu_ctr_read_csr(info.csr);
+  |   if (IS_ENABLED(CONFIG_32BIT))
+  |     val |= ((u64)riscv_pmu_ctr_read_csr(info.csr + 0x80)) << 32;
+  | }
+  | return val;
+
+[potential_risk] drivers/perf/riscv_pmu_sbi.c:799-820  pmu_sbi_ctr_start
+  Counter start path calls SBI COUNTER_START with the event's prev_count as init_value but performs no post-start verification that the configured event selector is actually counting. If the SBI firmware wrote an unimplemented event selector to mhpmeventN (which hardware may silently accept per WARL semantics), the counter will not increment, yet the kernel proceeds as if the counter is running. There is no readback-and-compare of the counter value after starting to detect a stuck counter.
+  | ret = sbi_ecall(SBI_EXT_PMU, SBI_EXT_PMU_COUNTER_START, hwc->idx,
+  |         1, flag, ival, 0, 0);
+  | if (ret.error && (ret.error != SBI_ERR_ALREADY_STARTED))
+  |   pr_err("Starting counter idx %d failed with error %d\n",
+
+[potential_risk] drivers/perf/riscv_pmu_sbi.c:565-582  pmu_sbi_ctr_get_idx
+  After SBI COUNTER_CFG_MATCH returns a counter index, the kernel only validates that the index is within cmask and pmu_ctr_list[idx].value is non-zero (i.e., the counter exists at the SBI level). It does not independently verify that the returned counter's capabilities (width, type) match what the event requires, nor that the event encoding is actually supported by that specific counter. The validation relies entirely on the SBI firmware's COUNTER_CFG_MATCH implementation correctness.
+  | if (ret.error) {
+  |   ...
+  |   return sbi_err_map_linux_errno(ret.error);
+  | }
+  | idx = ret.value;
+  | if (!test_bit(idx, &rvpmu->cmask) || !pmu_ctr_list[idx].value)
+  |   return -ENOENT;
+
+[compliant] drivers/perf/riscv_pmu_sbi.c:642-654  pmu_sbi_event_map
+  The event_map function flushes the check_std_events_work before allowing event configuration, ensuring standard HW and CACHE events have been validated against the SBI firmware. The SBI v3 path uses SBI_EXT_PMU_EVENT_GET_INFO (bulk query) which is efficient and correct. The pre-v3 path individually checks each event via COUNTER_CFG_MATCH. In both cases, unsupported standard events get event_idx=-ENOENT, preventing their use. This is proper validation for the standard event path.
+  | static int pmu_sbi_event_map(struct perf_event *event, u64 *econfig)
+  | {
+  |   ...
+  |   flush_work(&check_std_events_work);
+  |   return riscv_pmu_get_event_info(type, config, econfig);
+  | }
+
+[potential_risk] arch/riscv/kvm/vcpu_pmu.c:713-793  kvm_riscv_vcpu_pmu_ctr_cfg_match
+  KVM virtual PMU for guests delegates event creation to the host's perf_event_create_kernel_counter(). While this provides some protection (the host perf core will reject events the host PMU driver can't handle), the same raw-event gap propagates through: if the host riscv_pmu_sbi driver accepts a raw event encoding as valid-format but unimplemented, the KVM guest can create a perf_event that maps to an unimplemented hardware event. The guest will then read constant-zero values from the virtual counter. The KVM layer does not independently validate raw event encodings against the hart's implemented event list.
+  | } else {
+  |   ret = kvm_pmu_create_perf_event(pmc, &attr, flags, eidx, evtdata);
+  |   if (ret) {
+  |     sbiret = SBI_ERR_NOT_SUPPORTED;
+  |     goto out;
+  |   }
+  | }
+  | set_bit(ctr_idx, kvpmu->pmc_in_use);
+
+[compliant] drivers/perf/riscv_pmu_legacy.c:46-64  pmu_legacy_read_ctr
+  Legacy PMU driver only accesses the two mandatory fixed counters (CYCLE and INSTRET) which are defined as always-implemented by the RISC-V ISA. No programmable counters (hpmcounter3..hpmcounter31) are accessed, so there is no risk of reading an unimplemented or misconfigured counter. The driver maps only PERF_COUNT_HW_CPU_CYCLES and PERF_COUNT_HW_INSTRUCTIONS and returns -ENOENT for all other events.
+  | if (idx == RISCV_PMU_LEGACY_CYCLE) {
+  |   val = riscv_pmu_ctr_read_csr(CSR_CYCLE);
+  |   ...
+  | } else if (idx == RISCV_PMU_LEGACY_INSTRET) {
+  |   val = riscv_pmu_ctr_read_csr(CSR_INSTRET);
+
+[compliant] drivers/perf/riscv_pmu.c:134-143  riscv_pmu_ctr_read_csr
+  This is a low-level CSR read wrapper. It performs basic bounds checking (CSR_CYCLE..CSR_HPMCOUNTER31H range) and delegates to csr_read_num(). It does not (and should not, at this level) validate event implementation. The responsibility for event validation lies with the caller (riscv_pmu_sbi event_map/ctr_get_idx path). The bounds check correctly rejects out-of-range CSR numbers. Not a violation.
+  | if (csr < CSR_CYCLE || csr > CSR_HPMCOUNTER31H ||
+  |    (csr > CSR_HPMCOUNTER31 && csr < CSR_CYCLEH)) {
+  |   pr_err("Invalid performance counter csr %lx\n", csr);
+  |   return -EINVAL;
+  | }
+  | return csr_read_num(csr);
+

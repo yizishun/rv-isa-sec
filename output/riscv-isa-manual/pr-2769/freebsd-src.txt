@@ -1,0 +1,77 @@
+PR #2769  target=freebsd-src  overall=bug_confirmed
+Spec: FreeBSD never defines or validates sstatus.UXL (bits 33:32); the kernel blindly propagates whatever UXL M-mode firmware set through context switches, trapframe copies, and bhyve vCPU state, risking illegal UXL values causing mis-speculated instruction-width interpretation for user-mode execution
+Violation: FreeBSD kernel code writes the full sstatus register (or vsstatus in bhyve) via csrw without masking the UXL field (bits [33:32]) to architecturally legal values, or blindly propagates a corrupt UXL value set by M-mode firmware (OpenSBI) through context-switch save/restore and signal-delivery trapframe copies — and no FreeBSD code path currently validates that sstatus.UXL is an architecturally legal value because SSTATUS_UXL is not even defined in riscvreg.h.
+Consequence: data_corruption
+Pattern: csrw\s+sstatus|csrw\s+vsstatus|tf_sstatus\s*=|gp_sstatus\s*=|hyp_sstatus\s*=
+------------------------------------------------------------
+[bug_confirmed] sys/riscv/include/riscvreg.h:60-80  N/A (header definitions)
+  SSTATUS_UXL is not defined. Bits [33:32] (UXL field) of sstatus have no corresponding mask/constant in riscvreg.h, making it structurally impossible to validate or sanitize the UXL field anywhere in the kernel. Every SSTATUS_ definition (UIE, SIE, UPIE, SPIE, SPP, FS, XS, SUM, SD) covers only bits 0-18 and 63/31, leaving the UXL field unaddressable by any kernel code.
+  | #define SSTATUS_UIE    (1 << 0)
+  | #define SSTATUS_SIE    (1 << 1)
+  | #define SSTATUS_SUM    (1 << 18)
+  | /* NO SSTATUS_UXL definition — bits [33:32] invisible to kernel */
+  | #define SSTATUS_SD     (1ul << 63)
+
+[bug_confirmed] sys/riscv/riscv/exception.S:116-131  load_registers (macro)
+  csrw sstatus, t0 writes the full sstatus register from tf_sstatus on every trap return (user→kernel→user and kernel→kernel paths). Only SSTATUS_SIE/SSTATUS_SPIE are toggled (lines 118-130); UXL bits [33:32] pass through unmodified. If M-mode firmware (OpenSBI) sets a corrupt UXL value, FreeBSD re-asserts it on every sret. This is the single hottest code path in the kernel—every interrupt, syscall, page fault, and exception exits through this macro.
+  | load_registers:
+  |   ld    t0, (TF_SSTATUS)(sp)     // load saved sstatus
+  |   li    t1, SSTATUS_SPIE
+  |   or    t0, t0, t1                // only SPIE toggled
+  |   csrw  sstatus, t0               // UXL bits [33:32] written unvalidated
+
+[potential_risk] sys/riscv/riscv/exception.S:101-104  save_registers (macro)
+  csrr t0, sstatus reads the full sstatus register (including UXL) and stores it to tf_sstatus on the trapframe. This is the entry point: any corrupt UXL from hardware is faithfully captured into the trapframe and will be re-asserted on return via load_registers. This is the correct thing to do for save/restore fidelity, but combined with the lack of any UXL validation elsewhere, it means a corrupt UXL is preserved indefinitely across all context switches.
+  | csrr  t0, sstatus                // read full sstatus incl. UXL
+  | sd    t0, (TF_SSTATUS)(sp)        // store to trapframe unvalidated
+
+[bug_confirmed] sys/riscv/riscv/vm_machdep.c:106-118  cpu_fork
+  bcopy(td1->td_frame, tf, sizeof(*tf)) copies the parent's entire trapframe—including tf_sstatus with UXL bits—to the child. Only SSTATUS_SPIE and SSTATUS_SPP are toggled (lines 117-118). The child inherits the parent's UXL value blindly. In a fork bomb or long-running process tree, a single corrupt UXL introduced by firmware propagates to every descendant process.
+  | bcopy(td1->td_frame, tf, sizeof(*tf));  // UXL cloned verbatim
+  | tf->tf_sstatus |= (SSTATUS_SPIE);        // only SPIE/SPP touched
+  | tf->tf_sstatus &= ~(SSTATUS_SPP);        // UXL still unvalidated
+
+[bug_confirmed] sys/riscv/riscv/swtch.S:371-376  fork_trampoline
+  csrw sstatus, t0 — fork child's first return to userspace writes the full sstatus register from the inherited tf_sstatus. Only SSTATUS_SIE is masked (line 374). The child restores the parent's UXL from the blindly-copied trapframe (vm_machdep.c:109) and commits it to hardware on first sret. This is the final write that activates a potentially corrupt UXL for the child process.
+  | ld    t0, (TF_SSTATUS)(sp)       // load inherited sstatus
+  | li    t1, ~SSTATUS_SIE
+  | and   t0, t0, t1                  // only SIE cleared
+  | csrw  sstatus, t0                 // UXL written unvalidated
+
+[bug_confirmed] sys/riscv/riscv/exec_machdep.c:245-258  set_mcontext
+  tf->tf_sstatus = mcp->mc_gpregs.gp_sstatus copies the full sstatus (including UXL) from a user-supplied mcontext_t into the trapframe. The validation at lines 245-248 only checks changed bits against an allowlist of SSTATUS_SD, XS_MASK, FS_MASK, UPIE, UIE. UXL bits [33:32] are not in the allowlist AND are not excluded—meaning a userspace attacker can set UXL to an illegal value in a signal handler's mcontext, and set_mcontext will copy it to tf_sstatus without rejection, because UXL bits are not in the xor-diff mask.
+  | if (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &
+  |     ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_UPIE |
+  |     SSTATUS_UIE)) != 0)
+  |     return (EINVAL);             // UXL NOT in this mask
+  | ...
+  | tf->tf_sstatus = mcp->mc_gpregs.gp_sstatus;  // copies corrupt UXL
+
+[potential_risk] sys/riscv/riscv/exec_machdep.c:222-224  get_mcontext
+  mcp->mc_gpregs.gp_sstatus = tf->tf_sstatus copies the full sstatus (including UXL bits) into the user-visible mcontext_t. This leaks the hardware UXL value to userspace via sigreturn/swapcontext. While informational leakage is low severity, it creates a path where userspace can observe a corrupt UXL, modify other bits in the mcontext, and then re-inject the corrupt value via set_mcontext on sigreturn.
+  | mcp->mc_gpregs.gp_sstatus = tf->tf_sstatus;  // UXL leaked to userspace
+
+[potential_risk] sys/riscv/riscv/exec_machdep.c:83-85  fill_regs
+  regs->sstatus = frame->tf_sstatus copies full sstatus (including UXL) into the reg structure returned by PT_GETREGS. Userspace debuggers (gdb, lldb) can read the raw UXL value. Not directly exploitable but exposes hardware CSR state that the kernel itself cannot interpret (no SSTATUS_UXL constant).
+  | frame = td->td_frame;
+  | regs->sstatus = frame->tf_sstatus;  // UXL exposed via ptrace
+
+[bug_confirmed] sys/riscv/vmm/vmm_switch.S:67-80  vmm_switch_guest
+  csrrw t0, sstatus, t0 atomically swaps the host sstatus with the guest's hyp_sstatus on VM entry. The guest's hyp_sstatus (initialized at vmm_riscv.c:224 with SSTATUS_SPP|SSTATUS_SPIE|SSTATUS_FS_INITIAL, value=0x0000000000002120) has UXL=0 (which on RV64 means XLEN=64, architecturally legal). However, if HS-mode software or the guest OS writes vsstatus with an illegal UXL value, vmmops_vcpu_save_csrs (line 186) captures it, and vmmops_vcpu_restore_csrs (line 168) reasserts it. The vmm_switch path itself uses the stored hyp_sstatus which is initially correct at init time.
+  | ld    t0, (HYP_G_SSTATUS)(a0)    // guest sstatus (initial UXL=0/legal)
+  | ld    t1, (HYP_G_HSTATUS)(a0)
+  | csrrw t0, sstatus, t0             // atomically swap, no UXL validation
+  | sd    t0, (HYP_H_SSTATUS)(a0)     // save host sstatus
+
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:161-168  vmmops_vcpu_restore_csrs
+  csr_write(vsstatus, csrs->vsstatus) writes the full vsstatus from a saved guest CSR context without any UXL validation. The guest vsstatus is captured by vmmops_vcpu_save_csrs at line 186 via csr_read(vsstatus). If the guest OS writes an illegal UXL to vsstatus, the hypervisor blindly saves and restores it. For HS-mode VMMs (the current FreeBSD bhyve implementation), this means a malicious guest can set vsstatus.UXL to a reserved value and the VMM will faithfully reassert it on next VM entry.
+  | csr_write(vsstatus, csrs->vsstatus);   // full vsstatus, UXL unvalidated
+  | ...
+  | csrs->vsstatus = csr_read(vsstatus);    // captures corrupt guest UXL
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:223-225  vmmops_vcpu_init
+  hypctx->guest_regs.hyp_sstatus initialization uses only SSTATUS_SPP, SSTATUS_SPIE, and SSTATUS_FS_INITIAL (value 0x2120). On RV64 with UXL field at bits [33:32], this value implicitly sets UXL=0, which architecturally means UXL=XLEN (64-bit), a legal value. The initial guest sstatus is correctly formed with a legal UXL.
+  | hypctx->guest_regs.hyp_sstatus = SSTATUS_SPP | SSTATUS_SPIE;
+  | hypctx->guest_regs.hyp_sstatus |= SSTATUS_FS_INITIAL;
+  | // Value 0x2120 → UXL=0 (XLEN=64) on RV64: legal at init
+

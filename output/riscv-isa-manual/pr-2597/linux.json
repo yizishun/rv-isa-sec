@@ -1,0 +1,73 @@
+{
+  "pr_number": 2597,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2597,
+    "violation_condition": "Linux kernel enables Zicfiss shadow stack for a task (via hwprobe, prctl, or ELF aux vector) on hardware that advertises Zicfiss but lacks Zaamo atomic operations, or KVM exposes Zicfiss to a guest without also exposing Zaamo, causing shadow stack push/pop operations to use non-atomic memory accesses that race with concurrent stores on the same cache line.",
+    "security_consequence": "race_condition",
+    "vulnerability_pattern": "Zicfiss without Zaamo in ISA string / hwprobe / DT / ACPI detection logic, or SSP/SSPUSH/SSPOPCHK context-switch paths that assume atomic shadow stack updates but are compiled for a kernel running on Zicfiss-without-Zaamo hardware",
+    "affected_entities": [
+      "SSP",
+      "SSPCSR",
+      "SSPUSH",
+      "SSPOPCHK",
+      "C.SSPUSH",
+      "C.SSPOPCHK",
+      "misa.Zaamo",
+      "misa.Zimop",
+      "misa.Zicfiss"
+    ],
+    "summary": "Kernel must gate Zicfiss enablement on Zaamo presence; shadow stack memory updates that are non-atomic on Zaamo-less hardware can race, silently corrupting return addresses and defeating the CFI protection that Zicfiss is meant to provide."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "riscv_cfiss_validate",
+        "line_start": 310,
+        "line_end": 318,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Zicfiss validate callback ignores the isa_bitmap parameter—it does not check for RISCV_ISA_EXT_ZAAMO. On hardware that advertises Zicfiss in the ISA string but lacks Zaamo (and lacks 'A' which implies Zaamo), the kernel will still enumerate Zicfiss as present, enabling shadow stacks whose ssamoswap.d instructions will issue non-atomic memory accesses. This creates a race condition where a concurrent store on the same cache line can corrupt the shadow-stack token.",
+      "snippet": "static int riscv_cfiss_validate(const struct riscv_isa_ext_data *data,\n                const unsigned long *isa_bitmap)\n{\n    if (!IS_ENABLED(CONFIG_RISCV_USER_CFI) ||\n        (riscv_nousercfi & CMDLINE_DISABLE_RISCV_USERCFI_BCFI))\n        return -EINVAL;\n    return 0;\n}"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "riscv_isa_ext",
+        "line_start": 508,
+        "line_end": 509,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Zicfiss is declared with only riscv_xlinuxenvcfg_exts as its superset dependency. No Zaamo dependency is declared, unlike how 'A' correctly declares zaamo+zalrsc as its subsets. This means Zicfiss is accepted even when Zaamo is absent from the hart ISA bitmap.",
+      "snippet": "__RISCV_ISA_EXT_SUPERSET_VALIDATE(zicfiss, RISCV_ISA_EXT_ZICFISS, riscv_xlinuxenvcfg_exts,\n                                  riscv_cfiss_validate),"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sys_hwprobe.c",
+        "function_name": "hwprobe_isa_ext1",
+        "line_start": 207,
+        "line_end": 207,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "hwprobe exposes ZICFISS to userspace solely based on the ISA bitmap, without verifying Zaamo is also present. If the cpufeature validation is fixed, this path will naturally be gated by the upstream bitmap, but currently it independently permits exposure to userspace on Zaamo-lacking hardware.",
+      "snippet": "EXT_KEY(isainfo->isa, ZICFISS, pair->value, missing);"
+    },
+    {
+      "location": {
+        "file_path": "Documentation/devicetree/bindings/riscv/extensions.yaml",
+        "function_name": "",
+        "line_start": 599,
+        "line_end": 604,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The DT binding for zicfiss has no 'dependencies' on zaamo, unlike entries such as ziccamoa which correctly declares its zaamo dependency at line 970. This means a DTB can describe Zicfiss-present, Zaamo-absent hardware, and the kernel will accept it.",
+      "snippet": "- const: zicfiss\n  description: |\n    The standard Zicfiss extension for enforcing backward edge\n    control-flow integrity as ratified in commit 3f8e450 (\"merge\n    pull request #227 from ved-rivos/0709\") of riscv-cfi github repo."
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

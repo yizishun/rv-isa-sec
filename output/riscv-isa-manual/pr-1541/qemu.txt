@@ -1,0 +1,51 @@
+PR #1541  target=qemu  overall=potential_risk
+Spec: Memory-mapped MSIP is now defined as 32-bit register with bits 31:1 hardwired zero and eventual mip reflection; QEMU read path must not leak internal mip state through upper bits, and KVM must ensure eventual consistency
+Violation: QEMU's ACLINT SWI read handler (riscv_aclint_swi_read) returns `(env->mip & MIP_MSIP) > 0` to emulate the memory-mapped MSIP register, deriving the value directly from the hart's internal mip CSR state. If the read path is refactored to expose more than bit 0 (e.g., returning raw `env->mip & MIP_MSIP` without boolean reduction, or returning the full 32-bit mip slice), bits 31:1 would expose internal interrupt-pending state rather than reading as hardwired zero. Additionally, the spec's relaxed timing guarantee ('eventually, but not necessarily immediately') means KVM-accelerated multi-hart setups where MSIP writes go through hardware CLINT while mip reads are trapped by QEMU could observe stale mip.MSIP indefinitely, violating the eventual-reflect guarantee.
+Consequence: info_leak
+Pattern: riscv_aclint_swi_read|env->mip.*MIP_MSIP|aclint-swi.*read|MSIP.*register.*read
+------------------------------------------------------------
+[compliant] hw/intc/riscv_aclint.c:418-438  riscv_aclint_swi_read
+  The SWI read handler correctly gates on (env->mip & MIP_MSIP) > 0, which first masks out all bits except MIP_MSIP (bit 3) and then reduces the result to a boolean 0 or 1 via > 0. The return value is always 0 or 1 as a uint64_t, so bits 31:1 are hardwired to zero. No internal mip state other than MSIP can leak. The sswi path (supervisor-level SETSIP) always returns 0 per spec.
+  | if ((addr & 0x3) == 0) {
+  |     return (swi->sswi) ? 0 : ((env->mip & MIP_MSIP) > 0);
+  | }
+  | 
+  | qemu_log_mask(LOG_UNIMP,
+  |               "aclint-swi: invalid read: %08x", (uint32_t)addr);
+  | return 0;
+
+[compliant] hw/intc/riscv_aclint.c:441-467  riscv_aclint_swi_write
+  The SWI write handler only examines value & 0x1 (bit 0), correctly ignoring writes to bits 31:1 per the MSIP register format spec. For MSWI (sswi=false), it raises/lowers the software IRQ line, which propagates through riscv_cpu_set_irq -> riscv_cpu_update_mip(env, MIP_MSIP, BOOL_TO_MASK(level)). For SSWI (sswi=true), writes to SETSIP raise IRQ but never lower it (SSWI is write-1-to-set only). This is correct per ACLINT spec.
+  | if (value & 0x1) {
+  |     qemu_irq_raise(swi->soft_irqs[hartid - swi->hartid_base]);
+  | } else {
+  |     if (!swi->sswi) {
+  |         qemu_irq_lower(swi->soft_irqs[hartid - swi->hartid_base]);
+  |     }
+  | }
+
+[potential_risk] hw/intc/riscv_aclint.c:1036-1039  riscv_cpu_set_irq (caller context)
+  In KVM-accelerated setups, the ACLINT SWI write path raises MSIP via qemu_irq_raise, which calls riscv_cpu_set_irq -> kvm_riscv_set_irq(cpu, IRQ_M_SOFT, level). KVM injects the interrupt into hardware mip; QEMU's env->mip is NOT synchronously updated. When the ACLINT SWI read handler later reads env->mip (line 431), it may observe stale mip.MSIP state because the KVM path writes to hardware mip without mirroring back to env->mip. The ACLINT spec allows 'eventually, but not necessarily immediately' timing, so this is a spec-relaxed behavior rather than a hard bug, but it could cause guest-observable delays in observing MSIP writes.
+  | if (kvm_enabled()) {
+  |     kvm_riscv_set_irq(cpu, irq, level);
+  | } else {
+  |     riscv_cpu_update_mip(env, 1 << irq, BOOL_TO_MASK(level));
+  | }
+
+[compliant] hw/riscv/riscv-iommu.c:753-757  riscv_iommu_validate_device_ctx
+  The PR change adds a validation check: when GATP is BARE (no second-level address translation), MSIPTP mode must be OFF. This prevents an IOMMU device context from being configured with MSI page-table-based translation when there is no G-stage translation to apply — avoiding undefined/misconfigured MSI routing. Note: 'MSIPTP' here is 'MSI Page Table Pointer' (IOMMU interrupt remapping), completely unrelated to ACLINT's memory-mapped MSIP (Machine Software Interrupt Pending) register. This is a correct security-hardening addition per the RISC-V IOMMU architecture spec.
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |     get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |     RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |     return false;
+  | }
+
+[compliant] hw/intc/riscv_aclint.c:513-530  riscv_aclint_swi_reset_enter
+  Reset handler correctly clears MSIP registers by lowering all software IRQ lines for MSWI (sswi=false). For SSWI (sswi=true), it does nothing because SETSIP always reads 0 per spec. The reset values comply with the ACLINT spec requirement that MSIP registers are cleared to zero on reset.
+  | if (!swi->sswi) {
+  |     for (i = 0; i < swi->num_harts; i++) {
+  |         /* Clear MSIP registers by lowering software interrupts. */
+  |         qemu_irq_lower(swi->soft_irqs[i]);
+  |     }
+  | }
+

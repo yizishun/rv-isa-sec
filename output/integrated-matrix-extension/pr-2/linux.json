@@ -1,0 +1,128 @@
+{
+  "pr_number": 2,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2,
+    "violation_condition": "Linux kernel context switch saves/restores vtype CSR without preserving the lambda[2:0] (bits [XLEN-2:XLEN-4]), altfmt_A (bit 9), or altfmt_B (bit 10) fields newly defined by the Integrated Matrix extension, allowing one process's matrix tile geometry or signedness/format configuration to leak into another process",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "__state_to_v_state|__v_state_to_state|vstate_ctrl.*vtype|vtype.*save|vtype.*restore",
+    "affected_entities": [
+      "vtype",
+      "lambda[2:0]",
+      "altfmt_A",
+      "altfmt_B"
+    ],
+    "summary": "New vtype CSR fields (lambda[2:0], altfmt_A/B) introduced by IME are implicit architected state that must be context-switched; failure to save/restore them permits cross-process matrix computation corruption via vtype pollution"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__vstate_csr_save",
+        "line_start": 129,
+        "line_end": 165,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Reads the full vtype CSR via csrr into dest->vtype (unsigned long), which captures Zvvm extension bits (lambda[2:0] at bits 62:60, altfmt_A at bit 9, altfmt_B at bit 10) as part of the full register word. The kernel has no explicit definitions for these bits (csr.h only defines VTYPE_VSEW/VLMUL/VMA/VTA), so the save is correct only by implicit behavior — the kernel does not know these fields exist and cannot validate them.",
+      "snippet": "asm volatile (\n    \"csrr\t%0, \" __stringify(CSR_VSTART) \"\\n\\t\"\n    \"csrr\t%1, \" __stringify(CSR_VTYPE) \"\\n\\t\"\n    \"csrr\t%2, \" __stringify(CSR_VL) \"\\n\\t\"\n    : \"=r\" (dest->vstart), \"=r\" (dest->vtype), \"=r\" (dest->vl),"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__vstate_csr_restore",
+        "line_start": 167,
+        "line_end": 194,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Restores vtype via 'vsetvl x0, %2, %1' where %1 is src->vtype (the full saved value). The RISC-V spec defines vsetvl behavior for standard V fields (vsew, vlmul, vta, vma) only; whether Zvvm-specific bits (lambda[2:0], altfmt_A/B) pass through unchanged from rs2 to the hardware vtype CSR depends on the implementation. If any hardware clears undefined bits during vsetvl, Zvvm state is silently lost — the kernel has no fallback or validation for this.",
+      "snippet": "asm volatile (\n    \".option push\\n\\t\"\n    \".option arch, +zve32x\\n\\t\"\n    \"vsetvl\t x0, %2, %1\\n\\t\"\n    \".option pop\\n\\t\""
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__riscv_v_vstate_save",
+        "line_start": 196,
+        "line_end": 231,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Saves vtype correctly via __vstate_csr_save (line 202), but then executes 'vsetvli x0, x0, e8, m8, ta, ma' (line 219) to configure vector register save. This vsetvli explicitly encodes only standard V fields (e8=0, m8=3, ta=1, ma=1), which zeros lambda[2:0], altfmt_A, and altfmt_B in the live hardware vtype CSR. The saved memory copy is correct, but any vector operation between this clobber and __vstate_csr_restore sees zeroed Zvvm bits.",
+      "snippet": "__vstate_csr_save(save_to);\n// ... later in the function:\n\"vsetvli\t%0, x0, e8, m8, ta, ma\\n\\t\""
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__riscv_v_vstate_restore",
+        "line_start": 233,
+        "line_end": 268,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Executes 'vsetvli x0, x0, e8, m8, ta, ma' (line 255) for vector register loads, which zeros Zvvm bits in the live vtype CSR. Zvvm bits are restored last via __vstate_csr_restore (line 266), so the final state is correct for a complete save→restore cycle. However, any intermediate vector operation during restore (e.g., between vle8.v and the vsetvl restore) would see zeroed Zvvm bits.",
+      "snippet": "\"vsetvli\t%0, x0, e8, m8, ta, ma\\n\\t\"\n\"vle8.v\tv0, (%1)\\n\\t\"\n// ... register loads ...\n__vstate_csr_restore(restore_from);  // Zvvm bits restored here"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/ptrace.c",
+        "function_name": "invalid_ptrace_v_csr",
+        "line_start": 148,
+        "line_end": 152,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ACTIVELY REJECTS Zvvm vtype bits. The 'reserved' mask is computed as ~(VTYPE_VSEW | VTYPE_VLMUL | VTYPE_VMA | VTYPE_VTA) = ~0xFF, which rejects ANY bits outside the standard V fields (bits 63:8). Zvvm's lambda[2:0] (bits 62:60), altfmt_A (bit 9), and altfmt_B (bit 10) all fall in this rejected range. Any ptrace SETREGSET or CRIU checkpoint/restore of a Zvvm-using process will fail with -EINVAL. This is a concrete, demonstrable semantic gap where the kernel's explicit field knowledge actively breaks Zvvm compatibility.",
+      "snippet": "/* do not allow to set vtype reserved bits and vill bit */\nreserved = ~(VTYPE_VSEW | VTYPE_VLMUL | VTYPE_VMA | VTYPE_VTA);\nif (ptrace->vtype & reserved)\n    return 1;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "VTYPE bit definitions",
+        "line_start": 461,
+        "line_end": 468,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The kernel defines only VTYPE_VSEW (bits 5:3), VTYPE_VLMUL (bits 2:0), VTYPE_VTA (bit 6), and VTYPE_VMA (bit 7). No definitions exist for Zvvm Integrated Matrix extension fields: lambda[2:0] (bits 62:60 on RV64), altfmt_A (bit 9), altfmt_B (bit 10), or bs[1:0] (bits 12:11). All downstream code derived from these definitions (including invalid_ptrace_v_csr's reserved mask) inherits this gap. The kernel has no symbolic way to reference or validate these bits.",
+      "snippet": "#define VTYPE_VLMUL\t_AC(7, UL)\n#define VTYPE_VSEW\t(_AC(7, UL) << VTYPE_VSEW_SHIFT)\n#define VTYPE_VTA\t(_AC(1, UL) << VTYPE_VTA_SHIFT)\n#define VTYPE_VMA\t(_AC(1, UL) << VTYPE_VMA_SHIFT)"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__switch_to_vector",
+        "line_start": 369,
+        "line_end": 400,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Context-switch vector dispatch correctly saves prev's V state (including vtype with Zvvm bits via the riscv_v_vstate_save→__riscv_v_vstate_save→__vstate_csr_save chain) and sets up lazy restore for next. The preemptive-V path uses kernel_vstate instead and handles nesting correctly. The actual vtype preservation over a complete context-switch cycle is correct — the save captures all bits, and the deferred restore puts them back via __vstate_csr_restore.",
+      "snippet": "regs = task_pt_regs(prev);\nriscv_v_vstate_save(&prev->thread.vstate, regs);\n// ...\nriscv_v_vstate_set_restore(next, task_pt_regs(next));"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "__restore_v_state",
+        "line_start": 115,
+        "line_end": 143,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Signal-return V-state restore copies vtype (including Zvvm bits) from the signal frame back into thread_struct.vstate.vtype as a full unsigned long. No validation of Zvvm bits occurs, but the bits are preserved in memory and will be restored to the hardware vtype CSR later via __vstate_csr_restore when arch_exit_to_user_mode_prepare runs. Compliant given the kernel's approach of treating vtype as an opaque unsigned long.",
+      "snippet": "err = __copy_from_user(&current->thread.vstate, &state->v_state,\n                       offsetof(struct __riscv_v_ext_state, datap));"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_vector.c",
+        "function_name": "kvm_riscv_vcpu_guest_vector_save/restore",
+        "line_start": 43,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM guest V-state save/restore delegates to __kvm_riscv_vector_save/restore → __riscv_v_vstate_save/restore, which handles vtype as an opaque unsigned long. Guest Zvvm vtype bits are preserved through the kvm_cpu_context.vector.vtype field and restored via vsetvl on VM entry. Host V-state save/restore follows the same pattern. Compliant within the kernel's opaque-vtype approach.",
+      "snippet": "if ((cntx->sstatus & SR_VS) == SR_VS_DIRTY) {\n    if (riscv_isa_extension_available(isa, v))\n        __kvm_riscv_vector_save(cntx);\n    kvm_riscv_vcpu_vector_clean(cntx);\n}"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

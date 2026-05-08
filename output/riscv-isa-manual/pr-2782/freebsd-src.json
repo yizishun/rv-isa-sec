@@ -1,0 +1,176 @@
+{
+  "pr_number": 2782,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2782,
+    "violation_condition": "In the FreeBSD kernel, any code that reads the ssp CSR (0x011) to capture a thread's shadow-stack state—during cpu_switch(), savectx(), sendsig(), fork(), or ptrace—without first issuing a FENCE w,w (or stronger) to ensure that all prior SSPUSH/C.SSPUSH shadow-stack stores from the outgoing hart are globally visible. Because the spec now explicitly states ssp decrement and the shadow-stack store are unordered with respect to each other, ssp may be observed as already decremented while the corresponding store to [ssp] has not yet completed, exposing stale/garbage data when the thread resumes on a different hart or when the kernel reads shadow-stack memory.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "csr_read.*0x011|csrr.*ssp|SSP_SAVE|shadow_stack.*save|pcb.*ssp|savectx.*ssp|cpu_switch.*ssp|sendsig.*ssp|fork.*shadow",
+    "affected_entities": [
+      "ssp",
+      "SSPUSH",
+      "C.SSPUSH",
+      "SSPOPCHK"
+    ],
+    "summary": "SSPUSH ssp-decrement and shadow-stack store now explicitly unordered; kernel must fence before reading ssp for cross-hart context save, or resume sees stale shadow-stack contents"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/include/encoding.h",
+        "function_name": "N/A (header)",
+        "line_start": 532,
+        "line_end": 758,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "No CSR_SSP (0x011) definition exists in the RISC-V encoding header. The Zicfiss shadow-stack CSR is not registered in the kernel's CSR namespace, meaning no kernel code can reference it.",
+      "snippet": "#define CSR_FFLAGS 0x1\n#define CSR_FRM 0x2\n#define CSR_FCSR 0x3\n/* ... no 0x011 entry ... */\n#define CSR_SSTATUS 0x100"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The RISC-V struct pcb has no field for shadow-stack state (ssp CSR). It only tracks ra, sp, gp, tp, s0-s11, FP registers, fpcsr, fpflags, and onfault. No shadow-stack context is saved/restored across context switches because Zicfiss is not supported.",
+      "snippet": "struct pcb {\n  uint64_t pcb_ra, pcb_sp, pcb_gp, pcb_tp;\n  uint64_t pcb_s[12];\n  uint64_t pcb_x[32][2];\n  uint64_t pcb_fcsr, pcb_fpflags;\n  vm_offset_t pcb_onfault;\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "cpu_switch() saves/restores only ra, sp, s0-s11, and optionally FP state. No ssp CSR is read or written. Since Zicfiss is not supported, the FENCE w,w ordering issue for ssp reads is not applicable.",
+      "snippet": "sd ra, (PCB_RA)(x13)\nsd sp, (PCB_SP)(x13)\nsd s0, (PCB_S + 0*8)(x13)\n...\nld ra, (PCB_RA)(x13)\nld sp, (PCB_SP)(x13)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 206,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "cpu_throw() restores only ra, sp, s0-s11, and optionally FP state from the new thread's pcb. No ssp CSR is written.",
+      "snippet": "ld ra, (PCB_RA)(x13)\nld sp, (PCB_SP)(x13)\nld s0, (PCB_S + 0*8)(x13)\n..."
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "savectx() stores only ra, sp, tp, gp, s0-s11, and FP state. No ssp CSR is read. The FENCE w,w ordering concern does not apply.",
+      "snippet": "sd ra, (PCB_RA)(a0)\nsd sp, (PCB_SP)(a0)\nsd tp, (PCB_TP)(a0)\nsd gp, (PCB_GP)(a0)\nsd s0, (PCB_S + 0*8)(a0)\n..."
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sendsig",
+        "line_start": 337,
+        "line_end": 413,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sendsig() populates a sigframe using get_mcontext() and sets up the trapframe for signal delivery. No ssp CSR is read or written. Shadow-stack state is not part of the signal frame.",
+      "snippet": "get_mcontext(td, &frame.sf_uc.uc_mcontext, 0);\n...\ntf->tf_sepc = (register_t)catcher;\ntf->tf_sp = (register_t)fp;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "get_mcontext",
+        "line_start": 205,
+        "line_end": 228,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "get_mcontext() copies only gpregs (t, s, a, ra, sp, gp, tp, sepc, sstatus) and fpregs to the mcontext. No shadow-stack register is captured.",
+      "snippet": "memcpy(mcp->mc_gpregs.gp_t, tf->tf_t, ...);\nmemcpy(mcp->mc_gpregs.gp_s, tf->tf_s, ...);\nmcp->mc_gpregs.gp_ra = tf->tf_ra;\nmcp->mc_gpregs.gp_sp = tf->tf_sp;\nget_fpcontext(td, mcp);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_mcontext",
+        "line_start": 230,
+        "line_end": 262,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "set_mcontext() restores only gpregs and fpregs from mcontext back to the trapframe/pcb. No ssp CSR is written.",
+      "snippet": "memcpy(tf->tf_t, mcp->mc_gpregs.gp_t, ...);\nmemcpy(tf->tf_s, mcp->mc_gpregs.gp_s, ...);\ntf->tf_ra = mcp->mc_gpregs.gp_ra;\ntf->tf_sp = mcp->mc_gpregs.gp_sp;\nset_fpcontext(td, mcp);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/vm_machdep.c",
+        "function_name": "cpu_fork",
+        "line_start": 86,
+        "line_end": 129,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "cpu_fork() copies the parent's pcb and trapframe to the child. Since neither struct contains shadow-stack state (no Zicfiss support), no ssp CSR is read. The FENCE w,w ordering concern is not applicable.",
+      "snippet": "bcopy(td1->td_pcb, pcb2, sizeof(*pcb2));\ntf = td2->td_frame;\nbcopy(td1->td_frame, tf, sizeof(*tf));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/ptrace_machdep.c",
+        "function_name": "ptrace_set_pc",
+        "line_start": 64,
+        "line_end": 86,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The RISC-V ptrace support is minimal (only ptrace_set_pc, ptrace_single_step stub, ptrace_clear_single_step stub). No shadow-stack register is read or written.",
+      "snippet": "int ptrace_set_pc(struct thread *td, u_long addr) {\n  td->td_frame->tf_sepc = addr;\n  return (0);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "N/A (boot assembly)",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "locore.S has no references to ssp, 0x011, zicfiss, menvcfg, senvcfg, envcfg, or shadow-stack. The boot sequence does not configure any Zicfiss-related features.",
+      "snippet": "(no ssp/shadow-stack/CFI references found in locore.S)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "N/A",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "trap.c has no references to ssp, shadow-stack, or Zicfiss. Interrupt/trap handling does not interact with shadow-stack state.",
+      "snippet": "(no ssp/shadow-stack/CFI references found in trap.c)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/",
+        "function_name": "N/A (hypervisor)",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The RISC-V vmm (bhyve) directory has no references to ssp, shadow-stack, or Zicfiss. The hypervisor does not virtualize shadow-stack CSRs for guests.",
+      "snippet": "(no ssp/shadow-stack/CFI references found in sys/riscv/vmm/)"
+    }
+  ],
+  "overall_severity": "compliant"
+}

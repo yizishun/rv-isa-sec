@@ -1,0 +1,64 @@
+PR #2978  target=qemu  overall=potential_risk
+Spec: mstatus fields MIE/MPIE/SIE/SPIE/MPRV/MXR/SUM/TVM/TW/TSR must be writable when their dependent modes exist, else read-only 0 — QEMU WARL masking must dynamically track implemented privilege modes and satp.MODE writability
+Violation: QEMU's mstatus WARL write-mask (target/riscv/csr.c, typically in write_mstatus or a helper returning the legal writable bitmask) returns any of MIE, MPIE, SIE, SPIE, MPRV, MXR, SUM, TVM, TW, TSR as read-only zero when the corresponding privilege mode (S-mode, U-mode) or feature (page-based virtual memory via satp.MODE) IS implemented on the emulated hart. Conversely, the mask must return read-only zero when those modes/features are absent — over-approximating writability also leaks invalid state.
+Consequence: function_loss
+Pattern: write_mstatus.*mask|mstatus.*warl|mstatus.*ro_zero|SIE.*SPIE.*writable|MPRV.*writable|MXR.*satp.*MODE.*read.only|SUM.*satp.*MODE.*read.only|MIE.*MPIE.*writable
+------------------------------------------------------------
+[potential_risk] target/riscv/csr.c:2012-2015  write_mstatus
+  The WARL write-mask unconditionally includes SIE, SPIE, MPRV, SUM, MXR, TVM, TSR, TW regardless of whether S-mode (RVS), U-mode (RVU), or page-based virtual memory (satp.MODE != Bare) are implemented on the emulated hart. Per RISC-V privileged spec: SIE/SPIE must be read-only zero when S-mode is absent; MPRV must be read-only zero when U-mode is absent; SUM/MXR must be read-only zero when S-mode or paging is absent. The over-approximating mask allows guest software to write and subsequently read back WARL fields that hardware would force to zero, leaking false feature information and violating WARL constraints.
+  | mask = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_MIE | MSTATUS_MPIE |
+  |         MSTATUS_SPP | MSTATUS_MPRV | MSTATUS_SUM |
+  |         MSTATUS_MPP | MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TSR |
+  |         MSTATUS_TW;
+
+[potential_risk] target/riscv/csr.c:1925-1929  read_mstatus
+  read_mstatus returns env->mstatus without applying any conditional read-as-zero masking for SIE, SPIE, MPRV, SUM, MXR, TVM, TSR, or TW. Combined with the over-approximating write mask, this means guest software can write 1 to SIE (etc.) on an M-mode-only hart and read the bit back as 1, directly contradicting the WARL spec that requires those bits to be read-only zero when their associated privilege modes/features are absent. This can confuse guest discovery probes (e.g., checking for S-mode support) and leaks internal emulator state.
+  | static RISCVException read_mstatus(CPURISCVState *env, int csrno,
+  |                                    target_ulong *val)
+  | {
+  |     *val = add_status_sd(riscv_cpu_mxl(env), env->mstatus);
+  |     return RISCV_EXCP_NONE;
+
+[compliant] target/riscv/csr.c:2008-2011  write_mstatus
+  TLB flush is correctly triggered on MXR transitions, which affect virtual memory interpretation.
+  | if ((val ^ mstatus) & MSTATUS_MXR) {
+  |         tlb_flush(env_cpu(env));
+  |     }
+
+[compliant] target/riscv/csr.c:1969-1993  legalize_mpp
+  MPP legalization correctly constrains writable values to only implemented privilege modes (M only when S/U absent; M,S when S present; M,S,U when U present). If new_mpp is invalid, the field is held unchanged — proper WARL behavior.
+  | switch (new_mpp) {
+  |     case PRV_M: valid = true; break;
+  |     case PRV_S: valid = riscv_has_ext(env, RVS); break;
+  |     case PRV_U: valid = riscv_has_ext(env, RVU); break;
+  |     }
+  |     if (!valid) {
+  |         val = set_field(val, MSTATUS_MPP, old_mpp);
+  |     }
+
+[compliant] target/riscv/csr.c:2075-2089  write_mstatush
+  write_mstatush correctly applies mask only for implemented features: RVH gates MPV/GVA, Smdbltrp gates MDT. The MDT→MIE side-effect (clearing MIE when MDT is set to 1) is correct per the Smdbltrp extension spec.
+  | uint64_t mask = riscv_has_ext(env, RVH) ? MSTATUS_MPV | MSTATUS_GVA : 0;
+  |     if (riscv_cpu_cfg(env)->ext_smdbltrp) {
+  |         mask |= MSTATUS_MDT;
+  |         if ((valh & MSTATUS_MDT) != 0) {
+  |             mask |= MSTATUS_MIE;
+  |         }
+  |     }
+
+[compliant] target/riscv/csr.c:3984-4003  write_sstatus
+  write_sstatus delegates to write_mstatus after applying sstatus_v1_10_mask filtering — the sstatus filter is correct, but the underlying write_mstatus function still has the unconditional writability issue.
+  | target_ulong newval = (env->mstatus & ~mask) | (val & mask);
+  |     return write_mstatus(env, CSR_MSTATUS, newval, ra);
+
+[compliant] target/riscv/csr.c:3965-3982  read_sstatus
+  read_sstatus correctly masks env->mstatus through sstatus_v1_10_mask, which includes SSTATUS_SIE, SSTATUS_SPIE, SSTATUS_SUM, SSTATUS_MXR, etc. — only these S-mode-viewable bits are returned. This read path is correct.
+  | *val = add_status_sd(riscv_cpu_mxl(env), env->mstatus & mask);
+
+[compliant] target/riscv/cpu_helper.c:640-693  riscv_cpu_swap_hypervisor_regs
+  Hypervisor register swapping correctly banks the S-level view of mstatus (MXR, SUM, SPP, SPIE, SIE, UXL, VS, FS, SPELP, SDT) into vsstatus/mstatus_hs and restores the corresponding bank on context switch. No security concern.
+  | if (current_virt) {
+  |         env->vsstatus = env->mstatus & mstatus_mask;
+  |         env->mstatus &= ~mstatus_mask;
+  |         env->mstatus |= env->mstatus_hs;
+

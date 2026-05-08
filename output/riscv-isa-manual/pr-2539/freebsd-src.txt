@@ -1,0 +1,50 @@
+PR #2539  target=freebsd-src  overall=compliant
+Spec: hwpmc profiling data silently corrupted when ill-configured HPM counters return constant values instead of trapping, breaking performance monitoring integrity in FreeBSD's RISC-V port
+Violation: FreeBSD kernel (e.g., hwpmc driver) reads an HPM counter (hpmcounterN) after configuring its event selector (mhpmeventN) to an unsupported or illegal event code, and relies on the read either trapping or returning a distinguishable error value, but the hardware instead silently returns a constant value (e.g., zero) indistinguishable from a valid zero count
+Consequence: data_corruption
+Pattern: mhpmevent[0-9]+.*write.*hpmcounter[0-9]+.*read|csr_write.*mhpmevent.*csr_read.*hpmcounter|hwpmc.*configure.*counter.*read|pmc.*setup.*hpm
+------------------------------------------------------------
+[compliant] sys/riscv/conf/NOTES:93-95  N/A (kernel config)
+  hwpmc(4) is explicitly disabled for RISC-V via 'nodevice hwpmc' and 'nooptions HWPMC_HOOKS'. This prevents the kernel from ever entering the code paths that would write mhpmevent selectors and read hpmcounter values — the vulnerability pattern cannot manifest because the driver infrastructure does not exist.
+  | nodevice	hwpmc
+  | nooptions 	HWPMC_HOOKS
+
+[compliant] sys/dev/hwpmc/hwpmc_riscv.h:33-47  N/A (header-only skeleton)
+  RISC-V hwpmc header defines capabilities (PMC_CAP_READ, PMC_CAP_WRITE, etc.) and an evsel field in struct pmc_md_riscv_pmc, but no corresponding hwpmc_riscv.c implementation exists. The declared functions pmc_riscv_initialize() and pmc_riscv_finalize() in pmc_mdep.h are never defined, so mhpmevent configuration and hpmcounter reads are dead code paths that cannot be reached.
+  | struct pmc_md_riscv_pmc {
+  | 	uint32_t	pm_riscv_evsel;
+  | };
+
+[compliant] sys/riscv/include/pmc_mdep.h:30-59  N/A (stub declarations)
+  pmc_mdep.h explicitly documents 'On the RISC-V platform we don't support any PMCs yet' (line 32). pmc_riscv_initialize() and pmc_riscv_finalize() are declared but have no definitions anywhere in the source tree. The union pmc_md_op_pmcallocate contains only padding. No mhpmevent→hpmcounter write→read sequence can occur through the pmc layer.
+  | union pmc_md_op_pmcallocate {
+  | 	uint64_t		__pad[4];
+  | };
+  | struct pmc_mdep *pmc_riscv_initialize(void);
+  | void pmc_riscv_finalize(struct pmc_mdep *_md);
+
+[compliant] sys/riscv/include/cpufunc.h:129-132  rdhpmcounter (macro, never called)
+  The rdhpmcounter(n) macro (csr_read64(hpmcounter##n)) is defined alongside rdcycle/rdtime/rdinstret, but has zero call sites in the entire kernel tree. In contrast, rdcycle and rdtime are actively used in timer.c and VMM code. The mhpmevent write → hpmcounter read vulnerability pattern is absent from all actual kernel execution paths.
+  | #define	rdcycle()			csr_read64(cycle)
+  | #define	rdtime()			csr_read64(time)
+  | #define	rdinstret()			csr_read64(instret)
+  | #define	rdhpmcounter(n)			csr_read64(hpmcounter##n)
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:634-635  vm_enter_guest (vmm_loop context)
+  hcounteren is configured to expose only cycle and time (HCOUNTEREN_CY | HCOUNTEREN_TM) to the guest. hpmcounter3-31 are not exposed (hcounteren bits 3-31 remain zero), so a guest reading hpmcounter registers would trap with illegal-instruction. The mhpmevent registers are in M-mode address range (0x323-0x33F) and would also trap. The spec's vulnerability pattern (write mhpmevent, read hpmcounter, get silent zero) cannot occur within a bhyve guest either. The TODO comment acknowledges this area is under active consideration.
+  | /* TODO: should we trap rdcycle / rdtime? */
+  | csr_write(hcounteren, HCOUNTEREN_CY | HCOUNTEREN_TM);
+
+[compliant] sys/riscv/riscv/trap.c:366-371  cpu_exception_handler
+  Illegal instruction exceptions (including illegal CSR accesses to unimplemented HPM counters) trigger a kernel panic via 'panic('Unknown kernel exception %x ...')', not silent data corruption. Userspace illegal CSR accesses are signalled via SIGILL. There is no path where an unsupported mhpmevent write + hpmcounter read returns silently.
+  | case SCAUSE_ILLEGAL_INSTRUCTION:
+  | 	if (frame->tf_scause & SCAUSE_INTR) {
+  | 		...panic("Unknown kernel exception %x ...");
+  | 	}
+
+[compliant] sys/riscv/include/encoding.h:647-675  N/A (CSR address definitions)
+  CSR_MHPMEVENT3 through CSR_MHPMEVENT31 (M-mode addresses 0x323-0x33F) and corresponding DECLARE_CSR macros exist in the encoding header, but grep confirms these CSR names appear nowhere in any kernel .c source file outside of the header definitions themselves. The definitions exist for potential future use but have no runtime consumers.
+  | #define	CSR_MHPMEVENT3		(0x323)
+  | #define	CSR_MHPMEVENT4		(0x324)
+  | ...
+

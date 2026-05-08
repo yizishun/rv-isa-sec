@@ -1,0 +1,145 @@
+{
+  "pr_number": 2494,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2494,
+    "violation_condition": "In the KVM hypervisor (arch/riscv/kvm), when henvcfg.PMM is changed for a guest with hgatp.MODE in {sv48x4, sv57x4} and vsatp.MODE=Bare, without a subsequent HFENCE.GVMA with rs1=x0, stale TLB entries may alias guest-physical addresses differing only in the top 2 masked bits to the same supervisor-physical page.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "henvcfg.*PMM|hgatp.*MODE.*sv57x4|hgatp.*MODE.*sv48x4|vsatp.*MODE.*Bare|HFENCE\\.GVMA|kvm_arch_vcpu_load|kvm_arch_vcpu_put|kvm_riscv_vcpu_switch",
+    "affected_entities": [
+      "henvcfg",
+      "hgatp",
+      "vsatp",
+      "hstatus",
+      "HLV.H",
+      "HSV.H",
+      "HLVX.H",
+      "HFENCE.GVMA",
+      "senvcfg"
+    ],
+    "summary": "KVM must issue HFENCE.GVMA(rs1=x0) on henvcfg.PMM changes when hgatp uses x4 modes and vsatp.MODE=Bare, else GPA masking causes TLB-alias data corruption across guest pages"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_sbi_fwft.c",
+        "function_name": "kvm_sbi_fwft_set_pointer_masking_pmlen",
+        "line_start": 189,
+        "line_end": 190,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "When guest changes henvcfg.PMM via SBI FWFT SET (non-one_reg_access path), csr_write(CSR_HENVCFG, ...) directly modifies hardware without a subsequent HFENCE.GVMA. If vsatp.MODE=Bare and hgatp.MODE is sv48x4 or sv57x4, stale G-stage TLB entries may alias guest-physical addresses differing only in the top masked bits to the same supervisor-physical page, causing data corruption. The RISC-V privileged spec requires TLB invalidation after changing translation-relevant CSRs.",
+      "snippet": "if (!one_reg_access)\n    csr_write(CSR_HENVCFG, vcpu->arch.cfg.henvcfg);\n\nreturn SBI_SUCCESS;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_sbi.c",
+        "function_name": "kvm_riscv_vcpu_sbi_load_reset_state",
+        "line_start": 195,
+        "line_end": 196,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VCPU reset sets csr->vsatp = 0 (Bare mode). Combined with the PMM-change-via-SBI path above, a freshly reset guest that enables pointer masking while still in Bare mode (before setting up VS-stage paging) satisfies all conditions for the stale-TLB vulnerability: vsatp.MODE=Bare, hgatp.MODE in {sv48x4,sv57x4}, and no HFENCE.GVMA after PMM change.",
+      "snippet": "cntx->sstatus &= ~SR_SIE;\ncsr->vsatp = 0;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_swap_in_guest_state",
+        "line_start": 749,
+        "line_end": 761,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "This function correctly swaps scounteren, senvcfg, and sstateen0 between host and guest. henvcfg is not handled here, which is correct since henvcfg is an HS-mode CSR written during kvm_arch_vcpu_load() and does not need per-guest-entry swap. senvcfg (the S-mode envcfg visible to the guest) is properly swapped via csr_swap at line 756.",
+      "snippet": "vcpu->arch.host_scounteren = csr_swap(CSR_SCOUNTEREN, csr->scounteren);\nvcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/mmu.c",
+        "function_name": "kvm_riscv_mmu_update_hgatp",
+        "line_start": 604,
+        "line_end": 616,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hgatp update is correctly followed by HFENCE.GVMA when no hardware VMID support exists (line 614-615). When hardware VMID is available, the sanitize path in kvm_riscv_local_tlb_sanitize() handles CPU migration. This function does not contribute to the vulnerability.",
+      "snippet": "ncsr_write(CSR_HGATP, hgatp);\n\nif (!kvm_riscv_gstage_vmid_bits())\n    kvm_riscv_local_hfence_gvma_all();"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/tlb.c",
+        "function_name": "kvm_riscv_local_tlb_sanitize",
+        "line_start": 161,
+        "line_end": 167,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TLB sanitize correctly handles CPU migration by flushing G-stage TLB when the host CPU changes. However, it returns early when last_exit_cpu == cpu (line 166), meaning it cannot catch the in-place PMM change that occurs during a single vCPU run on the same CPU. This is by design — the sanitize is for cross-CPU migration, not for CSR changes mid-execution.",
+      "snippet": "if (!kvm_riscv_gstage_vmid_bits() ||\n    vcpu->arch.last_exit_cpu == vcpu->cpu)\n    return;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_sbi_fwft.c",
+        "function_name": "try_to_set_pmm",
+        "line_start": 132,
+        "line_end": 136,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "During initialization, try_to_set_pmm() directly sets and clears PMM on the hardware CSR to probe PMLEN support. The csr_read_clear restores PMM to 0 after the probe, but no HFENCE.GVMA is issued between the set and clear, nor after the final clear. If the host CPU has residual G-stage TLB state from a previous guest, the transient PMM enable/disable could briefly create the aliasing condition. However, this runs during VCPU init before the guest actually executes, so the practical risk is low.",
+      "snippet": "csr_set(CSR_HENVCFG, value);\nreturn (csr_read_clear(CSR_HENVCFG, ENVCFG_PMM) & ENVCFG_PMM) == value;"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_setup_config",
+        "line_start": 543,
+        "line_end": 562,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "henvcfg initialization correctly sets PBMTE, STCE, CBIE, CBCFE, CBZE, ADUE based on ISA extensions but explicitly does NOT set any PMM bits. PMM starts at PMLEN=0 (disabled), which is the safe default.",
+      "snippet": "if (riscv_isa_extension_available(isa, SVPBMT))\n    cfg->henvcfg |= ENVCFG_PBMTE;\n// ... no ENVCFG_PMM bits set"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 596,
+        "line_end": 615,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "henvcfg is correctly written to hardware during vcpu_load via both NACL and direct CSR paths. This is the normal path for henvcfg updates. The issue is that the SBI FWFT handler bypasses this load/put cycle.",
+      "snippet": "nacl_csr_write(nsh, CSR_HENVCFG, cfg->henvcfg);  // NACL path\n// ...\ncsr_write(CSR_HENVCFG, cfg->henvcfg);  // direct path"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_put",
+        "line_start": 643,
+        "line_end": 682,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vcpu_put correctly saves guest CSRs but does not save/restore henvcfg, which is an HS-mode CSR written during vcpu_load. This is correct behavior — henvcfg does not need save/restore across vCPU switches since each vcpu_load overwrites it.",
+      "snippet": "csr->vsstatus = csr_read(CSR_VSSTATUS);\n// ... saves VS CSRs but not HENVCFG"
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "__kvm_riscv_switch_to",
+        "line_start": 198,
+        "line_end": 219,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The assembly switch routine correctly saves/restores GPRs and key CSRs (SSTATUS, STVEC, SEPC, SSCRATCH, HSTATUS). It does not touch henvcfg, which is handled separately in C code. No vulnerability here.",
+      "snippet": "REG_S  ra, CTX_RA(t0)\n// ... GPR and CSR save/restore"
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

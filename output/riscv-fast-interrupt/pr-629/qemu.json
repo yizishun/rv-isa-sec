@@ -1,0 +1,146 @@
+{
+  "pr_number": 629,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 629,
+    "violation_condition": "QEMU ACLIC MMIO write handler permits modification of read-only IE and IP fields in sourcecfgK registers, allowing guest software to fabricate interrupt-pending and interrupt-enable state that should only be controlled through setipnum/clripnum/setienum/clrienum",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "sourcecfgK IE/IP fields writable despite RO spec | ACLIC mmio_write sourcecfg no RO mask",
+    "affected_entities": [
+      "sourcecfgK",
+      "domaincfg",
+      "setipnum",
+      "clripnum",
+      "setienum",
+      "clrienum",
+      "idelivery",
+      "ithreshold",
+      "topi",
+      "claimi"
+    ],
+    "summary": "ACLIC redesigned from indirect-CSR to APLIC-subset MMIO: sourcecfgK embeds read-only IE/IP mirrors replacing pending/enable arrays; QEMU must enforce RO semantics or guest can forge interrupt state"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_write",
+        "line_start": 741,
+        "line_end": 752,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sourcecfg MMIO write handler correctly masks write values. For non-delegated sources, only D (bit 10) and SM (bits 2:0) are writable via mask 'APLIC_SOURCECFG_D | APLIC_SOURCECFG_SM_MASK'. For delegated sources, only D and CHILDIDX (bits 9:0) are writable. IE and IP bits are NOT stored in sourcecfg registers at all — they reside in the separate state[] array controlled exclusively through SETIPNUM/CLRIPNUM/SETIENUM/CLRIENUM registers. No path exists for guest software to fabricate interrupt-enable or interrupt-pending state via sourcecfg writes.",
+      "snippet": "        if (value & APLIC_SOURCECFG_D) {\n            value &= (APLIC_SOURCECFG_D | APLIC_SOURCECFG_CHILDIDX_MASK);\n        } else {\n            value &= (APLIC_SOURCECFG_D | APLIC_SOURCECFG_SM_MASK);\n        }\n        aplic->sourcecfg[irq] = value;"
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_write",
+        "line_start": 753,
+        "line_end": 761,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Side-effects after sourcecfg write are correct: when source becomes delegated or inactive (SM=INACTIVE), both pending (IP) and enabled (IE) bits are forcibly cleared via riscv_aplic_set_pending_raw/enabled_raw. When source becomes active with rectified input=1, pending is set. This prevents stale IE/IP state from persisting across source configuration changes.",
+      "snippet": "        if ((aplic->sourcecfg[irq] & APLIC_SOURCECFG_D) ||\n            (aplic->sourcecfg[irq] == 0)) {\n            riscv_aplic_set_pending_raw(aplic, irq, false);\n            riscv_aplic_set_enabled_raw(aplic, irq, false);\n        } else {\n            if (riscv_aplic_irq_rectified_val(aplic, irq)) {\n                riscv_aplic_set_pending_raw(aplic, irq, true);\n            }\n        }"
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_set_pending",
+        "line_start": 275,
+        "line_end": 305,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SETIPNUM/CLRIPNUM handler (via riscv_aplic_set_pending) correctly gates pending modifications through riscv_aplic_source_active() check. Inactive or delegated sources silently ignore set-pending writes. For level-triggered sources in MSI mode, additional rectified-input consistency checks prevent spurious pending state. This ensures IP state can only be modified for active, non-delegated sources in valid trigger modes.",
+      "snippet": "    if (!riscv_aplic_source_active(aplic, irq)) {\n        return;\n    }\n    sm = aplic->sourcecfg[irq] & APLIC_SOURCECFG_SM_MASK;\n    if ((sm == APLIC_SOURCECFG_SM_LEVEL_HIGH) ||\n        (sm == APLIC_SOURCECFG_SM_LEVEL_LOW)) {"
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_set_enabled",
+        "line_start": 352,
+        "line_end": 360,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SETIENUM/CLRIENUM handler (via riscv_aplic_set_enabled) correctly gates enable modifications through riscv_aplic_source_active() check. Inactive or delegated sources silently ignore set-enable writes. This ensures IE state can only be modified for active, non-delegated sources.",
+      "snippet": "    if (!riscv_aplic_source_active(aplic, irq)) {\n        return;\n    }\n    riscv_aplic_set_enabled_raw(aplic, irq, enabled);"
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_read",
+        "line_start": 639,
+        "line_end": 642,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sourcecfg read path correctly returns the raw sourcecfg register value. IE/IP bits are not in sourcecfg, so reads of sourcecfg cannot leak IE/IP state. The separate SETIP/CLRIP/SETIE/CLRIE base-register read paths (lines 664-686) explicitly return pending/enabled word values via dedicated read functions, not via sourcecfg registers.",
+      "snippet": "    } else if ((APLIC_SOURCECFG_BASE <= addr) &&\n            (addr < (APLIC_SOURCECFG_BASE + (aplic->num_irqs - 1) * 4))) {\n        irq  = ((addr - APLIC_SOURCECFG_BASE) >> 2) + 1;\n        return aplic->sourcecfg[irq];"
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "vmstate_riscv_aplic",
+        "line_start": 978,
+        "line_end": 1012,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Migration state (vmstate_riscv_aplic) includes both sourcecfg[] and state[] arrays as separate VMSTATE_VARRAY_UINT32 fields with num_irqs sizing. IE and IP bits are embedded in state[] alongside the INPUT bit. This is architecturally correct — there are no missing fields that would cause silent corruption on live-migration. The domaincfg, MSI config addresses, idelivery, iforce, and ithreshold arrays are also all present.",
+      "snippet": "        VMSTATE_VARRAY_UINT32(sourcecfg, RISCVAPLICState,\n                              num_irqs, 0,\n                              vmstate_info_uint32, uint32_t),\n        VMSTATE_VARRAY_UINT32(state, RISCVAPLICState,\n                              num_irqs, 0,\n                              vmstate_info_uint32, uint32_t),"
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_realize",
+        "line_start": 895,
+        "line_end": 959,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reset/realize initializes sourcecfg, state, and target arrays via g_new0 (zero-initialized). All sources start in SM=INACTIVE (0) with no pending/enabled bits set. This is correct per spec — no interrupts are active or pending at reset. Default target in non-MSI mode is set to 1 (hart index 0, iprio=1). No IE/IP corruption possible at initialization.",
+      "snippet": "        aplic->sourcecfg = g_new0(uint32_t, aplic->num_irqs);\n        aplic->state = g_new0(uint32_t, aplic->num_irqs);\n        aplic->target = g_new0(uint32_t, aplic->num_irqs);"
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_request",
+        "line_start": 560,
+        "line_end": 624,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Hardware interrupt request path (@riscv_aplic_request) correctly delegates to child APLICs for delegated sources. For local sources, it checks edge/level trigger modes and only sets pending raw (IPCORE path through riscv_aplic_set_pending_raw). It does NOT set IE bits. The INPUT state bit is updated separately from IP. This clean separation prevents the HW IRQ path from fabricating interrupt-enable state.",
+      "snippet": "    sourcecfg = aplic->sourcecfg[irq];\n    if (sourcecfg & APLIC_SOURCECFG_D) {\n        childidx = sourcecfg & APLIC_SOURCECFG_CHILDIDX_MASK;\n        if (childidx < aplic->num_children) {\n            riscv_aplic_request(aplic->children[childidx], irq, level);\n        }\n        return;\n    }"
+    },
+    {
+      "location": {
+        "file_path": "include/hw/intc/riscv_aplic.h",
+        "function_name": "RISCVAPLICState",
+        "line_start": 36,
+        "line_end": 76,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "State structure cleanly separates sourcecfg (configuration: D, SM, CHILDIDX) from state[] (runtime: IP, IE, INPUT bit flags). The IE/IP fields exist only in state[], which is mutated exclusively through setipnum/clripnum/setienum/clrienum accessors. No field aliasing or union tricks could allow sourcecfg writes to corrupt IE/IP. The struct layout matches the architectural register separation.",
+      "snippet": "    uint32_t *sourcecfg;\n    uint32_t *state;\n    uint32_t *target;\n    uint32_t *idelivery;\n    uint32_t *iforce;\n    uint32_t *ithreshold;"
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_write",
+        "line_start": 793,
+        "line_end": 828,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SETIP/CLRIP/SETIE/CLRIE bitfield-word write handlers (SETIP_BASE, CLRIP_BASE, SETIE_BASE, CLRIE_BASE) and their num-register variants (SETIPNUM, CLRIPNUM, SETIENUM, CLRIENUM) all route through riscv_aplic_set_pending/set_enabled which gate on source_active(). No direct write path from MMIO to the state[] IP/IE bits bypasses the active-source guard. Write values to bitfield registers are properly used as bit-masks to select which IRQs to affect.",
+      "snippet": "    } else if ((APLIC_SETIP_BASE <= addr) &&\n            (addr < (APLIC_SETIP_BASE + aplic->bitfield_words * 4))) {\n        word = (addr - APLIC_SETIP_BASE) >> 2;\n        riscv_aplic_set_pending_word(aplic, word, value, true);\n    } else if (addr == APLIC_SETIPNUM) {\n        riscv_aplic_set_pending(aplic, value, true);"
+    }
+  ],
+  "overall_severity": "compliant"
+}

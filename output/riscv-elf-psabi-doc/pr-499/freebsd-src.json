@@ -1,0 +1,308 @@
+{
+  "pr_number": 499,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 499,
+    "violation_condition": "FreeBSD kernel context switch (cpu_switch) or signal delivery (sendsig) saves/restores only XLEN bits of capability registers x0-x31, stripping YLEN-wide capability metadata (bounds, permissions, seal, tag) and breaking the pure-capability ABI invariant that all pointers—including stack pointer, frame pointer, and return address—are capabilities with enforced bounds and permissions.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "swtch\\.S|savectx|setjmp|sendsig.*save.*reg|bhyve.*vmctx.*x[0-9]|copy(in|out).*cap|sizeof.*register.*XLEN|struct trapframe.*XLEN",
+    "affected_entities": [
+      "x5 (t0) — capability to on-stack arguments in pure-capability variadic calls",
+      "x1 (ra) — return address capability",
+      "x2 (sp) — stack pointer capability",
+      "all capability-extended GPRs x0-x31"
+    ],
+    "summary": "Kernel must preserve full YLEN (2*XLEN) capability register width and associated metadata across context switches, signal delivery, and VM save/restore; truncation to XLEN strips capability bounds and permissions, enabling privilege escape via unbound dereference after resume."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 357,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "cpu_switch saves/restores only XLEN (64) bits of callee-saved registers (ra, sp, s0-s11) via sd/ld. Under pure-capability ABI, these registers carry YLEN-wide (≥129-bit) capabilities including bounds, permissions, seal, and tag bits. The sd/ld instructions silently strip all capability metadata on save and fabricate unbounded capabilities from raw 64-bit addresses on load. This includes the return-address capability (ra), stack-pointer capability (sp), and all saved register capabilities (s0-s11), each of which is a valid capability in purecap ABI.",
+      "snippet": "sd  ra, (PCB_RA)(x13)\nsd  sp, (PCB_SP)(x13)\n/* s[0-11] */\nsd  s0, (PCB_S + 0 * 8)(x13)\n...\nsd  s11, (PCB_S + 11 * 8)(x13)\n\n/* restore */\nld  ra, (PCB_RA)(x13)\nld  sp, (PCB_SP)(x13)\nld  s0, (PCB_S + 0 * 8)(x13)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "savectx saves only XLEN bits of ra, sp, tp, gp, s0-s11 via sd. Under purecap ABI, all these registers are capabilities. The stored 64-bit values lose bounds, permissions, seal, and tag metadata. When looks like a valid saved capability (tag=1), the tag is lost; this enables privilege escalation because a later context restore via cpu_throw would fabricate an unbounded, unsealed capability from the stored 64-bit address.",
+      "snippet": "ENTRY(savectx)\n    sd  ra, (PCB_RA)(a0)\n    sd  sp, (PCB_SP)(a0)\n    sd  tp, (PCB_TP)(a0)\n    sd  gp, (PCB_GP)(a0)\n    sd  s0, (PCB_S + 0 * 8)(a0)\n    ...\n    sd  s11, (PCB_S + 11 * 8)(a0)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 206,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "cpu_throw loads new-thread registers via ld, reconstructing only 64-bit addresses from PCB slots. In purecap ABI, this fabricates new capabilities with unbounded address range, full permissions, and tag=0 (invalid) from what were previously valid capabilities with precise bounds and restricted permissions. This breaks the capability monotonicity invariant and enables privilege escalation.",
+      "snippet": "ld  ra, (PCB_RA)(x13)\nld  sp, (PCB_SP)(x13)\n/* s[0-11] */\nld  s0, (PCB_S + 0 * 8)(x13)\n...\nld  s11, (PCB_S + 11 * 8)(x13)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fork_trampoline",
+        "line_start": 365,
+        "line_end": 432,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fork_trampoline loads all user registers from the trapframe via ld, then executes sret to enter userspace. Under purecap ABI, the user ra, sp, gp, tp, t0-t6, s0-s11, a0-a7, and sepc are all capabilities. The ld loads from uint64_t trapframe fields strip all capability metadata, and sret from a raw 64-bit sepc fabricates an unbounded PCC capability. The newly created process enters userspace with fabricated capabilities rather than properly derived ones.",
+      "snippet": "ld  t0, (TF_T + 0 * 8)(sp)\n...\nld  s0, (TF_S + 0 * 8)(sp)\n...\nld  a0, (TF_A + 0 * 8)(sp)\n...\nld  ra, (TF_RA)(sp)\nld  gp, (TF_GP)(sp)\nld  tp, (TF_TP)(sp)\nld  sp, (TF_SP - TF_SIZE)(sp)\nsret"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers",
+        "line_start": 41,
+        "line_end": 114,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The save_registers macro saves all general-purpose registers (ra, sp, gp, tp, t0-t6, s0-s11, a0-a7) plus sepc and sstatus into the trapframe using sd. Under purecap ABI, every register saved is a capability (including sepc which becomes the PCC). The saved values are truncated to 64-bit addresses, destroying all capability metadata. This is the primary kernel entry path, so every trap/interrupt/syscall strips all thread capabilities.",
+      "snippet": "sd  ra, (TF_RA)(sp)\nsd  tp, (TF_TP)(sp)\nsd  gp, (TF_GP)(sp)\nsd  t0, (TF_T + 0 * 8)(sp)\n...\nsd  s0, (TF_S + 0 * 8)(sp)\n...\nsd  a0, (TF_A + 0 * 8)(sp)\n...\ncsrr  t0, sepc\nsd  t0, (TF_SEPC)(sp)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "load_registers",
+        "line_start": 116,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The load_registers macro restores all GPRs from the trapframe using ld, and writes sepc to the CSR for sret return. Under purecap ABI, this fabricates new capabilities from stored 64-bit addresses for every register. The sstatus write to CSR is safe (it's a scalar CSR, not a capability), but sepc→CSR write followed by sret constructs a new PCC from raw 64 bits, breaking code-address-space integrity.",
+      "snippet": "ld  t0, (TF_SEPC)(sp)\ncsrw  sepc, t0\n...\nld  ra, (TF_RA)(sp)\nld  t0, (TF_T + 0 * 8)(sp)\n...\nld  a0, (TF_A + 0 * 8)(sp)\n...\naddi  sp, sp, (TF_SIZE)\nsret"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/frame.h",
+        "function_name": "struct trapframe",
+        "line_start": 46,
+        "line_end": 58,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The trapframe structure allocates only uint64_t (XLEN=64 bits) per register. Under purecap ABI, each register holds a capability of YLEN≥129 bits (64-bit address + 64-bit metadata + 1-bit tag). The trapframe is therefore 2x too small to hold a purecap register file. All save/restore paths that use this structure (exception.S, fork_trampoline, sendsig, ptrace, etc.) are fundamentally incompatible with capability registers.",
+      "snippet": "struct trapframe {\n    uint64_t tf_ra;\n    uint64_t tf_sp;\n    uint64_t tf_gp;\n    uint64_t tf_tp;\n    uint64_t tf_t[7];\n    uint64_t tf_s[12];\n    uint64_t tf_a[8];\n    uint64_t tf_sepc;\n    uint64_t tf_sstatus;\n    uint64_t tf_stval;\n    uint64_t tf_scause;\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The PCB structure stores callee-saved registers as uint64_t fields (pcb_ra, pcb_sp, pcb_gp, pcb_tp, pcb_s[12]). Under purecap ABI, these are all capability registers requiring at least 16 bytes each (address + metadata). The PCB is undersized by a factor of ~2x, so cpu_switch/savectx write capability-width data into 64-bit slots, and cpu_throw reads back 64-bit values, corrupting the capability state of the resumed thread.",
+      "snippet": "struct pcb {\n    uint64_t pcb_ra;     /* Return address */\n    uint64_t pcb_sp;     /* Stack pointer */\n    uint64_t pcb_gp;     /* Global pointer */\n    uint64_t pcb_tp;     /* Thread pointer */\n    uint64_t pcb_s[12];  /* Saved registers */\n    ...\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/ucontext.h",
+        "function_name": "struct gpregs",
+        "line_start": 38,
+        "line_end": 48,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The gpregs structure (used in mcontext_t/ucontext_t for signal delivery) stores all GPRs as __register_t (__int64_t, 8 bytes each). Under purecap ABI, each register is a capability requiring ≥16 bytes. The signal frame placed on the user stack via sendsig and restored via sys_sigreturn therefore cannot store capability metadata. A signal handler that receives a ucontext and later sigreturns would receive fabricated capabilities, enabling privilege escalation through signal-handler manipulation.",
+      "snippet": "struct gpregs {\n    __register_t gp_ra;\n    __register_t gp_sp;\n    __register_t gp_gp;\n    __register_t gp_tp;\n    __register_t gp_t[7];\n    __register_t gp_s[12];\n    __register_t gp_a[8];\n    __register_t gp_sepc;\n    __register_t gp_sstatus;\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "get_mcontext",
+        "line_start": 205,
+        "line_end": 228,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "get_mcontext copies register state from the trapframe (struct trapframe, all uint64_t) to mcontext (struct gpregs, all __register_t/__int64_t) via memcpy. Under purecap ABI, these memcpy'ed array slices (sizeof(tf->tf_t), sizeof(tf->tf_s), sizeof(tf->tf_a)) are each 8*N bytes but the live registers hold capability-width data. The source trapframe already contains only 64-bit values (truncated by exception.S save_registers), so by this point the capability metadata is already lost.",
+      "snippet": "memcpy(mcp->mc_gpregs.gp_t, tf->tf_t, sizeof(mcp->mc_gpregs.gp_t));\nmemcpy(mcp->mc_gpregs.gp_s, tf->tf_s, sizeof(mcp->mc_gpregs.gp_s));\nmemcpy(mcp->mc_gpregs.gp_a, tf->tf_a, sizeof(mcp->mc_gpregs.gp_a));\nmcp->mc_gpregs.gp_ra = tf->tf_ra;\nmcp->mc_gpregs.gp_sp = tf->tf_sp;\nmcp->mc_gpregs.gp_gp = tf->tf_gp;\nmcp->mc_gpregs.gp_tp = tf->tf_tp;\nmcp->mc_gpregs.gp_sepc = tf->tf_sepc;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_mcontext",
+        "line_start": 230,
+        "line_end": 262,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "set_mcontext copies register state from mcontext (struct gpregs, all __register_t/__int64_t) back to the trapframe via memcpy and assignment. Under purecap ABI, the mcontext contains only 64-bit addresses (capability metadata was already lost during get_mcontext). Writing these back to the trapframe and eventually loading via exception.S load_registers would fabricate capabilities from the stored 64-bit values. The sstatus bitmask check (line 245-248) only guards scalar sstatus bits and is unaware of capability metadata.",
+      "snippet": "memcpy(tf->tf_t, mcp->mc_gpregs.gp_t, sizeof(tf->tf_t));\nmemcpy(tf->tf_s, mcp->mc_gpregs.gp_s, sizeof(tf->tf_s));\nmemcpy(tf->tf_a, mcp->mc_gpregs.gp_a, sizeof(tf->tf_a));\ntf->tf_ra = mcp->mc_gpregs.gp_ra;\ntf->tf_sp = mcp->mc_gpregs.gp_sp;\ntf->tf_gp = mcp->mc_gpregs.gp_gp;\ntf->tf_tp = mcp->mc_gpregs.gp_tp;\ntf->tf_sepc = mcp->mc_gpregs.gp_sepc;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sendsig",
+        "line_start": 336,
+        "line_end": 413,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sendsig builds a sigframe containing a ucontext with mcontext (via get_mcontext) on the kernel stack, then copyout()s the entire frame to the user stack. Under purecap ABI, the mcontext inside this frame contains only 64-bit register values (capability metadata stripped earlier in the chain). The copyout itself copies raw bytes faithfully, but the semantic content—capability register state—has already been denatured. The user signal handler receives a ucontext whose register state cannot be used to reconstruct valid capabilities.",
+      "snippet": "bzero(&frame, sizeof(frame));\nget_mcontext(td, &frame.sf_uc.uc_mcontext, 0);\nframe.sf_si = ksi->ksi_info;\nframe.sf_uc.uc_sigmask = *mask;\n...\nif (copyout(&frame, fp, sizeof(*fp)) != 0) {"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sys_sigreturn",
+        "line_start": 317,
+        "line_end": 334,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sys_sigreturn copyins the ucontext from userspace and applies it via set_mcontext. Under purecap ABI, the ucontext on the user stack was populated by sendsig with only 64-bit register values. Even if the signal handler attempted to preserve capability metadata, the struct gpregs/ucontext layout has no fields for it. The set_mcontext would write 64-bit values into the trapframe, and the subsequent exception.S load_registers would fabricate invalid capabilities from these values. The sret at the end of exception return constructs a new PCC from a raw 64-bit sepc, losing code capability bounds.",
+      "snippet": "if (copyin(uap->sigcntxp, &uc, sizeof(uc)))\n    return (EFAULT);\nerror = set_mcontext(td, &uc.uc_mcontext);\nif (error != 0)\n    return (error);\nkern_sigprocmask(td, SIG_SETMASK, &uc.uc_sigmask, NULL, 0);\nreturn (EJUSTRETURN);"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "fill_regs",
+        "line_start": 78,
+        "line_end": 96,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fill_regs copies register state from the trapframe to struct reg (all uint64_t) for ptrace core dumps. Under purecap ABI, both structures lack capability-width fields, so ptrace-based debuggers cannot observe capability metadata. The memcpy from tf->tf_s/tf_a/tf_t to regs->s/a/t copies only 64-bit addresses, stripping metadata that was already absent from the trapframe.",
+      "snippet": "memcpy(regs->t, frame->tf_t, sizeof(regs->t));\nmemcpy(regs->s, frame->tf_s, sizeof(regs->s));\nmemcpy(regs->a, frame->tf_a, sizeof(regs->a));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_regs",
+        "line_start": 98,
+        "line_end": 115,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "set_regs copies 64-bit values from struct reg back into the trapframe. Under purecap ABI, a debugger setting registers via ptrace would write only 64-bit addresses, which would subsequently be loaded by exception.S load_registers to fabricate new capabilities. This is a direct controllable privilege-escalation path: a debugger can write an arbitrary 64-bit address to sepc and on sret the kernel will construct a PCC pointing to that address with no bounds.",
+      "snippet": "frame->tf_sepc = regs->sepc;\nframe->tf_ra = regs->ra;\nframe->tf_sp = regs->sp;\nframe->tf_gp = regs->gp;\nframe->tf_tp = regs->tp;\nmemcpy(frame->tf_t, regs->t, sizeof(frame->tf_t));"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 41,
+        "line_end": 204,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmm_switch saves host and loads guest registers via sd/ld (64-bit operations). Under purecap ABI, both host and guest register files consist of capabilities. Saving ra, sp, gp, tp, s0-s11, a1-a7 of the host via sd strips host capability metadata. Loading guest ra, sp, gp, tp, t0-t6, s0-s11, a0-a7 via ld fabricates capabilities for the guest. After sret into the guest, the guest runs with fabricated PCC and data capabilities. On guest exit (Lswitch_return), guest capability state is saved again via sd, then host state restored via ld—also fabricating host capabilities. The hypervisor boundary becomes a capability-stripping barrier in both directions.",
+      "snippet": "/* Save host */\nsd  ra, (HYP_H_RA)(a0)\nsd  sp, (HYP_H_SP)(a0)\n...\nsd  s11, (HYP_H_S + 11 * 8)(a0)\n/* Load guest */\nld  ra, (HYP_G_RA)(a0)\nld  sp, (HYP_G_SP)(a0)\n...\nld  s11, (HYP_G_S + 11 * 8)(a0)\nsret"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/riscv.h",
+        "function_name": "struct hypregs",
+        "line_start": 43,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "struct hypregs allocates uint64_t per register for both host and guest contexts. Under purecap ABI, each register is a capability needing ≥16 bytes. The hypctx structure containing two hypregs instances (host and guest) is undersized by ~2x, so vmm_switch sd/ld operations overflow 64-bit slots with capability-width data. This is the structural root cause of capability corruption in the VMM layer—every host→guest and guest→host transition silently strips and fabricates capabilities.",
+      "snippet": "struct hypregs {\n    uint64_t hyp_ra;\n    uint64_t hyp_sp;\n    uint64_t hyp_gp;\n    uint64_t hyp_tp;\n    uint64_t hyp_t[7];\n    uint64_t hyp_s[12];\n    uint64_t hyp_a[8];\n    uint64_t hyp_sepc;\n    uint64_t hyp_sstatus;\n    uint64_t hyp_hstatus;\n};"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_getreg",
+        "line_start": 854,
+        "line_end": 880,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmmops_getreg returns a single uint64_t value per guest register. Under purecap ABI, a guest register is a capability (≥129 bits), so the returned uint64_t loses all metadata. This is the API through which userspace VMM tools (e.g., bhyvectl) read guest register state. A VMM tool reading the guest's ra or sp would receive only a 64-bit address, unable to reconstruct the actual capability.",
+      "snippet": "int vmmops_getreg(void *vcpui, int reg, uint64_t *retval) {\n    ...\n    regp = hypctx_regptr(hypctx, reg);\n    if (regp == NULL)\n        return (EINVAL);\n    *retval = *regp;\n    return (0);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_setreg",
+        "line_start": 882,
+        "line_end": 903,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmmops_setreg accepts a single uint64_t value to set a guest register. Under purecap ABI, setting a guest capability register from a 64-bit value fabricates an unbounded capability. A userspace VMM tool could inject arbitrary 64-bit addresses into guest ra, sp, or sepc, and on the next vmm_switch these would be loaded as unbounded capabilities, giving the guest unrestricted memory access.",
+      "snippet": "int vmmops_setreg(void *vcpui, int reg, uint64_t val) {\n    ...\n    regp = hypctx_regptr(hypctx, reg);\n    if (regp == NULL)\n        return (EINVAL);\n    *regp = val;\n    return (0);\n}"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/support.S",
+        "function_name": "setjmp",
+        "line_start": 227,
+        "line_end": 250,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "setjmp saves sp, s0-s11, ra as 64-bit values via sd into the jmp_buf. Under purecap ABI, sp and ra are capabilities (stack-pointer and return-address capabilities with bounds that prevent stack overflow/underflow attacks), and s0-s11 are data capabilities. Stripping these to 64 bits and later restoring via longjmp would fabricate unbounded capabilities, breaking the stack safety guarantees that purecap ABI provides.",
+      "snippet": "ENTRY(setjmp)\n    sd  sp, 0(a0)\n    addi a0, a0, 8\n    sd  s0, (0 * 8)(a0)\n    ...\n    sd  s11, (11 * 8)(a0)\n    sd  ra, (12 * 8)(a0)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/support.S",
+        "function_name": "longjmp",
+        "line_start": 252,
+        "line_end": 275,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "longjmp restores sp, s0-s11, ra from 64-bit values via ld. Under purecap ABI, this fabricates capabilities from raw addresses. The restored sp capability would have no stack bounds, undoing the stack-pointer bounds enforcement that purecap ABI relies on for spatial memory safety. The restored ra and s-register capabilities would similarly have unrestricted bounds and permissions.",
+      "snippet": "ENTRY(longjmp)\n    ld  sp, 0(a0)\n    addi a0, a0, 8\n    ld  s0, (0 * 8)(a0)\n    ...\n    ld  s11, (11 * 8)(a0)\n    ld  ra, (12 * 8)(a0)"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/machdep.c",
+        "function_name": "makectx",
+        "line_start": 277,
+        "line_end": 287,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "makectx constructs a PCB from a trapframe for kernel debugger backtracing. It copies tf->tf_s into pcb->pcb_s via memcpy (64-bit copies) and assigns tf->tf_sepc to pcb->pcb_ra as uint64_t. Under purecap ABI, the source trapframe already lacks capability metadata, so this propagates already-stripped values. The PCB constructed this way can produce backtraces from addresses but loses capability provenance information needed for full debugging.",
+      "snippet": "memcpy(pcb->pcb_s, tf->tf_s, sizeof(tf->tf_s));\npcb->pcb_ra = tf->tf_sepc;\npcb->pcb_sp = tf->tf_sp;\npcb->pcb_gp = tf->tf_gp;\npcb->pcb_tp = tf->tf_tp;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "exec_setregs",
+        "line_start": 172,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "exec_setregs initializes the trapframe for a new process image. It writes a raw user stack address (uintptr_t stack, a 64-bit value) into tf->tf_a[0] and tf->tf_sp, and the ELF entry point address into tf->tf_ra and tf->tf_sepc. Under purecap ABI, these should be capabilities derived from the process's capability environment (with appropriate bounds for stack, code, and argument capabilities). Writing raw 64-bit addresses means the new process starts with fabricated capabilities on its first exception return, bypassing the capability-based program loading model.",
+      "snippet": "memset(tf, 0, sizeof(struct trapframe));\ntf->tf_a[0] = stack;\ntf->tf_sp = STACKALIGN(stack);\ntf->tf_ra = imgp->entry_addr;\ntf->tf_sepc = imgp->entry_addr;"
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/reg.h",
+        "function_name": "struct reg",
+        "line_start": 40,
+        "line_end": 50,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "struct reg (used by ptrace) stores all GPRs as __uint64_t. Under purecap ABI, this is the ptrace ABI for register access: it can never represent capability metadata through the ptrace(2) PTRACE_GETREGS/PTRACE_SETREGS interface. Any debugger using these ptrace operations would see only 64-bit addresses and could only write 64-bit addresses, creating a structural ptrace ABI gap for purecap processes.",
+      "snippet": "struct reg {\n    __uint64_t ra;\n    __uint64_t sp;\n    __uint64_t gp;\n    __uint64_t tp;\n    __uint64_t t[7];\n    __uint64_t s[12];\n    __uint64_t a[8];\n    __uint64_t sepc;\n    __uint64_t sstatus;\n};"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

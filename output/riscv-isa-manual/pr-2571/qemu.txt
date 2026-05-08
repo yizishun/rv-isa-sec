@@ -1,0 +1,65 @@
+PR #2571  target=qemu  overall=bug_confirmed
+Spec: scountinhibit is a masked alias of mcountinhibit where non-delegated bits must read-as-zero and ignore writes; failure to dynamically apply the mcounteren delegation mask on every access leaks M-mode counter state to S-mode guest
+Violation: QEMU's scountinhibit CSR handler reads or writes mcountinhibit without dynamically applying the mcounteren delegation mask, or when menvcfg.CDE=0 the handler does not raise an illegal-instruction exception, or when CDE=1 and H extension is present, VS/VU mode access does not raise a virtual-instruction exception
+Consequence: info_leak
+Pattern: scountinhibit.*mcountinhibit|mcountinhibit.*mask|CDE.*scountinhibit|siselect.*0x40.*sireg|scountinhibit.*read.*zero|mcounteren.*scountinhibit
+------------------------------------------------------------
+[bug_confirmed] target/riscv/csr.c:393-406  scountinhibit_pred
+  Predicate does not check menvcfg.CDE before granting S-mode access to scountinhibit. Per Smcdeleg spec, scountinhibit must raise illegal-instruction when CDE=0. Currently only checks ext_ssccfg/ext_smcdeleg presence and virt_enabled, but never menvcfg.CDE. This allows S-mode to read/write scountinhibit (and thus mcountinhibit masked by mcounteren) even when M-mode has not delegated counter control — a spec violation with info_leak potential.
+  | static RISCVException scountinhibit_pred(CPURISCVState *env, int csrno)
+  | {
+  |     RISCVCPU *cpu = env_archcpu(env);
+  | 
+  |     if (!cpu->cfg.ext_ssccfg || !cpu->cfg.ext_smcdeleg) {
+  |         return RISCV_EXCP_ILLEGAL_INST;
+  |     }
+  | 
+  |     if (env->virt_enabled) {
+  |         return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;
+  |     }
+  | 
+  |     return smode(env, csrno);  /* <-- missing: if (!get_field(env->menvcfg, MENVCFG_CDE)) return RISCV_EXCP_ILLEGAL_INST */
+  | }
+
+[potential_risk] target/riscv/csr.c:3174-3218  write_menvcfg
+  MENVCFG_CDE is unconditionally in the base mask (line 3178) outside the RV64 block, meaning for RV32, every write to the low 32 bits of menvcfg inadvertently clears the CDE bit (bit 60) in env->menvcfg, since val (32-bit) & MENVCFG_CDE (bit 60) = 0. CDE should only be affected by menvcfgh writes on RV32. On RV64, the unconditional inclusion in base mask plus conditional inclusion (line 3184) makes CDE always writable even without ext_smcdeleg — though predicate guards mitigate impact.
+  | uint64_t mask = MENVCFG_FIOM | MENVCFG_CBIE | MENVCFG_CBCFE |
+  |                 MENVCFG_CBZE | MENVCFG_CDE;  /* CDE unconditional */
+  | ...
+  | if (riscv_cpu_mxl(env) == MXL_RV64) {
+  |     mask |= ... (cfg->ext_smcdeleg ? MENVCFG_CDE : 0) | ...  /* CDE conditional, but already in mask */
+  | }
+
+[compliant] target/riscv/csr.c:3059-3065  read_scountinhibit
+  Correctly masks mcountinhibit with mcounteren for S-mode reads. The delegation mask is properly applied — only counters delegated via mcounteren are visible.
+  | *val = env->mcountinhibit & env->mcounteren;
+  | return RISCV_EXCP_NONE;
+
+[compliant] target/riscv/csr.c:3067-3071  write_scountinhibit
+  Correctly masks write value with mcounteren before passing to write_mcountinhibit, preventing S-mode from toggling undelegated counters.
+  | return write_mcountinhibit(env, csrno, val & env->mcounteren, ra);
+
+[compliant] target/riscv/csr.c:2763-2766  rmw_xireg_cd
+  Indirect CSR access path (siselect 0x40-0x5F range) correctly checks both mcounteren delegation bit and menvcfg.CDE before granting access. This is the correct pattern that scountinhibit_pred should follow.
+  | if (!get_field(env->mcounteren, BIT(ctr_index)) ||
+  |     !get_field(env->menvcfg, MENVCFG_CDE)) {
+  |     goto done;
+  | }
+
+[compliant] target/riscv/csr.c:1617-1623  read_scountovf
+  Correctly checks menvcfg.CDE for virtualization of scountovf. When CDE=1 and virt_enabled, returns VIRT_INSTRUCTION_FAULT since the counter overflow register is delegated to HS-mode and invisible to VS-mode.
+  | if (riscv_cpu_cfg(env)->ext_sscofpmf &&
+  |     riscv_cpu_cfg(env)->ext_ssccfg &&
+  |     get_field(env->menvcfg, MENVCFG_CDE) &&
+  |     env->virt_enabled) {
+  |     return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;
+  | }
+
+[compliant] target/riscv/machine.c:474-474  vmstate_riscv_cpu
+  scountinhibit is correctly included in the VMState migration structure, preventing silent corruption during live-migration.
+  | VMSTATE_UINT32(env.scountinhibit, RISCVCPU),
+
+[compliant] target/riscv/cpu.h:415-415  (struct CPURISCVState)
+  scountinhibit is stored as a separate per-hart field (uint32_t) alongside the mcountinhibit shadow. Per-hart indexing is correct.
+  | uint32_t scountinhibit;
+

@@ -1,0 +1,69 @@
+PR #2868  target=qemu  overall=compliant
+Spec: Splitting norm:constrained_lrsc_forward_progress into five granular sub-tags (intro, sc, store_amo, branch, trap) clarifies that QEMU must not spuriously invalidate LR reservations—any reservation loss without an architected store, successful SC, branch exit, or trap constitutes a forward-progress denial-of-service against the guest hart's constrained LR/SC loop
+Violation: In QEMU TCG multi-hart emulation, when a guest hart H enters a constrained LR/SC loop, QEMU must guarantee forward progress via one of: (a) successful SC by any hart on H's reservation set, (b) unconditional store/AMO from another hart/device on the reservation set, (c) H branching out of the loop, or (d) H trapping. This guarantee is violated if QEMU's reservation tracking state for H is spuriously cleared without any of the above events occurring—for example, if the per-hart load reservation is lost on an unrelated CSR write, on an exception entry/return that incorrectly resets reservation state, or if TCG register allocation causes the reservation monitor to be silently invalidated without architected side-effects completing.
+Consequence: denial_of_service
+Pattern: helper_lr_d\b|helper_sc_d\b|cpu->load_res|cpu->load_val|reservation.*clear|LR.*reservation.*reset|load_res.*=.*-1|RISCVCPU.*load_res
+------------------------------------------------------------
+[compliant] target/riscv/insn_trans/trans_rva.c.inc:33-59  gen_lr
+  LR correctly loads data into load_val (via tcg_gen_qemu_ld_tl) and stores the reservation address into load_res (via tcg_gen_mov_tl). Both are TCG globals backed by per-vCPU CPURISCVState fields, so multi-hart isolation is maintained. Memory barriers for .aq/.rl/.ztso are correctly emitted.
+  | tcg_gen_qemu_ld_tl(load_val, src1, ctx->mem_idx, mop);
+  |     /* Put addr in load_res, data in load_val.  */
+  |     tcg_gen_mov_tl(load_res, src1);
+  |     gen_set_gpr(ctx, a->rd, load_val);
+
+[compliant] target/riscv/insn_trans/trans_rva.c.inc:61-109  gen_sc
+  SC correctly compares load_res with the store address, then uses tcg_gen_atomic_cmpxchg_tl(addr=load_res, cmp=load_val, new=src2). On address mismatch, probes write permissions and sets rd=1. Reservation is unconditionally cleared (load_res = -1) after both success and failure paths, which is spec-correct: any SC clears the reservation. No spurious clearing within the LR/SC pair in single-hart execution.
+  | tcg_gen_brcond_tl(TCG_COND_NE, load_res, src1, l1);
+  |     tcg_gen_atomic_cmpxchg_tl(dest, load_res, load_val, src2,
+  |                               ctx->mem_idx, mop);
+  |     tcg_gen_setcond_tl(TCG_COND_NE, dest, dest, load_val);
+  |     /* Clear the load reservation... */
+  |     tcg_gen_movi_tl(load_res, -1);
+
+[compliant] target/riscv/cpu_helper.c:1081-1105  riscv_cpu_set_mode
+  Reservation is cleared on every privilege mode transition (exception entry, MRET/SRET/MNRET, gdbstub priv write). The comment explicitly documents this as spec-compliant: ISA v2.2 required it, later revisions say the kernel 'should' use SC to yield. This is a conservative, defensive implementation that prevents cross-context reservation leaks. No spurious clearing in normal execution.
+  | /*
+  |      * Clear the load reservation - otherwise a reservation placed in one
+  |      * context/process can be used by another, resulting in an SC succeeding
+  |      * incorrectly.
+  |      */
+  |     env->load_res = -1;
+
+[compliant] target/riscv/insn_trans/trans_rvzawrs.c.inc:19-41  trans_wrs_sto
+  WRS.STO correctly clears the load reservation at translate time (tcg_gen_movi_tl(load_res, -1)) before exiting the TB. Per the Zawrs spec, the WRS instruction sequence must cause any pending LR reservation to be lost.
+  | /* Clear the load reservation  (if any).  */
+  |     tcg_gen_movi_tl(load_res, -1);
+  |     gen_update_pc(ctx, ctx->cur_insn_len);
+  |     tcg_gen_exit_tb(NULL, 0);
+
+[compliant] target/riscv/insn_trans/trans_rvzawrs.c.inc:43-62  trans_wrs_nto
+  WRS.NTO calls gen_helper_wrs_nto which may raise an exception. When an exception fires, riscv_raise_exception causes a longjmp into riscv_cpu_do_interrupt, which calls riscv_cpu_set_mode, which clears load_res at cpu_helper.c:1105. When no exception fires, falls through to trans_wrs_sto which also clears load_res. Both paths correctly clear the reservation.
+  | gen_helper_wrs_nto(tcg_env);
+  |     /* We only get here when helper_wrs_nto() doesn't raise an exception. */
+  |     return trans_wrs_sto(ctx, NULL);
+
+[compliant] target/riscv/machine.c:426-438  vmstate_riscv_cpu
+  Both load_res and load_val are included in the VMState via VMSTATE_UINTTL at lines 437-438. Reservation state is correctly migrated, preventing silent corruption on live migration.
+  | VMSTATE_UINTTL(env.load_res, RISCVCPU),
+  |         VMSTATE_UINTTL(env.load_val, RISCVCPU),
+
+[compliant] target/riscv/cpu.c:778-780  riscv_cpu_reset_hold
+  Reset correctly initializes load_res = -1 (no reservation). Correct behavior per spec.
+  | env->xl = riscv_cpu_mxl(env);
+  |     cs->exception_index = RISCV_EXCP_NONE;
+  |     env->load_res = -1;
+
+[compliant] target/riscv/translate.c:1489-1492  riscv_translate_init
+  load_res and load_val are registered as TCG global registers backed by CPURISCVState fields. Each vCPU has its own TCG context with its own globals. No cross-hart leakage of reservation state.
+  | load_res = tcg_global_mem_new(tcg_env, offsetof(CPURISCVState, load_res),
+  |                              "load_res");
+  |     load_val = tcg_global_mem_new(tcg_env, offsetof(CPURISCVState, load_val),
+  |                              "load_val");
+
+[potential_risk] target/riscv/insn_trans/trans_rva.c.inc:72-82  gen_sc
+  SC uses load_res (the reservation address) as the addr parameter to tcg_gen_atomic_cmpxchg_tl and load_val (the loaded data) as the cmp (expected old value). This is correct. However, QEMU TCG does NOT implement cross-hart reservation invalidation: a store/AMO from hart B to hart A's reservation set does NOT clear hart A's load_res. This is a known limitation of QEMU's simplified per-hart reservation model. The RISC-V spec requires SC to fail if another hart stores to the reservation set. This could violate the forward-progress guarantee in constrained LR/SC loops under multi-hart TCG emulation.
+  | tcg_gen_brcond_tl(TCG_COND_NE, load_res, src1, l1);
+  |     tcg_gen_atomic_cmpxchg_tl(dest, load_res, load_val, src2,
+  |                               ctx->mem_idx, mop);
+  |     tcg_gen_setcond_tl(TCG_COND_NE, dest, dest, load_val);
+

@@ -1,0 +1,45 @@
+PR #2580  target=xiangshan  overall=compliant
+Spec: Reserved AMOCAS.D/Q encodings with odd-numbered register pairs are accepted and executed with incorrect register pairing instead of raising illegal instruction exception; decoder lacks rd[0]/rs2[0] evenness validation gates
+Violation: When AMOCAS.D (RV32) or AMOCAS.Q (RV64) instruction encoding specifies an odd-numbered register for rd or rs2, the XiangShan decoder (RiscvInst.scala:22-24) only checks FUNCT7 bits 31:25 (= b00101??), which excludes rs2[0] (bit 20) and rd[0] (bit 7). No subsequent stage checks for even-register validity. The hardware proceeds to execute with rd+1/rs2+1 sequential pairing logic (DecodeUnitComp.scala:265-273), producing a wrong register pair instead of raising an illegal instruction exception as required for the reserved encoding.
+Consequence: data_corruption
+Pattern: isAMOCAS[^Q]|rs2\s*\+\s*1\.U|dest\s*\+\s*1\.U|AMO_CAS_[DQ].*src2|exceptionII.*AMO
+------------------------------------------------------------
+[compliant] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/decode/isa/bitfield/RiscvInst.scala:22-25  isAMOCAS
+  The isAMOCAS function checks OPCODE5Bit==AMO and FUNCT7==BitPat('b00101??'). FUNCT7 is inst(31,25) (7 bits), and BitPat('b00101??') is 7 bits where don't-care bits correspond to aq(bit26) and rl(bit25). This is a secondary identification hook (used for uopInfoGen isAmoCAS flag, line 1127), NOT the primary decode-gate. It correctly identifies all AMOCAS variants without false-positives since no other AMO instruction has funct7[6:2]=00101. The claim that this check 'excludes rs2[0] and rd[0]' is accurate but irrelevant — this function is not responsible for even-register validation.
+  | def isAMOCAS = {
+  |   this.OPCODE5Bit === xiangshan.backend.decode.isa.bitfield.OPCODE5Bit.AMO &&
+  |     this.FUNCT7 === BitPat("b00101??")
+  | }
+
+[compliant] /home/yzs/riscv/XiangShan/rocket-chip/src/main/scala/rocket/Instructions.scala:42-44  AMOCAS_Q/W/D (BitPat)
+  The instruction BitPat definitions use ????? for rd (bits 11:7) and rs2 (bits 24:20) fields, leaving them as don't-care in the decode table. While this means odd-register AMOCAS.Q encodings will match the decode table, the even-register constraint is enforced downstream at DecodeUnit.scala:874-875 via exceptionII logic, which raises an illegal instruction exception. Architecturally correct — the decode table matches scope (funct7+funct3+opcode), and semantic constraints (even-register) are checked in the exception logic. The security spec's claim that 'No subsequent stage checks' exist is false.
+  | def AMOCAS_Q = BitPat("b00101????????????100?????0101111")
+  | def AMOCAS_D = BitPat("b00101????????????011?????0101111")
+  | def AMOCAS_W = BitPat("b00101????????????010?????0101111")
+
+[compliant] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/decode/DecodeUnit.scala:874-900  exceptionII (isAmocasQIllegal)
+  This is the critical finding that disproves the security bug claim. Lines 874-875 define isAmocasQIllegal which checks inst.RD(0)===1.U || inst.RS2(0)===1.U for AMOCAS.Q. This is fed into exceptionII at line 900, which sets decodedInst.exceptionVec(illegalInstr). This means any AMOCAS.Q encoding with an odd rd or rs2 will raise an illegal instruction exception. The check correctly tests bit 7 (rd LSB) and bit 20 (rs2 LSB) of the instruction word. The claim that 'No subsequent stage checks for even-register validity' is definitively false.
+  | private val isAmocasQ = FuType.FuTypeOrR(decodedInst.fuType, FuType.mou) && decodedInst.fuOpType === LSUOpType.amocas_q
+  | private val isAmocasQIllegal = isAmocasQ && (inst.RD(0) === 1.U || inst.RS2(0) === 1.U)
+  | ...
+  | isAmocasQIllegal
+
+[compliant] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/decode/DecodeUnit.scala:279-279  DecodeUnit table (AMOCAS_D)
+  AMOCAS_D is decoded with uopSplitType=AMO_CAS_D. On RV64 (XiangShan), AMOCAS.D operates on a 64-bit value that fits in one 64-bit register — no register pairing is required. The DecodeUnitComp.scala code at lines 228-244 confirms no rs2+1/dest+1 logic for AMO_CAS_D. The even-register constraint only applies to AMOCAS.D on RV32, which XiangShan does not support. No security bug here.
+  | AMOCAS_D  -> XSDecode(..., uopSplitType = UopSplitType.AMO_CAS_D, ...)
+
+[compliant] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/decode/DecodeUnitComp.scala:265-274  uopSplit (AMO_CAS_Q)
+  The rs2+1 and dest+1 register pairing logic for AMOCAS.Q 128-bit CAS is gated by the exception check at DecodeUnit.scala:874-875. An instruction with odd rd/rs2 would have exceptionVec(illegalInstr) set, and the subsequent DecodeStage.scala:142-149 logic will flag it as illegal. The pairing Mux includes x0 guard (src2===0.U / dest===0.U), preventing incorrect x1 access. When combined with the exception check, this is architecturally correct: illegal encodings are flagged before they can architecturally commit, even if uops are speculatively issued.
+  | csBundle(2).lsrc(1) := Mux(src2 === 0.U, 0.U, src2 + 1.U)
+  | ...
+  | csBundle(3).lsrc(1) := Mux(dest === 0.U, 0.U, dest + 1.U)
+  | csBundle(3).ldest := Mux(dest === 0.U, 0.U, dest + 1.U)
+
+[compliant] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/mem/pipeline/AtomicsUnit.scala:83-104  AtomicsUnit (AMOCAS execution)
+  The AtomicsUnit correctly assembles the 128-bit CAS value from 4 source registers (rs2_l, rs2_h, rd_l, rd_h via stds Seq at line 103-104). The StdCntCASQ=4 (line 178) requires all 4 data uops before declaring data_valid. This logic only executes for non-exception instructions. The atomics unit correctly implements the AMOCAS.Q double-width CAS operation. No security issue.
+  | val isAMOCAS = LSUOpType.isAMOCAS(uop.fuOpType)
+  | val rs1, rs2_l, rs2_h, rd_l, rd_h = Reg(UInt(XLEN.W))
+  | val stds = Seq(rd_l, rs2_l, rd_h, rs2_h)
+  | val rs2 = Cat(rs2_h, Mux(isAMOCAS, rs2_l, stds.head))
+  | val rd = Cat(rd_h, rd_l)
+

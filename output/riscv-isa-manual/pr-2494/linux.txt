@@ -1,0 +1,63 @@
+PR #2494  target=linux  overall=bug_confirmed
+Spec: KVM must issue HFENCE.GVMA(rs1=x0) on henvcfg.PMM changes when hgatp uses x4 modes and vsatp.MODE=Bare, else GPA masking causes TLB-alias data corruption across guest pages
+Violation: In the KVM hypervisor (arch/riscv/kvm), when henvcfg.PMM is changed for a guest with hgatp.MODE in {sv48x4, sv57x4} and vsatp.MODE=Bare, without a subsequent HFENCE.GVMA with rs1=x0, stale TLB entries may alias guest-physical addresses differing only in the top 2 masked bits to the same supervisor-physical page.
+Consequence: data_corruption
+Pattern: henvcfg.*PMM|hgatp.*MODE.*sv57x4|hgatp.*MODE.*sv48x4|vsatp.*MODE.*Bare|HFENCE\.GVMA|kvm_arch_vcpu_load|kvm_arch_vcpu_put|kvm_riscv_vcpu_switch
+------------------------------------------------------------
+[bug_confirmed] arch/riscv/kvm/vcpu_sbi_fwft.c:189-190  kvm_sbi_fwft_set_pointer_masking_pmlen
+  When guest changes henvcfg.PMM via SBI FWFT SET (non-one_reg_access path), csr_write(CSR_HENVCFG, ...) directly modifies hardware without a subsequent HFENCE.GVMA. If vsatp.MODE=Bare and hgatp.MODE is sv48x4 or sv57x4, stale G-stage TLB entries may alias guest-physical addresses differing only in the top masked bits to the same supervisor-physical page, causing data corruption. The RISC-V privileged spec requires TLB invalidation after changing translation-relevant CSRs.
+  | if (!one_reg_access)
+  |     csr_write(CSR_HENVCFG, vcpu->arch.cfg.henvcfg);
+  | 
+  | return SBI_SUCCESS;
+
+[potential_risk] arch/riscv/kvm/vcpu_sbi.c:195-196  kvm_riscv_vcpu_sbi_load_reset_state
+  VCPU reset sets csr->vsatp = 0 (Bare mode). Combined with the PMM-change-via-SBI path above, a freshly reset guest that enables pointer masking while still in Bare mode (before setting up VS-stage paging) satisfies all conditions for the stale-TLB vulnerability: vsatp.MODE=Bare, hgatp.MODE in {sv48x4,sv57x4}, and no HFENCE.GVMA after PMM change.
+  | cntx->sstatus &= ~SR_SIE;
+  | csr->vsatp = 0;
+
+[compliant] arch/riscv/kvm/vcpu.c:749-761  kvm_riscv_vcpu_swap_in_guest_state
+  This function correctly swaps scounteren, senvcfg, and sstateen0 between host and guest. henvcfg is not handled here, which is correct since henvcfg is an HS-mode CSR written during kvm_arch_vcpu_load() and does not need per-guest-entry swap. senvcfg (the S-mode envcfg visible to the guest) is properly swapped via csr_swap at line 756.
+  | vcpu->arch.host_scounteren = csr_swap(CSR_SCOUNTEREN, csr->scounteren);
+  | vcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);
+
+[compliant] arch/riscv/kvm/mmu.c:604-616  kvm_riscv_mmu_update_hgatp
+  hgatp update is correctly followed by HFENCE.GVMA when no hardware VMID support exists (line 614-615). When hardware VMID is available, the sanitize path in kvm_riscv_local_tlb_sanitize() handles CPU migration. This function does not contribute to the vulnerability.
+  | ncsr_write(CSR_HGATP, hgatp);
+  | 
+  | if (!kvm_riscv_gstage_vmid_bits())
+  |     kvm_riscv_local_hfence_gvma_all();
+
+[compliant] arch/riscv/kvm/tlb.c:161-167  kvm_riscv_local_tlb_sanitize
+  TLB sanitize correctly handles CPU migration by flushing G-stage TLB when the host CPU changes. However, it returns early when last_exit_cpu == cpu (line 166), meaning it cannot catch the in-place PMM change that occurs during a single vCPU run on the same CPU. This is by design — the sanitize is for cross-CPU migration, not for CSR changes mid-execution.
+  | if (!kvm_riscv_gstage_vmid_bits() ||
+  |     vcpu->arch.last_exit_cpu == vcpu->cpu)
+  |     return;
+
+[potential_risk] arch/riscv/kvm/vcpu_sbi_fwft.c:132-136  try_to_set_pmm
+  During initialization, try_to_set_pmm() directly sets and clears PMM on the hardware CSR to probe PMLEN support. The csr_read_clear restores PMM to 0 after the probe, but no HFENCE.GVMA is issued between the set and clear, nor after the final clear. If the host CPU has residual G-stage TLB state from a previous guest, the transient PMM enable/disable could briefly create the aliasing condition. However, this runs during VCPU init before the guest actually executes, so the practical risk is low.
+  | csr_set(CSR_HENVCFG, value);
+  | return (csr_read_clear(CSR_HENVCFG, ENVCFG_PMM) & ENVCFG_PMM) == value;
+
+[compliant] arch/riscv/kvm/vcpu.c:543-562  kvm_riscv_vcpu_setup_config
+  henvcfg initialization correctly sets PBMTE, STCE, CBIE, CBCFE, CBZE, ADUE based on ISA extensions but explicitly does NOT set any PMM bits. PMM starts at PMLEN=0 (disabled), which is the safe default.
+  | if (riscv_isa_extension_available(isa, SVPBMT))
+  |     cfg->henvcfg |= ENVCFG_PBMTE;
+  | // ... no ENVCFG_PMM bits set
+
+[compliant] arch/riscv/kvm/vcpu.c:596-615  kvm_arch_vcpu_load
+  henvcfg is correctly written to hardware during vcpu_load via both NACL and direct CSR paths. This is the normal path for henvcfg updates. The issue is that the SBI FWFT handler bypasses this load/put cycle.
+  | nacl_csr_write(nsh, CSR_HENVCFG, cfg->henvcfg);  // NACL path
+  | // ...
+  | csr_write(CSR_HENVCFG, cfg->henvcfg);  // direct path
+
+[compliant] arch/riscv/kvm/vcpu.c:643-682  kvm_arch_vcpu_put
+  vcpu_put correctly saves guest CSRs but does not save/restore henvcfg, which is an HS-mode CSR written during vcpu_load. This is correct behavior — henvcfg does not need save/restore across vCPU switches since each vcpu_load overwrites it.
+  | csr->vsstatus = csr_read(CSR_VSSTATUS);
+  | // ... saves VS CSRs but not HENVCFG
+
+[compliant] arch/riscv/kvm/vcpu_switch.S:198-219  __kvm_riscv_switch_to
+  The assembly switch routine correctly saves/restores GPRs and key CSRs (SSTATUS, STVEC, SEPC, SSCRATCH, HSTATUS). It does not touch henvcfg, which is handled separately in C code. No vulnerability here.
+  | REG_S  ra, CTX_RA(t0)
+  | // ... GPR and CSR save/restore
+

@@ -1,0 +1,77 @@
+PR #2661  target=xiangshan  overall=bug_confirmed
+Spec: Incorrect PMP checker implementation of the mseccfg.MML=1 truth table would grant Machine mode read/write/execute access to regions that the spec mandates as denied, constituting a hardware-level privilege boundary escape
+Violation: When mseccfg.MML=1, the PMP checker in hardware incorrectly implements the MML truth table — e.g., treating an R=0,W=1 encoding for Machine mode as granting read access (which the spec defines as denied), or failing to distinguish between Machine-mode and Supervisor/User-mode permission checks for the same PMP entry. In Chisel/Verilog, this manifests as a wrong branch in the PMP permission calculation MUX or a missing mode qualifier (ldest.priv) in the permission lookup logic.
+Consequence: privilege_escape
+Pattern: (MML|mml|mseccfg\.MML|isMmLmode|mmlEn|pmpCheck.*priv|pmp.*machine.*access)
+------------------------------------------------------------
+[bug_confirmed] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:324-326  mseccfg CSRModule
+  mseccfg.MML, MMWP, and RLB are hardwired read-only zero (RO). The Smepmp extension is entirely non-functional—software writing MML=1 is silently ignored, and the PMP checker never enters MML enforcement mode. This is the root cause of all downstream Smepmp violations.
+  | val RLB   = RO( 2).withDescription("Rule-locking bypass control from the Smepmp extension.")
+  | val MMWP  = RO( 1).withDescription("Machine-mode whitelist policy control from the Smepmp extension.")
+  | val MML   = RO( 0).withDescription("Machine-mode lock-down control from the Smepmp extension.")
+
+[bug_confirmed] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMP.scala:403-412  pmp_check
+  PMP permission evaluation function has no MML truth table. Under Smepmp MML=1, the R/W/X bits encode a permission matrix (e.g., R=0,W=1 means 'read denied, execute only' for M-mode), but this code unconditionally treats R/W/X as independent per-bit enables for all privilege modes. An R=0,W=1 entry—which the spec defines as denying read access—would incorrectly grant write-without-read, or fail to encode execute-only semantics.
+  | def pmp_check(cmd: UInt, cfg: PMPConfig) = {
+  |   val resp = Wire(new PMPRespBundle)
+  |   resp.ld := TlbCmd.isRead(cmd) && !TlbCmd.isAmo(cmd) && !cfg.r
+  |   resp.st := (TlbCmd.isWrite(cmd) || TlbCmd.isAmo(cmd)) && !cfg.w
+  |   resp.instr := TlbCmd.isExec(cmd) && !cfg.x
+  |   ...
+  | }
+
+[bug_confirmed] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMP.scala:424-435  pmp_match_res
+  M-mode (mode > 1.U) unconditionally passes through all PMP checks regardless of MML state. Under Smepmp MML=1, the spec mandates that M-mode accesses are also subject to PMP enforcement according to the MML truth table. The 'passThrough' flag and 'ignore' override (line 435: 'passThrough && !pmp.cfg.l') grant full r/w/x to M-mode for any unlocked PMP entry, creating a privilege escape path where M-mode firmware can access any physical memory even when MML=1 should restrict it.
+  | val passThrough = if (pmpEntries.isEmpty) true.B else (mode > 1.U)
+  | val pmpDefault = WireInit(0.U.asTypeOf(new PMPEntry()))
+  | pmpDefault.cfg.r := passThrough
+  | pmpDefault.cfg.w := passThrough
+  | pmpDefault.cfg.x := passThrough
+  | ...
+  | val ignore = passThrough && !pmp.cfg.l
+  | cur.cfg.r := aligned && (pmp.cfg.r || ignore)
+  | cur.cfg.w := aligned && (pmp.cfg.w || ignore)
+  | cur.cfg.x := aligned && (pmp.cfg.x || ignore)
+
+[bug_confirmed] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMP.scala:460-465  PMPCheckerEnv
+  PMPCheckerEnv bundle carries mode/pmp/pma but has no mseccfg.MML/MMWP/RLB fields. The PMP checker module has no hardware path to observe the MML state, so even if mseccfg.MML were writable, the enforcement logic would never see it. Any future implementation that makes MML writable must also wire it through this bundle.
+  | class PMPCheckerEnv(implicit p: Parameters) extends PMPBundle {
+  |   val keyIDen = Bool()
+  |   val cmode = Bool()
+  |   val mode = UInt(2.W)
+  |   val pmp = Vec(NumPMPReal, new PMPEntry())
+  |   val pma = Vec(NumPMAReal, new PMPEntry())
+  | }
+
+[bug_confirmed] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMP.scala:586-591  PMPChecker (module body)
+  PMPChecker module invokes pmp_match_res and pmp_check with no MML-qualified logic. The result violates the Smepmp spec: when MML=1, the PMP checker must distinguish between M-mode and S/U-mode permission lookups for the same PMP entry (the R/W/X bits have different meanings per mode), but this code applies the same cfg.r/cfg.w/cfg.x interpretation to all modes through a single pmp_check call.
+  | val res_pmp = pmp_match_res(leaveHitMux, io.req.valid)(check_addr, req.size, io.check_env.pmp, io.check_env.mode, lgMaxSize)
+  | ...
+  | val resp_pmp = pmp_check(cmd, res_pmp.cfg)
+
+[potential_risk] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/CSRPMP.scala:32-40  pmpcfgs write gate
+  PMP config CSR write logic lacks MML/MMWP-aware write restrictions. Under Smepmp MML=1, certain R/W/X encodings are reserved (e.g., R=0,W=0,X=0 is reserved; RW=10 is treated specially under MMWP). The current write gate only blocks R=0,W=1, which is insufficient. If MML is later made writable, this write path would need to enforce MML-dependent legalization.
+  | when (w.wen && (!(!w.wdata(0).asBool && w.wdata(1).asBool))) {  // when R=0 W=1, reserved
+  |   reg.W := w.wdata(1).asBool
+  | }.otherwise {
+  |   reg.W := reg.W
+  | }
+  | reg.A := Mux(wen, Mux(w.wdata(4, 3) === 2.U, 3.U, w.wdata(4, 3).asUInt), reg.A.asUInt) // no support Na4
+
+[bug_confirmed] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/mem/MemBlock.scala:699-708  PMP checker wiring (D-cache)
+  PMP checker instantiation for D-cache passes tlbcsr.priv.dmode but no MML signal. The checker's check_env receives only mode+pmp+pma, so when MML=1 is intended, D-side memory accesses (loads, stores, atomics) bypass MML enforcement entirely—M-mode loads/stores always pass through.
+  | for ((p,d) <- pmp_check zip dtlb_pmps) {
+  |   ...
+  |   p.apply(tlbcsr.priv.dmode, pmp.io.pmp, pmp.io.pma, d)
+  | }
+
+[potential_risk] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/cache/mmu/L2TLB.scala:93-104  PTW PMP checker wiring
+  PTW PMP checkers are hardcoded to ModeS (line 98-103), meaning page table walks are always checked as Supervisor-mode regardless of the requesting hart's effective privilege. Under Smepmp MML=1 with MMWP, the PMP entries may encode different permissions for S-mode vs M-mode, so using a hardcoded privilege could either over-restrict or under-restrict PTW accesses. No MML signal is passed either.
+  | val pmp_check = VecInit(Seq.fill(4 or 5)(Module(new PMPChecker(lgMaxSize=3, sameCycle=true)).io))
+  | ...
+  | pmp_check.foreach(_.check_env.apply(ModeS, ...))
+
+[compliant] /home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/CSRPMP.scala:39-39  pmpcfgs write gate (A field)
+  NA4 address mode (enc=2) is silently WARL-converted to NAPOT (enc=3). This is correct WARL behavior per the spec—writing an unsupported address mode results in an unspecified but legal value. The hardware documents 'no support Na4' explicitly.
+  | reg.A := Mux(wen, Mux(w.wdata(4, 3) === 2.U, 3.U, w.wdata(4, 3).asUInt), reg.A.asUInt) // no support Na4
+

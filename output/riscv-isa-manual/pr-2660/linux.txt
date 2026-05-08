@@ -1,0 +1,51 @@
+PR #2660  target=linux  overall=potential_risk
+Spec: mcyclecfg/minstretcfg filter bits (MINH/SINH/VUINH at 61:58) must be fully saved/restored on context switch; a 32-bit truncation leaks filter state between tasks, enabling one task to suppress or expose counter increments in another task's privilege modes
+Violation: Linux kernel on RV64 reads mcyclecfg/minstretcfg as 64-bit CSRs but only saves/restores the low 32 bits during context switch (e.g., by using a u32 typed variable or CSR-width mismatch), leaving the upper bits — including the MINH, SINH, VUINH filter fields at bits 61:58 — uninitialized or stale from the previous task
+Consequence: info_leak
+Pattern: struct thread_struct or __switch_to lacking mcyclecfg/minstretcfg save/restore; save/restore using unsigned int instead of u64; context switch only handling cycle/instret counters without their cfg CSRs
+------------------------------------------------------------
+[potential_risk] arch/riscv/include/asm/processor.h:106-126  thread_struct
+  struct thread_struct has no fields for mcyclecfg/minstretcfg CSR save/restore. If Smcntrpmf is ever enabled (hardware implementing SSCOFPMF likely also has Smcntrpmf), per-task counter-filtering configuration (MINH, SINH, VUINH at bits 61:58) would not be preserved across context switches, leaking filtering policy from a previous task.
+  | struct thread_struct {
+  |     unsigned long ra;
+  |     unsigned long sp;
+  |     unsigned long s[12];
+  |     struct __riscv_d_ext_state fstate;
+  |     unsigned long envcfg;  /* envcfg is saved, but no mcyclecfg/minstretcfg */
+
+[potential_risk] arch/riscv/kernel/entry.S:421-471  __switch_to
+  __switch_to saves only callee-saved GPRs (ra, sp, s0-s11) and the SUM bit from sstatus. It does not save/restore mcyclecfg or minstretcfg CSRs. On hardware with Smcntrpmf where these CSRs hold per-task filtering state (MINH, SINH, VUINH), the configuration from the previous task would silently persist into the next task's execution.
+  | SYM_FUNC_START(__switch_to)
+  |     REG_S ra,  TASK_THREAD_RA_RA(a3)
+  |     REG_S sp,  TASK_THREAD_SP_RA(a3)
+  |     REG_S s0,  TASK_THREAD_S0_RA(a3)
+  |     ...
+  |     /* No mcyclecfg/minstretcfg save/restore */
+
+[potential_risk] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The switch_to macro dispatches to FPU save/restore, Vector save/restore, icache flush, and envcfg restore, but has no mcyclecfg/minstretcfg handling. The envcfg save/restore pattern (thread.envcfg + __switch_to_envcfg) would be the natural template for adding mcyclecfg/minstretcfg save/restore, but it's currently missing.
+  | if (has_fpu())                    \
+  |     __switch_to_fpu(__prev, __next);    \
+  | if (has_vector() || has_xtheadvector()) \
+  |     __switch_to_vector(__prev, __next); \
+  | __switch_to_envcfg(__next);             \
+  | /* No mcyclecfg/minstretcfg handling */
+
+[potential_risk] arch/riscv/include/asm/csr.h:251-317  (CSR definitions)
+  CSR definitions include CSR_CYCLE (0xc00), CSR_INSTRET (0xc02), and SCOUNTOVF (0xda0) for SSCOFPMF, but no definitions for mcyclecfg (0x321), minstretcfg (0x322), scyclecfg (0x0E1), or sinstretcfg (0x0E2) from Smcntrpmf. Smcntrpmf is not recognized as an ISA extension (no RISCV_ISA_EXT_SMCNTRPMF in hwcap.h), meaning the kernel has no awareness of these CSRs whatsoever.
+  | #define CSR_CYCLE        0xc00
+  | #define CSR_INSTRET      0xc02
+  | #define CSR_SCOUNTOVF    0xda0
+  | /* Missing: mcyclecfg=0x321, minstretcfg=0x322, scyclecfg=0x0E1, sinstretcfg=0x0E2 */
+
+[potential_risk] arch/riscv/kernel/cpufeature.c:583-583  riscv_isa_ext
+  SSCOFPMF is recognized as an ISA extension but Smcntrpmf is not. Hardware that advertises SSCOFPMF (counter overflow) is architecturally expected to also implement Smcntrpmf (counter configuration). The kernel's SBI PMU driver, which uses SSCOFPMF for overflow interrupts, may indirectly trigger M-mode firmware to program mcyclecfg/minstretcfg filtering bits without the kernel tracking this state per-task.
+  | __RISCV_ISA_EXT_DATA(sscofpmf, RISCV_ISA_EXT_SSCOFPMF),
+  | /* Smcntrpmf not listed; not in hwcap.h either */
+
+[potential_risk] arch/riscv/kvm/vcpu_switch.S:198-219  __kvm_riscv_switch_to
+  KVM VCPU context switch handles sstatus, stvec, sscratch, sepc and GPR save/restore, but has no mcyclecfg/minstretcfg handling. If a guest VM uses counter filtering (Smcntrpmf exposed to the guest), the filtering configuration would not be context-switched correctly between VCPUs or between host and guest, potentially leaking host counter-filtering policy into the guest or between guests.
+  | SAVE_HOST_AND_RESTORE_GUEST_CSRS .Lkvm_switch_return
+  | /* Only handles sstatus, stvec, sscratch, sepc */
+  | /* No mcyclecfg/minstretcfg save/restore */
+

@@ -1,0 +1,140 @@
+{
+  "pr_number": 196,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 196,
+    "violation_condition": "QEMU TCG incorrectly applies sign-extension (sext32) instead of zero-extension (zext32) to the per-product terms in PM4ADDAU.B, or applies zext32 instead of sext32 to PM4ADDA.B/PM4ADDASU.B. TCG also violates the spec if it swaps the signed/unsigned operand roles in PM4ADDASU.B (rs1 must be signed, rs2 must be unsigned) or if it processes the wrong number of 32-bit lanes (e.g., iterating once instead of XLEN/32 times on RV64).",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "tcg_gen_(ext|add|mul).*PM4|gen_pm4.*ext|PM4ADD.*helper|signed.*unsigned.*swap.*PM4|zext32.*sext32.*PM4|OP-32.*P-ext.*decode",
+    "affected_entities": [
+      "PM4ADDA.B",
+      "PM4ADDASU.B",
+      "PM4ADDAU.B",
+      "PM4ADDA.H"
+    ],
+    "summary": "Accumulating packed SIMD multiply-add instructions (PM4ADDA.B/PM4ADDASU.B/PM4ADDAU.B/PM4ADDA.H) require correct signed/unsigned extension per instruction variant; a sign-extension mismatch on product terms causes silently wrong guest results indistinguishable from guest software bugs"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/insn32.decode",
+        "function_name": "(decode table — PM4 entries absent)",
+        "line_start": 1,
+        "line_end": 1541,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "PM4ADD instructions (PM4ADDA.B, PM4ADDASU.B, PM4ADDAU.B, PM4ADDA.H) have NO decode entries. All four instructions are absent from the 32-bit instruction decode table. No arg struct mappings exist. When added, PM4ADDA.B and PM4ADDA.H use arg_r (rs1, rs2, rd); PM4ADDASU.B and PM4ADDAU.B also use arg_r since signed/unsigned is semantic (translator-level), not opcode-encoded. Risk: future implementer creates incorrect arg structs or omits PM4ADDA.H.",
+      "snippet": "(no PM4 decode entries — entire P-ext opcode space is unpopulated in insn32.decode)"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/translate.c",
+        "function_name": "get_gpr",
+        "line_start": 350,
+        "line_end": 382,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "get_gpr() applies DisasExtend (EXT_SIGN/EXT_ZERO/EXT_NONE) to the WHOLE register, not per 32-bit lane. For PM4 instructions on RV64 (XLEN=64, 2 lanes), each 32-bit lane requires independent sign/zero extension: PM4ADDA.B needs sext32 per lane, PM4ADDAU.B needs zext32 per lane, PM4ADDASU.B needs sext32 for rs1 lanes and zext32 for rs2 lanes. Calling get_gpr(ctx, rs1, EXT_SIGN) sign-extends only lane 0; lane 1 retains raw bits. Correct pattern: get_gpr(ctx, rs, EXT_NONE) then sextract32/zextract32 each lane in a loop.",
+      "snippet": "case EXT_SIGN:\n    t = tcg_temp_new();\n    tcg_gen_ext32s_tl(t, cpu_gpr[reg_num]);\n    return t;\ncase EXT_ZERO:\n    t = tcg_temp_new();\n    tcg_gen_ext32u_tl(t, cpu_gpr[reg_num]);\n    return t;"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/translate.c",
+        "function_name": "gen_set_gpr",
+        "line_start": 409,
+        "line_end": 428,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "gen_set_gpr() on RV32 unconditionally sign-extends via tcg_gen_ext32s_tl. PM4ADDAU.B (unsigned*unsigned accumulate) produces an unsigned 32-bit result that would be incorrectly sign-extended on RV32. On RV64, tcg_gen_mov_tl (no extension) leaves the 64-bit value intact, which is correct since the PM4 spec defines the per-product sum as filling the destination. Risk: RV32 PM4ADDAU.B results are corrupted by forced sign-extension.",
+      "snippet": "case MXL_RV32:\n    tcg_gen_ext32s_tl(cpu_gpr[reg_num], t);\n    break;\ncase MXL_RV64:\ncase MXL_RV128:\n    tcg_gen_mov_tl(cpu_gpr[reg_num], t);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/translate.c",
+        "function_name": "decoder_table",
+        "line_start": 1244,
+        "line_end": 1250,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "No P-ext decoder entry in decoder_table[]. A PM4/P-ext decode file would need a has_zpn_p() or has_zps_p() guard predicate and a decode function pointer. If the guard is too permissive, PM4 instructions decode on hardware without P-ext support (security bypass). If too restrictive, they are unreachable. The existing vendor decoders (xmips, xthead, xlrbr) serve as templates but none implement packed integer SIMD.",
+      "snippet": "const RISCVDecoder decoder_table[] = {\n    { always_true_p, decode_insn32 },\n    { has_xmips_p, decode_xmips},\n    { has_xthead_p, decode_xthead},\n    { has_XVentanaCondOps_p, decode_XVentanaCodeOps},\n    { has_xlrbr_p, decode_xlrbr},\n};"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvm.c.inc",
+        "function_name": "gen_mulhsu_w",
+        "line_start": 136,
+        "line_end": 145,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correct reference pattern for mixed signed*unsigned multiply: sext32(arg1) * zext32(arg2). PM4ADDASU.B must replicate this per 32-bit lane: sext32(lane_from_rs1) * zext32(lane_from_rs2) for each of the XLEN/32 lanes. Risk if replicated incorrectly: swapping roles (sext32 rs2, zext32 rs1) or uniform-extension of both operands.",
+      "snippet": "static void gen_mulhsu_w(TCGv ret, TCGv arg1, TCGv arg2)\n{\n    TCGv t1 = tcg_temp_new();\n    TCGv t2 = tcg_temp_new();\n    tcg_gen_ext32s_tl(t1, arg1);\n    tcg_gen_ext32u_tl(t2, arg2);\n    tcg_gen_mul_tl(ret, t1, t2);"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvm.c.inc",
+        "function_name": "trans_mulw",
+        "line_start": 322,
+        "line_end": 327,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "trans_mulw() processes a single 32-bit multiply with ctx->ol = MXL_RV32, operating on the whole register once. A PM4 translator that copies this single-operation pattern would only process lane 0. PM4 instructions on RV64 require XLEN/32 = 2 iterations (lane 0 at bits 31:0, lane 1 at bits 63:32). Risk: single-iteration translation producing wrong results for lane 1, silent data corruption on RV64 guests.",
+      "snippet": "static bool trans_mulw(DisasContext *ctx, arg_mulw *a)\n{\n    REQUIRE_64BIT(ctx);\n    ctx->ol = MXL_RV32;\n    return gen_arith(ctx, a, EXT_NONE, tcg_gen_mul_tl, NULL);\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvm.c.inc",
+        "function_name": "trans_mulhu",
+        "line_start": 161,
+        "line_end": 166,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correct reference for unsigned*unsigned multiplication: EXT_ZERO on both operands. PM4ADDAU.B must replicate this per lane. Each 32-bit lane of rs1 and rs2 must be zext32'd before multiply, and the final accumulated sum must be zero-extended (not sign-extended) to fill the destination register.",
+      "snippet": "static bool trans_mulhu(DisasContext *ctx, arg_mulhu *a)\n{\n    /* gen_mulh_w works for either sign as input. */\n    return gen_arith_per_ol(ctx, a, EXT_ZERO, gen_mulhu, gen_mulh_w,\n                            gen_mulhu_i128);\n}"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_cfg_fields.h.inc",
+        "function_name": "(extension config BOOL_FIELD declarations)",
+        "line_start": 1,
+        "line_end": 183,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "No ext_zpn/ext_zps/ext_zpn32/ext_zpn64 BOOL_FIELD entries exist. These fields drive ISA string construction, decode guard predicates, and CSR mstatus.XS tracking. Without them, no has_zpn_p() guard can be written, and the extension cannot be queried. Mismatched field names between cpu_cfg_fields.h.inc and cpu.c's .ext_offset cause silent decode failures.",
+      "snippet": "(no P-ext BOOL_FIELD entries — existing entries range from zba to zvfbfa and vendor extensions)"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_extensions / riscv_cpu_experimental_exts",
+        "line_start": 1236,
+        "line_end": 1389,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "No P-ext entries in any of the three extension registration arrays. Zpn/Zps would need entries mapping property name string, .ext_offset to cfg field, and multi-letter extension name. A mismatch between the property name (e.g., 'zpn32') and the cfg offset (e.g., offset for ext_zpn) causes the property setter to write a different field than the guard predicate reads.",
+      "snippet": "(no P-ext entries in riscv_cpu_extensions[], riscv_cpu_vendor_exts[], or riscv_cpu_experimental_exts[])"
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/tcg/tcg-cpu.c",
+        "function_name": "cpu_bump_multi_ext_priv_ver",
+        "line_start": 368,
+        "line_end": 420,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "cpu_bump_multi_ext_priv_ver() determines minimum privileged spec version per extension. P-ext (Zpn/Zps) requires at least Priv 1.12. If P-ext flags are added but not registered here (or registered with wrong priv_ver), PM4 instructions could decode on hardware claiming an older privilege spec version.",
+      "snippet": "static void cpu_bump_multi_ext_priv_ver(CPURISCVState *env,\n                                         uint32_t ext_offset)\n{\n    ...\n}"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

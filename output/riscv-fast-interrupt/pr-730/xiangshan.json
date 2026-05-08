@@ -1,0 +1,96 @@
+{
+  "pr_number": 730,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 730,
+    "violation_condition": "In XiangShan RTL, when a synchronous exception (e.g., page fault from stack access) occurs during CLIC hardware context save/restore, the trap entry CSR logic must write the original interrupt's exception PC into xepc/mnepc of the second trap, NOT the PC of the faulting instruction. If the hardware overwrites xepc/mnepc with the faulting instruction's own PC (the standard trap behavior), then after the exception handler executes MRET/SRET, execution resumes at the faulting instruction instead of the original interrupt handler entry point, causing the interrupt handler to be silently skipped.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "when (isCLICDoubleTrap || isNestedTrapInHandler) && (exceptionDuringContextSave) => xepc/mnepc must load from saved_original_epc, NOT from excuting_pc",
+    "affected_entities": [
+      "mepc",
+      "sepc",
+      "mnepc",
+      "mtval",
+      "stval",
+      "mstatus.mpp",
+      "sstatus.spp",
+      "CLIC_CTRL"
+    ],
+    "summary": "CLIC nested trap entry must preserve original interrupt epc in xepc/mnepc during synchronous exceptions in context save path, or interrupt handler silently dropped causing privilege-level control flow hijack"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMNEvent.scala",
+        "function_name": "TrapEntryMNEventModule",
+        "line_start": 44,
+        "line_end": 55,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When dbltrpToMN fires, TrapEntryMNEvent writes trapPC (second trap's executing PC) into mnepc without any awareness this is a double-trap context. The module reads the same TrapEntryEventInput as TrapEntryMEvent (which has hasDTExcp at CSREvent.scala:130) but never checks it. While mepc preserves the original first-trap PC, the double-trap cause info (mtval2/precause) is lost because TrapEntryMEvent does not co-fire.",
+      "snippet": "out.mnepc.bits.epc := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))\nout.mncause.bits.Interrupt := isInterrupt\nout.mncause.bits.ExceptionCode := highPrioTrapNO"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (trap routing)",
+        "line_start": 794,
+        "line_end": 797,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When dbltrpToMN=TRUE (line 794), TrapEntryMNEvent fires but TrapEntryMEvent is suppressed (line 795: !dbltrpToMN). Consequently, mtval2 (which should hold the first trap's precause per Smdbltrp) is NEVER written because only TrapEntryMEvent drives mtval2.ALL := Mux(isDTExcp, precause, tval2 >> 2). The double-trap handler cannot discover what the original trap was, making correct recovery impossible.",
+      "snippet": "trapEntryMNEvent.valid  := ((hasTrap && nmi) || dbltrpToMN) && !entryDebugMode && !debugMode && mnstatus.regOut.NMIE\ntrapEntryMEvent .valid  := hasTrap && entryPrivState.isModeM && !dbltrpToMN && !entryDebugMode && !debugMode && !nmi && mnstatus.regOut.NMIE"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (trap gating)",
+        "line_start": 794,
+        "line_end": 797,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "All four trap entry events (MNEvent, MEvent, HSEvent, VSEvent) are gated by mnstatus.regOut.NMIE. When NMIE=0 (after any NMI trap entry), every subsequent trap — including page faults from NMI handler stack accesses — is silently dropped. While Smrnmi declares this undefined behavior territory, the complete loss of trap information with no logging or escalation mechanism (e.g., critical error) means bugs in the NMI handler (e.g., stack overflow) produce zero observable side effects, making debugging and security forensics impossible.",
+      "snippet": "trapEntryMNEvent.valid  := ((hasTrap && nmi) || dbltrpToMN) && ... && mnstatus.regOut.NMIE\ntrapEntryMEvent .valid  := hasTrap && entryPrivState.isModeM && !dbltrpToMN && ... && mnstatus.regOut.NMIE\ntrapEntryHSEvent.valid  := hasTrap && entryPrivState.isModeHS && ... && mnstatus.regOut.NMIE\ntrapEntryVSEvent.valid  := hasTrap && entryPrivState.isModeVS && ... && mnstatus.regOut.NMIE"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/TrapHandleModule.scala",
+        "function_name": "TrapHandleModule",
+        "line_start": 82,
+        "line_end": 87,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The dbltrpToMN detection correctly identifies double-trap conditions: m_EX_DT = handleTrapUnderM && mstatus.MDT && hasTrap, AND mnstatus.NMIE=1. When NMIE=0 (during a running NMI handler), the double-trap is correctly NOT routed to MN. However, the hasDTExcp output captures all double-trap events (M, HS, VS) regardless of NMIE state, which is correct for mtval2 population when TrapEntryMEvent fires.",
+      "snippet": "private val m_EX_DT  = handleTrapUnderM  && mstatus.MDT.asBool  && hasTrap\nprivate val s_EX_DT  = handleTrapUnderHS && mstatus.SDT.asBool  && hasTrap\nprivate val vs_EX_DT = handleTrapUnderVS && vsstatus.SDT.asBool && hasTrap\nprivate val dbltrpToMN = m_EX_DT && mnstatus.NMIE.asBool\nprivate val hasDTExcp  = m_EX_DT || s_EX_DT || vs_EX_DT"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMEvent.scala",
+        "function_name": "TrapEntryMEventModule",
+        "line_start": 116,
+        "line_end": 122,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "When TrapEntryMEvent fires for a double-trap (hasDTExcp=TRUE), mepc IS overwritten with the second trap's PC — but this is spec-compliant Smdbltrp behavior. The original cause is correctly preserved in mtval2 := precause = Cat(isInterrupt, highPrioTrapNO). mcause is correctly set to EX_DT. mstatus.MDT is set to 1 (already was). After MRET returns to the second-trap PC (now in mepc), the original context is logically recoverable from mtval2.",
+      "snippet": "out.mepc.bits.epc := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))\nout.mcause.bits.Interrupt := isInterrupt && !isDTExcp\nout.mcause.bits.ExceptionCode := Mux(isDTExcp, ExceptionNO.EX_DT.U, highPrioTrapNO)\nout.mtval2.bits.ALL := Mux(isDTExcp, precause, tval2 >> 2)"
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/CSREvent.scala",
+        "function_name": "TrapEntryEventInput",
+        "line_start": 119,
+        "line_end": 156,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The TrapEntryEventInput bundle carries hasDTExcp (line 130) which is correctly populated in NewCSR.scala:812 from trapHandleMod's output. TrapEntryMEvent correctly reads this to differentiate double-trap behavior (EX_DT code, mtval2=precause). TrapEntryMNEvent ignores hasDTExcp entirely, which is by design since it assumes NMI semantics. The unified input bundle design is architecturally clean but creates a semantic gap: dbltrpToMN reuses the NMI trap entry path without communicating double-trap context to TrapEntryMNEvent.",
+      "snippet": "val hasDTExcp = Input(Bool())"
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

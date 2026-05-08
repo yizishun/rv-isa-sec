@@ -1,0 +1,12 @@
+PR #2501  target=freebsd-src  overall=potential_risk
+Spec: bhyve writes henvcfg without save/restore; spec PR adds explicit CBIE cascade (henvcfg overrides guest senvcfg invalidate→flush), making any CBO passthrough without proper context-switch virtualization a cross-vCPU CBIE state leak and guest data corruption vector
+Violation: In bhyve vmmops_run() at sys/riscv/vmm/vmm_riscv.c:632, csr_write(henvcfg, HENVCFG_STCE) unconditionally clears all other henvcfg fields including CBZE, CBCFE, and CBIE without save/restore across vCPU context switch. The spec now mandates that henvcfg.CBIE overrides guest senvcfg.CBIE semantics (flush vs invalidate cascade), so any future CBO passthrough without proper henvcfg save/restore leaks CBIE override state between vCPUs, or conversely, a missing restore of zeroed CBO bits causes guest-expected CBO.INVAL invalidate semantics to be silently downgraded to flush—corrupting guest cache-coherency invariants.
+Consequence: data_corruption
+Pattern: csr_write\(henvcfg,\s*(HENVCFG_|0x)
+------------------------------------------------------------
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:630-632  vmmops_run
+  csr_write(henvcfg, HENVCFG_STCE) unconditionally clears all other henvcfg fields (CBZE, CBCFE, CBIE, PBMTE, FIOM) on every vCPU run entry. henvcfg is not saved/restored across vCPU context switches — it is absent from both vmmops_vcpu_save_csrs() and vmmops_vcpu_restore_csrs(), and the hypcsr structure has no henvcfg field. The RISC-V spec states henvcfg.CBIE overrides guest senvcfg.CBIE semantics (flush vs invalidate cascade), so any future CBO passthrough that sets CBZE/CBCFE/CBIE would have those bits silently cleared on every vCPU entry, downgrading guest-expected CBO.INVAL invalidate to flush semantics and corrupting guest cache-coherency invariants. Currently no immediate data-corruption because CBO passthrough is not yet implemented, but the architectural gap is a latent vulnerability.
+  | csr_write(hgatp, pmap->pm_satp);
+  | if (has_sstc)
+  | 	csr_write(henvcfg, HENVCFG_STCE);
+

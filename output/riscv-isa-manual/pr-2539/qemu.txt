@@ -1,0 +1,71 @@
+PR #2539  target=qemu  overall=compliant
+Spec: Spec 2539 removes the trap allowance for ill-configured counters — if QEMU still raises #I for reads of counters programmed to unrecognized events, compliant guests expecting a silent constant return will fault, causing host-visible guest crash
+Violation: QEMU raises an illegal-instruction exception when guest reads an hpmcounter CSR whose corresponding mhpmevent register is set to an unimplemented event selector (ill-configured), instead of returning a constant zero value
+Consequence: denial_of_service
+Pattern: riscv_pmu_ctr_ctrl OR riscv_hpmcounter_read OR counter_get_ops: trap path for access to CSR where event selector is invalid/unsupported but the counter CSR index itself is implemented
+------------------------------------------------------------
+[compliant] target/riscv/csr.c:108-162  ctr
+  Predicate checks only pmu_avail_ctrs (counter index availability), not mhpmevent validity. Does NOT raise illegal-instruction for counters that exist but have invalid mhpmevent programming. Correctly gates access only on counter-index existence.
+  | if (!(cpu->pmu_avail_ctrs & ctr_mask)) {
+  |     /* No counter is enabled in PMU or the counter is out of range */
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+
+[compliant] target/riscv/csr.c:216-237  mctr
+  M-mode counter predicate likewise checks only pmu_avail_ctrs for counter-index availability. No mhpmevent-validity check. Does NOT trap on ill-configured counters.
+  | if ((BIT(ctr_index) & pmu_avail_ctrs >> 3) == 0) {
+  |     /* The PMU is not enabled or counter is out of range */
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+  | return RISCV_EXCP_NONE;
+
+[compliant] target/riscv/csr.c:1375-1412  riscv_pmu_read_ctr
+  For counters not mapped to cycles or instructions (i.e. ill-configured), falls into else branch returning ctr_val (0 after reset). Always returns RISCV_EXCP_NONE — no illegal-instruction trap. Compliant with spec: returns zero/current-value instead of raising exception.
+  | if (riscv_pmu_ctr_monitor_cycles(env, ctr_idx) ||
+  |     riscv_pmu_ctr_monitor_instructions(env, ctr_idx)) {
+  |     *val = riscv_pmu_ctr_get_fixed_counters_val(env, ctr_idx) -
+  |                                                 ctr_prev + ctr_val;
+  | } else {
+  |     *val = ctr_val;
+  | }
+  | return RISCV_EXCP_NONE;
+
+[compliant] target/riscv/csr.c:1192-1216  write_mhpmevent
+  Ignores return value of riscv_pmu_update_event_map(). CSR write always succeeds even if event selector is invalid/unsupported, which is correct spec behavior — writing unsupported event selectors is legal, counter just won't count.
+  | env->mhpmevent_val[evt_index] = mhpmevt_val;
+  | riscv_pmu_update_event_map(env, mhpmevt_val, evt_index);
+  | return RISCV_EXCP_NONE;
+
+[compliant] target/riscv/pmu.c:326-368  riscv_pmu_update_event_map
+  Returns -1 for unsupported raw events (default case in switch). This correctly prevents counter increments but does NOT cause any exception — the CSR write path ignores this return. Ill-configured counters silently return their static value (0).
+  | switch (event_idx) {
+  | case RISCV_PMU_EVENT_HW_CPU_CYCLES:
+  | case RISCV_PMU_EVENT_HW_INSTRUCTIONS:
+  | case RISCV_PMU_EVENT_CACHE_DTLB_READ_MISS:
+  | case RISCV_PMU_EVENT_CACHE_DTLB_WRITE_MISS:
+  | case RISCV_PMU_EVENT_CACHE_ITLB_PREFETCH_MISS:
+  |     break;
+  | default:
+  |     /* We don't support any raw events right now */
+  |     return -1;
+  | }
+
+[compliant] target/riscv/pmu.c:199-250  riscv_pmu_incr_ctr
+  Only increments counters whose event_idx is in cpu->pmu_event_ctr_map. Ill-configured counters (event_idx not in the map) will never be incremented, keeping their value at the static/written value (effectively zero). No exception raised — correct behavior.
+  | value = g_hash_table_lookup(cpu->pmu_event_ctr_map,
+  |                             GUINT_TO_POINTER(event_idx));
+  | if (!value) {
+  |     return -1;
+  | }
+
+[compliant] target/riscv/csr.c:1414-1428  read_hpmcounter
+  Delegates to riscv_pmu_read_ctr which never returns an exception. CSR index computation is correct (handles both M-mode and S-mode counter ranges). No trap path for ill-configured counters.
+  | if (csrno >= CSR_MCYCLE && csrno <= CSR_MHPMCOUNTER31) {
+  |     ctr_index = csrno - CSR_MCYCLE;
+  | } else if (csrno >= CSR_CYCLE && csrno <= CSR_HPMCOUNTER31) {
+  |     ctr_index = csrno - CSR_CYCLE;
+  | } else {
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+  | return riscv_pmu_read_ctr(env, val, false, ctr_index);
+

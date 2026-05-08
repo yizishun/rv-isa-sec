@@ -1,0 +1,46 @@
+PR #699  target=freebsd-src  overall=compliant
+Spec: IOMMU GPA superpage overlapping virtual interrupt file region silently bypasses MSI interrupt remapping, letting an assigned PCIe device inject arbitrary MSIs into a bhyve guest VM
+Violation: In FreeBSD's bhyve IOMMU GPA second-stage translation (or future RISC-V IOMMU driver), when a superpage mapping (2MB/1GB Sv39x4/Sv48x4 hgatp entry) spans a guest-physical range that overlaps a virtual interrupt file region (msiptp.MODE != MSIPTP_Off with active msi_addr_mask/pattern), and the IOMMU proceeds with the superpage granularity instead of reducing gst_page_sz to the largest sub-page that avoids the overlap—allowing the DMA write to bypass MSI page-table remapping and land directly as an unmediated memory access into the VIF region
+Consequence: privilege_escape
+Pattern: hgatp.*superpage|IOMMU.*GPA.*superpage|gst_page_sz|MSIPTP|msi_addr_mask
+------------------------------------------------------------
+[potential_risk] sys/riscv/riscv/pmap.c:1437-1442  pmap_ps_enabled
+  pmap_ps_enabled(pmap_t pmap __unused) ignores its pmap parameter entirely and returns the global superpages_enabled tunable. This means stage-2 (hgatp) pmaps in bhyve will also have superpage promotion enabled. If a future RISC-V IOMMU driver and MSIPTP/VIF infrastructure were added, 2MB hgatp superpage entries could span guest-physical ranges that overlap virtual interrupt file regions, allowing DMA writes to bypass MSI page-table remapping. Currently benign because no RISC-V IOMMU driver, MSIPTP CSR, or msi_addr_mask infrastructure exists in the FreeBSD RISC-V port.
+  | bool
+  | pmap_ps_enabled(pmap_t pmap __unused)
+  | {
+  | 
+  | 	return (superpages_enabled);
+  | }
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:626-630  vmmops_run
+  hgatp is written with pmap->pm_satp at VM entry, preceded by hfence_gvma() as required by the RISC-V spec (Section 5.3.2). No IOMMU involvement in this path — the hgatp CSR governs CPU-side second-stage translation only. DMA/IOMMU translation uses a separate IOMMU page-table root, which does not exist for RISC-V in this codebase.
+  | hfence_gvma();
+  | 
+  | csr_write(hgatp, pmap->pm_satp);
+  | if (has_sstc)
+  | 	csr_write(henvcfg, HENVCFG_STCE);
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:241-249  riscv_vmm_pinit
+  Stage-2 pmap initialization correctly calls pmap_pinit_stage(pmap, PM_STAGE2). No IOMMU context is associated with this pmap — the stage-2 mapping is purely for CPU-side G-stage translation via hgatp. No DMA remapping or VIF overlap logic is needed at this layer absent an IOMMU.
+  | pmap_pinit_stage(pmap, PM_STAGE2);
+  | 
+  | return (1);
+
+[compliant] sys/dev/vmm/vmm_mem.c:338-352  vm_free_memmap
+  The VM_MEMMAP_F_IOMMU flag is referenced only under #ifdef guard, and this macro is defined exclusively in sys/amd64/include/vmm_dev.h — it is not defined for RISC-V builds. The IOMMU memory-map tracking path is entirely compiled out on riscv, confirming that no GPA-to-IOMMU-page-table translation path exists for RISC-V guests.
+  | #ifdef VM_MEMMAP_F_IOMMU
+  | 		if ((m->flags & VM_MEMMAP_F_IOMMU) != 0)
+  | 			continue;
+  | #endif
+
+[potential_risk] sys/riscv/riscv/pmap.c:3129-3240  pmap_promote_l2
+  pmap_promote_l2 promotes 512 contiguous 4KB L3 PTEs into a 2MB L2 superpage. The only gate is pmap_ps_enabled(pmap), which unconditionally returns true for all pmap types including stage-2. In a stage-2 (hgatp) pmap, this creates GPA superpage mappings. If a future RISC-V IOMMU driver were to share or mirror the hgatp page tables (as some architectures do), a 2MB GPA superpage could span a VIF region boundary, granting DMA the ability to write into MSI-redirection memory as plain memory. Currently no IOMMU exists to exploit this, but the promotion path has no awareness of potential VIF overlap.
+  | static bool
+  | pmap_promote_l2(pmap_t pmap, pd_entry_t *l2, vm_offset_t va, vm_page_t ml3,
+  |     struct rwlock **lockp)
+  | {
+  | 	...
+  | 	if (!pmap_ps_enabled(pmap))
+  | 		return (false);
+

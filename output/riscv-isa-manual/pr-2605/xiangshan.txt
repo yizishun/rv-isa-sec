@@ -1,0 +1,60 @@
+PR #2605  target=xiangshan  overall=compliant
+Spec: scountovf VS-mode read access control: failing to mask OF bits with hcounteren leaks counter overflow status across virtualized privilege boundaries, allowing a guest VM to observe PMU overflow events of counters it should not have access to
+Violation: In XiangShan RTL, when reading scountovf CSR in VS-mode, the read data is formed by bitwise AND of the internal OF-bit vector with {mcounteren[31:3]} only, without also ANDing with {hcounteren[31:3]}, causing scountovf bits corresponding to counters where hcounteren[X]=0 to expose the raw OF-bit value instead of reading as zero
+Consequence: info_leak
+Pattern: scountovf.*read.*mcounteren.*(?!hcounteren)|scountovf_rdata.*:=.*OF_bits.*&.*mcounteren(?!.*hcounteren)
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala:157-161  scountovf (anonymous CSRModule body at line 157-161)
+  In VS-mode (hstatus.VGEIN=1 and HART is not in M-mode), the scountovf read data correctly ANDs the overflow bit vector (ofVec) with BOTH mcounteren.HPM and hcounteren.HPM, as required by the RISC-V Sscofpmf specification. The double-hardware-masking ensures that a counter's OF bit reads as 0 when either its mcounteren bit or its hcounteren bit is 0, preventing information leaks across priv levels. The security spec's claimed violation (missing hcounteren AND gate in VS-mode) does not match the actual RTL.
+  | privState.isModeVS -> (mcounteren.HPM.asUInt & hcounteren.HPM.asUInt & ofVec),
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:753-763  CSR wiring (match block for HasMhpmeventOfBundle at line 753-763)
+  The scountovf module's hcounteren IO port is correctly bound to hcounteren.rdata (the current read data of the hcounteren CSR), which holds the WARL-processed hcounteren register value including all 29 HPM bits (31:3) as part of the Counteren bundle. The ofVec signal correctly aggregates the OF bit (bit 63) from each mhpmevent3..mhpmevent31 CSR. Both the mcounteren and hcounteren values are supplied from hardware, not from stale latched copies.
+  | m.mcounteren := mcounteren.rdata
+  | m.hcounteren := hcounteren.rdata
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala:276-281  HasMhpmeventOfBundle trait (line 276-281)
+  The HasMhpmeventOfBundle trait declares mcounteren and hcounteren as Input IO ports of type Counteren (a Bundle with CY(0), TM(1), IR(2), HPM(31,3)). The HPM field at bits 31:3 carries 29 enable bits for counters 3-31, matching the perfCntNum=29 constant. Both ports are declared and connected — there is no missing port that could cause hcounteren to be silently disconnected or default to all-zeros.
+  | trait HasMhpmeventOfBundle { self: CSRModule[_] =>
+  |   val ofVec = IO(Input(UInt(perfCntNum.W)))
+  |   val privState = IO(Input(new PrivState))
+  |   val mcounteren = IO(Input(new Counteren))
+  |   val hcounteren = IO(Input(new Counteren))
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala:153-155  scountovf (anonymous CSRBundle definition at line 153-155)
+  The OFVEC field is defined as RO(31,3), a 29-bit read-only register covering bits 31:3. This matches the RISC-V spec where scountovf[31:3] directly map to overflow bits for mhpmcounter31..3, and bits 2:0 are implicitly zero (no overflow for cycle, time, instret). The withReset(0.U) ensures all OF bits read as 0 at reset, which is the correct initial state since no overflows have occurred.
+  | val OFVEC = RO(31, 3).withReset(0.U).withDescription(
+  |   "Overflow status bits for mhpmcounter3 through mhpmcounter31.")
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:190-198  mhpmevents CSR creation (line 190-198)
+  Each mhpmevent CSR's OF bit (bit 63) is set by hardware when ofFromPerfCnt is asserted (counter overflow) and reset/cleared by software write. The OF bit is sticky (latch semantics). Setting by hardware is guarded by .elsewhen (priority: software write overrides hardware set in the same cycle). This implements the correct Sscofpmf OF bit semantics.
+  | when(wen){
+  |   reg.OF := wdata.OF
+  | }.elsewhen(ofFromPerfCnt) {
+  |   reg.OF := ofFromPerfCnt
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:30-35  class Counteren (line 30-35)
+  The HPM field RW(31,3) in Counteren spans exactly the 29 counters (3-31). This is reused for both mcounteren and hcounteren. The fields CY(0), TM(1), IR(2) correctly map to cycle, time, and instret — these counters are not in scountovf (they do not overflow via Sscofpmf), consistent with hcounteren/mcounteren semantics where these bits gate counteren for the fixed-function counters.
+  | class Counteren extends CSRBundle {
+  |   val CY = RW(0).withReset(0.U)
+  |   val TM = RW(1).withReset(0.U)
+  |   val IR = RW(2).withReset(0.U)
+  |   val HPM = RW(31, 3).withReset(0.U)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MMUBundle.scala:917-941  PtwEntry.hit() (line 917-941)
+  The PtwEntry hit() function (shared infrastructure used by PTW cache lookup, not the G-stage specific HptwResp.hit()) correctly implements napot-aware tag comparison: when n != 0, tag_match(0) compares only the high bits (vpnnLen-1 downto pteNapotBits), ignoring the low 4 VPN bits that encode the offset within the 64KB page. This prevents false-negative cache/TLB misses on napot pages.
+  | when (n.getOrElse(0.U) =/= 0.U) {
+  |   tag_match(0) := tag(vpnnLen-1, pteNapotBits) === vpn(vpnnLen-1, pteNapotBits)
+  | } .otherwise {
+  |   tag_match(0) := tag(vpnnLen-1, 0) === vpn(vpnnLen-1, 0)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MMUBundle.scala:1345-1353  PtwRespS2.allStage_n calculation (line 1345-1353)
+  The allStage_n computation correctly handles napot propagation across two-stage combined translation. The napot bit is propagated if either stage has n=1 AND the other stage is non-leaf (i.e., a super-page or the matching 4KB level). It also handles the case where both stages are napot (n=1 && n=1). This correctly models the net 64KB page granularity through two-stage translation.
+  | val allStage_n = (s1.entry.n.getOrElse(0.U) =/= 0.U && s2.entry.level.getOrElse(0.U) =/= 0.U) ||
+  |   (s2.entry.n.getOrElse(0.U) =/= 0.U && s1.entry.level.getOrElse(0.U) =/= 0.U) ||
+  |   (s1.entry.n.getOrElse(0.U) =/= 0.U && s2.entry.n.getOrElse(0.U) =/= 0.U)
+
