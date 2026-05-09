@@ -41,66 +41,100 @@ done
 
 echo "Spec markers and logs staged."
 
-# ---- 步骤 2: 生成新文件摘要 ----
+# ---- 步骤 2: 统计并生成非 compliant 摘要 ----
 echo "=== Step 2: Building summary for Claude ==="
 
-echo "# specHunter Daily Scan — ${TODAY}" > "$SUMMARY_FILE"
-echo "New output files: ${STAGED_COUNT}" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
+BUG_COUNT=0
+RISK_COUNT=0
+COMPLIANT_COUNT=0
+PARSE_ERR_COUNT=0
 
-echo "$STAGED" | while IFS= read -r f; do
+SUMMARY_BODY=""
+
+while IFS= read -r f; do
   overall=$(jq -r '.overall_severity // "unknown"' "$f" 2>/dev/null || echo "parse_error")
+
+  case "$overall" in
+    bug_confirmed)  BUG_COUNT=$((BUG_COUNT + 1)) ;;
+    potential_risk) RISK_COUNT=$((RISK_COUNT + 1)) ;;
+    compliant)      COMPLIANT_COUNT=$((COMPLIANT_COUNT + 1)); continue ;;
+    *)              PARSE_ERR_COUNT=$((PARSE_ERR_COUNT + 1)); continue ;;
+  esac
+
   consequence=$(jq -r '.security_spec.security_consequence // "N/A"' "$f" 2>/dev/null || echo "N/A")
   spec=$(echo "$f" | cut -d'/' -f2)
   pr=$(echo "$f" | cut -d'/' -f3)
   target=$(basename "$f" .json)
-  echo "[$overall] $spec / $pr / $target → $consequence" >> "$SUMMARY_FILE"
-done
+  SUMMARY_BODY+="[$overall] $spec / $pr / $target -> $consequence"$'\n'
+done <<< "$STAGED"
+
+cat > "$SUMMARY_FILE" <<EOF
+# specHunter Daily Scan — ${TODAY}
+Total: ${STAGED_COUNT} | bug_confirmed: ${BUG_COUNT} | potential_risk: ${RISK_COUNT} | compliant: ${COMPLIANT_COUNT}
+EOF
+
+if [ -n "$SUMMARY_BODY" ]; then
+  echo "$SUMMARY_BODY" >> "$SUMMARY_FILE"
+else
+  echo "(none)" >> "$SUMMARY_FILE"
+fi
+
+echo "  DEBUG: BUG_COUNT=$BUG_COUNT RISK_COUNT=$RISK_COUNT COMPLIANT_COUNT=$COMPLIANT_COUNT PARSE_ERR_COUNT=$PARSE_ERR_COUNT"
+echo "  DEBUG: SUMMARY_BODY lines=$(echo "$SUMMARY_BODY" | wc -l)"
+echo "  DEBUG: SUMMARY_FILE=$(wc -c < "$SUMMARY_FILE") bytes, $(wc -l < "$SUMMARY_FILE") lines"
 
 # ---- 步骤 3: 调用 Claude 分析并生成报告 ----
+if [ "$BUG_COUNT" -eq 0 ] && [ "$RISK_COUNT" -eq 0 ]; then
+  echo "=== Step 3: Skipped (nothing to analyze) ==="
+  echo "=== Complete ==="
+  exit 0
+fi
 echo "=== Step 3: Claude analysis ==="
 
-claude -p "$(cat <<PROMPT
-你是 specHunter 扫描器的每日分析员。specHunter 对 RISC-V ISA 规范 PR 进行安全扫描，检查各开源实现（Linux、QEMU、OpenSBI、FreeBSD、XiangShan）是否符合规范的安全要求。
+PROMPT_TEXT=$(cat <<PROMPT
+你是 specHunter 扫描器的每日分析员。
 
 ## 任务
 
-1. 阅读 /tmp/spechunter-summary-${TODAY}.txt 了解今天新扫出的文件
-2. 对于标记为 "bug_confirmed" 或 "potential_risk" 的条目，读取对应的 JSON 文件以理解细节
+1. 阅读 /tmp/spechunter-summary-${TODAY}.txt，内有今天所有 bug_confirmed 和 potential_risk 条目及统计
+2. 读取对应 JSON 文件理解细节
 3. 生成报告写入 ${REPORT_FILE}
 
 ## 报告格式（中文）
 
 \`\`\`markdown
-# 每日扫描报告 — ${TODAY}
+# Daily Scan Report — ${TODAY}
 
-## 概览
-| 严重程度 | 数量 |
-|----------|------|
+## Overview
+| Severity | Count |
+|----------|-------|
 | bug_confirmed | N |
 | potential_risk | N |
 | compliant | N |
 
-## 确认 Bug（bug_confirmed）
-对每个 bug:
-- **Spec / PR / Target**: 哪个规范、哪个 PR、哪个项目
-- **后果**: info_leak / privilege_escape / denial_of_service / function_loss
-- **描述**: 2-3 句中简述问题
+## Confirmed Bugs
+For each bug:
+- **Spec / PR / Target**
+- **Consequence**: info_leak / privilege_escape / denial_of_service / function_loss
+- **Description**: 2-3 sentence summary
 
-## 潜在风险（potential_risk）
-同上
+## Potential Risks
+Same format as above.
 
-## 值得关注的跨 spec 模式
-如果今天有多个 PR 涉及同一类硬件机制（CSR 访问控制、计时器、调试安全等），在此标注。
+## Cross-Spec Patterns
+Note any common hardware mechanisms across multiple PRs today.
 \`\`\`
 
-## 重要约束
-- 只写入 ${REPORT_FILE}，不要修改其他文件
-- 用中文写，技术术语保留英文
-- 报告简洁，作为早上快速浏览用
-- ${STAGED_COUNT} 个新文件中只挑 bug_confirmed 和 potential_risk 的深入分析，compliant 的仅统计不计入详细分析
+## Constraints
+- Write only to ${REPORT_FILE}, do not modify other files
+- Be concise, for morning quick-scan use
+- Total ${STAGED_COUNT} new files, ${BUG_COUNT} bug_confirmed + ${RISK_COUNT} potential_risk need deep analysis
+- compliant entries have been pre-filtered out of the summary
 PROMPT
-)" --model sonnet --output-format text --dangerously-skip-permissions
+)
+echo "  DEBUG: PROMPT_TEXT=$(echo "$PROMPT_TEXT" | wc -c) bytes, $(echo "$PROMPT_TEXT" | wc -l) lines"
+
+claude -p "$PROMPT_TEXT" --model opus --output-format text --dangerously-skip-permissions --add-dir "$REPO" --add-dir /tmp --system-prompt "You are a security analysis assistant. You read files and write reports. Keep responses concise."
 
 echo "=== Complete ==="
 echo "Report: $REPORT_FILE"
