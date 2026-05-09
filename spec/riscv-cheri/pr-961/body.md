@@ -1,1 +1,0 @@
-This suggestion makes sense since using the Y prefix is more consistent with VADD vs ADDIW. The operation the RVY ADD does is actually slightly different: it operates only on the lower XLEN bits+rep check, and is not a YLEN wide add operation as would be the case for ADD(I)Y. Make the same change for the SH*ADD instruction as well.

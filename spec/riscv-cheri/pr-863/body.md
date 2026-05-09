@@ -1,3 +1,0 @@
- - The CRW field is extended to 3 bits. The CD and CRG bits are logical states encoded by the CRW field instead of proper separate bits in the PTE.
- - Clarify Reserved states for PTE.U=0. This should make it easier to add extensions that define CRW states that do not imply any CD/CRG semantics, for example a kernel revocation extension can define a cap-permissive state without load-side faults.
- - Flip the polarity of the encoded "PTE.CD" bit (PTE.CRW[1]), this ensures that software unaware of the Svucrg extension can continue to use the CRW bit with the exact same semantic.

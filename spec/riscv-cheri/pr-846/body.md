@@ -1,2 +1,0 @@
-- The example code for observing the execution mode was, AFAICT, backwards.
-- The M field is logically not a permission but is X-permission-dependent (see the "default" RV32 encoding), so reflect that in the text.
