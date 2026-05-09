@@ -134,7 +134,14 @@ PROMPT
 )
 echo "  DEBUG: PROMPT_TEXT=$(echo "$PROMPT_TEXT" | wc -c) bytes, $(echo "$PROMPT_TEXT" | wc -l) lines"
 
-claude -p "$PROMPT_TEXT" --model opus --output-format text --dangerously-skip-permissions --add-dir "$REPO" --add-dir /tmp --system-prompt "You are a security analysis assistant. You read files and write reports. Keep responses concise."
+cd /tmp
+claude -p "$PROMPT_TEXT" \
+  --model opus \
+  --output-format text \
+  --bare \
+  --allowedTools "Read, Write" \
+  --add-dir "$REPO" \
+  --system-prompt "You are a security analysis assistant. You read files and write reports. Keep responses concise."
 
 echo "=== Complete ==="
 echo "Report: $REPORT_FILE"
