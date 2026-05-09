@@ -1,0 +1,80 @@
+PR #3  target=linux  overall=compliant
+Spec: IME floating-point instructions produce implementation-defined fflags encoding microarchitectural grouping factor G, leaked through kernel fcsr save/restore across security boundaries
+Violation: Kernel context-switch and KVM vCPU save/restore paths preserve fflags/fcsr without sanitization, transparently propagating implementation-defined fflags values produced by IME floating-point matrix multiply-accumulate instructions (vfmmacc.vv, vfwmmacc.vv, vfqwmmacc.vv). The intermediate grouping factor G and rounding order within a single instruction are implementation-defined and not governed by frm, so the resulting fflags bit pattern encodes the host microarchitecture's internal accumulation grouping. A userspace process or guest VM can probe fflags after IME instructions to fingerprint the host microarchitecture, distinguishing CPU implementations or cores in a heterogeneous system.
+Consequence: info_leak
+Pattern: fcsr|fflags|__riscv_v_state_save|__riscv_v_state_restore|kvm_riscv_vcpu_fp
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/fpu.S:22-63  __fstate_save
+  Correctly saves the complete fcsr CSR (which includes frm[7:5] and fflags[4:0]) via frcsr at line 27, then stores to the thread struct at line 60. The kernel must faithfully preserve all architectural fcsr state across context switches — a process may legitimately accrue exception flags, context-switch out, and expect them to be intact upon resume. Sanitizing fflags here would be a kernel bug, not a fix.
+  | frcsr t0
+  | ...
+  | sw t0, TASK_THREAD_FCSR_F0(a0)
+
+[compliant] arch/riscv/kernel/fpu.S:65-106  __fstate_restore
+  Correctly restores the complete fcsr CSR from the thread struct via fscsr at line 103. This is required for correct context-switch semantics — fflags values set by FP/vector instructions executed before the switch must survive the switch.
+  | lw t0, TASK_THREAD_FCSR_F0(a0)
+  | ...
+  | fscsr t0
+
+[compliant] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The switch_to macro correctly sequences FP then vector state save/restore before the GPR switch. fstate_save/restore use SR_FS tracking (DIRTY/CLEAN/OFF) to avoid unnecessary save/restore operations — this is the standard lazy FP optimization used across architectures. No sanitization is applied (nor should it be).
+  | if (has_fpu())
+  |     __switch_to_fpu(__prev, __next);
+  | if (has_vector() || has_xtheadvector())
+  |     __switch_to_vector(__prev, __next);
+  | ...
+  | ((last) = __switch_to(__prev, __next));
+
+[compliant] arch/riscv/kvm/vcpu_switch.S:316-356  __kvm_riscv_fp_d_save
+  KVM guest FP save path reads fcsr via frcsr at line 320 and stores it to the kvm_cpu_context at line 353. Correctly preserves the full fcsr value including fflags. This is necessary for correct VM migration and save/restore semantics — if a guest accrued NX on a vfmacc instruction, the flag must survive VM exit and re-entry.
+  | frcsr t0
+  | ...
+  | sw t0, KVM_ARCH_FP_D_FCSR(a0)
+
+[compliant] arch/riscv/kvm/vcpu_switch.S:400-440  __kvm_riscv_fp_d_restore
+  KVM guest FP restore path loads fcsr from kvm_cpu_context at line 403 and writes via fscsr at line 437. Correctly restores the full architectural FP state that was saved at VM exit. Sanitization here would corrupt guest-visible state.
+  | lw t0, KVM_ARCH_FP_D_FCSR(a0)
+  | ...
+  | fscsr t0
+
+[compliant] arch/riscv/kvm/vcpu.c:629-631  kvm_arch_vcpu_load
+  VM entry sequence: host FP saved, guest FP restored. The ordering is correct and the save/restore faithfully preserves fcsr/fflags without sanitization — exactly what is needed for correct VM semantics.
+  | kvm_riscv_vcpu_host_fp_save(&vcpu->arch.host_context);
+  | kvm_riscv_vcpu_guest_fp_restore(&vcpu->arch.guest_context,
+  |                                 vcpu->arch.isa);
+
+[compliant] arch/riscv/kvm/vcpu.c:652-654  kvm_arch_vcpu_put
+  VM exit sequence: guest FP saved, host FP restored. Correct order and correct state preservation. The guest's fflags are saved to the guest context and the host's fflags are restored — any other behavior would either leak host state to the guest (security bug) or corrupt the guest state (functional bug).
+  | kvm_riscv_vcpu_guest_fp_save(&vcpu->arch.guest_context,
+  |                              vcpu->arch.isa);
+  | kvm_riscv_vcpu_host_fp_restore(&vcpu->arch.host_context);
+
+[compliant] arch/riscv/kernel/process.c:182-192  flush_thread
+  Correctly zeros the entire fstate struct (including fcsr/fflags) at exec() time. Comment at line 188 explicitly documents 'fflags: accrued exceptions cleared'. This is the right place to clear fflags — a new program image starts with clean FP state. The kernel does NOT clear fflags on regular context switch, which is also correct per spec.
+  | /* frm: round to nearest, ties to even (IEEE default)
+  |  * fflags: accrued exceptions cleared */
+  | fstate_off(current, task_pt_regs(current));
+  | memset(&current->thread.fstate, 0, sizeof(current->thread.fstate));
+
+[compliant] arch/riscv/kernel/head.S:471-471  .Lreset_regs_done_fpu
+  CPU initialization zeros fcsr (clearing both frm and fflags) before enabling FPU. This ensures each CPU starts with deterministic FP state. The boot CPU and secondary CPUs both execute this path.
+  | csrw fcsr, 0
+
+[compliant] arch/riscv/kvm/vcpu_fp.c:18-28  kvm_riscv_vcpu_fp_reset
+  Sets guest sstatus.FS to INITIAL (a vCPU reset does not touch saved fcsr — that is implicitly zero from the kvm_cpu_context allocation). The guest's fcsr state is properly isolated in guest_context and never merged with host state.
+  | cntx->sstatus &= ~SR_FS;
+  | if (riscv_isa_extension_available(vcpu->arch.isa, f) ||
+  |     riscv_isa_extension_available(vcpu->arch.isa, d))
+  |     cntx->sstatus |= SR_FS_INITIAL;
+
+[compliant] arch/riscv/include/asm/vector.h:129-165  __vstate_csr_save
+  Vector CSR save saves vstart, vtype, vl, vcsr, vlenb. For standard V, reads CSR_VCSR at line 162. For T-Head, assembles vcsr from VXSAT/VXRM. The vector VCSR does NOT alias fcsr/fflags — vector FP instructions set the scalar fflags in the fcsr CSR (per spec section 'Vector Floating-Point Exception Flags'), not in vcsr. The fcsr save/restore is handled independently by __fstate_save/restore.
+  | dest->vcsr = csr_read(CSR_VCSR);
+  | dest->vlenb = csr_read(CSR_VLENB);
+
+[compliant] arch/riscv/kernel/signal.c:92-93  riscv_v_sc_use_sigcontext
+  Signal delivery correctly saves vector state before copying to userspace. The FP state (including fcsr/fflags) is handled through the sigframe save path which calls fstate_save. Both FP and vector state are transparently written to the signal frame — this is correct: userspace has the right to inspect its own fflags via the signal frame (e.g., a signal handler might need to know whether the interrupted code produced inexact results).
+  | get_cpu_vector_context();
+  | riscv_v_vstate_save(&current->thread.vstate, regs);
+  | put_cpu_vector_context();
+

@@ -1,0 +1,152 @@
+{
+  "pr_number": 136,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 136,
+    "violation_condition": "The Linux kernel (as Host Supervisor Domain Manager) calls sbi_covh_connect_device() to initiate device connection, but the TSM proceeds into IDE link setup without first ensuring the RDSM has successfully programmed RP IDE keys via COVT sbi_covt_program_rp_ide_key() — a condition the kernel cannot observe or enforce because the COVT extension is TSM-internal and the spec removes the prior precondition that an SPDM session with the upstream root port must be established before device connection",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "sbi_covh_connect_device|sbi_covt_program_rp_ide_key|sbi_covt_set_go_rp_ide_key",
+    "affected_entities": [
+      "sbi_covh_connect_device",
+      "sbi_covt_program_rp_ide_key",
+      "sbi_covt_set_go_rp_ide_key",
+      "sbi_covt_set_stop_rp_ide_key",
+      "sbi_covt_clear_rp_ide_key",
+      "sbi_covt_rp_ide_key_status"
+    ],
+    "summary": "COVT SBI extension moves RP IDE key programming from an SPDM-authenticated RoT path to an RDSM-delegated path with no kernel-visible attestation that RP keys are in Programmed state before sbi_covh_connect_device() proceeds, allowing a compromised or buggy TSM/RDSM to complete device connection with missing or unprogrammed RP-side IDE keys, resulting in plaintext PCIe TLP exposure on the link"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "drivers/crypto/ccp/sev-dev-tsm.c",
+        "function_name": "dsm_connect",
+        "line_start": 266,
+        "line_end": 312,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The SEV-TIO TSM connect flow (x86-only) calls sev_tio_dev_connect() for firmware-mediated IDE key programming at line 290, then streams_enable() at line 295. This ordering relies on the PSP firmware to atomically program RP IDE keys before enabling the stream. On RISC-V with CoVE-IO, the equivalent would be sbi_covh_connect_device() which the spec drafts describe as proceeding into IDE link setup without ensuring the RDSM has first programmed RP IDE keys via sbi_covt_program_rp_ide_key(). The kernel has no visibility into whether the COVT extension (TSM-internal) completes before COVH proceeds. The SEV driver demonstrates the correct pattern (firmware-mediated atomic connect+key-prog), but a CoVE-IO driver on RISC-V would lack this guarantee because COVH and COVT are separate SBI extension domains with different privilege boundaries.",
+      "snippet": "ret = sev_tio_dev_connect(dev_data, tc_mask, ids, dev_data->cert_slot);\nret = sev_tio_spdm_cmd(dsm, ret);\nif (ret)\n\tgoto free_exit;\nstreams_enable(dev_data->ide);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/pci/tsm.c",
+        "function_name": "pci_tsm_connect",
+        "line_start": 186,
+        "line_end": 228,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The generic pci_tsm_connect() framework delegates the entire IDE setup sequence to ops->connect(pdev) at line 207 with no intermediate validation that IDE keys have been programmed before the stream is enabled. The framework has no mechanism to enforce that RP IDE key programming (COVT-equivalent) completes before device connection (COVH-equivalent). The sysfs connect_store() handler at line 260-285 is user-triggerable and proceeds directly to pci_tsm_connect() with no precondition checks on key state. On RISC-V CoVE-IO, this would manifest as the kernel calling sbi_covh_connect_device() without verifying sbi_covt_program_rp_ide_key() success — a condition the kernel cannot observe because COVT operates in the TSM privilege domain.",
+      "snippet": "pdev->tsm = pci_tsm;\ntsm_pf0 = to_pci_tsm_pf0(pdev->tsm);\nACQUIRE(mutex_intr, lock)(&tsm_pf0->lock);\nrc = ops->connect(pdev);\nif (rc)\n\treturn rc;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi.c",
+        "function_name": "sbi_probe_extension",
+        "line_start": 543,
+        "line_end": 553,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sbi_probe_extension(SBI_EXT_COVH) would return success if the COVH extension is present, but provides no FID-level semantic compatibility check. If a TSM re-maps FID semantics (e.g. FID 1024 from register_iommu to register_rp, FID 1025 from notify_iommu_msi to connect_device), the kernel has no mechanism to detect this change. The probe is binary — it confirms extension presence but not FID contract. A CoVE-IO driver using this probe would assume its compiled-in FID layout matches the TSM's, with no runtime enforcement.",
+      "snippet": "long sbi_probe_extension(int extid)\n{\n\tstruct sbiret ret;\n\tret = sbi_ecall(SBI_EXT_BASE, SBI_EXT_BASE_PROBE_EXT, extid, 0, 0, 0, 0, 0);\n\tif (!ret.error)\n\t\treturn ret.value;\n\treturn 0;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/pci/ide.c",
+        "function_name": "pci_ide_stream_enable",
+        "line_start": 687,
+        "line_end": 707,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "pci_ide_stream_enable() writes PCI_IDE_SEL_CTL_EN to the Selective IDE Stream Control register at line 698, then reads back the IDE stream status at line 701-703 to verify the stream entered SECURE state. This provides a hardware-level guarantee that IDE stream setup completed before reporting success. On RISC-V CoVE-IO, the equivalent hardware check would confirm the link entered secure state, but would NOT verify which entity (TSM via COVT or the kernel itself) programmed the keys — the hardware only reports the final stream state, not the key provenance.",
+      "snippet": "set_ide_sel_ctl(pdev, ide, settings, pos, true);\nsettings->enable = 1;\npci_read_config_dword(pdev, pos + PCI_IDE_SEL_STS, &val);\nif (FIELD_GET(PCI_IDE_SEL_STS_STATE, val) !=\n    PCI_IDE_SEL_STS_STATE_SECURE)\n\treturn -ENXIO;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/nacl.c",
+        "function_name": "kvm_riscv_nacl_enable",
+        "line_start": 53,
+        "line_end": 70,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM NACL demonstrates the canonical 'probe then blindly call FID' pattern that would make any CoVE-IO driver vulnerable: sbi_probe_extension(SBI_EXT_NACL) at line 121 confirms the extension exists, then sbi_ecall(SBI_EXT_NACL, SBI_EXT_NACL_SET_SHMEM, ...) at line 63-64 fires with the compiled-in FID. This pattern is correct for NACL where FID semantics are stable, but on RISC-V CoVE-IO where FID 1024/1025 semantics differ between spec drafts, the same pattern would silently pass parameter content with wrong semantics. NACL serves as a reference for how a CoVE-IO driver calling sbi_covh_connect_device(FID 1025) would operate — probe succeeds, ecall fires, no FID-contract validation.",
+      "snippet": "if (sbi_spec_version < sbi_mk_version(1, 0) ||\n    sbi_probe_extension(SBI_EXT_NACL) <= 0)\n\treturn -ENODEV;\nstatic_branch_enable(&kvm_riscv_nacl_available);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/virt/coco/tsm-core.c",
+        "function_name": "tsm_register",
+        "line_start": 77,
+        "line_end": 96,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "tsm_register() is the generic TSM device registration entry point. It creates a 'tsmN' device node and, if pci_ops is provided, calls pci_tsm_register() to enable sysfs connect/disconnect attributes. This is a framework layer with no RISC-V SBI CoVE-IO awareness. It correctly separates registration from connection — the actual connect flow (including IDE key programming) happens later in the driver-specific ops->connect() callback. No violation here; the risk is entirely in the driver implementation that would plug into this framework on RISC-V.",
+      "snippet": "struct tsm_dev *tsm_register(struct device *parent, struct pci_tsm_ops *pci_ops)\n{\n\t...\n\treturn tsm_register_pci_or_reset(no_free_ptr(tsm_dev), pci_ops);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/crypto/ccp/sev-dev-tsm.c",
+        "function_name": "streams_setup",
+        "line_start": 119,
+        "line_end": 146,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "streams_setup() programs IDE stream control registers on both the endpoint and root port before key programming. The comment at line 628-631 in ide.c notes: 'Setup control register early for devices that expect stream_id is set during key programming.' This is the correct architectural pattern: register setup → key programming → stream enable. The SEV driver follows this pattern correctly via streams_setup() → sev_tio_dev_connect() (key prog) → streams_enable(). On RISC-V CoVE-IO, this three-phase ordering maps to: pci_ide_stream_setup() → sbi_covt_program_rp_ide_key() → pci_ide_stream_enable(). The risk is that sbi_covh_connect_device() in the CoVE-IO spec combines phases 2 and 3 without the kernel being able to observe phase 2 completion.",
+      "snippet": "static u8 streams_setup(struct pci_ide **ide, u8 *ids)\n{\n\t...\n\tstream_setup(ide[i]);\n\t...\n\treturn tc_mask;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/pci/ide.c",
+        "function_name": "pci_ide_stream_setup",
+        "line_start": 596,
+        "line_end": 635,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "pci_ide_stream_setup() programs RID association registers and address association registers into the Selective IDE Stream register block, then writes the control register with enable=0 (line 632: 'set_ide_sel_ctl(pdev, ide, settings, pos, false)'). The comment at line 628-631 explicitly documents the ordering requirement: stream_id must be set during key programming. This code is architecturally correct on its own — it sets up registers in preparation for subsequent key programming and only then enables the stream. The vulnerability is not in this function but in what the CoVE-IO sbi_covh_connect_device() orchestrates around it.",
+      "snippet": "/*\n * Setup control register early for devices that expect\n * stream_id is set during key programming.\n */\nset_ide_sel_ctl(pdev, ide, settings, pos, false);\nsettings->setup = 1;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/pci/tsm.c",
+        "function_name": "connect_store",
+        "line_start": 260,
+        "line_end": 285,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The sysfs connect_store() handler at drivers/pci/tsm.c:260 accepts a 'tsmN' string from userspace, finds the TSM device, verifies it supports link operations (is_link_tsm), and immediately calls pci_tsm_connect() without any precondition that the SPDM session with the upstream root port has been established. On RISC-V CoVE-IO, this maps to: userspace triggers connect → kernel calls sbi_covh_connect_device() → TSM proceeds to IDE link setup. The specification concern is that the TSM may proceed without the RDSM having programmed RP IDE keys. The kernel has no observable signal from the COVT domain (TSM-internal) to gate this sysfs entry point. The connect_store() handler could be strengthened to require an explicit pre-condition (e.g., an 'rp_keys_programmed' attribute) before allowing connect.",
+      "snippet": "static ssize_t connect_store(struct device *dev, struct device_attribute *attr,\n\t\t\t     const char *buf, size_t len)\n{\n\t...\n\tstruct tsm_dev *tsm_dev __free(put_tsm_dev) = find_tsm_dev(id);\n\tif (!is_link_tsm(tsm_dev))\n\t\treturn -ENXIO;\n\trc = pci_tsm_connect(pdev, tsm_dev);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/nacl.c",
+        "function_name": "kvm_riscv_nacl_init",
+        "line_start": 114,
+        "line_end": 152,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "kvm_riscv_nacl_init() at line 114-152 demonstrates the full SBI extension lifecycle pattern that a RISC-V CoVE-IO KVM host would follow: (1) check sbi_spec_version at line 120, (2) sbi_probe_extension(SBI_EXT_NACL) at line 121, (3) probe features, (4) allocate shared memory, (5) later call sbi_ecall(SBI_EXT_NACL, FID, ...) on each vCPU. For CoVE-IO, this lifecycle would be: probe SBI_EXT_COVH → probe features → set shared memory → call connect_device(FID 1025). The NACL code shows that the kernel trusts the probe result to mean 'the set of FIDs I know are the ones the TSM implements' — there is no FID-level version negotiation. On CoVE-IO where FID 1025 semantics changed from notify_iommu_msi to connect_device, the kernel would pass root port BDF/segment parameters that the old FID would have interpreted as MSI configuration data.",
+      "snippet": "if (sbi_spec_version < sbi_mk_version(1, 0) ||\n    sbi_probe_extension(SBI_EXT_NACL) <= 0)\n\treturn -ENODEV;\nstatic_branch_enable(&kvm_riscv_nacl_available);\n...\nshmem_page = alloc_pages(GFP_KERNEL | __GFP_ZERO, get_order(SBI_NACL_SHMEM_SIZE));",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

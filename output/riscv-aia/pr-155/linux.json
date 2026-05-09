@@ -1,0 +1,151 @@
+{
+  "pr_number": 155,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 155,
+    "violation_condition": "Kernel runs on hardware with Ssamb but either (a) leaves interrupt 14 unmasked in (m|s)ie without installing a handler, causing an unhandled interrupt storm, or (b) iterates over local interrupts using a bound that excludes interrupt 14, failing to save/restore its iprio and enable/disable state across context switches, or (c) treats bits 13-15 in mideleg as a single block, unintentionally delegating the unhandled LAMBI to S-mode",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "BIT(14) missing in mie/mip/mideleg mask constants; iprio shift macros limited to interrupt 13; local-interrupt enumeration assuming counter-overflow-only at positions 13-15; hardcoded '13' as max local interrupt index",
+    "affected_entities": [
+      "mip",
+      "mie",
+      "mideleg",
+      "sip",
+      "sie",
+      "mvien",
+      "mvip",
+      "miprio",
+      "siprio",
+      "vsiprio"
+    ],
+    "summary": "Ssamb repurposes reserved interrupt 14 as local asynchronous-memory-buffer interrupt; unaware kernel code risks interrupt storms, incorrect iprio saves, and unintended delegation via mideleg"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "(macro definitions)",
+        "line_start": 101,
+        "line_end": 103,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "IRQ_LOCAL_MAX is defined as (IRQ_PMU_OVF + 1) = 14, and IRQ_LOCAL_MASK = GENMASK(13, 0). This excludes interrupt 14 (LAMBI) from the local interrupt mask. If Ssamb hardware were present, interrupt 14 would not be covered by mask/unmask logic (riscv_intc_irq_mask/unmask use BIT(d->hwirq) which would work, but IRQ_LOCAL_MASK is used in KVM to distinguish local from external interrupts). The spec (machine.adoc:1820-1826) reserves interrupts 14-15, so no current bug, but this mask boundary is a single point that must be updated if interrupt 14 is assigned to Ssamb.",
+      "snippet": "#define IRQ_PMU_OVF         13\n#define IRQ_LOCAL_MAX       (IRQ_PMU_OVF + 1)\n#define IRQ_LOCAL_MASK      GENMASK((IRQ_LOCAL_MAX - 1), 0)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1820,
+          "line_end": 1827,
+          "excerpt": "|12 + 13 + 14-15 | _Reserved_ + Counter-overflow interrupt + _Reserved_ + _Designated for platform use_"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "(macro definitions)",
+        "line_start": 186,
+        "line_end": 191,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VSIP_VALID_MASK whitelists only IRQ_S_SOFT (bit 1), IRQ_S_TIMER (bit 5), IRQ_S_EXT (bit 9), and IRQ_PMU_OVF (bit 13). Interrupt 14 (LAMBI) is not in the valid mask. If Ssamb were supported, injected LAMBI interrupts via VSIP would be filtered out by this mask in kvm_riscv_vcpu_has_interrupts() and kvm_riscv_vcpu_general_get_csr(sip).",
+      "snippet": "#define VSIP_VALID_MASK     ((_AC(1, UL) << IRQ_S_SOFT) | \\\n                 (_AC(1, UL) << IRQ_S_TIMER) | \\\n                 (_AC(1, UL) << IRQ_S_EXT) | \\\n                 (_AC(1, UL) << IRQ_PMU_OVF))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_has_interrupts",
+        "line_start": 449,
+        "line_end": 452,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Uses ~IRQ_LOCAL_MASK to let bits >= 14 pass through unfiltered from vsie. Since ~IRQ_LOCAL_MASK = ~GENMASK(13,0), interrupt 14 in vsie bypasses the VSIP_VALID_MASK whitelist. If Ssamb hardware existed and bit 14 were set in vsie, it would be treated as a pending interrupt without going through the validated local-interrupt path.",
+      "snippet": "ie = ((vcpu->arch.guest_csr.vsie & VSIP_VALID_MASK)\n    << VSIP_TO_HVIP_SHIFT) & (unsigned long)mask;\nie |= vcpu->arch.guest_csr.vsie & ~IRQ_LOCAL_MASK &\n    (unsigned long)mask;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_onereg.c",
+        "function_name": "kvm_riscv_vcpu_general_get_csr",
+        "line_start": 525,
+        "line_end": 528,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When reading sip CSR, hvip bit 14 passes through unfiltered via ~IRQ_LOCAL_MASK. The same pattern as vcpu.c:451 — bits >= 14 in hvip bypass the VSIP_VALID_MASK sanitization. With Ssamb hardware, a guest reading sip could see bit 14 without it being validated as a known local interrupt.",
+      "snippet": "if (reg_num == KVM_REG_RISCV_CSR_REG(sip)) {\n    kvm_riscv_vcpu_flush_interrupts(vcpu);\n    *out_val = (csr->hvip >> VSIP_TO_HVIP_SHIFT) & VSIP_VALID_MASK;\n    *out_val |= csr->hvip & ~IRQ_LOCAL_MASK;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/kvm_host.h",
+        "function_name": "(macro definitions)",
+        "line_start": 58,
+        "line_end": 60,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM_HIDELEG_DEFAULT correctly delegates only VS_SOFT, VS_TIMER, and VS_EXT — not PMU_OVF (bit 13) or interrupt 14. PMU_OVF is instead handled via CSR_HVIEN in kvm_riscv_aia_enable(). This bit-explicit approach avoids the trap of treating bits 13-15 as a block in mideleg, making (c) from the security spec a non-issue.",
+      "snippet": "#define KVM_HIDELEG_DEFAULT       (BIT(IRQ_VS_SOFT)  | \\\n                                 BIT(IRQ_VS_TIMER) | \\\n                                 BIT(IRQ_VS_EXT))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia.c",
+        "function_name": "kvm_riscv_aia_enable",
+        "line_start": 564,
+        "line_end": 567,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Only PMU_OVF (bit 13) is enabled in HVIEN. If Ssamb were supported, LAMBI (interrupt 14) would need similar HVIEN gate logic to selectively enable based on ISA extension availability. Currently, HVIEN and HIDELEG have no path for interrupt 14 filtering.",
+      "snippet": "csr_set(CSR_HIE, BIT(IRQ_S_GEXT));\nif (__riscv_isa_extension_available(NULL, RISCV_ISA_EXT_SSCOFPMF))\n    csr_set(CSR_HVIEN, BIT(IRQ_PMU_OVF));",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia.c",
+        "function_name": "aia_irq2bitpos (array)",
+        "line_start": 251,
+        "line_end": 260,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The aia_irq2bitpos array already maps interrupt 14 to bit position 48 (valid in HVIPRIO2 on 64-bit). The AIA iprio infrastructure (aia_get_iprio8, aia_set_iprio8, aia_rmw_iprio) already handles IRQs 0-63 generically via ISELECT_IPRIO0..ISELECT_IPRIO15 range. No hardcoded bound at 13 in the iprio code — the loop in aia_rmw_iprio() uses nirqs = 4*(BITS_PER_LONG/32) = 4 or 8 which would correctly cover IRQ 14 when it falls within the ISELECT range.",
+      "snippet": "static int aia_irq2bitpos[] = {\n0,   8, -1, -1,  16,  24, -1, -1, /* 0 - 7 */\n32, -1, -1, -1,  -1,  40, 48,  56, /* 8 - 15 */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "tools/arch/riscv/include/asm/csr.h",
+        "function_name": "(macro definitions)",
+        "line_start": 86,
+        "line_end": 87,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Mirror copy of IRQ_LOCAL_MAX and IRQ_LOCAL_MASK in tools/. Same exclusion of interrupt 14 as the main header. Any tools-side code using these macros for interrupt enumeration would miss LAMBI.",
+      "snippet": "#define IRQ_LOCAL_MAX       (IRQ_PMU_OVF + 1)\n#define IRQ_LOCAL_MASK      GENMASK((IRQ_LOCAL_MAX - 1), 0)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-intc.c",
+        "function_name": "riscv_intc_irq_mask / riscv_intc_irq_unmask",
+        "line_start": 52,
+        "line_end": 66,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The INTC mask/unmask uses BIT(d->hwirq) directly against CSR_IE/CSR_IEH without referencing IRQ_LOCAL_MASK. Since no handler is registered for interrupt 14, it will never be unmasked. This satisfies condition (a) — interrupt 14 is not left unmasked without a handler, because no code ever unmasks it. The per-IRQ mask approach is safe.",
+      "snippet": "static void riscv_intc_irq_mask(struct irq_data *d)\n{\n    if (IS_ENABLED(CONFIG_32BIT) && d->hwirq >= BITS_PER_LONG)\n        csr_clear(CSR_IEH, BIT(d->hwirq - BITS_PER_LONG));\n    else\n        csr_clear(CSR_IE, BIT(d->hwirq));\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

@@ -1,0 +1,28 @@
+PR #181  target=linux  overall=compliant
+Spec: CoVE-IO SBI address _lo/_hi split mandates _hi==0 on RV64; non-zero _hi in MMIO-map or IDE-key calls lets a buggy kernel driver redirect TSM-programmed IOMMU page tables to host memory, breaking TVM confidentiality
+Violation: Linux kernel CoVE host driver passes a non-zero _hi address parameter to any CoVE-IO SBI function on RV64, violating the spec mandate that _hi must be zero on RV64; the TSM may compute a combined physical address with spurious high bits, redirecting IOMMU mappings, DMA descriptors, or IDE key material to unintended physical pages
+Consequence: privilege_escape
+Pattern: _addr_hi\s*=|_hi\s*=\s*[^0]|sbi_cov[ght]_\w+\(
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/paravirt.c:66-73  pv_time_cpu_online
+  SBI STA extension properly passes hi=0 on RV64 (line 71: IS_ENABLED(CONFIG_32BIT) ? upper_32_bits(...) : 0). This is NOT a CoVE-IO SBI function but demonstrates the correct _hi-zeroing pattern that a CoVE-IO driver should follow.
+  | unsigned long hi = IS_ENABLED(CONFIG_32BIT) ? upper_32_bits((u64)pa) : 0;
+  | return sbi_sta_steal_time_set_shmem(lo, hi, 0);
+
+[compliant] arch/riscv/kvm/vcpu_sbi_sta.c:105-110  kvm_sbi_sta_steal_time_set_shmem
+  KVM STA handler properly rejects non-zero shmem_phys_hi on RV64 with SBI_ERR_INVALID_ADDRESS (line 108-109). Not a CoVE-IO function, but demonstrates correct defensive _hi checking.
+  | if (shmem_phys_hi != 0) {
+  |     if (IS_ENABLED(CONFIG_32BIT))
+  |         shmem |= ((gpa_t)shmem_phys_hi << 32);
+  |     else
+  |         return SBI_ERR_INVALID_ADDRESS;
+  | }
+
+[potential_risk] arch/riscv/kvm/vcpu_sbi_forward.c:10-14  vcpu_sbi_ext_experimental
+  KVM forwards all SBI calls in the experimental range (0x08000000-0x08FFFFFF) to userspace via KVM_EXIT_RISCV_SBI. If a guest OS or VMM invokes CoVE-IO FIDs through this path, raw guest register values (including potentially non-zero _hi on RV64) would be forwarded without the kernel validating that _hi==0.
+  | static const struct kvm_vcpu_sbi_extension vcpu_sbi_ext_experimental = {
+  |     .extid_start = SBI_EXT_EXPERIMENTAL_START,
+  |     .extid_end = SBI_EXT_EXPERIMENTAL_END,
+  |     .handler = kvm_riscv_vcpu_sbi_forward_handler,
+  | };
+

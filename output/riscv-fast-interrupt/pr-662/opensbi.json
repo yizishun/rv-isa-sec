@@ -1,0 +1,162 @@
+{
+  "pr_number": 662,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 662,
+    "violation_condition": "OpenSBI HSM suspend handler saves/restores existing AIA CSRs (eip, eie, eithreshold) but does not save/restore the newly added xacliciprio[k] and xaclicsourcecfg[k] indirect CSR state, because these registers are introduced in the Smidctrl/Ssidctrl extension that OpenSBI was not previously aware of",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "HSM suspend/resume CSR save-restore loop that iterates over a fixed list of CSRs without awareness of Smidctrl/Ssidctrl xacliciprio and xaclicsourcecfg indirect register state",
+    "affected_entities": [
+      "macliciprio",
+      "maclicsourcecfg",
+      "sacliciprio",
+      "saclicsourcecfg",
+      "mstateen",
+      "sstateen",
+      "eidelivery"
+    ],
+    "summary": "New ACLIC indirect CSRs (xacliciprio[k], xaclicsourcecfg[k]) added by Smidctrl/Ssidctrl require explicit save/restore across HSM suspend/resume; a firmware unaware of these extensions will silently lose interrupt priority and source configuration, corrupting M-mode and S-mode interrupt delivery after wakeup"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_save",
+        "line_start": 408,
+        "line_end": 433,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "HSM non-retentive suspend does not save Smidctrl/Ssidctrl ACLIC indirect CSR state (xacliciprio[k] and xaclicsourcecfg[k]). Only 5 CSRs are saved (MIE, MIP, MEDELEG, MIDELEG, MENVCFG). On resume, the hart-local APLIC domain interrupt priority and source configuration registers are lost if the platform implements the Smidctrl/Ssidctrl extensions, causing data corruption of peripheral interrupt routing configuration.",
+      "snippet": "hdata->saved_mie = csr_read(CSR_MIE);\nhdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);\nhdata->saved_medeleg = csr_read(CSR_MEDELEG);\nhdata->saved_mideleg = csr_read(CSR_MIDELEG);\nif (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)\n\thdata->saved_menvcfg = csr_read64(CSR_MENVCFG);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 378,
+          "line_end": 383,
+          "excerpt": "To have full control over the necessary APLIC registers, the following indirect CSR access is added. The registers xireg4 through xireg6 are reserved and raise an illegal instruction exception when xiselect is in the range 0x1000-0x10FF."
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 384,
+          "line_end": 401,
+          "excerpt": "When XLEN = 32, each xireg register controls the ACLIC priority setting of four interrupts. | 0x1000 | 4B | acliciprio0 | ... | 0x10FF | 4B | acliciprio255. Indirect access to acliciprio[k] mirror target[k*4].iprio up to target[k*4+3].iprio."
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 539,
+          "line_end": 555,
+          "excerpt": "When XLEN = 32, the xireg2 and xireg3 registers combined control the source configuration of four interrupts. | 0x1000 | 4B | aclicsourcecfg0 | aclicsourcecfg1 | ... | 0x10FF | 4B | aclicsourcecfg510 | aclicsourcecfg511."
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 652,
+          "line_end": 658,
+          "excerpt": "If the Smstateen extension is implemented, then the bit 53 (ACLIC) in mstateen0 is implemented. If bit 53 (ACLIC) of a controlling mstateen0 CSR is zero, then access to the new CSRs (acliciprio[k], aclicsourcecfg[k]) by S-mode or a lower-privilege mode results in an illegal instruction exception."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_restore",
+        "line_start": 435,
+        "line_end": 446,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "HSM non-retentive resume restores only the 5 saved CSRs and does not restore acliciprio[k] or aclicsourcecfg[k] indirect CSR state. After warm-boot resume, the S-mode ACLIC interrupt domain priority and source configuration registers are reset to their hardware default values (typically 0), which means: (a) all configured interrupt priorities are lost, (b) source delegation bits (D=1 for delegated interrupts) are cleared, causing all external interrupts to route to M-mode instead of S-mode, and (c) any software-configured sourcecfg delegation child index is lost.",
+      "snippet": "if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)\n\tcsr_write64(CSR_MENVCFG, hdata->saved_menvcfg);\ncsr_write(CSR_MIDELEG, hdata->saved_mideleg);\ncsr_write(CSR_MEDELEG, hdata->saved_medeleg);\ncsr_write(CSR_MIE, hdata->saved_mie);\ncsr_set(CSR_MIP, (hdata->saved_mip & (MIP_SSIP | MIP_STIP)));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 378,
+          "line_end": 383,
+          "excerpt": "To have full control over the necessary APLIC registers, the following indirect CSR access is added."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "sbi_hsm_data",
+        "line_start": 44,
+        "line_end": 53,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The sbi_hsm_data suspend context structure has no fields allocated for saving ACLIC indirect CSR state. The structure only holds saved_mie, saved_mip, saved_medeleg, saved_mideleg, and saved_menvcfg. To support Smidctrl/Ssidctrl, the structure needs additional fields for acliciprio[k] (up to 256/128 registers depending on XLEN) and aclicsourcecfg[k] (up to 512/256 half-words), or at minimum the xiselect and xireg indirect CSR access state for the active domain configuration.",
+      "snippet": "struct sbi_hsm_data {\n\tatomic_t state;\n\tunsigned long suspend_type;\n\tunsigned long saved_mie;\n\tunsigned long saved_mip;\n\tunsigned long saved_medeleg;\n\tunsigned long saved_mideleg;\n\tu64 saved_menvcfg;\n\tatomic_t start_ticket;\n};",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "include/sbi/sbi_hart.h",
+        "function_name": "sbi_hart_extensions",
+        "line_start": 31,
+        "line_end": 92,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The sbi_hart_extensions enum has no SBI_HART_EXT_SMACLIC or SBI_HART_EXT_SSACLIC entry. Without hart-level capability detection for Smidctrl/Ssidctrl, OpenSBI has no mechanism to know whether the underlying hardware implements ACLIC, and therefore cannot conditionally decide whether to save/restore ACLIC indirect CSR state during HSM suspend/resume.",
+      "snippet": "enum sbi_hart_extensions {\n\tSBI_HART_EXT_SMAIA = 0,\n\t...\n\tSBI_HART_EXT_MAX,\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 186,
+          "line_end": 188,
+          "excerpt": "| Smidctrl | Interrupt domain control interface at Machine level\n| Ssidctrl | Interrupt domain control interface at Supervisor level"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "include/sbi/riscv_encoding.h",
+        "function_name": "",
+        "line_start": 859,
+        "line_end": 876,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The SMSTATEEN0 bit definitions in riscv_encoding.h are missing bit 53 (ACLIC) as defined by the Smidctrl spec. Currently defined bits: CS(0), FCSR(1), CTR(54), SRMCFG(55), CONTEXT(57), IMSIC(58), AIA(59), SVSLCT(60), HSENVCFG(62). Without SMSTATEEN0_ACLIC defined, OpenSBI cannot properly configure state enable for S-mode ACLIC CSR access during init.",
+      "snippet": "#define SMSTATEEN0_IMSIC_SHIFT\t\t58\n#define SMSTATEEN0_IMSIC\t\t(_ULL(1) << SMSTATEEN0_IMSIC_SHIFT)\n#define SMSTATEEN0_AIA_SHIFT\t\t59\n#define SMSTATEEN0_AIA\t\t\t(_ULL(1) << SMSTATEEN0_AIA_SHIFT)\n// NOTE: SMSTATEEN0_ACLIC (bit 53) is missing",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 652,
+          "line_end": 658,
+          "excerpt": "If the Smstateen extension is implemented, then the bit 53 (ACLIC) in mstateen0 is implemented. If bit 53 (ACLIC) of a controlling mstateen0 CSR is zero, then access to the new CSRs (acliciprio[k], aclicsourcecfg[k]) by S-mode or a lower-privilege mode results in an illegal instruction exception."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "mstatus_init",
+        "line_start": 32,
+        "line_end": 98,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "mstatus_init() configures SMSTATEEN0 for AIA (bit 59) and IMSIC (bit 58) when SBI_HART_EXT_SMAIA is detected, but does not set bit 53 (ACLIC). On a platform with Smidctrl but without Smaia, S-mode access to ACLIC indirect CSRs (acliciprio[k], aclicsourcecfg[k]) would trap with illegal instruction exception because mstateen0[53] is not set by OpenSBI firmware.",
+      "snippet": "SMSTATEEN0_AIA | SMSTATEEN0_IMSIC\n// Missing: SMSTATEEN0_ACLIC (bit 53) for Smidctrl-only platforms",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 652,
+          "line_end": 658,
+          "excerpt": "If the Smstateen extension is implemented, then the bit 53 (ACLIC) in mstateen0 is implemented."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

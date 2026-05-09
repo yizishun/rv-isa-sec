@@ -1,0 +1,55 @@
+PR #775  target=freebsd-src  overall=potential_risk
+Spec: Kernel that writes to aclicsourcecfg[0] or target[0] iprio fields believing it configures interrupt #0 will silently get ROZ behavior, leaving IRQ #0 effectively dead/unroutable without the kernel realizing the misconfiguration.
+Violation: FreeBSD's APLIC driver writes to aclicsourcecfg[0] via xiselect=0x1000/xireg2 (XLEN=32) or acliciprio[0] to configure interrupt source #0 or target #0, and subsequently assumes the write succeeded — but the hardware silently drops the write because sourcecfg[0] and target[0] are hardwired read-only zero across all APLIC domains.
+Consequence: denial_of_service
+Pattern: for.*(i\s*=\s*0|int\s+i\s*=\s*0).*sourcecfg\[|for.*(i\s*=\s*0).*target\[|xiselect.*=.*0x1000.*xireg2
+------------------------------------------------------------
+[potential_risk] sys/riscv/riscv/aplic.c:287-287  aplic_map_intr
+  Missing lower-bound check on daf->cells[0]: only validates cells[0] > sc->ndev, but does not reject cells[0] == 0. If a malformed device tree maps interrupt source 0, subsequent calls to aplic_setup_intr/aplic_bind_intr will compute APLIC_SRC_CFG(0) = domaincfg offset (0x0000) and APLIC_TARGET(0) = genmsi offset (0x3000) via the (idx-1)*4 macro, corrupting domain configuration and MSI generation registers.
+  | if (daf->ncells != 2 || daf->cells[0] > sc->ndev) {
+  |     device_printf(dev, "Invalid cell data\n");
+  |     return (EINVAL);
+  | }
+  | 
+  | *isrcp = &sc->isrcs[daf->cells[0]].isrc;
+
+[potential_risk] sys/riscv/riscv/vmm/vmm_aplic.c:501-501  aplic_inject_irq
+  No bounds validation on irqid before accessing aplic->irqs[irqid]. A caller passing irqid == 0 or irqid >= nirqs would trigger out-of-bounds array access. While vm_assert_irq/vm_deassert_irq are the only callers, the irq parameter comes from userspace (bhyve) without validation in this function. If irqid == 0, the sourcecfg default (INACTIVE) prevents functional harm, but the OOB risk for irqid >= nirqs is real.
+  | irq = &aplic->irqs[irqid];
+  | if (irq->sourcecfg & SOURCECFG_D) {
+  |     mtx_unlock_spin(&aplic->mtx);
+  |     return (error);
+  | }
+
+[compliant] sys/riscv/riscv/riscv/aplic.c:361-371  aplic_setup_direct_mode
+  Interrupt initialization loop correctly starts at irq=1, skipping the non-existent interrupt source 0. APLIC_SRC_CFG(irq) with irq >= 1 always computes valid offsets. No writable aclicsourcecfg[0] or acliciprio[0] access exists in this driver.
+  | for (irq = 1; irq <= sc->ndev; irq++) {
+  |     isrcs[irq].irq = irq;
+  |     error = intr_isrc_register(&isrcs[irq].isrc, sc->dev,
+  |         0, "%s,%u", name, irq);
+  |     if (error != 0)
+  |         goto fail;
+  |     aplic_write(sc, APLIC_SRC_CFG(irq),
+  |         APLIC_SRC_CFG_SM_DETACHED);
+  | }
+
+[compliant] sys/riscv/riscv/vmm/vmm_aplic.c:275-286  aplic_mmio_access
+  MMIO range checks for both sourcecfg and target register windows start at index 1 (APLIC_SOURCECFG(1) and APLIC_TARGET(1)), correctly preventing guest access to the non-existent sourcecfg[0] and target[0] registers. The aplic_handle_sourcecfg function additionally rejects i <= 0.
+  | if ((reg >= APLIC_SOURCECFG(1)) &&
+  |     (reg <= APLIC_SOURCECFG(aplic->nirqs))) {
+  |     i = ((reg - APLIC_SOURCECFG(1)) >> 2) + 1;
+  |     error = aplic_handle_sourcecfg(aplic, i, write, val);
+  |     return (error);
+  | }
+  | 
+  | if ((reg >= APLIC_TARGET(1)) && (reg <= APLIC_TARGET(aplic->nirqs))) {
+  |     i = ((reg - APLIC_TARGET(1)) >> 2) + 1;
+  |     error = aplic_handle_target(aplic, i, write, val);
+  |     return (error);
+  | }
+
+[compliant] sys/riscv/riscv/vmm/vmm_aplic.c:124-125  aplic_handle_sourcecfg
+  Explicitly rejects index i <= 0 with ENOENT, enforcing that sourcecfg[0] cannot be read or written through the virtual APLIC interface.
+  | if (i <= 0 || i > aplic->nirqs)
+  |     return (ENOENT);
+

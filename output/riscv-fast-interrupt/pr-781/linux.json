@@ -1,0 +1,168 @@
+{
+  "pr_number": 781,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 781,
+    "violation_condition": "The kernel places the S-mode trap vector page (stvec) at a physical address where PMP/Smepmp does not grant S-mode execute permission — either during boot cpuidle (head.S PMPCFG write with X=0 at that region), through a context switch that changes stvec (KVM), or when M-mode firmware shares a CLIC vector table via xivt/xeivt without ensuring S-mode X permission on the shared table.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csrw CSR_STVEC, <reg> | csr_write(CSR_STVEC, | csr_write(CSR_TVEC, | csr_write(CSR_VSTVEC,",
+    "affected_entities": [
+      "CSR_STVEC",
+      "CSR_PMPCFG0",
+      "CSR_PMPADDR0",
+      "CSR_VSTVEC"
+    ],
+    "summary": "Any CSR write to stvec without corresponding guarantee that the target page has S-mode execute permission via PMP/Smepmp creates a trap-loop DoS: the next interrupt/exception vector fetch faults on instruction access, which itself faults, crashing the kernel."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/head.S",
+        "function_name": "_start_kernel",
+        "line_start": 234,
+        "line_end": 242,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Sets PMPCFG0 with X=1 (RWX=111 NAPOT) before any code executes. The PMP rule explicitly grants S-mode execute permission on all of memory. Even though L=0 (unlocked), the X bit is set, so stvec can point anywhere safely. No violation: the PMP setup does NOT create a region where stvec would lack X permission.",
+      "snippet": "la a0, .Lpmp_done\ncsrw CSR_TVEC, a0\nli a0, -1\ncsrw CSR_PMPADDR0, a0\nli a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)\ncsrw CSR_PMPCFG0, a0",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/kexec_relocate.S",
+        "function_name": "riscv_kexec_relocate",
+        "line_start": 45,
+        "line_end": 47,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Writes CSR_STVEC to the physical address of the relocation loop (label 1f minus VA_PA offset). This address is within the kexec relocation code page, which is kernel text already mapped with execute permission. The stvec is set before SATP is cleared, ensuring the trap vector is valid during the MMU-off transition. No PMP violation because the target is in kernel-owned memory where PMP already grants X.",
+      "snippet": "la s6, 1f\nsub s6, s6, s4\ncsrw CSR_STVEC, s6",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/kexec_relocate.S",
+        "function_name": "riscv_kexec_norelocate",
+        "line_start": 201,
+        "line_end": 208,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Sets CSR_STVEC to the new kernel entry point (a2) before clearing SATP. The comment correctly notes 'This will also trigger a jump to CSR_STVEC'. The target a2 is the physical entry point of the new kernel, which is in memory that PMP must grant X permission for the new kernel to boot. The write itself is standard kexec protocol. No PMP permission check is performed, but the new kernel entry point must have X permission by construction for kexec to function.",
+      "snippet": "/* This will also trigger a jump to CSR_STVEC\n * which in this case is the address of the new kernel. */\ncsrw CSR_STVEC, a2\ncsrw CSR_SATP, zero",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/suspend.c",
+        "function_name": "suspend_restore_csrs",
+        "line_start": 49,
+        "line_end": 49,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Restores CSR_TVEC from a saved suspend_context. The value was saved at suspend_save_csrs:19 via csr_read(CSR_TVEC) on the same hart before suspend. This is a strict save/restore cycle — the restored value was the working trap vector before suspend, so PMP permissions are unchanged. No violation.",
+      "snippet": "csr_write(CSR_TVEC, context->tvec);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "SAVE_HOST_AND_RESTORE_GUEST_CSRS",
+        "line_start": 50,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM guest entry: saves host stvec via csrrw and sets stvec to .Lkvm_switch_return (host kernel trap return path). The old host stvec is stored in KVM_ARCH_HOST_STVEC. The new stvec points to kernel text which always has X permission. At guest exit (line 152: SAVE_GUEST_AND_RESTORE_HOST_CSRS), the original host stvec is restored from KVM_ARCH_HOST_STVEC. This is textbook save/restore — no violation.",
+      "snippet": "/* Save Host STVEC and change it to return path */\ncsrrw t1, CSR_STVEC, t1\n...\nREG_S t1, (KVM_ARCH_HOST_STVEC)(a0)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_exit.c",
+        "function_name": "kvm_riscv_vcpu_unpriv_read",
+        "line_start": 75,
+        "line_end": 125,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Temporarily swaps CSR_STVEC to __kvm_riscv_unpriv_trap (line 75) for the duration of an HLV.X unprivileged load, then restores old_stvec (line 125). The temporary stvec points to kernel text (always X-permitted). The paired csr_swap/csr_write ensures correct restore. No violation.",
+      "snippet": "old_stvec = csr_swap(CSR_STVEC, (ulong)&__kvm_riscv_unpriv_trap);\n...\ncsr_write(CSR_STVEC, old_stvec);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 607,
+        "line_end": 607,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Writes CSR_VSTVEC from csr->vstvec, which is guest-owned CSR state saved at vcpu_put:675 via csr_read(CSR_VSTVEC). The host does NOT validate the guest's vstvec value before writing it to the hardware CSR. If a malicious guest sets vstvec.MODE=11 (CLIC/Smivt interrupt vector table mode), the hardware will switch to CLIC interrupt vectoring in VS-mode. While this does not directly violate the stvec/PMP spec (vstvec controls VS-mode, not host S-mode), the host has no CLIC-aware scause parsing at the trap exit path (line 856 reads CSR_SCAUSE without CLIC decoding), creating a guest-to-host confusion risk. However, this is primarily a KVM guest isolation issue, not a direct PMP-execute violation on the host stvec.",
+      "snippet": "csr_write(CSR_VSTVEC, csr->vstvec);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1269,
+          "line_end": 1273,
+          "excerpt": "Interrupt vector table mode is encoded as a new state in the existing xtvec WARL register, where xtvec.MODE (the two least-significant bits) is 11."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 588,
+        "line_end": 588,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "In the NACL (nested acceleration) path, writes CSR_VSTVEC via nacl_csr_write(nsh, CSR_VSTVEC, csr->vstvec). Same guest-state propagation as the non-NACL path at line 607. No host-side validation of the guest vstvec value. Under nested virtualization, the L1 guest's vstvec propagates to the L0 host's hardware CSR_VSTVEC, meaning a nested-guest-controlled MODE=11 could activate CLIC vectoring in the VS-level hardware. The same guest isolation concern applies.",
+      "snippet": "nacl_csr_write(nsh, CSR_VSTVEC, csr->vstvec);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1269,
+          "line_end": 1273,
+          "excerpt": "Interrupt vector table mode is encoded as a new state in the existing xtvec WARL register, where xtvec.MODE (the two least-significant bits) is 11."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "",
+        "line_start": 321,
+        "line_end": 321,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR_STVEC (0x105) is defined but the CLIC/Smivt CSR constants CSR_SIVT (0x107) and CSR_SEIVT (0x108) are NOT defined anywhere in the kernel. Per the CLIC spec (aclic.adoc:1198-1202), these are the S-mode interrupt vector table base registers required for CLIC IVT mode (stvec.MODE=11). Without these definitions, the kernel structurally cannot validate or configure CLIC shared vector tables. If M-mode firmware shares a CLIC vector table via xivt/xeivt without S-mode X permission on the table memory, the kernel has no mechanism to detect or remediate this. The kernel is blind to CLIC vector table permission state.",
+      "snippet": "#define CSR_STVEC 0x105",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1198,
+          "line_end": 1203,
+          "excerpt": "(NEW) 0x107 sivt: S-mode Interrupt-handler vector table base address\n(NEW) 0x108 seivt: S-mode External Interrupt-handler vector table base address"
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1323,
+          "line_end": 1335,
+          "excerpt": "If xivt or xeivt is configured such that multiple privilege levels share a single vector table, the memory protection units (e.g., PMP, Smepmp) must grant execution permission to the shared vector table for all applicable lower privilege levels."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

@@ -1,0 +1,98 @@
+PR #735  target=freebsd-src  overall=compliant
+Spec: Smip hardware pop re-accesses interrupted context's stack using previous-privilege-mode translation that may be stale after FreeBSD pmap operations between push and pop on the same hart
+Violation: FreeBSD kernel modifies the page tables or TLB state for the interrupted context's stack page between a Smip hardware interrupt push (cspspush stores using previous privilege mode translation) and the corresponding hardware pop (sipopret/mipopret loads using SPP/MPP-era translation with implicit SUM/MPRV), causing the pop to dereference through stale virtual-to-physical mappings
+Consequence: data_corruption
+Pattern: pmap_remove|pmap_activate|pmap_qremove|sfence.vma|cpu_switch|cpu_throw|sstatus.*SUM|mstatus.*MPRV co-located in trap-return or interrupt-service window with implicit sipopret/mipopret semantics
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/exception.S:219-225  cpu_exception_handler_supervisor
+  Standard sret used for trap return, not sipopret. The sret instruction does NOT trigger hardware auto-pop semantics (register restore from stack) that sipopret does per the Smip/Ssip spec (aclic.adoc:1499-1500). Without Smip hardware push/pop enabled, the vulnerability condition (page-table modification between hardware push and hardware pop) cannot manifest.
+  | ENTRY(cpu_exception_handler_supervisor)
+  | 	save_registers 1
+  | 	mv	a0, sp
+  | 	call	_C_LABEL(do_trap_supervisor)
+  | 	load_registers 1
+  | 	sret
+
+[compliant] sys/riscv/riscv/exception.S:227-235  cpu_exception_handler_user
+  User trap return via sret, not sipopret. The explicit save_registers/load_registers macros perform full software context save/restore. No Smip hardware auto-push/pop is involved because MIPU/SIPU bits are never set by FreeBSD kernel.
+  | ENTRY(cpu_exception_handler_user)
+  | 	save_registers 0
+  | 	mv	a0, sp
+  | 	call	_C_LABEL(do_trap_user)
+  | 	do_ast
+  | 	load_registers 0
+  | 	csrrw	sp, sscratch, sp
+  | 	sret
+
+[compliant] sys/riscv/riscv/exception.S:41-114  save_registers (macro)
+  save_registers performs explicit software save of all GPRs to stack frame, reading sstatus/sscratch/sepc/stval/scause via csrr instructions. This is standard RISC-V trap entry, not Smip hardware auto-push. The macro correctly captures the full trap state including sstatus.SPP/SPIE bits that reflect the actual privilege at trap time. No cspspush instruction is used.
+  | csrr	t0, sscratch
+  | 	sd	t0, (TF_SP)(sp)
+  | 	csrr	t0, sepc
+  | 	sd	t0, (TF_SEPC)(sp)
+  | 	csrr	t0, sstatus
+  | 	sd	t0, (TF_SSTATUS)(sp)
+
+[compliant] sys/riscv/riscv/exception.S:116-182  load_registers (macro)
+  load_registers performs explicit software restore from stack frame. Uses csrw to restore sstatus, sepc, sscratch, then relies on sret for the architectural privilege transition. No sipopret instruction is executed. sret does not have implicit sipopret semantics per the RISC-V fast-interrupt spec which explicitly separates xipopret from xret (aclic.adoc:1499-1500).
+  | ld	t0, (TF_SSTATUS)(sp)
+  | 	csrw	sstatus, t0
+  | 	ld	t0, (TF_SEPC)(sp)
+  | 	csrw	sepc, t0
+  | 	ld	t0, (TF_SP)(sp)
+  | 	csrw	sscratch, t0
+
+[compliant] sys/riscv/riscv/swtch.S:365-432  fork_trampoline
+  Initial user-mode entry via sret (line 431). The fork_trampoline performs explicit software register restore from the trapframe, writes sscratch with the kernel stack pointer for future trap handling, and uses sret to drop to U-mode. This is a standard exception return path, not an interrupt context; sret performs the normal SPP→privilege, SPIE→SIE transition with no Smip hardware pop involved.
+  | ld	t0, (TF_SSTATUS)(sp)
+  | 	li	t1, ~SSTATUS_SIE
+  | 	and	t0, t0, t1
+  | 	csrw	sstatus, t0
+  | 	...
+  | 	csrw	sscratch, sp
+  | 	ld	sp, (TF_SP - TF_SIZE)(sp)
+  | 	sret
+
+[compliant] sys/riscv/riscv/trap.c:307-377  do_trap_supervisor
+  KASSERT validates sstatus.SPP==S-mode and SIE==0 and SUM==0 after trap entry. This correctly checks the architectural sstatus bits set by the hardware trap mechanism, which accurately reflect the privilege mode at the time of the trap. Since Smip is not enabled, there is no divergence between sstatus bits and actual effective privilege level. The assertions accurately enforce the expected trap contract.
+  | KASSERT((csr_read(sstatus) & (SSTATUS_SPP | SSTATUS_SIE)) ==
+  |     SSTATUS_SPP, ("Came from S mode with interrupts enabled"));
+  | KASSERT((csr_read(sstatus) & (SSTATUS_SUM)) == 0,
+  |     ("Came from S mode with SUM enabled"));
+
+[compliant] sys/riscv/riscv/trap.c:380-460  do_trap_user
+  KASSERT validates sstatus.SPP==U-mode and SIE==0 and SUM==0 after trap entry. Same rationale as do_trap_supervisor: without Smip enabled, sstatus bits are the authoritative source of trap-entry privilege state and no divergence from cspspush-controlled effective privilege can occur.
+  | KASSERT((csr_read(sstatus) & (SSTATUS_SPP | SSTATUS_SIE)) == 0,
+  |     ("Came from U mode with interrupts enabled"));
+  | KASSERT((csr_read(sstatus) & (SSTATUS_SUM)) == 0,
+  |     ("Came from U mode with SUM enabled"));
+
+[compliant] sys/riscv/vmm/vmm_switch.S:41-121  vmm_switch
+  bhyve host→guest world-switch uses sret (line 120) to enter guest mode. sstatus/sscratch/stvec are atomically swapped via csrrw with host/guest values. The sret executes with guest sstatus loaded, performing normal architectural privilege transition into guest VS-mode. No sipopret/mipopret instructions are used. The Smip implicit pop semantics do not apply to this sret-based guest entry path.
+  | csrrw	t0, sstatus, t0
+  | 	csrrw	t1, hstatus, t1
+  | 	csrrw	t2, scounteren, t2
+  | 	csrrw	t3, sscratch, a0
+  | 	csrrw	t4, stvec, t4
+  | 	csrw	sepc, t5
+  | 	...
+  | 	sret
+
+[compliant] sys/riscv/vmm/vmm_switch.S:122-170  .Lswitch_return
+  Guest→host return path: saves guest state to hypctx, restores host sstatus/sscratch/stvec/hstatus/scounteren via csrrw. Guest sepc is captured before host CSR restoration (line 164: csrr t0, sepc). This is a standard hardware trap→host context-restore, not a Smip pop sequence. Host return is via ret (line 202), not sret or sipopret, because the host context continues executing from the saved ra.
+  | csrr	t0, sepc
+  | 	csrw	stvec, t1
+  | 	csrrw	t2, sscratch, t2
+  | 	csrrw	t3, scounteren, t3
+  | 	csrrw	t4, hstatus, t4
+  | 	csrrw	t5, sstatus, t5
+
+[compliant] sys/riscv/vmm/vmm_switch.S:206-220  vmm_unpriv_trap
+  Guest unprivileged load/store emulation trap handler: saves sepc/scause/stval/htval/htinst, advances sepc past the hlvx.hu instruction, and returns to guest via sret (line 219). This is a standard synchronous trap return to guest mode. No Smip hardware push/pop is involved. The sret restores guest privilege mode normally via SPP→privilege transition.
+  | csrr	a1, sepc
+  | 	sd	a1, HYP_TRAP_SEPC(a0)
+  | 	addi	a1, a1, 4
+  | 	csrw	sepc, a1
+  | 	...
+  | 	sret
+

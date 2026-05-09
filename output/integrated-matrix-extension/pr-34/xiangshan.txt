@@ -1,0 +1,45 @@
+PR #34  target=xiangshan  overall=compliant
+Spec: Spec removes illegal-instruction trap on vfmmacc.vv with mixed E4M3×E5M2 or FP16×BF16 inputs; XiangShan decoder must drop the 'mixed-format requires widening' guard and add subextension-requirement rows for non-widening mixed FP16/BF16 vfmmacc.vv — failure to do so causes spurious illegal-instruction denial-of-service on valid mixed-format matrix code
+Violation: In XiangShan RTL, the instruction decoder (IDU) for the matrix unit raises an illegal-instruction exception when vfmmacc.vv is issued with altfmt_A ≠ altfmt_B (mixed E4M3×E5M2 at SEW=8, or mixed FP16×BF16 at SEW=16), due to a decoder check that enforces the old spec restriction permitting mixed-format only on widening instructions (vfwmmacc.vv/vfqwmmacc.vv). Alternatively, the subextension-validity check (CSR-based feature-enable logic) omits the two new vfmmacc.vv rows for mixed FP16/BF16 and fails to require both Zvvfp16mm AND Zvvbf16mm, causing either spurious illegal-instruction traps when both extensions ARE present, or privilege escapes when one extension is missing but the instruction is nevertheless permitted.
+Consequence: denial_of_service
+Pattern: Chisel when/switch on altfmt_A=/=altfmt_B that gates isWidening before permitting mixed-format vfmmacc; CSR misa/isecfg subextension check table missing Zvvfp16mm+Zvvbf16mm rows for non-widening vfmmacc.vv; decode stage exception-gen for mixed-format vfmmacc without checking altfmt_A =/= altfmt_B ONLY for widening ops
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/fu/Vsetu.scala:100-100  vtypeIllegal computation
+  The vtypeIllegal check does `vtype.reserved.orR`, treating all bits above 7 as reserved. When integrated-matrix support is added and altfmt_A (vtype[9]) and altfmt_B (vtype[10]) are carved from the reserved field, setting either altfmt bit to 1 will trigger vill=1, making matrix mode entirely unusable. This is the exact same class of bug documented in altfmt_vtype_reserved_findings.json. The reserved.orR blanket check must exclude altfmt bits.
+  | private val vtypeIllegal = vtype.reserved.orR
+
+[compliant] src/main/scala/xiangshan/backend/decode/VecDecoder.scala:593-691  opfvv decode table
+  The opfvv decode table contains only standard V-extension floating-point instructions (vfmacc, vfwmacc, etc.) dispatched via FuType.vfma. No vfmmacc/vfwmmacc/vfqwmmacc matrix decode entries exist. Since the integrated-matrix extension is not implemented in XiangShan, no matrix instructions can be decoded, so no illegal-instruction traps can be spuriously raised for mixed-format vfmmacc.vv — the instruction simply decodes as illegal (unrecognized opcode), which is correct absent the extension.
+  | VFMACC_VV -> OPFVV(SrcType.vp, SrcType.vp, FuType.vfma, VfmaType.vfmacc, ...),
+  |     VFWMACC_VV -> OPFVV(SrcType.vp, SrcType.vp, FuType.vfma, VfmaType.vfmacc_w, ...),
+  |     // no VFMMACC_VV, VFWMMACC_VV, or VFQWMMACC_VV entries
+
+[compliant] src/main/scala/xiangshan/backend/decode/VecExceptionGen.scala:42-52  class VecExceptionGen
+  VecExceptionGen validates standard V-extension conditions (vill, EEW, EMUL, register alignment, overlap, vstart) but has no matrix-specific format checks. No altfmt_A/altfmt_B legality validation, no isWidening-gated mixed-format restriction, and no Zvvfp16mm/Zvvbf16mm subextension checking exist. Since matrix instructions are not decodable (NOT_YET_IMPLEMENTED), no false-positive or false-negative traps can occur for mixed-format matrix operations. When matrix support is added, the subextension check table from PR #34 line 56-59 must be implemented without any isWidening gate on mixed-format vfmmacc.vv.
+  | io.illegalInst := instIllegal || villIllegal || eewIllegal || emulIllegal || regNumIllegal || regOverlapIllegal || vstartIllegal
+
+[compliant] src/main/scala/xiangshan/backend/fu/CSR.scala:120-127  class VtypeStruct
+  VtypeStruct has a single `reserved` field spanning bits [62:8] with no allocation for altfmt_A (bit 9), altfmt_B (bit 10), or lambda[2:0] (bits XLEN-2:XLEN-4). Without these fields, the matrix engine cannot distinguish FP16 from BF16 inputs or same-format from mixed-format operations. However, since the integrated-matrix extension is not implemented, this is compliant — the reserved field correctly rejects all altfmt values by treating them as reserved bits (vill=1 via Vsetu.scala:100).
+  | class VtypeStruct(implicit p: Parameters) extends XSBundle {
+  |   val vill = UInt(1.W)
+  |   val reserved = UInt((XLEN - 9).W)
+  |   val vma = UInt(1.W)
+  |   val vta = UInt(1.W)
+  |   val vsew = UInt(3.W)
+  |   val vlmul = UInt(3.W)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/vector/Bundles.scala:18-39  class VType / class VsetVType
+  Both VType (line 18) and VsetVType (line 32) bundles lack altfmt_A/altfmt_B fields. Every pipeline consumer (decode, rename, dispatch, issue, execute) would need format awareness for matrix operations. Currently compliant because matrix extension is NOT_YET_IMPLEMENTED — no pipeline stage reads altfmt because no altfmt bits exist to propagate.
+  | class VType(implicit p: Parameters) extends Bundle {
+  |   val illegal = Bool()
+  |   val vma     = Bool()
+  |   val vta     = Bool()
+  |   val vsew    = VSew()
+  |   val vlmul   = VLmul()
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:606-650  class MisaBundle / misa extension bits
+  MisaBundle defines only standard RISC-V extension bits (A, B, C, D, E, F, G, H, I, M, N, P, Q, S, U, V, X). No Zvvfp16mm, Zvvbf16mm, or Zvt extension bits exist. No subextension-level checking is performed for matrix format combinations. Compliant because the integrated-matrix extension is NOT_YET_IMPLEMENTED — there is no misa bit to advertise as present or absent, so no subextension bypass can occur.
+  | // No Zvvfp16mm, Zvvbf16mm, or Zvt extension bits in misa
+

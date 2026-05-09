@@ -1,0 +1,46 @@
+PR #609  target=qemu  overall=compliant
+Spec: ACLIC sourcecfgK register format changes based on D bit — QEMU must zero/remap fields on D-bit transitions or else guest-stashed values in IPRIO/SM positions (D=0) become readable as Child-Index bits (D=1), leaking prior configuration state across delegation boundaries
+Violation: QEMU emulates sourcecfgK as a single flat register without zeroing/remapping fields when the D (delegation) bit transitions between 0 and 1 in M-domain. When D=0, bits 23:16 hold IPRIO and bits 2:0 hold SM; when D=1, bits 9:0 hold Child Index. A guest writes a value in one format, toggles D, then reads back the other format, observing stale bits from the previous format at aliased bit positions.
+Consequence: info_leak
+Pattern: sourcecfg.*write.*d_bit|sourcecfg.*delegation.*format|aclic.*sourcecfg.*transition
+------------------------------------------------------------
+[compliant] hw/intc/riscv_aplic.c:741-761  riscv_aplic_write
+  QEMU's sourcecfg write uses a full register overwrite (aplic->sourcecfg[irq] = value) after masking the written value based on the new D bit. When D=1, value is masked to (D | CHILDIDX_MASK), zeroing bits 31:11 and 9:3. When D=0, value is masked to (D | SM_MASK), zeroing bits 31:11 and 9:3. Since the entire 32-bit register is replaced each write, no stale bits from a prior format survive across a D-bit toggle. The read path returns the raw stored value, which is safe because only valid-field bits are ever stored.
+  | if (value & APLIC_SOURCECFG_D) {
+  |             value &= (APLIC_SOURCECFG_D | APLIC_SOURCECFG_CHILDIDX_MASK);
+  |         } else {
+  |             value &= (APLIC_SOURCECFG_D | APLIC_SOURCECFG_SM_MASK);
+  |         }
+  |         aplic->sourcecfg[irq] = value;
+
+[compliant] hw/intc/riscv_aplic.c:744-746  riscv_aplic_write
+  When num_children==0, writes with D=1 are forced to 0 (WARL constraint), preventing invalid delegation to a non-existent child domain. This prevents an attacker from setting D=1 on a domain with no children and then observing stale CHILDIDX bits.
+  | if (!aplic->num_children && (value & APLIC_SOURCECFG_D)) {
+  |             value = 0;
+  |         }
+
+[compliant] hw/intc/riscv_aplic.c:752-761  riscv_aplic_write
+  Post-write side-effects are correct: when D=1 or SM=INACTIVE (sourcecfg==0), pending and enabled bits are atomically cleared. When transitioning to active, the rectified input is re-evaluated and pending is set if appropriate. No side-effect gaps.
+  | aplic->sourcecfg[irq] = value;
+  |         if ((aplic->sourcecfg[irq] & APLIC_SOURCECFG_D) ||
+  |             (aplic->sourcecfg[irq] == 0)) {
+  |             riscv_aplic_set_pending_raw(aplic, irq, false);
+  |             riscv_aplic_set_enabled_raw(aplic, irq, false);
+
+[compliant] hw/intc/riscv_aplic.c:925-925  riscv_aplic_realize
+  sourcecfg array is g_new0-allocated, resetting all entries to 0 (D=0, SM=INACTIVE) as mandated by the spec for inactive sources.
+  | aplic->sourcecfg = g_new0(uint32_t, aplic->num_irqs);
+
+[compliant] hw/intc/riscv_aplic.c:992-994  vmstate_riscv_aplic
+  sourcecfg array is included in the VMState migration descriptors, ensuring correct live migration of per-source configuration state.
+  | VMSTATE_VARRAY_UINT32(sourcecfg, RISCVAPLICState,
+  |                                   num_irqs, 0,
+  |                                   vmstate_info_uint32, uint32_t),
+
+[potential_risk] hw/intc/riscv_aplic.c:726-883  riscv_aplic_write
+  QEMU currently has no ACLIC indirect-CSR interface (Smidctrl/Ssidctrl via xiselect-based ireg2/ireg3 for sourcecfg). If such support is added (in target/riscv/csr.c), the indirect CSR path must implement its own D-bit-aware masking and full-register-replacement semantics, separate from this memory-mapped handler. Currently this is a non-issue since ACLIC CSR emulation does not exist in QEMU.
+  | /* Memory-mapped sourcecfg write — works correctly for APLIC MMIO path.
+  |  * No corresponding indirect-CSR sourcecfg path exists yet in QEMU
+  |  * for ACLIC Smidctrl/Ssidctrl (xiselect range 0x1000). */
+  |     } else if ((APLIC_SOURCECFG_BASE <= addr) &&
+

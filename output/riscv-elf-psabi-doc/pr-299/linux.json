@@ -1,0 +1,252 @@
+{
+  "pr_number": 299,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 299,
+    "violation_condition": "Linux kernel loads an LP64E ELF binary (ELFCLASS64 + EF_RISCV_RVE) but elf_check_arch() in arch/riscv/include/asm/elf.h does not inspect EF_RISCV_RVE, so the kernel applies full LP64 register semantics: all 31 GPRs are saved/restored in signal frames (restore_sigcontext/setup_sigframe in signal.c), exposed via ptrace (user_regs_struct in ptrace.h), included in core dumps (ELF_CORE_COPY_REGS), and context-switched (save_from_x6_to_x31/restore_from_x6_to_x31 + __switch_to s2-s11 save/restore). The LP64E ABI declares x16-x31 do not participate in the calling convention (all are temporaries), so the kernel exposes register state that userspace components compiled for LP64E do not expect to be preserved nor meaningful.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "elf_check_arch.*EM_RISCV && !(flags & EF_RISCV_RVE)",
+    "affected_entities": [
+      "EF_RISCV_RVE",
+      "elf_check_arch",
+      "user_regs_struct",
+      "LP64E",
+      "save_from_x6_to_x31",
+      "restore_from_x6_to_x31",
+      "restore_sigcontext",
+      "setup_sigframe"
+    ],
+    "summary": "Kernel has zero EF_RISCV_RVE awareness; loads LP64E binaries with full 31-GPR semantics, exposing register state in ptrace/signals/coredumps that the LP64E ABI declares non-participating temporaries (x16-x31)"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/elf.h",
+        "function_name": "elf_check_arch",
+        "line_start": 37,
+        "line_end": 38,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "elf_check_arch() is the sole gatekeeper for native ELF binary loading. It checks e_machine==EM_RISCV and EI_CLASS==ELF_CLASS but does NOT inspect e_flags for EF_RISCV_RVE. An LP64E ELF binary (ELFCLASS64 + EF_RISCV_RVE) passes this check and is loaded with full 31-GPR register semantics, even though the RV64E spec declares only x0-x15 exist and x16-x31 are reserved. EF_RISCV_RVE is not even defined in this kernel tree (git grep returns zero results in include/). This is the root cause: the kernel has zero awareness of RV64E.",
+      "snippet": "#define elf_check_arch(x) (((x)->e_machine == EM_RISCV) && \\\n                   ((x)->e_ident[EI_CLASS] == ELF_CLASS))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32e.adoc",
+          "line_start": 23,
+          "line_end": 43,
+          "excerpt": "RV32E and RV64E reduce the integer register count to 16 general-purpose registers, (x0-x15), where x0 is a dedicated zero register. [...] RV32E and RV64E use the same instruction-set encoding as RV32I and RV64I respectively, except that only registers x0-x15 are provided. All encodings specifying the other registers x16-x31 are reserved."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/elf.h",
+        "function_name": "ELF_CORE_COPY_REGS",
+        "line_start": 129,
+        "line_end": 133,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ELF_CORE_COPY_REGS copies the full struct user_regs_struct (all 31 GPRs: pc, ra, sp, gp, tp, t0-t2, s0-s1, a0-a7, s2-s11, t3-t6) into core dumps. For an LP64E process this leaks register values x16-x31 which by the RV64E spec do not exist and whose encodings are reserved. These values could contain stale data from prior kernel or userspace execution contexts.",
+      "snippet": "#define ELF_CORE_COPY_REGS(dest, regs)          \\\ndo {                                             \\\n        *(struct user_regs_struct *)&(dest) =     \\\n                *(struct user_regs_struct *)regs; \\\n} while (0);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32e.adoc",
+          "line_start": 40,
+          "line_end": 43,
+          "excerpt": "RV32E and RV64E use the same instruction-set encoding as RV32I and RV64I respectively, except that only registers x0-x15 are provided. All encodings specifying the other registers x16-x31 are reserved."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "compat_elf_check_arch",
+        "line_start": 119,
+        "line_end": 124,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The compat (32-bit) ELF check also does NOT inspect EF_RISCV_RVE. It only checks compat_mode_supported, EM_RISCV, and ELFCLASS32. A hypothetical RV32E binary (ELFCLASS32+EF_RISCV_RVE) would be loaded into compat mode with full 31-GPR semantics. However, RV32E may be less likely to target Linux than RV64E, so this is rated potential_risk rather than bug_confirmed.",
+      "snippet": "bool compat_elf_check_arch(Elf32_Ehdr *hdr)\n{\n        return compat_mode_supported &&\n               hdr->e_machine == EM_RISCV &&\n               hdr->e_ident[EI_CLASS] == ELFCLASS32;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "restore_sigcontext",
+        "line_start": 219,
+        "line_end": 227,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "restore_sigcontext() copies sizeof(sc->sc_regs) (the full user_regs_struct, all 31 GPRs plus pc) from the user signal frame back into pt_regs. For an LP64E process, the user signal frame was laid out by a userspace compiled with LP64E ABI that only expects x0-x15 to be meaningful, yet the kernel reads and restores all 31 slots. This exposes x16-x31 register slots to manipulation via crafted signal frames (a potential attack surface), and on the save side leaks stale kernel/process state into user memory.",
+      "snippet": "static long restore_sigcontext(struct pt_regs *regs,\n        struct sigcontext __user *sc)\n{\n        void __user *sc_ext_ptr = &sc->sc_extdesc.hdr;\n        __u32 rsvd;\n        long err;\n        /* sc_regs is structured the same as the start of pt_regs */\n        err = __copy_from_user(regs, &sc->sc_regs, sizeof(sc->sc_regs));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32e.adoc",
+          "line_start": 23,
+          "line_end": 27,
+          "excerpt": "RV32E and RV64E reduce the integer register count to 16 general-purpose registers, (x0-x15), where x0 is a dedicated zero register."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "setup_sigcontext",
+        "line_start": 353,
+        "line_end": 388,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "setup_sigcontext() copies all 31 GPRs from pt_regs into the user signal frame via __copy_to_user(&sc->sc_regs, regs, sizeof(sc->sc_regs)) at line 362. For an LP64E process, this writes register values x16-x31 into user memory. These register values may contain stale kernel data or data leaked from other processes that previously executed on the same CPU, constituting an information leak across security boundaries.",
+      "snippet": "static long setup_sigcontext(struct rt_sigframe __user *frame,\n        struct pt_regs *regs)\n{\n        [...snip...]\n        /* sc_regs is structured the same as the start of pt_regs */\n        err = __copy_to_user(&sc->sc_regs, regs, sizeof(sc->sc_regs));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32e.adoc",
+          "line_start": 23,
+          "line_end": 27,
+          "excerpt": "RV32E and RV64E reduce the integer register count to 16 general-purpose registers, (x0-x15)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "init_rt_signal_env",
+        "line_start": 568,
+        "line_end": 582,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "signal_minsigstksz is computed from get_rt_frame_size(true) which assumes the full pt_regs frame size. For an LP64E process, the minimum signal stack size would be unnecessarily inflated (due to slots for x16-x31 that don't exist in the LP64E ABI), but this is only a minor consumption of user stack space and not a security bug per se. The real issue is that the signal frame structure itself (struct sigcontext containing struct user_regs_struct) presumes all 31 GPRs.",
+      "snippet": "signal_minsigstksz = get_rt_frame_size(true);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/uapi/asm/ptrace.h",
+        "function_name": "user_regs_struct",
+        "line_start": 24,
+        "line_end": 57,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct user_regs_struct is the UAPI ptrace register view. It defines all 31 GPRs (pc, ra, sp, gp, tp, t0-t2, s0-s1, a0-a7, s2-s11, t3-t6). This structure is exposed via PTRACE_GETREGS/PTRACE_SETREGS and forms the layout of sigcontext.sc_regs and core dump register state. For an LP64E process traced via ptrace, registers x16-x31 (a6-a7, s2-s11, t3-t6) are exposed to the tracer even though the RV64E spec reserves these encodings. This is an info_leak: x16-x31 contain kernel-internal or stale cross-process data.",
+      "snippet": "struct user_regs_struct {\n        unsigned long pc;\n        unsigned long ra;\n        [...all 31 GPRs...]\n        unsigned long s11;\n        unsigned long t3;  /* x28-x31 = reserved in RV64E */\n        unsigned long t4;\n        unsigned long t5;\n        unsigned long t6;\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32e.adoc",
+          "line_start": 40,
+          "line_end": 43,
+          "excerpt": "RV32E and RV64E use the same instruction-set encoding as RV32I and RV64I respectively, except that only registers x0-x15 are provided. All encodings specifying the other registers x16-x31 are reserved."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 421,
+        "line_end": 470,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "__switch_to (the context-switch path) saves and restores callee-saved registers s0-s11 (x8-x9, x18-x27) into thread_struct. Of these, s2-s11 (x18-x27) are reserved/do-not-exist in the RV64E LP64E ABI. When context-switching between processes, the kernel unconditionally saves and restores these registers for ALL processes, including LP64E ones. Any kernel-internal data that happened to be in those registers (stale values from prior system calls, interrupt handlers, or other processes) is preserved and restored, creating a cross-process info_leak channel. Additionally, s2-s11 are saved on every exception entry via save_from_x6_to_x31 (asm.h:141-150).",
+      "snippet": "SYM_FUNC_START(__switch_to)\n        REG_S ra,  TASK_THREAD_RA_RA(a3)\n        REG_S sp,  TASK_THREAD_SP_RA(a3)\n        REG_S s0,  TASK_THREAD_S0_RA(a3)\n        REG_S s1,  TASK_THREAD_S1_RA(a3)\n        REG_S s2,  TASK_THREAD_S2_RA(a3)\n        [...s3-s11...]\n        REG_L s2,  TASK_THREAD_S2_RA(a4)\n        [...s3-s11...]",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32e.adoc",
+          "line_start": 25,
+          "line_end": 27,
+          "excerpt": "RV32E and RV64E reduce the integer register count to 16 general-purpose registers, (x0-x15)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/asm.h",
+        "function_name": "save_from_x6_to_x31 / restore_from_x6_to_x31",
+        "line_start": 128,
+        "line_end": 185,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The save_from_x6_to_x31 and restore_from_x6_to_x31 macros are used on every exception entry/return (handle_exception, ret_from_exception, handle_kernel_stack_overflow). They unconditionally save and restore all GPRs x6 through x31 into pt_regs on the stack. For an LP64E process, this saves registers x16-x31 which the spec declares reserved/do-not-exist. On exception return (restore), stale kernel data that happened to populate those pt_regs slots (e.g. from a prior kernel thread or interrupt context) is loaded into the CPU's x16-x31 registers, then accessible to userspace when the LP64E process resumes and reads those registers via inline asm or crafted instruction encodings.",
+      "snippet": ".macro save_from_x6_to_x31\n        REG_S x16, PT_A6(sp)     /* x16 reserved in RV64E */\n        REG_S x17, PT_A7(sp)     /* x17 reserved in RV64E */\n        REG_S x18, PT_S2(sp)     /* x18 reserved in RV64E */\n        [...x19-x27...]\n        REG_S x28, PT_T3(sp)\n        REG_S x29, PT_T4(sp)\n        REG_S x30, PT_T5(sp)\n        REG_S x31, PT_T6(sp)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32e.adoc",
+          "line_start": 40,
+          "line_end": 43,
+          "excerpt": "RV32E and RV64E use the same instruction-set encoding as RV32I and RV64I respectively, except that only registers x0-x15 are provided. All encodings specifying the other registers x16-x31 are reserved."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/ptrace.h",
+        "function_name": "pt_regs",
+        "line_start": 15,
+        "line_end": 56,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "struct pt_regs is the kernel's in-memory representation of saved register state. It includes all 31 GPRs. While this is required for kernel operation even with LP64E userspace (the kernel itself still needs the full register file), the fact that pt_regs is directly exposed to userspace via sigcontext.restore_sigcontext/setup_sigcontext (the comment at ptrace.h:24 says 'struct user_regs_struct must form a prefix of struct pt_regs') means the kernel's internal register state layout IS the ABI. This architectural coupling means the full 31-GPR layout cannot change without breaking userspace ABI, even if LP64E were properly supported.",
+      "snippet": "struct pt_regs {\n        unsigned long epc;\n        unsigned long ra;\n        [...all 31 GPRs through t6...]\n        unsigned long status;\n        unsigned long badaddr;\n        unsigned long cause;\n        unsigned long orig_a0;\n};",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "arch_dup_task_struct",
+        "line_start": 214,
+        "line_end": 224,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "arch_dup_task_struct() does *dst = *src (a full task_struct copy), which includes thread_struct.s[12] (s0-s11 callee-saved registers), thread_struct.ra, and thread_struct.sp. For an LP64E process being forked, registers s2-s11 (x18-x27) from the parent are copied to the child even though those registers do not exist in the LP64E ISA. This is a cross-process info_leak at clone()-time: any stale kernel data in those register slots is inherited.",
+      "snippet": "int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)\n{\n        fstate_save(src, task_pt_regs(src));\n        *dst = *src;\n        [...]\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32e.adoc",
+          "line_start": 40,
+          "line_end": 43,
+          "excerpt": "only registers x0-x15 are provided. All encodings specifying the other registers x16-x31 are reserved."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/uapi/asm/sigcontext.h",
+        "function_name": "sigcontext",
+        "line_start": 31,
+        "line_end": 37,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct sigcontext embeds struct user_regs_struct as sc_regs. This is the UAPI structure that defines the layout written into user signal frames and read back during sigreturn. The structure unconditionally includes all 31 GPRs. An LP64E process delivering a signal would have a signal frame with slots for x16-x31, and those slots contain whatever stale data was in pt_regs at delivery time. The LP64E userspace signal handler sees extra state that should not exist according to the RV64E spec.",
+      "snippet": "struct sigcontext {\n        struct user_regs_struct sc_regs;  /* 31 GPRs exposed to LP64E userspace */\n        union {\n                union __riscv_fp_state sc_fpregs;\n                struct __riscv_extra_ext_header sc_extdesc;\n        };\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32e.adoc",
+          "line_start": 25,
+          "line_end": 27,
+          "excerpt": "RV32E and RV64E reduce the integer register count to 16 general-purpose registers, (x0-x15)"
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

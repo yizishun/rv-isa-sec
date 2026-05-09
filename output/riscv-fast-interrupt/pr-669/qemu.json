@@ -1,0 +1,152 @@
+{
+  "pr_number": 669,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 669,
+    "violation_condition": "When QEMU enables ext_smidctrl or ext_ssidctrl but the indirect CSR access path (sireg*/vsireg* via ISELECT windowing) still permits read/write access to ISELECT_IMSIC_EIDELIVERY (0x70) and ISELECT_IMSIC_EITHRESHOLD (0x72), which the updated spec explicitly removes from Smidctrl/Ssidctrl scope. Additionally, the new mithreshold CSR (IPRIOLEN bits, applies to major+minor interrupt identities) is absent while the stale eithreshold path remains reachable.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "ISELECT-based indirect CSR access (sireg*/vsireg* read/write handlers) gate on ext_ssaia but lack ext_smidctrl/ssidctrl checks to block eidelivery (ISELECT 0x70) and eithreshold (ISELECT 0x72); missing mithreshold CSR registration alongside reachable old eithreshold path",
+    "affected_entities": [
+      "sireg",
+      "sireg2",
+      "sireg4",
+      "vsireg",
+      "vsireg2",
+      "vsireg4",
+      "eidelivery",
+      "eithreshold",
+      "mithreshold",
+      "ISELECT"
+    ],
+    "summary": "Smidctrl/Ssidctrl removes eidelivery and eithreshold from scope and adds mithreshold; stale ISELECT access to eidelivery/eithreshold while mithreshold is absent enables guest interrupt-delivery manipulation outside the spec-defined Smidctrl control model"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xireg_aia",
+        "line_start": 2649,
+        "line_end": 2727,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The AIA indirect CSR dispatcher gates IMSIC register access on ext_smaia/ext_ssaia and the presence of a registered aia_ireg_rmw_fn callback, but lacks any ext_smidctrl/ext_ssidctrl check to block ISELECT_IMSIC_EIDELIVERY (0x70) and ISELECT_IMSIC_EITHRESHOLD (0x72). When Smidctrl/Ssidctrl are eventually implemented, the stale eidelivery and eithreshold paths via sireg*/vsireg* will remain reachable if an IMSIC device is also registered. Per ACLIC spec (aclic.adoc:340): 'The AIA eidelivery and eithreshold CSRs defined for the IMSIC are not included in the scope of Smidctrl/Ssidctrl.'",
+      "snippet": "    case CSR_SIREG:\n        if (!riscv_cpu_cfg(env)->ext_ssaia ||\n            (env->priv == PRV_S && env->mvien & MIP_SEIP &&\n            env->siselect >= ISELECT_IMSIC_EIDELIVERY &&\n            env->siselect <= ISELECT_IMSIC_EIE63)) {\n            goto done;\n        }\n        ...\n    } else if (ISELECT_IMSIC_FIRST <= isel && isel <= ISELECT_IMSIC_LAST) {\n        if (env->aia_ireg_rmw_fn[priv]) {\n            ret = env->aia_ireg_rmw_fn[priv](...);\n        }\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 340,
+          "line_end": 340,
+          "excerpt": "The AIA {eidelivery} and {eithreshold} CSRs defined for the Incoming Message Signaled Interrupt Controller (IMSIC) are not included in the scope of Smidctrl/Ssidctrl."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xireg",
+        "line_start": 2924,
+        "line_end": 2925,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The top-level xireg dispatcher dispatches any iselect in the AIA range (0x30-0x3f, 0x70-0xff) directly to rmw_xireg_aia() without checking whether smidctrl/ssidctrl is enabled. If Smidctrl/Ssidctrl is active, the 0x70-0x7f sub-range (IMSIC control registers) should either be blocked or redirected to ACLIC-specific handlers instead of the generic AIA dispatch.",
+      "snippet": "    if (xiselect_aia_range(isel)) {\n        return rmw_xireg_aia(env, csrno, isel, val, new_val, wr_mask);\n    } else if (riscv_cpu_cfg(env)->ext_smcsrind ||",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 300,
+          "line_end": 304,
+          "excerpt": "Smidctrl depends on the Smcsrind and Smaia extensions. Ssidctrl depends on the Sscsrind and Ssaia extensions."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_imsic.c",
+        "function_name": "riscv_imsic_rmw",
+        "line_start": 234,
+        "line_end": 240,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The IMSIC RMW callback unconditionally dispatches ISELECT_IMSIC_EIDELIVERY and ISELECT_IMSIC_EITHRESHOLD to their respective handlers. If a system has both an IMSIC device and Smidctrl/Ssidctrl enabled (a valid mixed configuration), the IMSIC-side eidelivery/eithreshold access must still be blocked for the ACLIC domain. The IMSIC callback has no awareness of Smidctrl/Ssidctrl extension state.",
+      "snippet": "    switch (isel) {\n    case ISELECT_IMSIC_EIDELIVERY:\n        return riscv_imsic_eidelivery_rmw(imsic, page, val,\n                                          new_val, wr_mask);\n    case ISELECT_IMSIC_EITHRESHOLD:\n        return riscv_imsic_eithreshold_rmw(imsic, page, val,\n                                           new_val, wr_mask);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 340,
+          "line_end": 348,
+          "excerpt": "The AIA eidelivery and eithreshold CSRs defined for the IMSIC are not included in the scope of Smidctrl/Ssidctrl. ... In an ACLIC, registers eipk and eiek serve the same functionality as with eidelivery = 1 in an IMSIC."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "",
+        "line_start": 1037,
+        "line_end": 1038,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ISELECT_IMSIC_EIDELIVERY (0x70) and ISELECT_IMSIC_EITHRESHOLD (0x72) definitions are correct per the AIA spec. These macros are used correctly by the IMSIC and CSR dispatch code for the existing Smaia/Ssaia implementation.",
+      "snippet": "#define ISELECT_IMSIC_EIDELIVERY           0x70\n#define ISELECT_IMSIC_EITHRESHOLD          0x72",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 1064,
+          "line_end": 1066,
+          "excerpt": "| 0x70 | eidelivery | none | none | none | none | none\n| 0x72 | eithreshold | none | none | none | none | none"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xiselect",
+        "line_start": 2455,
+        "line_end": 2459,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The iselect write mask correctly expands from ISELECT_MASK_AIA (0x1ff, allowing 0x70 and 0x72) to ISELECT_MASK_SXCSRIND (0xfff) when Smcsrind/Sscsrind is enabled. This is correct because Smidctrl/Ssidctrl depend on Smcsrind/Sscsrind respectively. The expanded mask is needed for ACLIC's additional iselect space (0x1000-0x10FF). No current bug since smidctrl/ssidctrl don't exist yet.",
+      "snippet": "    if (riscv_cpu_cfg(env)->ext_smcsrind || riscv_cpu_cfg(env)->ext_sscsrind) {\n        wr_mask &= ISELECT_MASK_SXCSRIND;\n    } else {\n        wr_mask &= ISELECT_MASK_AIA;\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 303,
+          "line_end": 304,
+          "excerpt": "Smidctrl depends on the Smcsrind and Smaia extensions. Ssidctrl depends on the Sscsrind and Ssaia extensions."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "",
+        "line_start": 6100,
+        "line_end": 6210,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR registration table has no entries for mithreshold (CSR 0x347) or sithreshold (CSR 0x147). These CSRs are defined by the ACLIC spec as new WLRL CSRs implementing IPRIOLEN bits that apply the priority threshold to both major and minor interrupt identities. When Smidctrl/Ssidctrl are implemented, these must be registered. Their absence alongside reachable eithreshold would mean the guest uses the wrong threshold mechanism.",
+      "snippet": "(No mithreshold/sithreshold CSR entries in the registration table)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 680,
+          "line_end": 709,
+          "excerpt": "(NEW) 0x347 mithreshold — Interrupt enable threshold. A new WLRL M-mode CSR, mithreshold, determines the priority cutoff used to mask lower-priority interrupts. Register mithreshold implements exactly IPRIOLEN bits."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

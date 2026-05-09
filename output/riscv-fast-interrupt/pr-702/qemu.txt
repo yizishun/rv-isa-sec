@@ -1,0 +1,176 @@
+PR #702  target=qemu  overall=compliant
+Spec: Opcode funct7=0x08 was repurposed from M-mode cspspush/cspspop/ipopxret to S-mode scspspush/scspspop/sipopret; QEMU TCG must enforce the new privilege-level decode or risk U-mode executing supervisor stack-pointer-swap and sipopret(sret) as a privilege-escape vector.
+Violation: QEMU TCG translates the old cspspush/cspspop/ipopxret opcodes (funct7=0x08) as M-mode instructions, but the spec repurposes funct7=0x08 for the new S-mode scspspush/scspspop/sipopret instructions. If QEMU decodes funct7=0x08 without checking the privilege mode against the new S-mode semantics, U-mode guest code could execute supervisor-level stack pointer swap operations (scspspush/scspspop) and sipopret (which ends in sret), bypassing the spec-mandated illegal-instruction trap for insufficient privilege. Additionally, if funct7=0x08 is still decoded as the old M-mode semantics in QEMU but guest software expects the new S-mode semantics, the emulation silently corrupts the wrong privilege level's shadow stack pointer state (msp vs ssp).
+Consequence: privilege_escape
+Pattern: trans_*(cspspush|cspspop|ipopxret|mcspspush|mcspspop|scspspush|scspspop|mipopret|sipopret) && (funct7 == 0x08 || funct7 == 0x18) && !check_privilege(mode, required_priv)
+------------------------------------------------------------
+[compliant] target/riscv/insn_trans/trans_rvzicfiss.c.inc:53-70  trans_sspush
+  sspush correctly checks ctx->bcfi_enabled before executing. bcfi_enabled is a TB flag derived from cpu_get_bcfien() which gates on privilege mode and the corresponding xenvcfg.SSE bit. U-mode guest code cannot execute sspush unless S-mode SSE is enabled via senvcfg. The TB flag is immutable during TB execution so privilege checks are correctly baked into translation.
+  | static bool trans_sspush(DisasContext *ctx, arg_sspush *a)
+  | {
+  |     if (!ctx->bcfi_enabled) {
+  |         return false;
+  |     }
+  |     ...
+  |     tcg_gen_qemu_st_tl(data, addr, SS_MMU_INDEX(ctx), ...);
+  |     tcg_gen_st_tl(addr, tcg_env, offsetof(CPURISCVState, ssp));
+  |     return true;
+  | }
+
+[compliant] target/riscv/insn_trans/trans_rvzicfiss.c.inc:25-51  trans_sspopchk
+  sspopchk correctly checks ctx->bcfi_enabled before executing shadow stack load-and-compare. The TB flag bcfi_enabled is set from cpu_get_bcfien() which correctly gates per-privilege-level SSE. No direct privilege check is needed because the TB flag already encodes the privilege-gated SSE state.
+  | static bool trans_sspopchk(DisasContext *ctx, arg_sspopchk *a)
+  | {
+  |     if (!ctx->bcfi_enabled) {
+  |         return false;
+  |     }
+  |     ...
+  |     tcg_gen_qemu_ld_tl(data, addr, SS_MMU_INDEX(ctx), ...);
+  |     tcg_gen_addi_tl(addr, addr, tmp);
+  |     tcg_gen_st_tl(addr, tcg_env, offsetof(CPURISCVState, ssp));
+  |     return true;
+  | }
+
+[compliant] target/riscv/insn_trans/trans_rvzicfiss.c.inc:72-83  trans_ssrdp
+  ssrdp correctly checks ctx->bcfi_enabled and ignores writes to x0 (a->rd == 0). Since bcfi_enabled is a TB flag gated on privilege-level SSE, ssp cannot be leaked to unauthorized privilege modes via this instruction.
+  | static bool trans_ssrdp(DisasContext *ctx, arg_ssrdp *a)
+  | {
+  |     if (!ctx->bcfi_enabled || a->rd == 0) {
+  |         return false;
+  |     }
+  |     TCGv dest = dest_gpr(ctx, a->rd);
+  |     tcg_gen_ld_tl(dest, tcg_env, offsetof(CPURISCVState, ssp));
+  |     ...
+  | }
+
+[compliant] target/riscv/insn_trans/trans_rvzicfiss.c.inc:85-112  trans_ssamoswap_w
+  trans_ssamoswap_w correctly rejects M-mode execution with a store/AMO access fault (line 89-91), matching the spec requirement that ssamoswap in M-mode must fault. For non-M modes with bcfi disabled, it calls gen_helper_ssamoswap_disabled() which correctly raises either ILLEGAL_INST or VIRT_INSTRUCTION_FAULT based on menvcfg.SSE state and virtualization context.
+  | if (ctx->priv == PRV_M) {
+  |     generate_exception(ctx, RISCV_EXCP_STORE_AMO_ACCESS_FAULT);
+  | }
+  | if (!ctx->bcfi_enabled) {
+  |     gen_helper_ssamoswap_disabled(tcg_env);
+  | }
+
+[compliant] target/riscv/insn_trans/trans_rvzicfiss.c.inc:114-142  trans_ssamoswap_d
+  trans_ssamoswap_d mirrors trans_ssamoswap_w in its privilege and SSE checks: M-mode gets store/AMO access fault, non-M with disabled bcfi calls helper_ssamoswap_disabled. The control flow for privilege-gated bcfi is correct.
+  | if (ctx->priv == PRV_M) {
+  |     generate_exception(ctx, RISCV_EXCP_STORE_AMO_ACCESS_FAULT);
+  | }
+  | if (!ctx->bcfi_enabled) {
+  |     gen_helper_ssamoswap_disabled(tcg_env);
+  | }
+
+[compliant] target/riscv/csr.c:189-213  cfi_ss
+  CSR_SSP access control (cfi_ss) correctly implements three-tier checking: (1) extension existence via ext_zicfiss, (2) M-mode always-has-access bypass, (3) cpu_get_bcfien() for non-M modes, which checks the privilege-appropriate xenvcfg.SSE bit. When bcfi is inactive, debugger access is allowed but normal execution gets ILLEGAL_INST or VIRT_INSTRUCTION_FAULT depending on virtualization state.
+  | if (!cpu_get_bcfien(env)) {
+  |     if (env->debugger) {
+  |         return RISCV_EXCP_NONE;
+  |     } else if (env->virt_enabled) {
+  |         return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;
+  |     }
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+
+[compliant] target/riscv/cpu_helper.c:92-119  cpu_get_bcfien
+  cpu_get_bcfien() correctly gates shadow stack enablement per privilege level: U-mode checks senvcfg.SSE, S-mode checks henvcfg.SSE (if virt_enabled) or menvcfg.SSE, and M-mode always returns false. This correctly implements the hierarchical SSE enablement model from the Zicfiss spec.
+  | switch (env->priv) {
+  | case PRV_U:
+  |     return env->senvcfg & SENVCFG_SSE;
+  | case PRV_S:
+  |     if (env->virt_enabled) {
+  |         return env->henvcfg & HENVCFG_SSE;
+  |     }
+  |     return env->menvcfg & MENVCFG_SSE;
+  | case PRV_M:
+  |     return false;
+  | }
+
+[potential_risk] target/riscv/csr.c:3177-3222  write_menvcfg
+  write_menvcfg() uses a WARL mask that includes MENVCFG_SSE (line 3197), which correctly restricts writes to the SSE bit. However, when MENVCFG_SSE is toggled (changed from 0->1 or 1->0), no tlb_flush() or tb_flush() is triggered. Since bcfi_enabled is a TB flag set at TB creation time from cpu_get_bcfien(), a previously translated TB with stale bcfi_enabled could execute shadow stack instructions with incorrect privilege assumptions. Other menvcfg field changes (CDE, STCE) also lack explicit flush but CDE/STCE are handled through separate mechanisms (icount updates, timer callbacks). The SSE toggle is the most concerning as it directly affects instruction decode validity.
+  | if (env_archcpu(env)->cfg.ext_zicfiss) {
+  |     mask |= MENVCFG_SSE;
+  | }
+  | ...
+  | env->menvcfg = (env->menvcfg & ~mask) | (val & mask);
+  | ...
+  | return write_henvcfg(env, CSR_HENVCFG, env->henvcfg, ra);
+
+[compliant] target/riscv/csr.c:3298-3303  write_senvcfg
+  write_senvcfg() correctly implements hierarchical SSE gating: S-mode SSE can only be set if the higher privilege mode (M-mode) has SSE enabled in menvcfg. When virt_enabled, henvcfg.SSE is also checked. This prevents a lower privilege mode from enabling shadow stack without higher-privilege authorization.
+  | if (env_archcpu(env)->cfg.ext_zicfiss &&
+  |     get_field(env->menvcfg, MENVCFG_SSE) &&
+  |     (env->virt_enabled ? get_field(env->henvcfg, HENVCFG_SSE) : true)) {
+  |     mask |= SENVCFG_SSE;
+  | }
+
+[compliant] target/riscv/csr.c:3355-3359  write_henvcfg
+  write_henvcfg() correctly implements hierarchical SSE gating: hypervisor SSE can only be set when menvcfg.SSE is already enabled. This prevents VS/VU-mode from using shadow stack when M-mode has not authorized it.
+  | if (env_archcpu(env)->cfg.ext_zicfiss &&
+  |     get_field(env->menvcfg, MENVCFG_SSE)) {
+  |     mask |= HENVCFG_SSE;
+  | }
+
+[compliant] target/riscv/machine.c:384-400  vmstate_ssp
+  The ssp CSR state is correctly included in the VM state migration subsection. The subsection is only sent when ext_zicfiss is enabled (ssp_needed returns ext_zicfiss), preventing migration compatibility issues. The ssp field is migrated as a target_ulong, which is correct for both RV32 and RV64.
+  | static bool ssp_needed(void *opaque)
+  | {
+  |     return cpu->cfg.ext_zicfiss;
+  | }
+  | static const VMStateDescription vmstate_ssp = {
+  |     .needed = ssp_needed,
+  |     .fields = (const VMStateField[]) {
+  |         VMSTATE_UINTTL(env.ssp, RISCVCPU),
+  |     }
+  | };
+
+[compliant] target/riscv/cpu_helper.c:1506-1528  PTE shadow stack page handling
+  Shadow stack page PTE handling correctly interprets PTE_W without PTE_R as a shadow stack page when bcfi is enabled and first_stage is true. Read-only PTEs (PTE_R only) accessed with shadow-stack index (is_sstack_idx) correctly fault as store page faults. This ensures shadow stack pages cannot be read through normal loads, preventing unauthorized shadow stack disclosure.
+  | case PTE_W:
+  |     if (cpu_get_bcfien(env) && first_stage) {
+  |         sstack_page = true;
+  |         rwx = is_sstack_idx ? (PTE_R | PTE_W) : (is_probe ? 0 :  PTE_R);
+  |         break;
+  |     }
+  |     return TRANSLATE_FAIL;
+  | case PTE_R:
+  |     if (is_sstack_idx) {
+  |         return TRANSLATE_FAIL;
+  |     }
+
+[compliant] target/riscv/insn_trans/trans_rvzicfiss.c.inc:25-83  sspush/sspopchk/ssrdp
+  REQUIRE_ZICFISS macro is defined but NOT called in trans_sspush/trans_sspopchk/trans_ssrdp — these functions only check ctx->bcfi_enabled. This is intentional because sspush/sspopchk/ssrdp are carved out of the Zimop MOP encoding space in insn32.decode, and the decode table ensures Zicfiss instructions are only matched when the Zicfiss-specific encoding bits differ from the generic MOP pattern. If Zicfiss is not implemented, the MOP-r/MOP-rr catch-all decodes these as nop-like MOP instructions (set rd=0), which is architecturally correct per the Zimop spec. The ssamoswap instructions do call REQUIRE_ZICFISS since they have no MOP fallback.
+  | #define REQUIRE_ZICFISS(ctx) do {        \
+  |     if (!ctx->cfg_ptr->ext_zicfiss) {    \
+  |         return false;                    \
+  |     }                                    \
+  | } while (0)
+
+[compliant] target/riscv/op_helper.c:734-781  helper_ssamoswap_disabled
+  helper_ssamoswap_disabled() correctly implements the ssamoswap exception priority rules: when M-mode SSE is disabled, all non-M modes get ILLEGAL_INST; when M-mode SSE is enabled but the current mode's SSE is disabled, VS/VU get VIRT_INSTRUCTION_FAULT and U-mode gets ILLEGAL_INST. This matches the RISC-V CFI spec v1.0 ch2.7 semantics.
+  | if (!get_field(env->menvcfg, MENVCFG_SSE)) {
+  |     exception = RISCV_EXCP_ILLEGAL_INST;
+  |     goto done;
+  | }
+  | if (env->virt_enabled) {
+  |     exception = RISCV_EXCP_VIRT_INSTRUCTION_FAULT;
+  | } else {
+  |     exception = RISCV_EXCP_ILLEGAL_INST;
+  | }
+
+[compliant] target/riscv/insn32.decode:1037-1054  Zicfiss instruction decode
+  The Zicfiss instructions (ssrdp, sspopchk, sspush) are correctly carved out of the Zimop MOP encoding space using nested decode blocks. The specific opcode encoding (1100110 for mop.r, 1100111 for mop.rr with funct3=100) matches the Zicfiss spec. Instructions that don't match the specific Zicfiss encoding patterns fall through to the generic mop_r_n/mop_rr_n decode, which correctly executes as nop per the Zimop extension. No funct7=0x08 encoding is used — the shadow stack instructions use the MOP system instruction encoding space (opcode=1110011) rather than the funct7-based encoding described in the vulnerability pattern.
+  | {
+  |   # zicfiss instructions carved out of mop.r
+  |   [
+  |     ssrdp     1100110 11100 00000 100 rd:5  1110011
+  |     sspopchk  1100110 11100 00001 100 00000 1110011 &r2 rs1=1 rd=0
+  |     sspopchk  1100110 11100 00101 100 00000 1110011 &r2 rs1=5 rd=0
+  |   ]
+  |   mop_r_n    1 . 00 .. 0111 .. ..... 100 ..... 1110011 @mop5
+  | }
+
+[compliant] N/A:0-0  N/A
+  The vulnerability pattern described in the security spec (funct7=0x08 decoding old M-mode cspspush/cspspop/ipopxret instructions vs new S-mode scspspush/scspspop/sipopret instructions) does not apply to this codebase. None of those instruction mnemonics exist here. The QEMU Zicfiss implementation uses completely different instruction names (sspush/sspopchk/ssrdp), a different encoding space (MOP system instructions, opcode=1110011, not funct7-based), and does not implement SSTP S-mode return instructions (sipopret/ipopxret). The PR context ('698 smtp add sstp extension') suggests these instructions are expected in a future PR but are not yet in this codebase. No funct7=0x08 encoding conflict exists to exploit.
+  | N/A — no funct7=0x08 shadow stack instructions exist in this codebase
+

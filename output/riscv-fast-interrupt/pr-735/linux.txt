@@ -1,0 +1,77 @@
+PR #735  target=linux  overall=compliant
+Spec: Ssip push/pop use interrupted privilege's MMU translation; kernel must preserve user stack mappings between push and sipopret
+Violation: Kernel S-mode fast-interrupt handler (between CLIC hardware push and sipopret) modifies the user page table entries for the interrupted task's stack region—e.g., via munmap, mprotect, COW page break, or signal frame setup overwriting saved register slots—causing sipopret's implicit loads (which use sstatus.SPP=U translation with implicit SUM) to read from unmapped or stale physical pages instead of the original register save area
+Consequence: data_corruption
+Pattern: user page table modification or user stack write in S-mode interrupt handler path reachable before sipopret/sret return
+------------------------------------------------------------
+[potential_risk] arch/riscv/kernel/signal.c:413-481  setup_rt_frame
+  setup_rt_frame writes signal frame data to the interrupted task's user stack via __copy_to_user (line 432) and __put_user (lines 428-432). It then changes regs->sp to point to the new frame (line 469). If the kernel were running under Ssip between CLIC push and sipopret, sipopret's implicit loads from the original user sp would read from stack pages whose contents have been overwritten by the signal frame, or from the new sp that sipopret doesn't know about. Currently compliant because Ssip/sipopret is not implemented.
+  | regs->sp = (unsigned long)frame;
+  | regs->epc = (unsigned long)ksig->ka.sa.sa_handler;
+  | /* ... after err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set)) */
+
+[potential_risk] arch/riscv/mm/fault.c:278-439  handle_page_fault
+  handle_page_fault is called from do_page_fault in the S-mode exception path (traps.c:430), which is reachable from handle_exception -> excp_vect_table -> do_page_fault. For user-mode page faults on stack pages, this can trigger COW via handle_mm_fault (lines 362, 406) -> do_wp_page -> wp_page_copy, which allocates a new physical page and updates the PTE for the faulting stack address. If Ssip were active, sipopret's implicit loads would use SPP=U translation to read from the original physical page that the PTE no longer points to, reading stale or freed data. faulthandler_disabled() guard (line 325) only protects hard-IRQ context, not exception context. Currently compliant because Ssip/sipopret is not implemented.
+  | fault = handle_mm_fault(vma, addr, flags | FAULT_FLAG_VMA_LOCK, regs);
+  | /* or */
+  | fault = handle_mm_fault(vma, addr, flags, regs);
+
+[compliant] arch/riscv/kernel/entry.S:247-318  ret_from_exception
+  ret_from_exception uses sret (line 315) to return from S-mode traps. It does not use sipopret. The sstatus save/restore sequence (lines 248, 279, 301) correctly handles sstatus.SPP for the standard sret return. There is no CLIC/sipopret support; the kernel's interrupt return path is entirely standard RISC-V privileged architecture. Fully compliant with the current architecture state.
+  | csrw CSR_STATUS, a0
+  | csrw CSR_EPC, a2
+  | REG_L x1,  PT_RA(sp)
+  | ...
+  | sret
+
+[compliant] arch/riscv/kernel/entry.S:125-238  handle_exception
+  handle_exception is the S-mode trap entry. It properly saves all CSRs (sstatus at line 190, sepc at line 191, scause at line 193) to the pt_regs stack frame. No CLIC-specific CSRs (sithreshold, spistatus, sspcs) are saved/restored because the kernel does not implement Smnip/Ssnip/Smip/Ssip extensions. The sstatus CSR save via csrrc (line 183) only touches SR_SUM, SR_FS_VS, and SR_ELP bits. For interrupt-originated traps, it calls do_irq (line 221) then ret_from_exception (line 222), which uses sret, not sipopret. Fully compliant with the current architecture state.
+  | REG_S s1, PT_STATUS(sp)
+  | REG_S s2, PT_EPC(sp)
+  | ...
+  | bge s4, zero, 1f
+  | call do_irq
+  | j ret_from_exception
+
+[compliant] arch/riscv/kernel/entry.S:381-408  call_on_irq_stack
+  call_on_irq_stack switches to the per-CPU IRQ stack for interrupt handling (when CONFIG_IRQ_STACKS is enabled). This is a standard kernel mechanism unrelated to Ssip/CLIC. The function does not modify user page tables. The stack switch is purely between kernel stacks and doesn't interact with sipopret semantics. Currently fully compliant.
+  | REG_S sp, TASK_TI_IRQ_STACK(tp)
+  | REG_L sp, TASK_TI_IRQ_STACK(tp)
+  | /* ... call handler ... */
+  | REG_L sp, TASK_TI_IRQ_STACK(tp)
+
+[compliant] arch/riscv/kernel/traps.c:449-459  do_irq
+  do_irq is the C-level S-mode interrupt handler. It calls irqentry_enter, dispatches to the arch IRQ handler, then calls irqentry_exit. irqentry_exit may eventually call exit_to_user_mode_loop -> arch_do_signal_or_restart, but this path does not use sipopret. The final return is always via sret (entry.S:315). Fully compliant with current architecture state.
+  | state = irqentry_enter(regs);
+  | handle_riscv_irq(regs);
+  | irqentry_exit(regs, state);
+
+[compliant] arch/riscv/kernel/signal.c:499-566  arch_do_signal_or_restart
+  arch_do_signal_or_restart modifies regs->epc, regs->sp, regs->a0 during signal delivery. It calls handle_signal -> setup_rt_frame which writes to user stack. However, this function is only reachable via exit_to_user_mode_loop which runs just before ret_from_exception's sret (not sipopret). There is no Ssip/CLIC push that would make these user stack writes corrupt sipopret's implicit loads. Fully compliant with current architecture state.
+  | if (get_signal(&ksig)) {
+  |     handle_signal(&ksig, regs);
+  |     return;
+  | }
+
+[compliant] arch/riscv/include/asm/csr.h:1-600  N/A (CSR definitions)
+  The kernel's CSR definition header (csr.h) defines standard privileged architecture CSRs: sstatus (0x100), sie (0x104), sip (0x144), stopi (0xdb0), stopei (0x15c). It does NOT define any CLIC/Ssip-specific CSRs: spistatus (0x146), sithreshold (0x147), sspcs (0x149), sivt (0x107), seivt (0x108). The kernel also does not define or reference the sipopret instruction. This confirms that no Smnip/Ssnip/Smip/Ssip/Smcsps/Sscsps/Smivt/Ssivt support has been implemented. Fully compliant with current architecture state.
+  | #define CSR_SSTATUS     0x100
+  | #define CSR_SIE         0x104
+  | #define CSR_SIP         0x144
+  | #define CSR_STOPI       0xdb0
+  | #define CSR_STOPEI      0x15c
+
+[compliant] arch/riscv/kernel/entry.S:421-471  __switch_to
+  __switch_to saves/restores sstatus via csrr (line 442) into the SUM slot of thread.ra, and applies SUM bits via csrs (line 451). It does not save/restore any CLIC-specific state (pithreshold from xpistatus, spistatus, sspcs, etc.) because the kernel does not implement Smnip/Ssnip/Smip/Ssip. If these extensions were added, this function would need to save/restore spistatus and sspcs to prevent leakage of interrupt preemption state across context switches. Currently compliant.
+  | csrr s0, CSR_STATUS
+  | REG_S s0, TASK_THREAD_SUM_RA(a3)
+  | ...
+  | REG_L s1, TASK_THREAD_SUM_RA(a4)
+  | csrs CSR_STATUS, s1
+
+[compliant] arch/riscv/mm/context.c:318-338  switch_mm
+  switch_mm handles MM context switching and eventually writes SATP CSR. It does not touch any CLIC-specific CSRs. The SATP write changes the address translation regime but this occurs during normal process context switch (not in S-mode interrupt context). No interaction with sipopret semantics. Compliant.
+  | membarrier_arch_switch_mm(prev, next, task);
+  | /* ... */
+  | __flush_tlb_range / csr_write(CSR_SATP, ...)
+

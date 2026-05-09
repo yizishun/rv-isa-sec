@@ -1,0 +1,125 @@
+{
+  "pr_number": 729,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 729,
+    "violation_condition": "In XiangShan RTL, when ACLIC IVT mode is implemented and a trap is taken due to an interrupt, the entry logic in TrapHandleModule.scala and TrapEntryMEvent/TrapEntryHSEvent/TrapEntryVSEvent modules transitions to the handler PC via the in-memory vector table read, but does NOT write to or clear the corresponding interrupt-pending bit (e.g., CLIC/ACLIC per-interrupt pending register bits or standard mip/sip CSR pending bits). Specifically, for level-sensitive interrupts (e.g., software interrupts), the pending bit remains asserted after trap entry because no hardware clear path exists between the IVT handler-fetch logic and the interrupt pending register bank. The trap entry event modules only update mstatus/mepc/mcause/mtval registers with no side effect to interrupt pending state.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "IVT mode trap handler fetch at (VTBASE+XLEN/8*exccode) followed by PC redirect WITHOUT corresponding interrupt-pending bit write/clear operation; absence of Mux/Bool/Reg write targeting interrupt pending register (ip_reg, ipReg, interruptPending, irq_pending) in the trap-entry-to-IVT-handler data path; TrapHandleModule/TrapEntryEvent contains no connection to InterruptFilter/InterruptBundle for pending-bit deassertion",
+    "affected_entities": [
+      "CSR_mip",
+      "CSR_mvip",
+      "CSR_sip",
+      "CSR_hvip",
+      "CLIC_IP",
+      "ACLIC_INT_PENDING",
+      "TrapHandleModule",
+      "InterruptBundle"
+    ],
+    "summary": "ACLIC spec requires hardware to clear corresponding interrupt-pending bit in IVT mode upon successful handler fetch; missing this clear causes level-sensitive interrupts to remain pending, triggering immediate re-trap upon handler entry and creating an infinite trap-loop denial-of-service"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRDefines.scala",
+        "function_name": "XtvecMode",
+        "line_start": 158,
+        "line_end": 162,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "XtvecMode WARL only allows Direct(0) and Vectored(1). IVT mode (mode=3 per Smivt spec) is not in legalValues and would be WARL-converted. The IVT/Smivt extension is not implemented in this RTL, so the claimed vulnerability (missing interrupt-pending-bit clear on IVT trap entry) cannot manifest.",
+      "snippet": "object XtvecMode extends CSREnum with WARLApply {\n    val Direct = Value(0.U)\n    val Vectored = Value(1.U)\n    override protected def legalValues: Seq[EnumType] = Seq(Direct, Vectored)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1275,
+          "line_end": 1308,
+          "excerpt": "mode  PC on Interrupt\n00    OBASE                                # Direct mode\n01    OBASE+4*exccode                      # Vectored mode\n11    M[VTBASE+XLEN/8*vtoffset] & VTMASK   # Interrupt vector table mode\n10    Reserved\n\n...the hart clears the low bit(s)...clears the corresponding interrupt-pending bit if possible, and sets the PC to this handler address."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/TrapHandleModule.scala",
+        "function_name": "TrapHandleModule",
+        "line_start": 92,
+        "line_end": 101,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The trap PC computation only handles Direct (BASE) and Vectored (BASE+4*exccode) modes. There is no IVT mode (mode=3) handling, no VTBASE-based memory fetch, and no connection to interrupt-pending registers. This is correct for the current feature set since IVT is not implemented.",
+      "snippet": "private val xtvec = MuxCase(io.in.mtvec, Seq(\n    traptoVS -> io.in.vstvec,\n    trapToHS -> io.in.stvec\n))\n...\nprivate val pcFromXtvec = Cat(xtvec.addr.asUInt + Mux(xtvec.mode === XtvecMode.Vectored && hasIR, adjustinterruptNO(5, 0), 0.U), 0.U(2.W))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMEvent.scala",
+        "function_name": "TrapEntryMEventModule",
+        "line_start": 100,
+        "line_end": 123,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TrapEntryMEvent only updates mstatus(MPV,MPP,GVA,MPIE,MIE,MDT), mepc, mcause, mtval, mtval2, mtinst. No write to mip/mipReg or any interrupt-pending register. This is correct because IVT mode is not implemented, and standard RISC-V trap entry never requires hardware pending-bit clearing.",
+      "snippet": "out.mstatus.bits.MPIE  := current.mstatus.MIE\nout.mstatus.bits.MIE   := 0.U\nout.mepc.bits.epc      := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))\nout.mcause.bits.Interrupt := isInterrupt && !isDTExcp\nout.mcause.bits.ExceptionCode := Mux(isDTExcp, ExceptionNO.EX_DT.U, highPrioTrapNO)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryHSEvent.scala",
+        "function_name": "TrapEntryHSEventModule",
+        "line_start": 100,
+        "line_end": 127,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TrapEntryHSEvent only updates mstatus(SPP,SPIE,SIE,SDT), hstatus(SPV,SPVP,GVA), sepc, scause, stval, htval, htinst. No write to sip/sipReg or any interrupt-pending register. This is correct; standard RISC-V trap entry leaves interrupt-pending management to software.",
+      "snippet": "out.mstatus.bits.SPP  := current.privState.PRVM.asUInt(0, 0)\nout.mstatus.bits.SPIE := current.sstatus.SIE\nout.mstatus.bits.SIE  := 0.U\nout.sepc.bits.epc     := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))\nout.scause.bits.Interrupt := isInterrupt",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryVSEvent.scala",
+        "function_name": "TrapEntryVSEventModule",
+        "line_start": 100,
+        "line_end": 122,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TrapEntryVSEvent only updates vsstatus(SPP,SPIE,SIE,SDT), vsepc, vscause, vstval. No write to vsip/vsipReg or any interrupt-pending register. This is correct; standard RISC-V trap entry leaves interrupt-pending management to software.",
+      "snippet": "out.vsstatus.bits.SPP  := current.privState.PRVM.asUInt(0, 0)\nout.vsstatus.bits.SPIE := current.vsstatus.SIE\nout.vsstatus.bits.SIE  := 0.U\nout.vsepc.bits.epc     := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))\nout.vscause.bits.Interrupt := isInterrupt",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "mip CSR register logic",
+        "line_start": 260,
+        "line_end": 311,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The mip register logic shows that interrupt pending bits (MSIP, SSIP, VSSIP) are software-writable via CSR writes, while external/timer pending bits (MEIP, SEIP, MTIP, STIP) are read-only and driven by platform interrupt sources. If Smivt IVT mode is added in the future, the mip register would need a new write path for hardware-initiated pending-bit clearing (specifically for edge-triggered interrupts where software-writable pending bits must be cleared by hardware on IVT trap entry). The current register logic has no such path.",
+      "snippet": "// bit 3 MSIP is software-writable\nregOut.MSIP := Mux1H(Seq(\n    fromSip.MSIP.valid  -> fromSip.MSIP.bits,\n    ...wen -> wdata.MSIP,\n))\n// bit 7 MTIP is read-only in mip\nregOut.MTIP := platformIRP.MTIP",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1300,
+          "line_end": 1308,
+          "excerpt": "the hart then fetches an XLEN-bit handler address...If the fetch is successful, the hart clears the low bit(s)...clears the corresponding interrupt-pending bit if possible, and sets the PC to this handler address."
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1314,
+          "line_end": 1315,
+          "excerpt": "In case of a level-sensitive interrupt, it might not be possible to clear the interrupt-pending bit."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

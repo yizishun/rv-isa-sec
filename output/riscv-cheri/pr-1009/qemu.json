@@ -1,0 +1,88 @@
+{
+  "pr_number": 1009,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1009,
+    "violation_condition": "In QEMU TCG, when emulating a CHERI capability load (e.g., CLC) through an authorizing capability that grants R and C but lacks LM, the emulator checks the capability tag read FROM MEMORY (or the pre-authorization tag) to decide whether to strip W and LM, rather than checking the tag of the finalized capability being WRITTEN INTO THE DESTINATION REGISTER after bounds/authority checks have completed. If authorization clears the tag (e.g., bounds violation, representability failure), a QEMU implementation checking the memory tag would strip W/LM from a now-untagged value, whereas hardware would skip stripping because the written-back tag is 0.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "tag check on source/memory tag instead of destination/writeback tag before LM/W permission stripping in capability load emulation (e.g., if (mem_ctag) vs if (result_ctag) before clearing CAP_PERM_WRITE | CAP_PERM_LOAD_MUTABLE)",
+    "affected_entities": [
+      "CLC",
+      "CAP_PERM_LOAD_MUTABLE",
+      "CAP_PERM_WRITE",
+      "ctag"
+    ],
+    "summary": "Capability load LM/W permission stripping must gate on the written-back (post-authorization) tag, not the memory tag; using the pre-authorization tag can cause permission stripping on already-invalidated capabilities, diverging from hardware behavior"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "scountinhibit_pred",
+        "line_start": 394,
+        "line_end": 411,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "scountinhibit_pred now correctly checks menvcfg.CDE before allowing access to scountinhibit. Before this fix, scountinhibit was accessible even when menvcfg.CDE=0, violating the spec requirement that CDE=0 must raise an illegal-instruction exception. The fix adds the missing gate: if (!get_field(env->menvcfg, MENVCFG_CDE)) return RISCV_EXCP_ILLEGAL_INST. This matches the existing CDE-gating pattern already used for scountovf (line 1625) and sireg* indirect access (line 2769). The read/write paths (read_scountinhibit, write_scountinhibit) correctly mask through env->mcounteren, enforcing the delegated-bits-only access pattern per spec.",
+      "snippet": "    if (!get_field(env->menvcfg, MENVCFG_CDE)) {\n        return RISCV_EXCP_ILLEGAL_INST;\n    }\n\n    if (env->virt_enabled) {\n        return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcdeleg.adoc",
+          "line_start": 113,
+          "line_end": 115,
+          "excerpt": "[#norm:ssccfg_illegal_scountinhibit_cde0]#When `menvcfg`.CDE=0, attempts to access `scountinhibit` raise an illegal-instruction exception.# [#norm:ssccfg_illegal_scountinhibit_vs_vu]#When Supervisor Counter Delegation is enabled, attempts to access `scountinhibit` from VS-mode or VU-mode raise a virtual-instruction exception.#"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_menvcfg",
+        "line_start": 3176,
+        "line_end": 3204,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MENVCFG_CDE is included in the write mask for both menvcfg and menvcfgh write handlers (lines 3183 and 3241), gated on cfg->ext_smcdeleg. Writes to CDE are properly constrained by the mask — only bit 60 is writable when smcdeleg is present. No side-effects (TLB flush, FENCE.I) are triggered by CDE changes, which is correct per spec (CDE only gates CSR accessibility, no microarchitectural state implications).",
+      "snippet": "    uint64_t mask = MENVCFG_FIOM | MENVCFG_CBIE | MENVCFG_CBCFE |\n                    MENVCFG_CBZE | MENVCFG_CDE;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_scountinhibit",
+        "line_start": 3064,
+        "line_end": 3076,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "read_scountinhibit masks through env->mcounteren, returning only bits delegated by M-mode. write_scountinhibit similarly ANDs the write value with env->mcounteren before delegating to write_mcountinhibit. This correctly enforces the non-delegated bits as read-only zero per spec, preventing S-mode from writing inhibit bits for counters not delegated to it.",
+      "snippet": "    *val = env->mcountinhibit & env->mcounteren;\n    return RISCV_EXCP_NONE;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcdeleg.adoc",
+          "line_start": 111,
+          "line_end": 111,
+          "excerpt": "[#norm:ssccfg_scountinhibit_nondelegated_ro]#For counters not delegated to S-mode, the associated bits in `scountinhibit` are read-only zero.#"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "(no CHERI code in this repo)",
+        "line_start": 0,
+        "line_end": 0,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "This upstream qemu/qemu repository contains zero CHERI capability emulation code. Grep for cheri, CAP_PERM, load_mutable, PERM_WRITE, PERM_LOAD_MUTABLE, CLC, cap_load, writeback tag across target/ returned no matches. No cheri*.c, cheri*.h, or cap*.c files exist. The security spec's vulnerability pattern (checking source/memory tag instead of destination/writeback tag before stripping W/LM permissions in authorized capability loads) cannot be evaluated here because there is no code to evaluate. CHERI emulation lives in downstream forks (CHERIoT-Platform/qemu, CTSRD-CHERI/qemu). The PR's title 'Reword to clarify that load LM permission clearing is based on written back tag' appears to describe a different codebase — this branch only modifies a scountinhibit CDE check.",
+      "snippet": "N/A — no CHERI capability load emulation code exists in this repository",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,107 @@
+PR #146  target=opensbi  overall=potential_risk
+Spec: OpenSBI as RDSM must synchronize Smmtt/SmDAP domain protection CSRs with proper domain-aware fences and preserve domain isolation state across HSM suspend/resume; missing fences after MTT CSR writes or stale CSR restore on resume can break supervisor domain isolation, allowing cross-domain privilege escape.
+Violation: OpenSBI (acting as RDSM in M-mode) writes to Smmtt/SmDAP domain protection CSRs (e.g., mttp or equivalent MTT registers) without a subsequent domain-aware fence (SFENCE.W.INVAL or SFENCE.VMA with domain operand), or the HSM suspend/resume path fails to save/restore domain protection CSR state, allowing a resumed hart to operate with stale or unvalidated domain isolation configuration.
+Consequence: privilege_escape
+Pattern: csr[wrs].*mttp|csr[wrs].*mtt|csr[wrs].*mdap|csr[wrs].*smmtt|sfence\.w\.inval|sfence\.vma|domain.*suspend|domain.*resume|hsm_suspend.*domain|hsm_resume.*domain|smdap|smmtt|COVT.*sbi_handler
+------------------------------------------------------------
+[potential_risk] lib/sbi/sbi_domain_context.c:102-169  switch_to_next_domain_context
+  Domain context switch saves/restores sstatus, sie, stvec, sscratch, sepc, scause, stval, sip, satp, scounteren, senvcfg, srmcfg (lines 131-146) but has zero awareness of domain protection CSRs (mttp, mmte). No Smmtt/SmDAP CSR save/restore exists. If Smmtt were enabled, MTT configuration would leak between domains. SFENCE.W.INVAL (domain-aware fence) is also absent — only __sbi_sfence_vma_all() (line 140) follows SATP swap, which is insufficient for MTT cache invalidation.
+  | ctx->sstatus = csr_swap(CSR_SSTATUS, dom_ctx->sstatus);
+  | ctx->sie = csr_swap(CSR_SIE, dom_ctx->sie);
+  | /* ... no mttp/mmte save/restore anywhere */
+  | ctx->satp = csr_swap(CSR_SATP, dom_ctx->satp);
+  | __sbi_sfence_vma_all();
+
+[potential_risk] lib/sbi/sbi_domain_context.c:24-59  hart_context (struct)
+  The hart_context structure stores per-domain hart state (trap_ctx, sstatus, sie, stvec, sscratch, sepc, scause, stval, sip, satp, scounteren, senvcfg, srmcfg) but lacks fields for domain protection CSRs (mttp, mmte). Without these fields, domain-specific MTT root pointer and MTE configuration pointer cannot be saved/restored across domain context switches.
+  | struct hart_context {
+  |     struct sbi_trap_context trap_ctx;
+  |     unsigned long sstatus;
+  |     /* ... no mttp, mmte fields */
+  |     unsigned long srmcfg;
+  |     struct sbi_domain *dom;
+  |     struct hart_context *prev_ctx;
+  |     bool initialized;
+  | };
+
+[potential_risk] lib/sbi/sbi_hsm.c:44-53  sbi_hsm_data (struct)
+  The sbi_hsm_data structure stores saved_mie, saved_mip, saved_medeleg, saved_mideleg, saved_menvcfg for non-retentive suspend/restore but has no fields for saved_mttp or saved_mmte. Without these fields, domain protection CSR state has nowhere to be persisted during suspend and cannot be restored on resume.
+  | struct sbi_hsm_data {
+  |     atomic_t state;
+  |     unsigned long suspend_type;
+  |     unsigned long saved_mie;
+  |     unsigned long saved_mip;
+  |     unsigned long saved_medeleg;
+  |     unsigned long saved_mideleg;
+  |     u64 saved_menvcfg;
+  |     /* NO saved_mttp, saved_mmte */
+  |     atomic_t start_ticket;
+  | };
+
+[potential_risk] lib/sbi/sbi_hsm.c:408-433  __sbi_hsm_suspend_non_ret_save
+  HSM non-retentive suspend save path saves MIE, MIP, MEDELEG, MIDELEG, MENVCFG (lines 427-432) but does NOT save any domain protection CSRs (mttp, mmte). During non-retentive suspend the hart loses power; all MTT configuration state is lost. Resume without save/restore would leave the hart with domain protection disabled (mttp=0 at hardware reset).
+  | hdata->saved_mie = csr_read(CSR_MIE);
+  | hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+  | hdata->saved_medeleg = csr_read(CSR_MEDELEG);
+  | hdata->saved_mideleg = csr_read(CSR_MIDELEG);
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  |     hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+  | /* NO csr_read(CSR_MTTP); NO csr_read(CSR_MMTE) */
+
+[potential_risk] lib/sbi/sbi_hsm.c:435-446  __sbi_hsm_suspend_non_ret_restore
+  HSM non-retentive suspend restore path restores MENVCFG, MIDELEG, MEDELEG, MIE, MIP (lines 440-445) but does NOT restore mttp/mmte. After non-retentive suspend, hardware has lost all domain protection state. The restore path must write saved mttp/mmte values and execute SFENCE.W.INVAL. Without this, the resumed hart runs with domain protection disabled, breaking isolation guarantees before MRET to S-mode.
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  |     csr_write64(CSR_MENVCFG, hdata->saved_menvcfg);
+  | csr_write(CSR_MIDELEG, hdata->saved_mideleg);
+  | csr_write(CSR_MEDELEG, hdata->saved_medeleg);
+  | csr_write(CSR_MIE, hdata->saved_mie);
+  | csr_set(CSR_MIP, (hdata->saved_mip & (MIP_SSIP | MIP_STIP)));
+  | /* NO restore of mttp/mmte; NO SFENCE.W.INVAL */
+
+[potential_risk] lib/sbi/sbi_init.c:483-499  init_warm_resume
+  The warm resume path (entry for harts waking from non-retentive suspend) calls sbi_hsm_hart_resume_start() → sbi_hart_reinit() → sbi_hart_protection_configure() → sbi_hsm_hart_resume_finish(). sbi_hart_reinit() calls mstatus_init() which initializes mstatus, scounteren, mcounteren, menvcfg, mseccfg, mie, satp etc. but never touches mttp/mmte. sbi_hart_protection_configure() configures PMP-based isolation but is unaware of MTT-based domain protection. On hardware with Smmtt/SmDAP, mttp would remain at reset value (0=disabled).
+  | static void __noreturn init_warm_resume(struct sbi_scratch *scratch, u32 hartid)
+  | {
+  |     int rc;
+  |     sbi_hsm_hart_resume_start(scratch);
+  |     rc = sbi_hart_reinit(scratch);
+  |     /* ... */
+  |     rc = sbi_hart_protection_configure(scratch);
+  |     /* ... */
+  |     sbi_hsm_hart_resume_finish(scratch, hartid);
+  | }
+
+[potential_risk] lib/sbi/sbi_hart.c:32-189  mstatus_init
+  mstatus_init() initializes mstatus, scounteren, mcounteren, mcountinhibit, mhpmevent, hstatus, mstateen0-3, sstateen0-3, menvcfg, mseccfg, mie, satp — but has no initialization of domain protection CSRs (mttp, mmte). Called by both cold boot (init_coldboot) and warm resume (init_warm_resume). In cold boot, MTT may carry stale entries from earlier firmware stages. In warm resume, MTT is at hardware reset default. mttp should be initialized (at minimum to 0=disabled) with a domain-aware fence.
+  | csr_write(CSR_MSTATUS, mstatus_val);
+  | /* ... many CSR init writes ... */
+  | csr_write(CSR_MIE, 0);
+  | if (misa_extension('S'))
+  |     csr_write(CSR_SATP, 0);
+  | /* NO mttp/mmte initialization; NO SFENCE.W.INVAL */
+
+[potential_risk] lib/sbi/sbi_hart.c:769-834  sbi_hart_switch_mode
+  sbi_hart_switch_mode() performs MRET to lower privilege after setting up mstatus, mepc, stvec/sscratch/sie/satp. Before MRET, if domain protection CSRs were modified, SFENCE.W.INVAL must be executed to ensure MTT configuration is visible to the hart's memory access checks. No such domain-aware fence exists. Used by sbi_hsm_hart_start_finish(), sbi_hsm_hart_resume_finish(), and switch_to_next_domain_context().
+  | csr_write(CSR_MSTATUS, val);
+  | csr_write(CSR_MEPC, next_addr);
+  | /* ... setup stvec/sscratch/sie/satp for S-mode ... */
+  | __asm__ __volatile__("mret" : : "r"(a0), "r"(a1));
+  | /* NO SFENCE.W.INVAL before MRET */
+
+[potential_risk] lib/sbi/sbi_trap.c:361-365  sbi_trap_handler
+  The M-mode trap handler has no handling for domain-protection-related traps (domain access faults that Smmtt/SmDAP would generate). Any such trap would fall through to the default case and be redirected to S-mode via sbi_trap_redirect(). S-mode has no way to distinguish a domain protection violation from a generic access fault. RDSM should intercept domain protection faults in M-mode to enforce domain isolation policy.
+  | default:
+  |     msg = "trap redirect failed";
+  |     rc  = sbi_trap_redirect(regs, trap);
+  |     break;
+
+[potential_risk] lib/sbi/sbi_ecall_hsm.c:19-50  sbi_ecall_hsm_handler
+  The HSM SBI ecall handler implements SBI_EXT_HSM_HART_START, STOP, GET_STATUS, SUSPEND but has no COVT/COVH domain protection SBI extension handlers. There is no SBI-level mechanism for S-mode to request domain ownership transitions that would require MTT reprogramming by M-mode RDSM.
+  | case SBI_EXT_HSM_HART_START:
+  |     ret = sbi_hsm_hart_start(...); break;
+  | case SBI_EXT_HSM_HART_STOP:
+  |     ret = sbi_hsm_hart_stop(...); break;
+  | case SBI_EXT_HSM_HART_SUSPEND:
+  |     ret = sbi_hsm_hart_suspend(...); break;
+  | /* NO COVT/COVH handler */
+

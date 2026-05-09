@@ -1,0 +1,227 @@
+{
+  "pr_number": 21,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 21,
+    "violation_condition": "When QEMU TCG translates vmttl.v/vmtts.v instructions and incorrectly computes the transposed memory access pattern—specifically miscalculating row/column decomposition from the linear element index using lambda and LMUL (row = (i/λ) % LMUL, col = i % λ), or failing to apply the immediate Lλ override that temporarily replaces vtype.vlambda for address calculation—causing memory reads/writes to wrong guest addresses or wrong register file lanes, including access beyond the intended matrix tile bounds.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "trans_tile_ld|trans_tile_st|vmttl|vmtts|gen_vmttl|gen_vmtts|linesize.*lambda.*LMUL|tile_transpose.*offset|vlambda.*override",
+    "affected_entities": [
+      "vmttl.v",
+      "vmtts.v",
+      "vtype"
+    ],
+    "summary": "Incorrect TCG translation of Zvvmttls transposing tile load/store memory access pattern (row/col index decomposition from lambda/LMUL, or failure to honor immediate Lλ override) causes guest data corruption through misrouted matrix element transfers between memory and vector register file."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "VTYPE FIELD definitions",
+        "line_start": 190,
+        "line_end": 195,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VTYPE FIELD macros define VLMUL(0:3), VSEW(3:3), VTA(6), VMA(7), ALTFMT(8), RESERVED(9+). No vlambda bitfield exists. If IME repurposes bits ≥9 for vlambda (which controls row/col decomposition λ in vmttl.v/vmtts.v transposed addressing), these bits are aliased into the RESERVED field and would be trapped as illegal by vtype_reserved(). A new FIELD(VTYPE, VLAMBDA, ...) definition must be added, and RESERVED must shrink to make room.",
+      "snippet": "FIELD(VTYPE, ALTFMT, 8, 1)\nFIELD(VTYPE, RESERVED, 9, sizeof(target_ulong) * 8 - 10)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vtype_reserved",
+        "line_start": 36,
+        "line_end": 50,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Reserved-bit check traps all bits at or above R_VTYPE_ALTFMT_SHIFT (bit 8) or R_VTYPE_RESERVED_SHIFT (bit 9) as reserved. Any vlambda bits placed in this range by IME would cause vsetvl (line 103) to set vill=1 and invalidate all vector state. Must be rewritten to allow IME-allocated vtype bits before tile instructions can function.",
+      "snippet": "reserved = vtype & MAKE_64BIT_MASK(R_VTYPE_RESERVED_SHIFT,\n                                   xlen - 1 - R_VTYPE_RESERVED_SHIFT);\n// ...\nif ((sew > cpu->cfg.elen) || vill || (vtype_reserved(env, s2) != 0)) {\n    reset_ill_vtype(env);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "HELPER(vsetvl)",
+        "line_start": 61,
+        "line_end": 127,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Stores raw s2 into env->vtype at line 125 without extracting or validating a vlambda field. No range-checking of λ vs LMUL/SEW constraints, no λ×LMUL tile-dimension sanity check. When IME adds vlambda bits to vtype, vsetvl must validate that λ is consistent with current SEW/LMUL and reject invalid configurations. Additionally, the immediate Lλ override encoded in vmttl.v/vmtts.v instruction words (which temporarily replaces vtype.vlambda for address calculation) is not consumed here — the translation path must separately handle this per-instruction override.",
+      "snippet": "env->vl = vl;\nenv->vtype = s2;  // raw store, no vlambda extraction/validation\nenv->vstart = 0;\nenv->vill = 0;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "reset_ill_vtype",
+        "line_start": 52,
+        "line_end": 59,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "On illegal vtype, only clears vill, vtype, vl, vstart. If CPURISCVState gains matrix-specific fields (tile config, accumulator state), illegal-vtype reset would leave stale matrix state intact, potentially causing cross-context state leakage between privileged domains or after VM reset.",
+      "snippet": "env->vill = 1;\nenv->vtype = 0;\nenv->vl = 0;\nenv->vstart = 0;\n// no matrix state fields cleared",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_ldst_stride",
+        "line_start": 308,
+        "line_end": 339,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Computes memory addresses as 'base + stride * i + (k << log2_esz)' — a purely linear index. Transposed tile loads/stores (vmttl.v/vmtts.v) require 2D addressing: row = (i/λ) % LMUL, col = i % λ, with address = base + col*esz + row*tile_stride. This function cannot be reused for transposed tile access without a complete rewrite or a separate tile-specific path. The correct mask/tail-check ordering (mask at line 325 BEFORE memory access at line 333) is demonstrated here and must be preserved in any tile helper.",
+      "snippet": "target_ulong addr = base + stride * i + (k << log2_esz);  // linear only\nldst_elem(env, adjust_addr(env, addr), i + k * max_elems, vd, ra);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_page_ldst_us",
+        "line_start": 377,
+        "line_end": 427,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Unconditionally calls probe_pages() for the full element range (line 392) before any mask check. Currently safe because only used in unmasked (vm=1) paths. If future IME tile load/store helpers reuse vext_page_ldst_us for masked paths, the probe would fault on pages containing only inactive/tail elements, violating the spec requirement that inactive/tail elements never raise exceptions.",
+      "snippet": "probe_pages(env, addr, size, ra, access_type, mmu_index, &host, &flags, true);\n// ...then for (i = env->vstart; i < evl; ++i) { ldst_host/ldst_tlb }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_continuous_ldst_tlb",
+        "line_start": 249,
+        "line_end": 259,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Iterates from env->vstart to evl and calls ldst_tlb() for EVERY element with NO mask verification. Safe only because called exclusively from vext_page_ldst_us (unmasked path). If any future IME tile load/store code calls this directly for a masked operation, every inactive/tail element would trigger a memory access — and faults would leak information about memory accessibility for elements that must never raise exceptions.",
+      "snippet": "for (i = env->vstart; i < evl; env->vstart = ++i, addr += esz) {\n    ldst_tlb(env, adjust_addr(env, addr), i, vd, ra);  // NO mask check\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/tcg/tcg-cpu.c",
+        "function_name": "cpu_get_tb_cpu_state (LMUL/SEW/ALTFMT extraction)",
+        "line_start": 121,
+        "line_end": 138,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "TB flags only extract VLMUL, VSEW, VTA, VMA, ALTFMT from env->vtype. No vlambda field is extracted. Transposed tile translation needs vlambda in TB flags to resolve row/col decomposition at translate time without re-reading the vtype CSR. EXT_TB_FLAGS has bits available after ALTFMT (bit 32) but the bit budget may be insufficient if vlambda requires multiple bits.",
+      "snippet": "uint32_t vsew = FIELD_EX64(env->vtype, VTYPE, VSEW);\n// ...\next_flags = FIELD_DP64(ext_flags, EXT_TB_FLAGS, ALTFMT, altfmt);\n// no vlambda → TB_FLAGS or EXT_TB_FLAGS extraction",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn32.decode",
+        "function_name": "decode patterns (no tile load/store)",
+        "line_start": 373,
+        "line_end": 379,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "No decode pattern exists for vmttl.v or vmtts.v. The tile load/store opcodes must be allocated and wired to translation functions. vmttl.v/vmtts.v need a distinct decode format to encode the immediate Lλ override field in the instruction word — the existing r2_nfvm/rnfvm formats do not encode this field. Without these patterns, the TCG frontend will treat vmttl.v/vmtts.v as illegal instructions, making the transposed addressing bug unreachable.",
+      "snippet": "vle8_v     ... 000 . 00000 ..... 000 ..... 0000111 @r2_nfvm\n# No vmttl.v / vmtts.v decode patterns exist",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "(no tile load/store translation handlers)",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "No gen_helper_vmttl/gen_helper_vmtts prototype or trans_vmttl/trans_vmtts translation function exists. These would need to (a) extract the Lλ immediate override from the instruction word, (b) use it instead of vtype.vlambda for row/col decomposition, (c) compute row=(i/λ)%LMUL, col=i%λ, (d) emit TCG ops for the decomposed memory accesses. No existing translation pattern supports per-instruction CSR field override.",
+      "snippet": "// No tile load/store translation handlers defined in any trans_*.c.inc file",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_vector",
+        "line_start": 138,
+        "line_end": 153,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Migration VMSTATE only serializes vreg[], vxrm, vxsat, vl, vstart, vtype, vill. Any IMA matrix-specific state (vlambda field in vtype, tile configuration, matrix accumulator registers) is missing. Live-migration of a guest using IMA would silently lose matrix state on the destination, causing incorrect execution. This is the classic 'missing field in vmstate' migration bug.",
+      "snippet": "VMSTATE_UINTTL(env.vtype, RISCVCPU),\nVMSTATE_BOOL(env.vill, RISCVCPU),\nVMSTATE_END_OF_LIST()\n// no matrix-specific fields",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/kvm/kvm-cpu.c",
+        "function_name": "kvm_riscv_get_regs_vector / kvm_riscv_put_regs_vector",
+        "line_start": 839,
+        "line_end": 893,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM get/put paths sync vstart, vl, vtype, vlenb, and vreg[] but do NOT transfer vxrm or vxsat. If KVM supports IMA, no vlambda or matrix CSR register sync exists. QEMU would fail to transfer matrix configuration between host and guest, causing state divergence and silently incorrect tile operation results after KVM_RUN.",
+      "snippet": "ret = kvm_get_one_reg(cs, RISCV_VECTOR_CSR_REG(vtype), &reg);\nenv->vtype = reg;\n// vxrm, vxsat, and matrix fields NOT transferred",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_vtype",
+        "line_start": 928,
+        "line_end": 943,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR read handler ORs vill bit with env->vtype but does not mask or decompose any vlambda field. If vlambda occupies bits within vtype, CSR reads expose vlambda to guest software without WARL filtering. While vtype is technically read-only (written via vsetvl, not CSR write), the exposure of implementation-defined configuration bits through what software expects as reserved (read-as-zero) space could leak implementation-specific details to unprivileged guests.",
+      "snippet": "*val = (target_ulong)vill | env->vtype;\n// no vlambda WARL masking — raw vtype bits exposed",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_vxrm",
+        "line_start": 967,
+        "line_end": 975,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "WARL violation: write_vxrm stores val directly into env->vxrm without applying a bitmask. vxrm has exactly 2 bits (values 0=rne, 1=rtz, 2=rdn, 3=rod), but any arbitrary target_ulong can be written. An illegal rounding mode stored this way is read back verbatim by read_vxrm (csr.c:963) and dispatched by all vector fixed-point instructions. If the integrated-matrix spec uses vxrm for single-final-rounding after K_eff accumulation, an out-of-range vxrm would cause out-of-bounds dispatch in the rounding path, corrupting guest computation.",
+      "snippet": "env->vxrm = val;  // no WARL mask — should be: env->vxrm = val & 0x3;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "cpu_reset (vector/matrix state init)",
+        "line_start": 784,
+        "line_end": 784,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CPU reset sets env->vill = true but does not initialize any matrix-specific state fields. If IMA adds dedicated matrix CSRs or internal state fields to CPURISCVState, these must be explicitly zeroed/reset here — relying on the global memset zero-fill is fragile since zero may not be the architecturally-defined reset value for all matrix registers.",
+      "snippet": "env->vill = true;\n// no matrix-specific state initialization",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "hw/riscv/riscv-iommu.c",
+        "function_name": "riscv_iommu_validate_device_ctx",
+        "line_start": 753,
+        "line_end": 757,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correctly rejects device contexts where GATP is BARE (no address translation) but MSIPTP is not OFF. When GATP=BARE, there is no second-level translation, so MSI address translation should not be configured — enabling it would be a misconfiguration. The check returns false (invalid context), preventing the IOMMU from accepting an inconsistent device context. This is a correct security-hardening addition, unrelated to the IME PR.",
+      "snippet": "if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&\n    get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=\n    RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {\n    return false;\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

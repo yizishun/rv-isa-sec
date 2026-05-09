@@ -1,0 +1,189 @@
+{
+  "pr_number": 735,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 735,
+    "violation_condition": "During hardware-implemented CLIC interrupt push (register save sequence), the store address translation uses the current (post-trap) privilege mode instead of the interrupted context's privilege mode. During mipopret/sipopret hardware pop (register restore sequence), the load address translation uses the current privilege mode instead of mstatus.MPP/sstatus.SPP respectively, or the MPRV/SUM-equivalent translation override is not atomically set before the first load and not atomically cleared after the last load, creating a window where speculative or concurrent accesses observe incorrect translation attributes.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "search for hardware FSM or microcode that generates automatic memory accesses during CLIC push/pop sequences; verify that the TLB translation request carries the correct `effective_priv` field (previous privilege for push saves, MPP for mipopret loads, SPP for sipopret loads) rather than the architectural `cur_priv`; check that MPRV-equivalent and SUM-equivalent translation overrides are temporally scoped exactly to the hardware-generated load/store window with no speculative leakage outside that window",
+    "affected_entities": [
+      "mstatus.MPRV",
+      "mstatus.MPP",
+      "sstatus.SUM",
+      "sstatus.SPP",
+      "mipopret",
+      "sipopret",
+      "CLIC push/pop hardware FSM",
+      "TLB translation request effective_priv field",
+      "LSU load/store during interrupt context save/restore"
+    ],
+    "summary": "CLIC hardware push saves registers to the interrupted context's stack, requiring store translation at the victim privilege level; mipopret/sipopret hardware pop restores registers from stack, requiring load translation at mstatus.MPP/sstatus.SPP respectively. Any mismatch in the effective privilege used for these hardware-generated memory accesses is a privilege-escape vulnerability: stores could corrupt memory the victim cannot access, and loads could leak data across privilege boundaries."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (trap entry event wiring)",
+        "line_start": 794,
+        "line_end": 797,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "XiangShan does NOT implement CLIC Smip/Ssip hardware interrupt push/pop. Trap entry is handled entirely through CSR register writes (mepc, mcause, mtval, mstatus, etc.) via TrapEntryMEvent/TrapEntryHSEvent/TrapEntryVSEvent/TrapEntryMNEvent modules. No hardware FSM generates automatic memory accesses for register save during interrupt entry, so the vulnerability condition (incorrect effective_priv on push-store TLB translations) cannot arise.",
+      "snippet": "trapEntryMNEvent.valid := ((hasTrap && nmi) || dbltrpToMN) && !entryDebugMode && !debugMode && mnstatus.regOut.NMIE\ntrapEntryMEvent .valid := hasTrap && entryPrivState.isModeM && !dbltrpToMN && !entryDebugMode && !debugMode && !nmi && mnstatus.regOut.NMIE\ntrapEntryHSEvent.valid := hasTrap && entryPrivState.isModeHS && !entryDebugMode && !debugMode && mnstatus.regOut.NMIE\ntrapEntryVSEvent.valid := hasTrap && entryPrivState.isModeVS && !entryDebugMode && !debugMode && mnstatus.regOut.NMIE",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1438,
+          "line_end": 1507,
+          "excerpt": "=== Interrupt handler push and pop extension (Smip & Ssip). The Smip and Ssip extensions depend upon the Smcsps and Sscsps extensions, respectively. The interrupt handler push and pop extension adds automatic (partial) context save and restore behavior. If MIPU is set, a trap taken at Machine level due to an interrupt causes automatic stacking. If SIPU is set, a trap taken at Supervisor level due to an interrupt causes automatic stacking."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (xRET privilege restore and MPRV)",
+        "line_start": 810,
+        "line_end": 818,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The xRET path (MRET/SRET/MNRET) correctly uses the post-return privilege state for subsequent instruction fetch — the next privilege mode is derived from mstatus.MPP/MNPP/SPP respectively. MPRV translation override for load/store is correctly gated by NMIE (forced to zero when NMIE=0). No hardware pop-memory-accesses exist, so there is no MPRV/SUM scoping window to exploit.",
+      "snippet": "in.iMode.PRVM := PRVM\nin.iMode.V := V\n// when NMIE is zero, force to behave as MPRV is zero\nin.dMode.PRVM := Mux(mstatus.regOut.MPRV.asBool && mnstatus.regOut.NMIE.asBool, mstatus.regOut.MPP, PRVM)\nin.dMode.V := V.asUInt.asBool || mstatus.regOut.MPRV && mnstatus.regOut.NMIE.asBool && (mstatus.regOut.MPP =/= PrivMode.M) && mstatus.regOut.MPV",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (TLB dmode/imode export)",
+        "line_start": 1468,
+        "line_end": 1479,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TLB privilege mode signals correctly differentiate imode (instruction fetch privilege = current PRVM) from dmode (data access privilege = MPP under MPRV, or current PRVM). The NMIE gate on MPRV prevents stale MPRV effects during NMI handling. No CLIC push/pop hardware exists to misuse these signals.",
+      "snippet": "io.tlb.imode := PRVM.asUInt\nio.tlb.dmode := Mux(\n  (debugMode && dcsr.regOut.MPRVEN || !debugMode) && mstatus.regOut.MPRV && mnstatus.regOut.NMIE,\n  mstatus.regOut.MPP.asUInt,\n  PRVM.asUInt\n)\nio.tlb.dvirt := Mux(\n  (debugMode && dcsr.regOut.MPRVEN || !debugMode) && mstatus.regOut.MPRV && mnstatus.regOut.NMIE && mstatus.regOut.MPP =/= PrivMode.M,\n  mstatus.regOut.MPV.asUInt,\n  V.asUInt\n)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/TLB.scala",
+        "function_name": "TLB (dmode/imode mode selection)",
+        "line_start": 86,
+        "line_end": 94,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "TLB correctly selects between dmode (data access under MPRV) and imode (instruction fetch privilege) based on request type (useDmode). The CSR.dmode and CSR.imode inputs properly carry the privilege level. Since no CLIC hardware push/pop FSM generates memory accesses, these signals are only used for architectural load/store and instruction fetch — no speculative privilege escape window exists.",
+      "snippet": "val mode_tmp = if (q.useDmode) csr.priv.dmode else csr.priv.imode\nval mode = (0 until Width).map(i => Mux(isHyperInst(i), csr.priv.spvp, mode_tmp))\nval virt_in = csr.priv.virt\nval virt_out = req.map(a => RegEnable(csr.priv.virt, a.fire))\nval sum = (0 until Width).map(i => Mux(virt_out(i) || isHyperInst(i), csr.priv.vsum, csr.priv.sum))\nval mxr = (0 until Width).map(i => Mux(virt_out(i) || isHyperInst(i), csr.priv.vmxr || csr.priv.mxr, csr.priv.mxr))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMEvent.scala",
+        "function_name": "TrapEntryMEventModule",
+        "line_start": 102,
+        "line_end": 122,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "M-mode trap entry correctly saves previous privilege (MPP=current.PRVM, MPV=current.V) to CSR fields. No memory push occurs — all state goes to CSRs. The Smip automatic stacking (hardware save of x10-x15 to stack) is NOT implemented, so there is no push-store whose address translation could use the wrong privilege mode.",
+      "snippet": "out.mstatus.bits.MPV  := current.privState.V\nout.mepc.bits.epc     := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))\nout.mcause.bits.ExceptionCode := Mux(isDTExcp, ExceptionNO.EX_DT.U, highPrioTrapNO)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/MNretEvent.scala",
+        "function_name": "MNretEventModule",
+        "line_start": 33,
+        "line_end": 55,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MNret correctly restores privilege from mnstatus.MNPP/MNPV. No hardware pop-memory-access occurs — xRET only restores CSR state and target PC. No mipopret/sipopret instruction exists in the decoder, so there is no pop-load whose TLB translation could use the wrong effective privilege.",
+      "snippet": "outPrivState.PRVM := in.mnstatus.MNPP\noutPrivState.V    := Mux(in.mnstatus.MNPP === PrivMode.M, VirtMode.Off.asUInt, in.mnstatus.MNPV.asUInt)\nout.mnstatus.bits.NMIE := 1.U",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "CSR address definitions",
+        "line_start": 150,
+        "line_end": 153,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Smstateen CSRs (mstateen0-3) are implemented, but bit 53 (ACLIC) and bit 58 (IMSIC) are not used because the CLIC/Smip/Ssip extensions are not implemented. The decoder has no entries for mipopret, sipopret, mcspspush, scspspush, mcspspop, scspspop, or any CLIC CSRs (acliciprio, aclicsourcecfg, spistatus, sithreshold, mspcs, sspcs). The vulnerability pattern — auto-generated memory accesses during push/pop using wrong privilege — is inapplicable.",
+      "snippet": "val mstateen0 = 0x30c\nval mstateen1 = 0x30d\nval mstateen2 = 0x30e\nval mstateen3 = 0x30f",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryHSEvent.scala",
+        "function_name": "TrapEntryHSEventModule",
+        "line_start": 102,
+        "line_end": 127,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HS-mode trap entry correctly saves previous privilege to mstatus.SPP and hstatus.SPV. No automatic stacking/hardware memory push is performed. Ssip automatic stacking is not implemented, so there is no vulnerability.",
+      "snippet": "out.mstatus.bits.SPP  := current.privState.PRVM.asUInt(0, 0)\nout.hstatus.bits.SPV  := current.privState.V\nout.sepc.bits.epc     := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMNEvent.scala",
+        "function_name": "TrapEntryMNEventModule",
+        "line_start": 42,
+        "line_end": 55,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MN-mode (NMI) trap entry saves previous privilege to mnstatus.MNPP/MNPV. Smip explicitly does not affect NMI behavior (spec line 1456). No automatic stacking is performed. Compliant.",
+      "snippet": "out.mnstatus.bits.MNPP := current.privState.PRVM\nout.mnstatus.bits.MNPV := current.privState.V\nout.mnstatus.bits.NMIE := 0.U\nout.mnepc.bits.epc     := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryVSEvent.scala",
+        "function_name": "TrapEntryVSEventModule",
+        "line_start": 101,
+        "line_end": 120,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VS-mode trap entry writes to vsstatus/vsepc/vscause/vstval CSRs. No hardware stack push. Ssip automatic stacking is not implemented, so no vulnerability exists.",
+      "snippet": "out.vsstatus.bits.SPP  := current.privState.PRVM.asUInt(0, 0)\nout.vsstatus.bits.SPIE := current.vsstatus.SIE\nout.vsepc.bits.epc     := Mux(isFetchMalAddr, in.fetchMalTval(63, 1), trapPC(63, 1))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/MretEvent.scala",
+        "function_name": "MretEventModule",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MRET restores privilege from mstatus.MPP/MPV. No hardware pop/load sequence. The spec's concern about MPRV/SUM-equivalent scoping during mipopret hardware-pop loads does not apply because mipopret is not implemented — MRET is a pure CSR-state transition without automatic memory accesses.",
+      "snippet": "(MRET is a pure CSR-based privilege transition; no automatic memory access)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/SretEvent.scala",
+        "function_name": "SretEventModule",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SRET restores privilege from sstatus.SPP (or vsstatus.SPP in V=1). No sipopret hardware-pop loads exist. The vulnerability condition — pop-load using current privilege instead of SPP — does not apply because no automatic memory pop occurs.",
+      "snippet": "(SRET is a pure CSR-based privilege transition; no automatic memory access)",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

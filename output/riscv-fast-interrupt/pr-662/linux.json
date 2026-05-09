@@ -1,0 +1,168 @@
+{
+  "pr_number": 662,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 662,
+    "violation_condition": "Linux kernel AIA interrupt driver (irq-riscv-imsic.c, irq-riscv-aplic.c) reads eidelivery CSR and branches on values 0 (none), 1 (IMSIC/MSI), or 0x40000000 (PLIC/APLIC direct), but encounters the hardwired value 0x20000000 on ACLIC systems — an unrecognized delivery mode. Writes to eidelivery intended to switch modes are silently ignored because the CSR is fixed. Additionally, kernel SMP code assumes per-hart IMSIC interrupt files with independent pending/enable bits, but ACLIC hart-local APLIC domains are single-hart-only with no IDC structures for multi-hart delivery, causing secondary harts to lack functional external interrupt delivery.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "eidelivery.*0x[01]|CSR_IEIDELIVERY|riscv_imsic_eidelivery|switch.*delivery.mode|imsic.*probe.*eidelivery|aplic.*probe.*eidelivery|case 0x40000000|readl.*IEIDELIVERY",
+    "affected_entities": [
+      "eidelivery",
+      "eip",
+      "eie",
+      "eithreshold",
+      "eipk",
+      "eiek",
+      "xtopei",
+      "xacliciprio",
+      "xaclicsourcecfg",
+      "setip",
+      "setie",
+      "in_clrip",
+      "clrie"
+    ],
+    "summary": "eidelivery CSR hardwired to 0x20000000 on ACLIC systems (Smidctrl/Ssidctrl) breaks existing kernel AIA interrupt drivers that only handle delivery modes 0/1/0x40000000, causing unrecognized-mode fallback and loss of all external interrupt delivery"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-imsic-state.c",
+        "function_name": "imsic_local_delivery",
+        "line_start": 241,
+        "line_end": 251,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Kernel unconditionally writes IMSIC_EIDELIVERY=1 (iselect=0x70, ireg=1) and IMSIC_EITHRESHOLD=0 (iselect=0x72, ireg=0) to enable interrupt delivery. The ACLIC spec explicitly states 'The AIA eidelivery and eithreshold CSRs defined for the IMSIC are not included in the scope of Smidctrl/Ssidctrl' (aclic.adoc:340). On ACLIC these indirect CSRs raise illegal-instruction or are hardwired-zero. Writes are silently dropped, so delivery is never actually enabled, yet the kernel proceeds assuming it succeeded.",
+      "snippet": "if (enable) {\n    imsic_csr_write(IMSIC_EITHRESHOLD, IMSIC_ENABLE_EITHRESHOLD);\n    imsic_csr_write(IMSIC_EIDELIVERY, IMSIC_ENABLE_EIDELIVERY);\n    return;\n}\nimsic_csr_write(IMSIC_EIDELIVERY, IMSIC_DISABLE_EIDELIVERY);\nimsic_csr_write(IMSIC_EITHRESHOLD, IMSIC_DISABLE_EITHRESHOLD);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 338,
+          "line_end": 347,
+          "excerpt": "The AIA eidelivery and eithreshold CSRs defined for the Incoming Message Signaled Interrupt Controller (IMSIC) are not included in the scope of Smidctrl/Ssidctrl. NOTE: It is not anticipated that ACLIC implementations would allow dynamically switching eidelivery into other modes. If e.g. MSI delivery is required in a system, it is recommended to use the full AIA implementation with IMSIC. Therefore, no dynamic selection of ACLIC operation via eidelivery is provided. In an ACLIC, registers eipk and eiek serve the same functionality as with eidelivery = 1 in an IMSIC."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "imsic_vsfile_local_update",
+        "line_start": 550,
+        "line_end": 587,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "KVM VCPU restore path writes eidelivery/eithreshold to VS-level indirect CSRs via VSISELECT/VSIREG. On ACLIC, eidelivery/eithreshold are excluded from the interrupt domain control interface (aclic.adoc:340). Guest VMs expecting functional external interrupt delivery get silent no-ops on these writes — delivery never activates for the guest.",
+      "snippet": "imsic_vs_csr_write(IMSIC_EITHRESHOLD, mrif->eithreshold);\nimsic_vs_csr_write(IMSIC_EIDELIVERY, mrif->eidelivery);\ncsr_write(CSR_HSTATUS, old_hstatus);\ncsr_write(CSR_VSISELECT, old_vsiselect);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 338,
+          "line_end": 344,
+          "excerpt": "The AIA eidelivery and eithreshold CSRs defined for the Incoming Message Signaled Interrupt Controller (IMSIC) are not included in the scope of Smidctrl/Ssidctrl."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "imsic_swfile_extirq_update",
+        "line_start": 614,
+        "line_end": 635,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM external interrupt injection gates on eidelivery being non-zero in the swfile. On ACLIC where eidelivery is not a functional CSR, the swfile field may carry a hardwired-zero value, causing the condition to never evaluate true and external interrupts to never be injected into the guest (DoS).",
+      "snippet": "if (imsic_mrif_atomic_read(mrif, &mrif->eidelivery) &&\n    imsic_mrif_topei(mrif, imsic->nr_eix, imsic->nr_msis))\n    kvm_riscv_vcpu_set_interrupt(vcpu, IRQ_VS_EXT);\nelse\n    kvm_riscv_vcpu_unset_interrupt(vcpu, IRQ_VS_EXT);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 338,
+          "line_end": 344,
+          "excerpt": "The AIA eidelivery and eithreshold CSRs defined for the IMSIC are not included in the scope of Smidctrl/Ssidctrl."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-imsic-state.c",
+        "function_name": "imsic_setup_state",
+        "line_start": 808,
+        "line_end": 811,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "IMSIC driver probes when SxAIA is available. ACLIC depends on Smcsrind+Smaia (aclic.adoc:303-304), so Smaia IS present on ACLIC systems. The ISA extension check 'riscv_isa_extension_available(NULL, SxAIA)' cannot distinguish AIA-with-IMSIC from AIA-with-ACLIC. On ACLIC hardware, the IMSIC driver proceeds to configure non-existent MMIO IMSIC hardware and allocates SMP per-CPU structures that are incompatible with ACLIC's single-hart design.",
+      "snippet": "if (!riscv_isa_extension_available(NULL, SxAIA)) {\n    pr_err(\"%pfwP: AIA support not available\\n\", fwnode);\n    return -ENODEV;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 303,
+          "line_end": 304,
+          "excerpt": "Smidctrl depends on the Smcsrind and Smaia extensions. Ssidctrl depends on the Sscsrind and Ssaia extensions."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-imsic-state.c",
+        "function_name": "imsic_starting_cpu",
+        "line_start": 142,
+        "line_end": 154,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CPU hotplug path calls imsic_hw_states_init() -> imsic_local_delivery(true) to enable eidelivery. On ACLIC this silently fails. Combined with ACLIC's single-hart APLIC domain model (aclic.adoc:227,240-244), the SMP IMSIC per-hart interrupt file model is fundamentally incompatible — secondary harts lack functional external interrupt delivery.",
+      "snippet": "imsic_state_online();\nenable_percpu_irq(imsic_parent_irq, irq_get_trigger_type(imsic_parent_irq));\nimsic_hw_states_init();",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 239,
+          "line_end": 244,
+          "excerpt": "The APLIC was designed as a multi-hart interrupt controller. Here, APLIC domains are used tightly coupled with a single hart."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "drivers/irqchip/irq-riscv-imsic-state.c",
+        "function_name": "imsic_local_sync_all",
+        "line_start": 226,
+        "line_end": 239,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Local sync reads/writes eip/eie via ISELECT/IREG CSRs, which ACLIC reuses (aclic.adoc:346-348: 'eip and eie arrays act as an alias of the pending and enable bits'). This indirect CSR interface is compatible; the issue is only with the eidelivery/eithreshold registers at iselect 0x70/0x72.",
+      "snippet": "raw_spin_lock_irqsave(&lpriv->lock, flags);\nif (force_all)\n    bitmap_fill(lpriv->dirty_bitmap, imsic->global.nr_ids + 1);\nif (!__imsic_local_sync(lpriv))\n    __imsic_local_timer_start(lpriv, smp_processor_id());\nraw_spin_unlock_irqrestore(&lpriv->lock, flags);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 346,
+          "line_end": 348,
+          "excerpt": "In an ACLIC, registers eipk and eiek serve the same functionality as with eidelivery = 1 in an IMSIC, i.e. they are the pending and enable bits for an interrupt source k."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/aia_imsic.c",
+        "function_name": "imsic_mrif_rmw",
+        "line_start": 310,
+        "line_end": 363,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM MRIF read-modify-write correctly implements the full IMSIC indirect CSR space. The function itself is correct for standard AIA IMSIC; the ACLIC incompatibility is at the CSR level (eidelivery/eithreshold don't exist), not in this virtualization logic.",
+      "snippet": "case IMSIC_EIDELIVERY:\n    old_val = imsic_mrif_atomic_rmw(mrif, &mrif->eidelivery, new_val, wr_mask & 0x1);\n    break;\ncase IMSIC_EITHRESHOLD:\n    old_val = imsic_mrif_atomic_rmw(mrif, &mrif->eithreshold, new_val, wr_mask & (IMSIC_MAX_ID - 1));\n    break;",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

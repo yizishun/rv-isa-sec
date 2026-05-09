@@ -1,0 +1,87 @@
+PR #640  target=xiangshan  overall=compliant
+Spec: Removal of Smaiae embedded subset and direct routing of ACLIC dependencies to full Smaia/Ssaia means virtual interrupt CSRs (mvip/mvien) must follow AIA WARL rules — hardcoding them to read-only zero (the old Smaiae behavior) causes silent virtual interrupt delivery failure, which is a hardware-level privilege escape where supervisor interrupts that should be injectable per spec are permanently masked
+Violation: XiangShan RTL hardcodes mvip/mvien (or hip/hvip/hvien) CSR fields to read-only zero based on the removed Smaiae extension's constraints, but the CSR module now claims direct Smaia/Ssaia dependency per the updated spec — software relying on virtual interrupt injection via these CSRs (e.g., supervisor-level interrupt preemption or delegated interrupt handling) will silently fail because the hardware ignores writes to virtual interrupt pending/enable bits that the full AIA spec permits to be implemented as WARL-writable
+Consequence: privilege_escape
+Pattern: mvip.*readOnly|mvien.*readOnly|hvip.*readOnly|hvien.*readOnly|virtualInterrupt.*false|RO_ZERO.*mvip|RO_ZERO.*mvien|Smaiae.*hardcoded|embeddedSubset.*aia
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:681-690  MvienBundle
+  MvienBundle correctly implements AIA spec: SSIE (bit 1) and SEIE (bit 9) are RW per spec strong recommendation; local interrupt enable bits (14-63) are RW; LCOFIE (bit 13) and non-local non-HS bits (VSSIE, MSIE, STIE, VSTIE, MTIE, VSEIE, MEIE, SGEIE) remain RO via InterruptEnableBundle defaults, which is spec-correct. No Smaiae-related hardcoding to read-only zero exists.
+  | class MvienBundle extends InterruptEnableBundle {
+  |   // Ref: riscv interrupt spec - 5.3 Interrupt filtering and virtual interrupts for supervisor level
+  |   // It is strongly recommended that bit 9 of mvien be writable.
+  |   // It is strongly recommended that bit 1 of mvien also be writable.
+  |   // A bit in mvien can be set to 1 only for major interrupts 1, 9, and 13–63.
+  |   this.SSIE.setRW().withReset(0.U)
+  |   this.SEIE.setRW().withReset(0.U)
+  |   this.getLocal.foreach(_.setRW().withReset(0.U))
+  |   this.LCOFIE.setRO().withReset(0.U)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:692-696  MvipBundle
+  MvipBundle correctly implements AIA spec: HS interrupt pending bits (SSIP, STIP, SEIP) are RW; local interrupt pending bits (14-63) are RW; LCOFIP (bit 13) is RO. The mvip module logic (lines 142-181) correctly implements alias vs independent register behavior based on mvien bits for SSIP, STIP (gated by menvcfg.STCE), and SEIP.
+  | class MvipBundle extends InterruptPendingBundle {
+  |   this.getHS.foreach(_.setRW().withReset(0.U))
+  |   this.getLocal.foreach(_.setRW().withReset(0.U))
+  |   this.LCOFIP.setRO().withReset(0.U)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:142-181  mvip module alias logic (SSIP/STIP/SEIP)
+  mvip alias logic correctly implements AIA spec: SSIP is independent writable when mvien.SSIE=1, alias of mip.SSIP otherwise (lines 146-149). STIP aliases mip.STIP when writable, read-only zero when menvcfg.STCE=1 (lines 154-157). SEIP alias/independent logic per mvien.SEIE (lines 162-166). Local interrupt writes forwarded from sip/vsip (lines 173-181).
+  | reg.SSIP := Mux(wen && this.mvien.SSIE.asBool, wdata.SSIP, reg.SSIP)
+  | regOut.SSIP := Mux(this.mvien.SSIE.asBool, reg.SSIP, this.mip.SSIP)
+  | toMip.SSIP.valid := wen && !this.mvien.SSIE.asBool
+  | toMip.SSIP.bits := wdata.SSIP
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:265-282  mip.SEIP alias logic
+  mip.SEIP correctly implements: when mvien.SEIE=0, mip.SEIP is alias of mvip.SEIP (writable); when mvien.SEIE=1, mip.SEIP is read-only zero. Read value correctly ORs mvip.SEIP with platform IRQ and AIA sources (line 282). References riscv-aia issue #64 for correctness rationale.
+  | toMvip.SEIP.valid := wen && !this.mvien.SEIE
+  | toMvip.SEIP.bits := wdata.SEIP
+  | regOut.SEIP := Mux(!this.mvien.SEIE, this.mvip.SEIP.asUInt, 0.U)
+  | rdataFields.SEIP := regOut.SEIP || platformIRP.SEIP || aiaToCSR.seip
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:271-278  HvienBundle
+  HvienBundle correctly implements AIA spec: bits 12:0 are RO ("reserved and must be read-only zeros" per hypervisor spec), local interrupt enable bits 14-63 are RW, LCOFIE (bit 13) is RO. No Smaiae-related incorrect hardcoding.
+  | class HvienBundle extends InterruptEnableBundle {
+  |   // Ref: riscv interrupt spec - 6.3.2 Virtual interrupts for VS level
+  |   // Bits 12:0 of hvien are reserved and must be read-only zeros.
+  |   // For interrupt numbers 13–63, implementations may freely choose which bits of hvien are writable
+  |   this.getLocal.foreach(_.setRW().withReset(0.U))
+  |   this.LCOFIE.setRO().withReset(0.U)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:253-258  HvipBundle
+  HvipBundle correctly implements: VS interrupt pending bits (VSSIP, VSTIP, VSEIP) are RW; local interrupt pending bits 14-63 are RW; LCOFIP (bit 13) is RO. Writes accepted from mip, hip, and vsip correctly muxed (lines 116-129).
+  | class HvipBundle extends InterruptPendingBundle {
+  |   this.getVS.foreach(_.setRW().withReset(0.U))
+  |   this.getLocal.foreach(_.setRW().withReset(0.U))
+  |   this.LCOFIP.setRO().withReset(0.U)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala:21-62  sie module (mvien alias logic)
+  sie correctly implements mvien-based alias logic: when mideleg=1, sie is alias of mie; when mideleg=0 and mvien=1, sie uses its own register (usingReg). Hardwired bits (M-mode and VS-mode bits) are set to zero as required. sip module (line 102) similarly uses mvipIsAlias = ~mideleg & mvien for correct virtual interrupt routing.
+  | val mieIsAlias = mideleg
+  | val usingReg   = ~mideleg & mvien
+  | regOut := (mieIsAlias & mie) | (usingReg & reg)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:259-264  ssAiaHaddr / csrIsAIA
+  ssAiaHaddr list omits mvip/mvien, but this is correct: mvip/mvien are M-mode CSRs (addr 0x308/0x309, addr[9:8]=0b11). Non-M-mode access is already blocked by privilege-level check. The mstateen0.AIA bit controls non-M-mode access per smstateen spec, which is already forbidden for these M-mode CSRs. Adding them to the AIA check would be redundant.
+  | private val ssAiaHaddr = Seq(CSRs.hvien.U, CSRs.hvictl.U, CSRs.hviprio1.U, CSRs.hviprio2.U)
+  | private val ssAiaVSaddr = addr === CSRs.vstopi.U
+  | private val ssAiaSaddr = addr === CSRs.stopi.U
+  | private val csrIsAIA = ssAiaHaddr.map(_ === addr).reduce(_ || _) || ssAiaVSaddr || ssAiaSaddr
+  | private val accessAIA_EX_II = csrIsAIA && !privState.isModeM && !mstateen0.AIA.asBool
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:689-695  mvip/mvien LCOFI bits
+  LCOFIP and LCOFIE are RO (hardwired zero) in both MvienBundle and MvipBundle, as well as in HvienBundle and HvipBundle. This is correct since XiangShan does not implement the Sscofpmf extension (counter-overflow interrupts). No Sscofpmf references found in NewCSR directory.
+  | this.LCOFIE.setRO().withReset(0.U)  // in MvienBundle
+  | this.LCOFIP.setRO().withReset(0.U)  // in MvipBundle
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:654-679  MipBundle (LCOFIP, MTIP wiring)
+  MipBundle correctly implements: LCOFIP is RW with reset 0; HS bits (SSIP/STIP/SEIP) and VS bits (VSSIP/VSTIP/VSEIP) are RW; M-mode bits (MSIP/MTIP/MEIP) are RO as platform-level interrupts. This matches the AIA spec where some bits in mip are RO aliases of platform/mvip signals.
+  | class MipBundle extends InterruptPendingBundle {
+  |   this.LCOFIP.setRW().withReset(0.U)
+  |   this.getHS.foreach(_.setRW().withReset(0.U))
+  |   this.getVS.foreach(_.setRW().withReset(0.U))
+  |   this.LCOFIP.setRW().withReset(0.U)
+  | }
+

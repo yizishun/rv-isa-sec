@@ -1,0 +1,47 @@
+PR #392  target=linux  overall=compliant
+Spec: R_RISCV_ALIGN_DOWN (type 62) rounds alignment down (addend→next-lower power-of-two) unlike R_RISCV_ALIGN (type 43) which rounds up; conflating the two in the module loader would corrupt code alignment and create misaligned instruction boundaries exploitable as ROP gadgets
+Violation: The kernel module loader (module.c:apply_relocate_add) or kexec file loader (machine_kexec_file.c) encounters R_RISCV_ALIGN_DOWN (type 62) and either (a) has no handler causing an out-of-bounds array access if ARRAY_SIZE(reloc_handlers) implicitly grows past 62, or (b) handles it using R_RISCV_ALIGN's round-up semantics instead of the round-down semantics, corrupting the addend-derived alignment boundary
+Consequence: data_corruption
+Pattern: R_RISCV_ALIGN_DOWN.*reloc_handler|case R_RISCV_ALIGN_DOWN.*break|type == 62.*ALIGN
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/module.c:808-818  apply_relocate_add
+  R_RISCV_ALIGN_DOWN (type 62) is not defined in the kernel elf.h header (the enum stops at R_RISCV_SUB_ULEB128=61). The bounds check `if (type < ARRAY_SIZE(reloc_handlers))` at line 810 correctly guards against OOB access: for type 62, ARRAY_SIZE(reloc_handlers) is 62 (indices 0-61), so the condition fails, handler becomes NULL, and the kernel cleanly returns -EINVAL with 'Unknown relocation type 62'. No OOB vulnerability.
+  | type = ELF_RISCV_R_TYPE(rel[i].r_info);
+  | if (type < ARRAY_SIZE(reloc_handlers))
+  | 	handler = reloc_handlers[type].reloc_handler;
+  | else
+  | 	handler = NULL;
+  | if (!handler) {
+  | 	pr_err("%s: Unknown relocation type %u\n", me->name, type);
+  | 	return -EINVAL;
+
+[compliant] arch/riscv/kernel/module.c:638-645  process_accumulated_relocations
+  No bounds check at line 640 (`reloc_handlers[curr_type].reloc_handler(...)`) before indexing the reloc_handlers array. However, type 62 can never reach this path because only types with accumulate_handler entries (ADD/SUB/SET/ULEB128: types 33-40, 52-55, 60-61) are added to the accumulate hash table. No type 62 accumulation entry exists, so this is safe in practice. This is a defense-in-depth gap, not an exploitable bug.
+  | curr_type = rel_entry_iter->type;
+  | reloc_handlers[curr_type].reloc_handler(
+  | 	me, &buffer, rel_entry_iter->value);
+  | kfree(rel_entry_iter);
+
+[compliant] arch/riscv/kernel/module.c:524-595  reloc_handlers[]
+  The reloc_handlers array has entries up to index 61 (R_RISCV_SUB_ULEB128). The comment at line 593 says '62-191 reserved for future standard use'. No R_RISCV_ALIGN_DOWN (62) handler exists, which is correct for the current kernel state. The existing R_RISCV_ALIGN (43) handler at line 571 errors out with 'unexpected relocation type' — appropriate because ALIGN relocations are supposed to be resolved by the linker before the kernel module loader sees them. If someone copy-pastes this entry for ALIGN_DOWN (62) in the future, they'd get the same error-on-sight behavior, which would reject valid ALIGN_DOWN relocations rather than performing round-down NOP padding — a latent copy-paste risk but not a current bug.
+  | [R_RISCV_ALIGN]    = { .reloc_handler = apply_r_riscv_align_rela },
+  | ...
+  | /* 62-191 reserved for future standard use */
+
+[compliant] arch/riscv/kernel/machine_kexec_file.c:239-250  arch_kexec_apply_relocations_add
+  The switch handles R_RISCV_ALIGN (43), R_RISCV_PCREL_LO12_I, and R_RISCV_RELAX as no-op breaks. No case exists for R_RISCV_ALIGN_DOWN (62). Type 62 falls to the default case at line 247-249 which prints 'Unknown rela relocation: 62' and returns -ENOEXEC. This is correct: the kernel safely rejects the unknown relocation type without any memory corruption or undefined behavior.
+  | case R_RISCV_ALIGN:
+  | case R_RISCV_RELAX:
+  | 	break;
+  | ...
+  | default:
+  | 	pr_err("Unknown rela relocation: %d\n", r_type);
+  | 	return -ENOEXEC;
+
+[compliant] arch/riscv/include/uapi/asm/elf.h:82-98  N/A (relocation enum definitions)
+  The relocation type enum stops at R_RISCV_SUB_ULEB128 (61). R_RISCV_ALIGN_DOWN (type 62) is NOT defined in this header. This means R_RISCV_ALIGN_DOWN is not yet allocated by the psABI from the '62-191 reserved for future standard use' range — the kernel cannot have a semantic mismatch handler for a relocation type that does not exist in the ELF psABI yet.
+  | #define R_RISCV_ALIGN     43
+  | ...
+  | #define R_RISCV_SET_ULEB128   60
+  | #define R_RISCV_SUB_ULEB128   61
+

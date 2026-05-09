@@ -1,0 +1,130 @@
+{
+  "pr_number": 702,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 702,
+    "violation_condition": "Linux kernel context-switches between tasks that use scspspush/sipopret without saving and restoring the ssp CSR (which holds the S-mode shadow stack pointer and PUSH/PPUSH bits), causing one task to resume with another task's S-mode stack pointer and conditional-swap state.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "context_switch.*(?:ssp|CSR_SSP)|__switch_to.*(?:ssp|0x[0-9a-fA-F]+.*ssp)|sipopret|scspspush|scspspop",
+    "affected_entities": [
+      "ssp",
+      "scspspush",
+      "scspspop",
+      "sipopret",
+      "sret"
+    ],
+    "summary": "New Ssip extension adds ssp CSR and sipopret instruction; kernel must context-switch ssp or risk cross-task stack-pointer corruption and unintended conditional stack swaps on interrupt return"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 421,
+        "line_end": 471,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "__switch_to does not save or restore the sspcs CSR (0x149, S-mode conditional-swap stack pointer with PUSH/PPUSH bits). If hardware implements the Sscsps extension and kernel context-switches between tasks that use scspspush/scspspop/sipopret, the next task inherits the previous task's sspcs.SP, sspcs.PUSH, and sspcs.PPUSH state. The spec text at aclic.adoc:965-967 explicitly states: 'The PPUSH bit ... corresponds to the value of the PUSH bit in the previous context. This bit is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted.' The kernel's __switch_to saves ra, sp, s0–s11, STATUS, SUM, and shadow call stack but has no code path for sspcs.",
+      "snippet": "SYM_FUNC_START(__switch_to)\n\t/* Save context into prev->thread */\n\tli    a4,  TASK_THREAD_RA\n\tadd   a3, a0, a4\n\tadd   a4, a1, a4\n\tREG_S ra,  TASK_THREAD_RA_RA(a3)\n\t...\n\t/* No save/restore of sspcs CSR (0x149) */\n\tret\nSYM_FUNC_END(__switch_to)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 958,
+          "line_end": 970,
+          "excerpt": "The PUSH bit indicates that the stack pointer in {xspcs} shall be swapped during the push sequence of the next handler. The PPUSH bit indicates that the stack pointer shall be swapped back into {xspcs}. It corresponds to the value of the PUSH bit in the previous context. This bit is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted."
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 920,
+          "line_end": 955,
+          "excerpt": "New CSRs are introduced to hold an alternative stack pointer. Conditionally, this stack pointer can be swapped with the currently active one. Number 0x149 Name sspcs Description: S-mode stack pointer for conditional swap (WARL). In addition to the stack pointer, this register holds two additional fields, PUSH and PPUSH (as in previous PUSH). These indicate if a stack pointer swap is expected during a push or pop sequence, respectively."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/switch_to.h",
+        "function_name": "switch_to",
+        "line_start": 113,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The switch_to macro sequences FPU save/restore, vector save/restore, icache flush, envcfg switch, and __switch_to — but has no handling for sspcs (0x149). The __switch_to_envcfg inline only writes CSR_ENVCFG; there is no analogous __switch_to_sspcs or any mechanism to context-switch the Sscsps conditional-swap state.",
+      "snippet": "#define switch_to(prev, next, last)           \\\ndo {                                           \\\n\t...                                        \\\n\t__switch_to_envcfg(__next);               \\\n\t((last) = __switch_to(__prev, __next));    \\\n} while (0)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 965,
+          "line_end": 967,
+          "excerpt": "This bit is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "",
+        "line_start": 332,
+        "line_end": 336,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR_SSP (0x011) is correctly defined. However note this is the Zicfiss user-mode shadow stack pointer — a different CSR from the sspcs (0x149) described in the Sscsps spec. The CSR numbering gap between STIMECMPH (0x15D) and STIMECMP (0x14D) shows that sspcs at 0x149 is not defined here. The kernel handles CSR_SSP (0x011) correctly via save_userssp/restore_userssp in entry.S, but this is a different CSR from what the security spec's violation condition describes.",
+      "snippet": "#define CSR_STIMECMP           0x14D\n#define CSR_STIMECMPH          0x15D\n\n/* zicfiss user mode csr.  CSR_SSP holds current shadow stack pointer */\n#define CSR_SSP                 0x011",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "save_userssp",
+        "line_start": 99,
+        "line_end": 110,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "save_userssp correctly reads CSR_SSP (0x011, Zicfiss user shadow stack pointer) via csrrw and stores it to TASK_TI_USER_SSP (thread_info.user_cfi_state.user_shdw_stk) when returning from userspace. It also zeroes CSR_SSP for sanitization. This mechanism correctly context-switches the user-mode shadow stack pointer, but it only fires on exception entry from U-mode — it saves the value into the current task's per-task storage, not into a per-CPU area, so cross-task contexts are properly isolated.",
+      "snippet": ".macro save_userssp tmp, status\n\tALTERNATIVE(\"nops(4)\",\n\t\t__stringify(\n\t\tandi \\tmp, \\status, SR_SPP;\n\t\tbnez \\tmp, skip_ssp_save;\n\t\tcsrrw \\tmp, CSR_SSP, x0;\n\t\tREG_S \\tmp, TASK_TI_USER_SSP(tp);\n\t\tskip_ssp_save:),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "restore_userssp",
+        "line_start": 112,
+        "line_end": 123,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "restore_userssp correctly restores CSR_SSP (0x011) from TASK_TI_USER_SSP when returning to userspace. This properly restores the user-mode shadow stack pointer for the current task.",
+      "snippet": ".macro restore_userssp tmp, status\n\tALTERNATIVE(\"nops(4)\",\n\t\t__stringify(\n\t\tandi \\tmp, \\status, SR_SPP;\n\t\tbnez \\tmp, skip_ssp_restore;\n\t\tREG_L \\tmp, TASK_TI_USER_SSP(tp);\n\t\tcsrw CSR_SSP, \\tmp;\n\t\tskip_ssp_restore:),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_switch.S",
+        "function_name": "SAVE_HOST_AND_RESTORE_GUEST_CSRS",
+        "line_start": 41,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "KVM VCPU context switch does not save or restore the host sspcs CSR (0x149) when switching between host and guest. If the host kernel or the guest VM uses scspspush/scspspop/sipopret (Sscsps/Ssip extensions), the conditional-swap state could leak between host and guest or between VCPUs.",
+      "snippet": ".macro SAVE_HOST_AND_RESTORE_GUEST_CSRS __resume_addr\n\t/* Load Guest CSR values */\n\tREG_L\tt0, (KVM_ARCH_GUEST_SSTATUS)(a0)\n\tla\tt1, \\__resume_addr\n\tREG_L\tt2, (KVM_ARCH_GUEST_SEPC)(a0)\n\t/* No save/restore of sspcs */\n\t...",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 965,
+          "line_end": 967,
+          "excerpt": "This bit is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

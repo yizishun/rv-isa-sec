@@ -1,0 +1,25 @@
+PR #735  target=qemu  overall=compliant
+Spec: CLIC interrupt push stores and pop loads must use the effective privilege mode (previous mode for push, MPP/SPP for pop) for address translation and protection; failure causes GPR save/restore to target wrong physical addresses, corrupting the interrupted context's architectural state on mret/sret
+Violation: QEMU's implementation of CLIC/Smip interrupt push/pop (mipopret/sipopret) performs memory load/store operations using the current privilege mode's address translation (mem_idx) instead of the effective privilege mode specified by the spec: previous privilege mode for push stores, mstatus.MPP for mipopret loads, and sstatus.SPP for sipopret loads. Additionally, mipopret loads fail to apply MPRV semantics and sipopret loads fail to apply SUM semantics during translation.
+Consequence: data_corruption
+Pattern: helper_mipopret|helper_sipopret|clint.*push|clic.*stack|cpu_stl_data|cpu_ldl_data.*mipopret|sipopret.*translate|smip.*mem_idx|get_physical_address.*clic|riscv_cpu_do_interrupt.*clic|smip.*ld|smip.*st
+------------------------------------------------------------
+[compliant] target/riscv/cpu_helper.c:2206-2547  riscv_cpu_do_interrupt
+  Classic trap entry saves context to CSRs only (mepc/mcause/mtval/stval etc.) — no memory push/pop operations exist. The Smip xSP-based memory push/pop mechanism is not implemented in this QEMU version, so there is no risk of incorrect mem_idx usage during interrupt push/pop memory accesses.
+  | env->mepc = env->elr;
+  | ...
+  | riscv_cpu_set_mode(env, PRV_M, false);
+
+[compliant] target/riscv/op_helper.c:457-503  helper_mnret
+  RNMI mret restores state from CSRs only (mnepc, mnstatus). No memory load operations are performed. This is not the Smip xipopret path.
+  | target_ulong retpc = env->mnepc;
+  | target_ulong prev_priv = get_field(env->mnstatus, MNSTATUS_MNPP);
+  | ...
+  | riscv_cpu_set_mode(env, prev_priv, prev_virt);
+
+[compliant] target/riscv/csr.c:398-401  scountinhibit_pred
+  This branch adds the missing CDE check for scountinhibit CSR access — a correctness fix unrelated to Smip/CLIC interrupt push/pop. The change correctly gates scountinhibit on MENVCFG_CDE per the Smcdeleg/Ssccfg spec.
+  | if (!get_field(env->menvcfg, MENVCFG_CDE)) {
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+

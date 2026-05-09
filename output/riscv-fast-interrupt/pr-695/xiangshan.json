@@ -1,0 +1,130 @@
+{
+  "pr_number": 695,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 695,
+    "violation_condition": "XiangShan currently defines CSR 'mscratchcsw' (M-mode conditional-swap stack pointer, i.e., msp) at 0x348 (CSRs.scala:138), 'sscratchcsw' (ssp) at 0x148 (CSRs.scala:133), with no registers at 0x347, 0x147, 0xFB1, or 0x1B1 for mithreshold/sithreshold/mipreemptcfg. The spec diff renumbers the CSR address space: msp 0x348→0x349, ssp 0x148→0x149, mipreemptcfg 0x347→0x348, mithreshold 0xFB1→0x347, sithreshold 0x1B1→0x147. After this change, any CSRRW/CSRRS/CSRRC to 0x348 in XiangShan will read/write the old stack-pointer register (mscratchcsw) instead of the spec-mandated mipreemptcfg register, corrupting interrupt preemption configuration. Accesses to 0x347 and 0x147 are unmapped by XiangShan and will either raise illegal-instruction exceptions or return zero, silently ignoring interrupt threshold settings.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "(0x348|0x349|0x148|0x149|0x146|0x147|0x346|0x347).*CSR|val\\s+(mscratchcsw|sscratchcsw|mscratchcswl|sscratchcswl)\\s*=|mscratchcsw|sscratchcsw|mintstatus|sintstatus",
+    "affected_entities": [
+      "mscratchcsw",
+      "sscratchcsw",
+      "mscratchcswl",
+      "sscratchcswl",
+      "mipreemptcfg",
+      "mithreshold",
+      "sithreshold",
+      "msp",
+      "ssp"
+    ],
+    "summary": "CSR address renumbering collision: XiangShan msp/ssp scratchcsw registers at old 0x348/0x148 collide with spec's new mipreemptcfg at 0x348 and new ssp at 0x149; unmapped mithreshold/sithreshold at 0x347/0x147 silently drop interrupt threshold and preemption config, allowing unauthorized interrupt preemption"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "CSR address definitions (mscratchcsw)",
+        "line_start": 138,
+        "line_end": 139,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "CSR address conflict: mscratchcsw (M-mode conditional-swap stack pointer, i.e. msp) is defined at 0x348, but the spec (aclic.adoc:681) assigns mipreemptcfg (Interrupt Preemption Configuration) to 0x348. Any CSRRW/CSRRS/CSRRC to 0x348 reads/writes the stack pointer register instead of the interrupt preemption configuration register, corrupting interrupt nesting behavior. The stack pointer should be at 0x349 (as mspcs per aclic.adoc:924), and 0x348 should hold mipreemptcfg with WARL preemptmsk field (bits 3:0). Software configuring preemption via 0x348 will silently corrupt the M-mode stack pointer.",
+      "snippet": "val mintstatus = 0x346\n// 0x347 is unmapped — mithreshold missing\nval mscratchcsw = 0x348   // ← should be mipreemptcfg\nval mscratchcswl = 0x349   // ← should be mspcs (renamed from mscratchcsw)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 676,
+          "line_end": 682,
+          "excerpt": "(NEW) 0x347 mithreshold | (NEW) 0x348 mipreemptcfg — Interrupt preemption configuration"
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 921,
+          "line_end": 926,
+          "excerpt": "(NEW) 0x349 mspcs — M-mode stack pointer for conditional swap (WARL)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "CSR address definitions (gap at 0x347)",
+        "line_start": 137,
+        "line_end": 138,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Missing CSR: mithreshold (interrupt enable threshold) at 0x347 is not defined. Address 0x347 falls between mintstatus (0x346) and mscratchcsw (0x348) and is unmapped. Accesses to 0x347 will raise illegal-instruction exceptions via MaskedRegMap.isIllegalAddr (RegMap.scala:60-63), causing software that configures interrupt priority thresholds to get fatal exceptions instead of silently setting thresholds. This prevents any OS/hypervisor from using the Smnip interrupt threshold mechanism.",
+      "snippet": "val mintstatus = 0x346\nval mscratchcsw = 0x348  // gap at 0x347 — mithreshold missing",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 676,
+          "line_end": 682,
+          "excerpt": "(NEW) 0x347 mithreshold — Interrupt enable threshold"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "CSR address definitions (sscratchcsw)",
+        "line_start": 132,
+        "line_end": 133,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR address misalignment: sscratchcsw (S-mode conditional-swap stack pointer) defined at 0x148, but spec assigns sithreshold to 0x147 and sspcs (S-mode stack pointer) to 0x149. Address 0x148 is between sithreshold (0x147) and sspcs (0x149) — the spec has no CSR at 0x148. The S-mode stack pointer should be at 0x149 per spec, and sscratchcswl at 0x149 would collide with spec's sspcs. Additionally, 0x147 is unmapped, so sithreshold access also raises illegal-instruction.",
+      "snippet": "val sintstatus = 0x146\n// 0x147 is unmapped — sithreshold missing\nval sscratchcsw = 0x148\nval sscratchcswl = 0x149",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 741,
+          "line_end": 746,
+          "excerpt": "(NEW) 0x146 spistatus | (NEW) 0x147 sithreshold — Interrupt enable threshold"
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 921,
+          "line_end": 926,
+          "excerpt": "(NEW) 0x149 sspcs — S-mode stack pointer for conditional swap (WARL)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "rocket-chip/src/main/scala/rocket/Instructions.scala",
+        "function_name": "CSR address definitions (duplicate of CSRs.scala)",
+        "line_start": 1029,
+        "line_end": 1031,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Mirror of Finding #1 in rocket-chip's Instructions.scala: mscratchcsw at 0x348 and mscratchcswl at 0x349 are identically misaligned. This duplicate definition carries the same address conflict risk if the rocket-chip CSR layer is used for Smnip CSR handling. The same 0x347 gap for mithreshold exists between mintstatus (0x346) and mscratchcsw (0x348).",
+      "snippet": "val mintstatus = 0x346\nval mscratchcsw = 0x348\nval mscratchcswl = 0x349",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 676,
+          "line_end": 682,
+          "excerpt": "(NEW) 0x347 mithreshold | (NEW) 0x348 mipreemptcfg"
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 921,
+          "line_end": 926,
+          "excerpt": "(NEW) 0x349 mspcs — M-mode stack pointer for conditional swap"
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

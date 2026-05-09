@@ -1,0 +1,14 @@
+PR #30  target=qemu  overall=compliant
+Spec: Pre-PR30 spec had three inconsistent VL divisibility divisors (λ, K_eff, λ×LMUL) across GEMM instructions; a QEMU implementation matching the old spec would accept invalid VL values and compute wrong N_tile for widening/narrowing variants when LMUL>1, causing silent data corruption on the C accumulator tile
+Violation: In QEMU TCG translate or helper code implementing integrated-matrix GEMM instructions, the VL divisibility check uses the old divisor (just λ or K_eff = λ × W × LMUL) instead of the unified λ × LMUL to compute N_tile = VL / (λ × LMUL). Specifically, if decode_gemm_geometry or equivalent QEMU logic retains a vl_divisor_is_lambda flag or uses K_eff as the divisor, then for instructions where W > 1 (integer widening W=2/4/8, FP narrowing W=2/4/8) and LMUL > 1, VL values that should raise Illegal Instruction are instead accepted, and N_tile is incorrectly computed (too small), leading to register file access bounds that are too narrow but within-vector-element indexing that silently overruns the intended tile column count.
+Consequence: data_corruption
+Pattern: vl_div.*(?:lambda|K_eff|vl_divisor_is_lambda)[^L]*LMUL|decode_gemm_geometry\([0-9]+,\s*(?:true|false)\)|N_tile.*=.*vl\s*/\s*(?:lambda|K_eff)
+------------------------------------------------------------
+[compliant] target/riscv/vector_helper.c:0-0  N/A (integrated-matrix GEMM not implemented)
+  Integrated-matrix GEMM (vmttl.v, vmtts.v, vmtl.v) instructions are not implemented in QEMU. The decode_gemm_geometry function, N_tile computation, vl_divisor_is_lambda flag, and K_eff-based VL divisibility checks referenced in the security spec do not exist in the codebase. No code path performs the vulnerable VL / (λ × LMUL) or VL / K_eff computation that the security spec describes. The existing V-extension infrastructure (OPIVV3/OPFVV3 MAC templates in vector_helper.c, vsetvl at line 61, vtype validation in vtype_reserved at line 36) handles only the standard V-extension semantics and has no awareness of matrix tile geometry, lambda encoding, or CMUL register grouping.
+  | // No integrated-matrix GEMM code exists in QEMU.
+  | // Closest ancestors: standard V-extension MACC helpers (OPIVV3 at L1960, OPFVV3 at L3480)
+  | // These are per-element multiply-accumulate, not matrix GEMM with K_eff-level accumulation.
+  | // vtype_reserved() at L36 treats bits >= 9 as RESERVED, blocking any vlambda encoding.
+  | // vsetvl helper at L61 does not extract/validate lambda, mtype, or matrix tile dimensions.
+

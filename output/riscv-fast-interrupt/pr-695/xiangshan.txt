@@ -1,0 +1,31 @@
+PR #695  target=xiangshan  overall=bug_confirmed
+Spec: CSR address renumbering collision: XiangShan msp/ssp scratchcsw registers at old 0x348/0x148 collide with spec's new mipreemptcfg at 0x348 and new ssp at 0x149; unmapped mithreshold/sithreshold at 0x347/0x147 silently drop interrupt threshold and preemption config, allowing unauthorized interrupt preemption
+Violation: XiangShan currently defines CSR 'mscratchcsw' (M-mode conditional-swap stack pointer, i.e., msp) at 0x348 (CSRs.scala:138), 'sscratchcsw' (ssp) at 0x148 (CSRs.scala:133), with no registers at 0x347, 0x147, 0xFB1, or 0x1B1 for mithreshold/sithreshold/mipreemptcfg. The spec diff renumbers the CSR address space: msp 0x348→0x349, ssp 0x148→0x149, mipreemptcfg 0x347→0x348, mithreshold 0xFB1→0x347, sithreshold 0x1B1→0x147. After this change, any CSRRW/CSRRS/CSRRC to 0x348 in XiangShan will read/write the old stack-pointer register (mscratchcsw) instead of the spec-mandated mipreemptcfg register, corrupting interrupt preemption configuration. Accesses to 0x347 and 0x147 are unmapped by XiangShan and will either raise illegal-instruction exceptions or return zero, silently ignoring interrupt threshold settings.
+Consequence: privilege_escape
+Pattern: (0x348|0x349|0x148|0x149|0x146|0x147|0x346|0x347).*CSR|val\s+(mscratchcsw|sscratchcsw|mscratchcswl|sscratchcswl)\s*=|mscratchcsw|sscratchcsw|mintstatus|sintstatus
+------------------------------------------------------------
+[bug_confirmed] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:138-139  CSR address definitions (mscratchcsw)
+  CSR address conflict: mscratchcsw (M-mode conditional-swap stack pointer, i.e. msp) is defined at 0x348, but the spec (aclic.adoc:681) assigns mipreemptcfg (Interrupt Preemption Configuration) to 0x348. Any CSRRW/CSRRS/CSRRC to 0x348 reads/writes the stack pointer register instead of the interrupt preemption configuration register, corrupting interrupt nesting behavior. The stack pointer should be at 0x349 (as mspcs per aclic.adoc:924), and 0x348 should hold mipreemptcfg with WARL preemptmsk field (bits 3:0). Software configuring preemption via 0x348 will silently corrupt the M-mode stack pointer.
+  | val mintstatus = 0x346
+  | // 0x347 is unmapped — mithreshold missing
+  | val mscratchcsw = 0x348   // ← should be mipreemptcfg
+  | val mscratchcswl = 0x349   // ← should be mspcs (renamed from mscratchcsw)
+
+[bug_confirmed] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:137-138  CSR address definitions (gap at 0x347)
+  Missing CSR: mithreshold (interrupt enable threshold) at 0x347 is not defined. Address 0x347 falls between mintstatus (0x346) and mscratchcsw (0x348) and is unmapped. Accesses to 0x347 will raise illegal-instruction exceptions via MaskedRegMap.isIllegalAddr (RegMap.scala:60-63), causing software that configures interrupt priority thresholds to get fatal exceptions instead of silently setting thresholds. This prevents any OS/hypervisor from using the Smnip interrupt threshold mechanism.
+  | val mintstatus = 0x346
+  | val mscratchcsw = 0x348  // gap at 0x347 — mithreshold missing
+
+[potential_risk] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:132-133  CSR address definitions (sscratchcsw)
+  CSR address misalignment: sscratchcsw (S-mode conditional-swap stack pointer) defined at 0x148, but spec assigns sithreshold to 0x147 and sspcs (S-mode stack pointer) to 0x149. Address 0x148 is between sithreshold (0x147) and sspcs (0x149) — the spec has no CSR at 0x148. The S-mode stack pointer should be at 0x149 per spec, and sscratchcswl at 0x149 would collide with spec's sspcs. Additionally, 0x147 is unmapped, so sithreshold access also raises illegal-instruction.
+  | val sintstatus = 0x146
+  | // 0x147 is unmapped — sithreshold missing
+  | val sscratchcsw = 0x148
+  | val sscratchcswl = 0x149
+
+[bug_confirmed] rocket-chip/src/main/scala/rocket/Instructions.scala:1029-1031  CSR address definitions (duplicate of CSRs.scala)
+  Mirror of Finding #1 in rocket-chip's Instructions.scala: mscratchcsw at 0x348 and mscratchcswl at 0x349 are identically misaligned. This duplicate definition carries the same address conflict risk if the rocket-chip CSR layer is used for Smnip CSR handling. The same 0x347 gap for mithreshold exists between mintstatus (0x346) and mscratchcsw (0x348).
+  | val mintstatus = 0x346
+  | val mscratchcsw = 0x348
+  | val mscratchcswl = 0x349
+

@@ -1,0 +1,36 @@
+PR #30  target=linux  overall=potential_risk
+Spec: Unified VL divisibility to λ×LMUL across all GEMM instructions; kernel must ensure restored vtype/vl pairs satisfy the new invariant or risk illegal-instruction traps (DoS) from mismatched hardware/spec expectations on context switch boundaries.
+Violation: Kernel restores vtype (with lambda, SEW, LMUL) and vl via sigreturn/ptrace/KVM without validating that vl is a multiple of (vtype.lambda × vtype.LMUL), allowing a userspace thread to observe hardware illegal-instruction traps or execute GEMM instructions with incoherent tile geometry depending on whether the hardware implements the old (inconsistent per-instruction) or new (unified λ×LMUL) VL divisibility checks.
+Consequence: denial_of_service
+Pattern: restore_v_state|__fpsimd_restore_state|riscv_vr_set|kvm_riscv_vcpu_set_reg|vtype.*LMUL.*vl|sigreturn.*v_ext
+------------------------------------------------------------
+[potential_risk] arch/riscv/kernel/signal.c:115-143  __restore_v_state
+  sigreturn restores vtype and vl from userspace with zero validation. The function copies the entire __riscv_v_ext_state (including vstart, vtype, vl, vcsr, vlenb) directly from the user signal frame via __copy_from_user() at line 129-130 without checking vtype reserved bits, VLMAX consistency, or any vl-divisibility constraint. The hardware vsetvl in __vstate_csr_restore (vector.h:172) provides a safety net by setting vill for invalid vtype encodings and capping vl to VLMAX, but no kernel-side validation exists. When the proposed integrated-matrix λ field is added to vtype, this path will require a vl % (λ × LMUL) divisibility check.
+  | err = __copy_from_user(&current->thread.vstate, &state->v_state,
+  |                        offsetof(struct __riscv_v_ext_state, datap));
+  | if (unlikely(err))
+  |     return err;
+  | 
+  | /* Copy the pointer datap itself. */
+  | err = __get_user(datap, &state->v_state.datap);
+
+[potential_risk] arch/riscv/kvm/vcpu_vector.c:165-203  kvm_riscv_vcpu_set_reg_vector
+  KVM ONE_REG interface for vector CSRs has zero validation. The function sets vtype, vl, vstart, vcsr individually (line 199: copy_from_user(reg_addr, uaddr, reg_size)) with no cross-field consistency check. A VMM can write vl and vtype independently to inconsistent values. The hardware vsetvl in __kvm_riscv_vector_restore (via __vstate_csr_restore, vector.h:172) will sanitize at VCPU load time, but the guest context remains in an inconsistent intermediate state between successive ONE_REG calls. When the integrated-matrix λ field is added, this path will need vl % (λ × LMUL) validation.
+  | rc = kvm_riscv_vcpu_vreg_addr(vcpu, reg_num, reg_size, &reg_addr);
+  | if (rc)
+  |     return rc;
+  | 
+  | if (copy_from_user(reg_addr, uaddr, reg_size))
+  |     return -EFAULT;
+  | 
+  | return 0;
+
+[compliant] arch/riscv/kernel/ptrace.c:217-251  riscv_vr_set
+  ptrace vector register setter has proper validation via invalid_ptrace_v_csr() (lines 238-239). It checks: vtype reserved bits (line 150-151), VLMUL reserved encoding 0x4 (line 165), SEW/ELEN consistency (line 158), VLMAX constraint VL ≤ LMUL×VLEN/SEW (lines 175-184), vcsr reserved bits (line 144-145), and vlenb immutability (line 140). For the current standard V extension vtype encoding (no λ field), this is comprehensive. When λ is added to vtype, the reserved-bits check at line 150 will need to be relaxed and a vl % (λ × LMUL) check added.
+  | if (invalid_ptrace_v_csr(vstate, &ptrace_vstate))
+  |     return -EINVAL;
+  | 
+  | vstate->vstart = ptrace_vstate.vstart;
+  | vstate->vl = ptrace_vstate.vl;
+  | vstate->vtype = ptrace_vstate.vtype;
+

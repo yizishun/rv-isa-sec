@@ -1,0 +1,77 @@
+{
+  "pr_number": 703,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 703,
+    "violation_condition": "XiangShan RTL implements ACLIC/SMIP hardware stack push (automatic GPR saving on interrupt entry) but does not gate this behavior on mtvec.mode != 0 (vectored mode). When mtvec.mode = 0 (direct mode), both interrupts and synchronous exceptions share the same trap entry point at mtvec.BASE. The ACLIC hardware stack push fires on interrupt entry and modifies sp/x-registers, but the shared exception handler at the same entry point does not expect these side effects — the hardware corrupts the interrupted context that synchronous exception handlers rely on. Additionally, if the CLIC/ACLIC module's enable/configure logic does not reject writes that enable SMIP features while mtvec.mode = 0, the core enters an architecturally-incompatible state.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "mtvec.mode check missing before CLIC/ACLIC/SMIP hardware stack push; mtvec.mode === 0.U && smip_enable; clic_save_gpr without mtvec_mode_vectored gate; aclic_hwstack_push && (mtvec_mode === Direct)",
+    "affected_entities": [
+      "mtvec",
+      "mtvec.mode",
+      "mclicbase",
+      "ACLIC_SMIP_CTRL",
+      "trap_entry_fsm",
+      "hw_stack_push_engine"
+    ],
+    "summary": "ACLIC hardware stack push on interrupt entry must be gated on mtvec.mode != 0; direct mode causes shared interrupt/exception entry point to receive unexpected sp/x-register side effects, enabling privilege escape via corrupted exception handler context"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/TrapHandleModule.scala",
+        "function_name": "TrapHandleModule (trap PC computation)",
+        "line_start": 92,
+        "line_end": 101,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "XiangShan does NOT implement the ACLIC/SMIP hardware stack push extension. There is no automatic GPR saving (x10-x15) on interrupt entry, no mipopret/sipopret instruction support, and no mcspspush/mcspspop CSR logic. The core uses AIA+IMSIC for interrupt control, not ACLIC. The vulnerability condition — hardware stack push corrupting GPRs when mtvec.mode=0 (Direct mode) with shared interrupt/synchronous exception entry — cannot fire because the vulnerable code path does not exist. The existing mtvec.mode checking logic is correctly implemented for vectored-mode PC offset computation.",
+      "snippet": "private val pcFromXtvec = Cat(xtvec.addr.asUInt + Mux(xtvec.mode === XtvecMode.Vectored && hasIR, adjustinterruptNO(5, 0), 0.U), 0.U(2.W))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1487,
+          "line_end": 1491,
+          "excerpt": "NOTE: As this extension modifies interrupt trap behavior but not the behaviour of synchronous exception traps, it should only be used in interrupt handling modes that provide separate entry points for interrupt and synchronous exception traps. Specifically, mtvec.mode = 0 (direct) is incompatible."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMEvent.scala",
+        "function_name": "TrapEntryMEvent (machine-mode trap entry)",
+        "line_start": 1,
+        "line_end": 134,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Machine-mode trap entry only saves CSR state (mstatus, mepc, mcause, mtval, mtval2, mtinst). No hardware GPR save (x10-x15) or stack pointer manipulation occurs. This is architecturally correct for a core without Smip/Ssip — the RTL does not need an mtvec.mode gate because it never performs the hardware stack push that would require one.",
+      "snippet": "// Saves: mstatus(MPV,MPP,GVA,MPIE,MIE,MDT), mepc, mcause, mtval, mtval2, mtinst. No GPR save.",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala",
+        "function_name": "XtvecBundle",
+        "line_start": 16,
+        "line_end": 21,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The xtvec CSR field encoding is correct: mode at bits 1:0 (Direct=0, Vectored=1), addr at bits 63:2 as WARL. The XtvecMode enum in CSRDefines.scala:158-162 defines only Direct and Vectored as legal values (mode=11/IVT mode not implemented). This is consistent with the core not implementing ACLIC's Smivt extension which would add mode=11.",
+      "snippet": "class XtvecBundle extends CSRBundle {\n  val mode = XtvecMode(1, 0, wNoFilter).withReset(0.U)\n  val addr = WARL(63, 2, wNoFilter).withReset(0.U)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1203,
+          "line_end": 1211,
+          "excerpt": "| Value | Name | Description\n| 0 | Direct | All traps set pc to BASE.\n| 1 | Vectored | Asynchronous interrupts set pc to BASE+4*cause.\n| >=2 | -- | Reserved"
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

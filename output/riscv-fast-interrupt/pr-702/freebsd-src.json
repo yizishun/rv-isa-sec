@@ -1,0 +1,328 @@
+{
+  "pr_number": 702,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 702,
+    "violation_condition": "FreeBSD context-switch path (swtch.S) or bhyve VM-entry/VM-exit does not save/restore the per-hart ssp architectural state (ssp.SP, ssp.PUSH, ssp.PPUSH), causing a thread or vCPU to inherit stale shadow-stack-pointer state from the previously scheduled entity that had executed scspspush/scspspop/sipopret.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "ssp\\.(SP|PUSH|PPUSH)|scspspush|scspspop|sipopret|Ssip|CSR_SSCRATCH|ENABLE_SMCSPS|ENABLE_SSCSPS",
+    "affected_entities": [
+      "ssp.SP",
+      "ssp.PUSH",
+      "ssp.PPUSH",
+      "scspspush",
+      "scspspop",
+      "sipopret",
+      "sstatus.SPP",
+      "sstatus.SPIE"
+    ],
+    "summary": "Ssip adds supervisor-level ssp architectural state invisible to the register file; FreeBSD's context switch and bhyve VM-entry paths lack awareness of ssp.SP/PUSH/PPUSH, risking stack corruption when scheduling across threads or vCPUs that use scspspush/scspspop/sipopret"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_switch saves/restores ra, sp, s0-s11, and FPU state to PCB but does not save/restore the sspcs CSR (0x149). When a thread that has executed scspspush/scspspop/sipopret is preempted, the sspcs.SP, sspcs.PUSH, and sspcs.PPUSH fields are not saved. The next thread inherits the stale sspcs state directly from hardware, causing thread A's sspcs.SP (the saved supervisor stack pointer) to be used when thread B executes sipopret or scspspop.",
+      "snippet": "cpu_switch:\n  sd ra, (PCB_RA)(x13)     /* saves ra, sp, s0-s11 */\n  sd sp, (PCB_SP)(x13)\n  /* ... no csrr sspcs / sd to PCB */\n  /* ... no ld from PCB / csrw sspcs on restore */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 964,
+          "line_end": 967,
+          "excerpt": "The PPUSH bit ... corresponds to the value of the PUSH bit in the previous context. This bit is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 203,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_throw loads ra, sp, s0-s11 from new PCB but never initializes sspcs (0x149). The newly dispatched thread inherits whatever sspcs.SP/PUSH/PPUSH values were left in hardware by the previously executing context. This means sipopret or scspspop executed by the new thread could swap to an arbitrary stale sspcs.SP value.",
+      "snippet": "cpu_throw:\n  ld ra, (PCB_RA)(x13)\n  ld sp, (PCB_SP)(x13)\n  /* no csrw sspcs, 0 or csrw sspcs, <saved_val> */\n  ret",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 964,
+          "line_end": 967,
+          "excerpt": "The PPUSH bit ... is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers",
+        "line_start": 41,
+        "line_end": 114,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The save_registers macro saves sepc, sstatus, stval, scause to the trapframe but does not save sspcs (0x149). When an interrupt/trap occurs in a context that has active sspcs state (PUSH or PPUSH set), that architectural state is silently lost. On return via load_registers + sret, the hardware sspcs register still holds the stale value since no save/restore was done.",
+      "snippet": "save_registers:\n  csrr t0, sepc;  sd t0, (TF_SEPC)(sp)\n  csrr t0, sstatus; sd t0, (TF_SSTATUS)(sp)\n  csrr t0, stval;   sd t0, (TF_STVAL)(sp)\n  csrr t0, scause;  sd t0, (TF_SCAUSE)(sp)\n  /* no csrr sspcs */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 964,
+          "line_end": 967,
+          "excerpt": "The PPUSH bit ... needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "load_registers",
+        "line_start": 116,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The load_registers macro restores sstatus and sepc from the trapframe but does not restore sspcs (0x149). When a trap returns via sret (invoked after load_registers), the sspcs CSR retains whatever value was left by the previous execution context rather than the value that belonged to the thread being resumed.",
+      "snippet": "load_registers:\n  csrw sstatus, t0\n  csrw sepc, t0\n  /* no csrw sspcs */\n  addi sp, sp, (TF_SIZE)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 964,
+          "line_end": 967,
+          "excerpt": "The PPUSH bit ... needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct pcb has no pcb_sspcs field for storing the sspcs CSR (0x149). Without this field, the context-switch assembly in swtch.S has nowhere to save/restore the sspcs.SP, sspcs.PUSH, and sspcs.PPUSH state. Compare with pcb_fcsr which correctly stores the FPU control register across context switches.",
+      "snippet": "struct pcb {\n  uint64_t pcb_ra, pcb_sp, pcb_gp, pcb_tp;\n  uint64_t pcb_s[12];\n  uint64_t pcb_x[32][2]; /* FPU saved */\n  uint64_t pcb_fcsr;     /* FP CSR saved */\n  /* no pcb_sspcs, no pcb_sspcs_present */\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 921,
+          "line_end": 953,
+          "excerpt": "New CSRs are introduced to hold an alternative stack pointer... 0x149 sspcs S-mode stack pointer for conditional swap (WARL) ... holds SP[XLEN-1:2], PUSH, PPUSH fields."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/frame.h",
+        "function_name": "struct trapframe",
+        "line_start": 46,
+        "line_end": 58,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct trapframe has no tf_sspcs field for saving the sspcs CSR (0x149) across trap entry/exit. Traps that preempt a thread using the Sscsps extension will silently lose the sspcs state, as there is no slot in the trapframe to store it.",
+      "snippet": "struct trapframe {\n  uint64_t tf_ra, tf_sp, tf_gp, tf_tp;\n  uint64_t tf_t[7], tf_s[12], tf_a[8];\n  uint64_t tf_sepc, tf_sstatus, tf_stval, tf_scause;\n  /* no tf_sspcs */\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 964,
+          "line_end": 967,
+          "excerpt": "This bit is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/genassym.c",
+        "function_name": "(global)",
+        "line_start": 65,
+        "line_end": 99,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "genassym.c emits offset symbols (PCB_RA, PCB_SP, PCB_S, TF_SEPC, TF_SSTATUS, etc.) for assembly access to pcb and trapframe fields, but emits no PCB_SSPCS or TF_SSPCS symbol. Even if the fields were added to struct pcb and struct trapframe, the assembly code would lack the offset constants to reference them.",
+      "snippet": "ASSYM(PCB_RA, offsetof(struct pcb, pcb_ra));\nASSYM(PCB_SP, offsetof(struct pcb, pcb_sp));\n/* ... no PCB_SSPCS */\nASSYM(TF_SEPC, offsetof(struct trapframe, tf_sepc));\n/* ... no TF_SSPCS */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "savectx saves ra, sp, tp, gp, s0-s11, and FPU state for crash dumps but does not save sspcs (0x149). Post-mortem crash analysis cannot determine the sspcs state of the crashed thread, complicating debugging of sipopret/scspspop-related failures.",
+      "snippet": "savectx:\n  sd ra, (PCB_RA)(a0)\n  sd sp, (PCB_SP)(a0)\n  /* ... no sd sspcs */\n  __fpe_state_save a0\n  ret",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fork_trampoline",
+        "line_start": 365,
+        "line_end": 432,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "fork_trampoline restores user registers and CSR state before sret to userspace, but does not initialize sspcs (0x149). A newly forked child process inherits the parent's sspcs.SP/PUSH/PPUSH state from hardware. If the parent had sspcs.PUSH=1 (meaning a stack swap was expected), the child's first sipopret or scspspop will use the parent's stale sspcs.SP value, causing stack corruption.",
+      "snippet": "fork_trampoline:\n  /* restores tf_sepc, tf_sstatus, all GPRs */\n  csrw sscratch, sp      /* sscratch, not sspcs */\n  sret                   /* no sspcs initialization before sret */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1658,
+          "line_end": 1661,
+          "excerpt": "sipopret: scspspop sp, sp  # Swap stack pointer with sspcs ... sret"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 41,
+        "line_end": 204,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "vmm_switch (VM-entry/VM-exit) saves/restores host sstatus, hstatus, scounteren, stvec, sscratch and guest GPRs/CSRs, but never saves or restores sspcs (0x149). A vCPU guest using scspspush/scspspop/sipopret will have its sspcs.SP/PUSH/PPUSH state silently overwritten on VM-exit, and the host's sspcs state is not preserved on VM-entry. This causes cross-VM information leakage of the sspcs state.",
+      "snippet": "vmm_switch:\n  /* VM-entry: csrrw sstatus, hstatus, scounteren, sscratch, stvec */\n  /* no csrrw sspcs */\n  /* ... */\n.Lswitch_return:  /* VM-exit */\n  /* restores host stvec, sscratch, scounteren, hstatus, sstatus */\n  /* no csrw sspcs */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 964,
+          "line_end": 967,
+          "excerpt": "This bit is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/riscv.h",
+        "function_name": "struct hypcsr",
+        "line_start": 56,
+        "line_end": 68,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct hypcsr holds guest virtualized CSR state (vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, vsatp, scounteren, senvcfg) but has no vsspcs field. Without this field, bhyve cannot virtualize the sspcs CSR (0x149) for guest VMs. A guest that expects Sscsps functionality would see incorrect sspcs behavior.",
+      "snippet": "struct hypcsr {\n  uint64_t hvip, vsstatus, vsie, vstvec, vsscratch;\n  uint64_t vsepc, vscause, vstval, vsatp;\n  uint64_t scounteren, senvcfg;\n  /* no vsspcs */\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 921,
+          "line_end": 925,
+          "excerpt": "0x149 sspcs S-mode stack pointer for conditional swap (WARL)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_restore_csrs",
+        "line_start": 161,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "vmmops_vcpu_restore_csrs and vmmops_vcpu_save_csrs restore/save vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, vsatp but do not touch sspcs (0x149). The guest sspcs state is neither saved on VM-exit nor restored on VM-entry. A guest thread that uses scspspush will find its sspcs.PUSH bit silently reset and its sspcs.SP value lost across VM-exit/VM-entry.",
+      "snippet": "static void vmmops_vcpu_restore_csrs(struct vcpu *vcpu) {\n  /* restores vsstatus, vsie, vstvec, vsscratch, vsepc, ... */\n  /* no csrw sspcs */\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 954,
+          "line_end": 967,
+          "excerpt": "These indicate if a stack pointer swap is expected during a push or pop sequence... This bit is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/vm_machdep.c",
+        "function_name": "cpu_fork",
+        "line_start": 87,
+        "line_end": 129,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_fork bcopy's the parent's pcb and trapframe to the child but does not explicitly initialize or clear sspcs (0x149) state for the child thread. Since sspcs is a hardware CSR (not in PCB/trapframe), the child thread inherits whatever sspcs value is currently in the hardware CSR at the time fork_trampoline executes sret. This is non-deterministic.",
+      "snippet": "cpu_fork:\n  bcopy(td1->td_pcb, pcb2, sizeof(*pcb2));\n  bcopy(td1->td_frame, tf, sizeof(*tf));\n  /* no sspcs initialization */\n  td2->td_pcb->pcb_ra = (uintptr_t)fork_trampoline;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 964,
+          "line_end": 967,
+          "excerpt": "This bit is part of the context of an interrupt handler, and needs to be saved and restored if a handler can be preempted."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "(global)",
+        "line_start": 1,
+        "line_end": 200,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "riscvreg.h has no #define for CSR_SSPCS (0x149) or sspcs field bit masks (SSPCS_PUSH, SSPCS_PPUSH, SSPCS_SP_SHIFT). Without these defines, kernel C code cannot even read or write the sspcs CSR. Compare with existing defines for sstatus, stvec, sscratch, sepc, etc.",
+      "snippet": "/* riscvreg.h: no #define CSR_SSPCS 0x149 */\n/* no #define SSPCS_PUSH 0x1 */\n/* no #define SSPCS_PPUSH 0x2 */\n/* no #define SSPCS_SP_MASK */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 921,
+          "line_end": 925,
+          "excerpt": "0x149 sspcs S-mode stack pointer for conditional swap (WARL)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_unpriv_trap",
+        "line_start": 206,
+        "line_end": 220,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmm_unpriv_trap saves sepc, scause, stval, htval, htinst in struct hyptrap but does not save sspcs (0x149). If an unprivileged trap is taken while the vCPU has active sspcs state, that state is lost from the trap context structure. However, this is a secondary issue — the primary gap is the lack of sspcs handling in vmm_switch itself.",
+      "snippet": "vmm_unpriv_trap:\n  csrr a1, sepc\n  sd a1, HYP_TRAP_SEPC(a0)\n  /* no csrr sspcs */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 307,
+        "line_end": 377,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "do_trap_supervisor handles standard exception causes (page faults, illegal instruction, breakpoint) but has no handling for Sscsps/Ssip-specific trap conditions. If the sspcs CSR is not enabled or a sipopret execution causes a fault, the default panic() case fires with 'Unknown kernel exception'.",
+      "snippet": "do_trap_supervisor:\n  switch (cause) {\n    case SCAUSE_LOAD_PAGE_FAULT: ...\n    default: panic(\"Unknown kernel exception %lu\", cause);\n  }",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

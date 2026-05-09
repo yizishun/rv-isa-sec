@@ -1,0 +1,42 @@
+PR #703  target=qemu  overall=potential_risk
+Spec: Smip SP swap must only fire on async==true (interrupts, not exceptions), and QEMU must reject Smip + mtvec.MODE=0, otherwise guest kernel exception handlers execute with the wrong stack pointer after a prior interrupt silently swapped SP↔XSP
+Violation: In QEMU TCG, Smip's SP↔XSP stack-pointer swap is triggered for both synchronous exceptions and asynchronous interrupts at trap entry (riscv_cpu_do_interrupt, line 2206), rather than being gated on the 'async' flag (line 2221). Additionally, QEMU permits Smip to be active while mtvec.MODE=0 or stvec.MODE=0 (direct mode), where the spec declares direct-mode-with-shared-entry-points incompatible because the trap handler cannot distinguish an interrupt (SP was swapped) from an exception (SP was not swapped).
+Consequence: data_corruption
+Pattern: SP↔XSP swap code at trap-entry (cpu_helper.c:riscv_cpu_do_interrupt epilogue, ~line 2531) lacking "if (async)" guard; AND/OR absence of startup validation that ext_smip requires (mtvec & 3) != 0 and (stvec & 3) != 0 (vectored mode only)
+------------------------------------------------------------
+[potential_risk] target/riscv/cpu_helper.c:2206-2547  riscv_cpu_do_interrupt
+  Smip extension is not implemented. The SP↔XSP swap code the security spec warns about does not exist. However, if a future implementation inserts Smip swap at the epilogue (around line 2536, where env->elp is cleared unconditionally), it would lack an 'if (async)' guard — causing swap for synchronous exceptions too. Line 2221 already computes 'bool async' correctly, but no Smip consumer uses it.
+  | 2221:    bool async = !!(cs->exception_index & RISCV_EXCP_INT_FLAG);
+  | ...
+  | 2536:    env->elp = false;  /* unconditional — Smip swap here would lack async guard */
+
+[potential_risk] target/riscv/cpu_helper.c:2183-2198  riscv_do_nmi
+  NMI trap-entry is a separate code path from riscv_cpu_do_interrupt. The Smip spec (aclic.adoc:1456) states: 'This extension does not affect Non-Maskable Interrupts (NMIs).' If a future Smip implementation adds SP↔XSP swap here, it would violate the spec. The NMI path uses a single entry point (rnmi_irqvec) without vectored-mode dispatch.
+  | 2183:  static void riscv_do_nmi(CPURISCVState *env, target_ulong cause, bool virt)
+  | ...
+  | 2197:    riscv_cpu_set_mode(env, PRV_M, false);  /* no Smip swap guard */
+
+[potential_risk] target/riscv/csr.c:3000-3010  write_mtvec
+  write_mtvec accepts MODE=0 (direct) unconditionally: 'if ((val & 3) < 2)' allows both direct (0) and vectored (1). The Smip spec declares 'mtvec.mode = 0 (direct) is incompatible' because shared entry points prevent the handler from distinguishing interrupt (SP swapped) from exception (SP not swapped). If Smip were implemented, MODE=0 must be treated as reserved/WARL.
+  | 3003:    /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
+  | 3004:    if ((val & 3) < 2) {
+  | 3005:        env->mtvec = val;  /* accepts MODE=0 unconditionally */
+
+[potential_risk] target/riscv/csr.c:4157-4167  write_stvec
+  Same as write_mtvec: write_stvec accepts MODE=0 unconditionally. S-mode interrupt handler push/pop (Ssip) also requires vectored mode for the same reason — direct mode provides a single entry point for both interrupts and exceptions, making the SP↔XSP swap ambiguous.
+  | 4160:    /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
+  | 4161:    if ((val & 3) < 2) {
+  | 4162:        env->stvec = val;  /* accepts MODE=0 unconditionally */
+
+[potential_risk] target/riscv/csr.c:5219-5229  write_vstvec
+  Same pattern: write_vstvec accepts MODE=0 unconditionally. VS-mode virtual supervisor mode inherits the same incompatibility with direct mode when Ssip is active.
+  | 5222:    /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
+  | 5223:    if ((val & 3) < 2) {
+  | 5224:        env->vstvec = val;  /* accepts MODE=0 unconditionally */
+
+[potential_risk] target/riscv/tcg/tcg-cpu.c:822-866  riscv_cpu_validate_set_extensions
+  No ext_smip validation block exists. The extension is not declared in cpu_cfg_fields.h.inc (only ext_zicfilp/ext_zicfiss at lines 39-40). A future implementation must add: (a) dependency validation — Smip depends on Smcsps (aclic.adoc:1440), which in turn depends on Zicsr+A+S+Zimop, (b) startup validation that reset mtvec/stvec are in vectored mode. The adjacent Zicfiss validation (lines 822-843) and Zicfilp validation (line 863) provide templates.
+  | 39:  BOOL_FIELD(ext_zicfilp)
+  | 40:  BOOL_FIELD(ext_zicfiss)
+  | /* no BOOL_FIELD(ext_smip) */
+

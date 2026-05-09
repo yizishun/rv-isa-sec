@@ -1,0 +1,175 @@
+{
+  "pr_number": 729,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 729,
+    "violation_condition": "In QEMU's emulation of smehv IVT (Interrupt Vector Table) mode: when the CPU takes an interrupt trap in IVT mode, it fetches the handler address from VTBASE + XLEN/8 × exccode, sets PC to that address — but does NOT clear the corresponding interrupt-pending bit in mip/sip or the IMSIC eistate. After the handler executes mret/sret, riscv_cpu_interrupt() re-evaluates and finds the same pending bit still set, causing immediate re-delivery of the same interrupt in an infinite loop.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "IVT/hardware-vectored trap entry path that fetches handler address from VTBASE/mivt/sivt and sets PC but lacks a preceding or concurrent write to clear the pending bit (mip CSR or IMSIC EIP/eistate) for the interrupt being taken — search for vtbase, VTBASE, mivt, sivt alongside pc assignment without corresponding pending-bit clear",
+    "affected_entities": [
+      "mivt",
+      "sivt",
+      "mip",
+      "sip",
+      "IMSIC_EIP",
+      "IMSIC_eistate",
+      "riscv_cpu_do_interrupt"
+    ],
+    "summary": "IVT mode trap entry must atomically clear the interrupt-pending bit when vectoring; failure to do so causes infinite re-delivery loop (DoS) after mret/sret"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2503,
+        "line_end": 2508,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "M-mode trap dispatch computes PC from mtvec without checking mivt.EHV for hardware-vectored mode. No mivt CSR exists in QEMU, and the interrupt-pending bit is never cleared during trap entry. If IVT mode (xtvec.mode=11) were implemented, the spec requires clearing the corresponding interrupt-pending bit (aclic.adoc lines 1300-1306), but riscv_cpu_do_interrupt() has no code path to do so. The mip/sip bits are only modified through software CSR writes (rmw_mip64/rmw_sip64), never by hardware during interrupt delivery.",
+      "snippet": "if (nnmi_excep) {\n    env->pc = env->rnmi_excpvec;\n} else {\n    env->pc = (env->mtvec >> 2 << 2) +\n              ((async && (env->mtvec & 3) == 1) ? cause * 4 : 0);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1300,
+          "line_end": 1307,
+          "excerpt": "In interrupt vector table mode, when interrupts are taken, the interrupt behavior is modified as follows: After executing the required side-effects as required with the existing behavior, the hart then fetches an XLEN-bit handler address ... If the fetch is successful, the hart clears the low bit(s) (depending on IALIGN) of the handler address, clears the corresponding interrupt-pending bit if possible, and sets the PC to this handler address."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2421,
+        "line_end": 2422,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "S-mode trap dispatch computes PC from stvec without checking sivt.EHV for hardware-vectored mode. Same issue as M-mode: no sivt CSR exists, no IVT mode (xtvec.mode=11) is implemented, and the pending-bit clear required by spec is absent from the trap delivery path.",
+      "snippet": "env->pc = (env->stvec >> 2 << 2) +\n          ((async && (env->stvec & 3) == 1) ? cause * 4 : 0);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1300,
+          "line_end": 1307,
+          "excerpt": "In interrupt vector table mode, when interrupts are taken ... clears the corresponding interrupt-pending bit if possible, and sets the PC to this handler address."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_mtvec",
+        "line_start": 3000,
+        "line_end": 3009,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "write_mtvec only validates xtvec.mode bits [1:0] for values 0 (direct) and 1 (vectored). Mode 11 (IVT, required by Smivt) is treated as reserved and silently ignored with LOG_UNIMP. When IVT mode is implemented, this handler must accept mode=11 and coordinate with the mivt CSR, and the spec requires mode 11 to be valid (aclic.adoc line 1282).",
+      "snippet": "/* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */\nif ((val & 3) < 2) {\n    env->mtvec = val;\n} else {\n    qemu_log_mask(LOG_UNIMP, \"CSR_MTVEC: reserved mode not supported\\n\");\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1279,
+          "line_end": 1283,
+          "excerpt": "mode  PC on Interrupt\n 00   OBASE                         # Direct mode\n 01   OBASE+4*exccode               # Vectored mode\n 11   M[VTBASE+XLEN/8*vtoffset] & VTMASK   # Interrupt vector table mode\n 10   Reserved"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_stvec",
+        "line_start": 4157,
+        "line_end": 4166,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "write_stvec has the same issue as write_mtvec: IVT mode (mode=11) is rejected as reserved. When Ssivt is implemented, this must accept mode=11 for S-mode IVT delivery.",
+      "snippet": "/* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */\nif ((val & 3) < 2) {\n    env->stvec = val;\n} else {\n    qemu_log_mask(LOG_UNIMP, \"CSR_STVEC: reserved mode not supported\\n\");\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1279,
+          "line_end": 1283,
+          "excerpt": "mode  PC on Interrupt ... 11   M[VTBASE+XLEN/8*vtoffset] & VTMASK   # Interrupt vector table mode"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "",
+        "line_start": 188,
+        "line_end": 201,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Missing CSR_MIVT (0x307), CSR_MEIVT (0x308), CSR_SIVT (0x107), and CSR_SEIVT (0x108) register number definitions. The slot 0x308 is currently occupied by CSR_MVIEN (AIA), creating a spec conflict that must be resolved when implementing IVT. The spec defines mivt at 0x307, meivt at 0x308, sivt at 0x107, seivt at 0x108 (aclic.adoc lines 1196-1202).",
+      "snippet": "/* Virtual Interrupts for Supervisor Level (AIA) */\n#define CSR_MVIEN           0x308\n#define CSR_MVIP            0x309\n/* CSR_MIVT (0x307), CSR_MEIVT (0x308), CSR_SIVT (0x107), CSR_SEIVT (0x108) are absent */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1196,
+          "line_end": 1202,
+          "excerpt": "Number  Name   Description\n 0x305  mtvec  M-mode Trap-handler base address / interrupt mode\n (NEW) 0x307  mivt   M-mode Interrupt-handler vector table base address\n (NEW) 0x308  meivt  M-mode External Interrupt-handler vector table base address\n 0x105  stvec  S-mode Trap-handler base address / interrupt mode\n (NEW) 0x107  sivt   S-mode Interrupt-handler vector table base address\n (NEW) 0x108  seivt  S-mode External Interrupt-handler vector table base address"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "",
+        "line_start": 317,
+        "line_end": 393,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CPURISCVState struct has no mivt, meivt, sivt, or seivt fields. Without these fields, the IVT base address and EHV bit cannot be stored or read during trap dispatch. Migration (machine.c), KVM sync (kvm-cpu.c), and reset (cpu.c) all lack corresponding entries.",
+      "snippet": "uint64_t stvec;       /* line 317 */\nuint64_t mtvec;       /* line 321 */\nuint64_t vstvec;      /* line 379 */\nuint64_t stvec_hs;    /* line 393 */\n/* uint64_t mivt;     -- MISSING */\n/* uint64_t sivt;     -- MISSING */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1395,
+          "line_end": 1420,
+          "excerpt": "The CSR is changed by adding a bit to control if synchronous exception hardware vectoring is active. ... EHV (WARL) at bit 1"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2525,
+        "line_end": 2529,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The trap dispatch does trigger qemu_plugin_vcpu_interrupt_cb for async interrupts and clears environment flags (two_stage_lookup, two_stage_indirect_lookup). These side-effects are correctly performed. The pending-bit clearing issue is only relevant for the unimplemented IVT mode.",
+      "snippet": "if (async) {\n    qemu_plugin_vcpu_interrupt_cb(cs, last_pc);\n} else {\n    qemu_plugin_vcpu_exception_cb(cs, last_pc);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_imsic.c",
+        "function_name": "riscv_imsic_topei_rmw",
+        "line_start": 126,
+        "line_end": 148,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "IMSIC TOPEI RMW correctly clears the IMSIC eistate PENDING bit when software writes to claim an interrupt. This is the software claim mechanism (via AIA), not the hardware auto-clear that IVT mode would require. The IMSIC eistate pending bits are properly managed for the current (non-IVT) interrupt delivery model.",
+      "snippet": "if (topei && wr_mask) {\n    topei >>= IMSIC_TOPEI_IID_SHIFT;\n    base = page * imsic->num_irqs;\n    if (topei) {\n        qatomic_and(&imsic->eistate[base + topei], ~IMSIC_EISTATE_PENDING);\n    }\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

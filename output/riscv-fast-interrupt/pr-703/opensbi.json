@@ -1,0 +1,251 @@
+{
+  "pr_number": 703,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 703,
+    "violation_condition": "OpenSBI configures mtvec.MODE=0 (Direct) while the ACLIC/Smip fast-interrupt extension is active, causing M-mode interrupts and synchronous exceptions to share a single trap entry point despite the extension modifying only interrupt trap behavior (e.g., automatic GPR stack saves) and not exception trap behavior.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "CSR write to mtvec with MODE field (bits 1:0) cleared to 0 (Direct mode), combined with any ACLIC/Smip enable or configuration CSR writes (e.g., miprio, mnxti, or similar ACLIC CSRs).",
+    "affected_entities": [
+      "mtvec",
+      "CSR_mnxti",
+      "CSR_miprio",
+      "CSR_mcause",
+      "M-mode_trap_handler"
+    ],
+    "summary": "Smip/ACLIC fast interrupts require vectored mtvec (mtvec.MODE ≠ 0) because the extension diverges interrupt vs. exception entry behavior; Direct mode causes shared-entry handlers to mis-handle hardware-saved GPRs on the interrupted stack."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "_start_warm (trap handler setup)",
+        "line_start": 393,
+        "line_end": 401,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "CSR_MTVEC is programmed with the address of _trap_handler (or _trap_handler_hyp), producing mtvec.MODE=0 (Direct mode). The ACLIC Smip specification explicitly states 'mtvec.mode = 0 (direct) is incompatible' with the Smip extension because Smip modifies interrupt trap behavior (auto-save x10-x15, push stack) but does not modify exception trap behavior, so shared entry points cause data corruption when hardware pushes registers onto the exception stack.",
+      "snippet": "/* Setup trap handler */\nlla\ta4, _trap_handler\ncsrr\ta5, CSR_MISA\nsrli\ta5, a5, ('H' - 'A')\nandi\ta5, a5, 0x1\nbeq\ta5, zero, _skip_trap_handler_hyp\nlla\ta4, _trap_handler_hyp\n_skip_trap_handler_hyp:\ncsrw\tCSR_MTVEC, a4",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1487,
+          "line_end": 1490,
+          "excerpt": "As this extension modifies interrupt trap behavior but not the behaviour of synchronous exception traps, it should only be used in interrupt handling modes that provide separate entry points for interrupt and synchronous exception traps. Specifically, mtvec.mode = 0 (direct) is incompatible."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "_start (cold boot Zkr stack guard)",
+        "line_start": 110,
+        "line_end": 132,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "During cold boot, mtvec is temporarily set to __stack_chk_guard_done (line 112, MODE=0) and then to _start_hang (line 136, MODE=0) before the final trap handler setup. If interrupts fire during this early init phase with ACLIC/Smip active, the hardware would push x10-x15 but the handler would not expect nor restore them, causing register corruption. These are transitional but on hardware where Smip is fused on, the window exists.",
+      "snippet": "lla\tt0, __stack_chk_guard_done\ncsrw\tCSR_MTVEC, t0\n...\nlla\ts4, _start_hang\ncsrw\tCSR_MTVEC, s4",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1472,
+          "line_end": 1481,
+          "excerpt": "The existing trap behavior is modified. Before executing the first instruction of the trap handler, this extension ensures the interrupted context is partially saved. It performs the following operations in order: Save registers x10-x15, Adjusts the stack pointer to create the stack frame, Conditionally performs a stack pointer swap by executing xcspspush sp."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "include/sbi/sbi_hart.h",
+        "function_name": "enum sbi_hart_extensions",
+        "line_start": 29,
+        "line_end": 93,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The sbi_hart_extensions enum defines SBI_HART_EXT_SMAIA (for AIA/IMSIC-based interrupt controller) but has no entry for SBI_HART_EXT_SMACLIC, SBI_HART_EXT_SMIP, or any ACLIC-related extension. Without this enumeration, hart_detect_features() cannot detect Smip hardware, and the firmware has no mechanism to distinguish ACLIC-capable harts from baseline ones.",
+      "snippet": "enum sbi_hart_extensions {\n\tSBI_HART_EXT_SMAIA,\n\tSBI_HART_EXT_SMSTATEEN,\n\t...\n\t/* No SBI_HART_EXT_SMACLIC, SBI_HART_EXT_SMIP */\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 198,
+          "line_end": 199,
+          "excerpt": "Smip | Support for interrupt handler push/pop at Machine level. Ssip | Support for interrupt handler push/pop at Supervisor level."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "hart_detect_features",
+        "line_start": 646,
+        "line_end": 648,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "hart_detect_features() probes CSR_MTOPI to detect SBI_HART_EXT_SMAIA (AIA local interrupt controller), but performs no corresponding probe for ACLIC/Smip CSRs (e.g., mnxti, miprio). The __check_ext_csr macro used here temporarily writes MODE=0 to mtvec via csr_read_allowed, creating a double hazard: the probe itself uses MODE=0 on hardware that may already have Smip active, and the absence of Smip detection means the firmware proceeds to configure mtvec.MODE=0 permanently.",
+      "snippet": "/* Detect if hart has AIA local interrupt CSRs */\n__check_ext_csr(SBI_HART_PRIV_VER_UNKNOWN,\n\t\tCSR_MTOPI, SBI_HART_EXT_SMAIA);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1487,
+          "line_end": 1490,
+          "excerpt": "it should only be used in interrupt handling modes that provide separate entry points for interrupt and synchronous exception traps. Specifically, mtvec.mode = 0 (direct) is incompatible."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "include/sbi/sbi_csr_detect.h",
+        "function_name": "csr_read_allowed / csr_write_allowed (macros)",
+        "line_start": 17,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Both csr_read_allowed and csr_write_allowed macros use csrrw to swap mtvec with sbi_hart_expected_trap (MODE=0) for CSR probe duration, then csrw restore. On Smip hardware, if an interrupt arrives during the probe window, the handler at sbi_hart_expected_trap uses MODE=0 with no Smip awareness — hardware pushes x10-x15 onto the stack, but the expected-trap handler neither expects nor restores those registers. Additionally, the handler ends with mret instead of ipopxret, skipping hardware pop.",
+      "snippet": "register ulong mtvec = (ulong)sbi_hart_expected_trap;\nasm volatile(\n  \"csrrw %[mtvec], \" STR(CSR_MTVEC) \", %[mtvec]\\n\"\n  ...\n  \"csrw \" STR(CSR_MTVEC) \", %[mtvec]\"\n);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1472,
+          "line_end": 1481,
+          "excerpt": "Before executing the first instruction of the trap handler, this extension ensures the interrupted context is partially saved. It performs: Save registers x10-x15, Adjusts the stack pointer to create the stack frame, Conditionally performs a stack pointer swap."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap.c",
+        "function_name": "sbi_trap_handler",
+        "line_start": 317,
+        "line_end": 322,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The interrupt dispatch path gates the AIA interrupt path on SBI_HART_EXT_SMAIA, and falls through to sbi_trap_nonaia_irq() for non-AIA hardware. On ACLIC/Smip hardware (without IMSIC), interrupts would fall into the non-AIA path which only handles timer/software/external interrupts via legacy mcause bits. ACLIC-specific interrupts using mnxti-based notification would not be recognized.",
+      "snippet": "if (mcause & MCAUSE_IRQ_MASK) {\n  if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(),\n      SBI_HART_EXT_SMAIA))\n    rc = sbi_trap_aia_irq();\n  else\n    rc = sbi_trap_nonaia_irq(mcause & ~MCAUSE_IRQ_MASK);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_save",
+        "line_start": 427,
+        "line_end": 433,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "HSM non-retentive suspend saves MIE, MIP, MEDELEG, MIDELEG, MENVCFG but does not save any ACLIC/Smip-related CSRs (mnxti, miprio, mintthresh, mivt, meivt, or Smip control bits). After resume, these CSRs revert to their reset values, potentially re-enabling Smip with the incompatible mtvec.MODE=0 still configured, or losing interrupt priority state.",
+      "snippet": "hdata->saved_mie = csr_read(CSR_MIE);\nhdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);\nhdata->saved_medeleg = csr_read(CSR_MEDELEG);\nhdata->saved_mideleg = csr_read(CSR_MIDELEG);\nif (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)\n  hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1462,
+          "line_end": 1463,
+          "excerpt": "If MIPU is set, a trap taken at Machine level due to an interrupt causes automatic stacking. If SIPU is set, a trap taken at Supervisor level due to an interrupt causes automatic stacking."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "_trap_handler / _trap_handler_hyp",
+        "line_start": 672,
+        "line_end": 724,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Both _trap_handler and _trap_handler_hyp unconditionally end with 'mret' and unconditionally save/restore all GPRs including x10-x15 via TRAP_SAVE_GENERAL_REGS_EXCEPT_SP_T0. On Smip hardware with auto-push enabled, the hardware would have already stacked x10-x15 and adjusted sp before entering the handler. The trap handler would then save already-stacked registers again, and the final mret would return without popping them — xipopret (not xret) is required to restore the hardware-saved context.",
+      "snippet": "_trap_handler:\n  TRAP_SAVE_AND_SETUP_SP_T0\n  TRAP_SAVE_MEPC_MSTATUS 0\n  TRAP_SAVE_GENERAL_REGS_EXCEPT_SP_T0\n  TRAP_SAVE_INFO 0 0\n  TRAP_CALL_C_ROUTINE\n  TRAP_RESTORE_GENERAL_REGS_EXCEPT_A0_T0\n  TRAP_RESTORE_MEPC_MSTATUS 0\n  TRAP_RESTORE_A0_T0\n  mret",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1495,
+          "line_end": 1507,
+          "excerpt": "When executing an xipopret instruction the context saved during the trap is restored and a return is executed. It performs: Conditionally performs a stack pointer swap by executing xcspspop sp, Restores registers x10-x15, Adjust the stack pointer to destroy the stack frame, Executes an xret according to the current level."
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1499,
+          "line_end": 1500,
+          "excerpt": "An explicit interrupt return instruction is included, rather than modifying the xret behavior, so that the hart does not need to do bookkeeping whether it is in an interrupt or exception context."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_unpriv.c",
+        "function_name": "DEFINE_UNPRIVILEGED_LOAD_FUNCTION / DEFINE_UNPRIVILEGED_STORE_FUNCTION (macros)",
+        "line_start": 21,
+        "line_end": 69,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Unprivileged load/store/fetch macros temporarily swap mtvec to sbi_hart_expected_trap (MODE=0) during each S-mode memory access. If an interrupt arrives during this window on Smip hardware, the expected-trap handler runs with hardware auto-push of x10-x15 that it does not expect, and returns with mret instead of ipopxret. Same vulnerability as the CSR probe macros but in the unprivileged access path.",
+      "snippet": "register ulong mtvec = (ulong)sbi_hart_expected_trap;\n\"csrrw %[mtvec], \" STR(CSR_MTVEC) \", %[mtvec]\\n\"\n...\n\"csrw \" STR(CSR_MTVEC) \", %[mtvec]\"",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1487,
+          "line_end": 1490,
+          "excerpt": "As this extension modifies interrupt trap behavior but not the behaviour of synchronous exception traps, it should only be used in interrupt handling modes that provide separate entry points. Specifically, mtvec.mode = 0 (direct) is incompatible."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_expected_trap.S",
+        "function_name": "__sbi_expected_trap / __sbi_expected_trap_hext",
+        "line_start": 24,
+        "line_end": 69,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Both expected-trap handlers (used during CSR probing and unprivileged accesses) end with 'mret'. On Smip hardware, if an interrupt arrives while mtvec temporarily points here (MODE=0), the hardware auto-pushes x10-x15 and adjusts sp. These handlers don't restore those registers, and using mret instead of ipopxret means the hardware never pops the saved context — leaving sp permanently offset and x10-x15 stale.",
+      "snippet": "__sbi_expected_trap:\n  csrr  a4, CSR_MCAUSE\n  REG_S a4, SBI_TRAP_INFO_OFFSET(cause)(a3)\n  ...\n  csrw  CSR_MEPC, a4\n  mret",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1497,
+          "line_end": 1507,
+          "excerpt": "When executing an xipopret instruction the context saved during the trap is restored and a return is executed. It performs: Conditionally performs a stack pointer swap by executing xcspspop sp, Restores registers x10-x15, Adjust the stack pointer, Executes an xret."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "mstatus_init",
+        "line_start": 89,
+        "line_end": 98,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "mstatus_init() gates SMSTATEEN0_AIA and SMSTATEEN0_IMSIC enables on SBI_HART_EXT_SMAIA. On ACLIC-only hardware (no IMSIC), the SMSTATEEN bits for the ACLIC interrupt file (if any) would not be enabled. Additionally, if Smip control bits are allocated in mstatus (as noted by the spec: 'These bits do not yet have an allocated encoding. The authors intend to ask for encoding in mstatus'), the current mstatus initialization provides no mechanism to control them.",
+      "snippet": "if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMAIA))\n  mstateen_val |= (SMSTATEEN0_AIA | SMSTATEEN0_IMSIC);\nelse\n  mstateen_val &= ~(SMSTATEEN0_AIA | SMSTATEEN0_IMSIC);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1462,
+          "line_end": 1468,
+          "excerpt": "If MIPU is set, a trap taken at Machine level due to an interrupt causes automatic stacking. If SIPU is set, a trap taken at Supervisor level due to an interrupt causes automatic stacking. If one of the bits is clear, the trap behavior at the respective level is unmodified."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

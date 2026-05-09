@@ -1,0 +1,253 @@
+{
+  "pr_number": 933,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 933,
+    "violation_condition": "On a hypothetical CHERI-RISC-V FreeBSD port, if the kernel context-switch path (cpu_switch/cpu_throw in sys/riscv/riscv/swtch.S or the trap handler in exception.S) saves and restores only the existing sstatus fields without awareness of the new 3-bit sstatus sub-fields (RGE, SRG, URG) mandated by Svyrg, then one process's supervisor/user capability read generation and enable state could leak into another process's execution context. Additionally, if the pmap layer constructs PTEs with bits 58:55 set without the Svyrg enable bit (sstatus.RGE) being active, or sets bits 58:56 to non-zero values when only bit 58 (Y) is defined by the base RVY PTE format, a page-fault will be raised where normal capability access was intended.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "sstatus.*save|sstatus.*restore|sstatus.*context|PTE.*0x0[0-9a-fA-F]0[0-9a-fA-F]0[0-9a-fA-F]0[0-9a-fA-F][0-9a-fA-F]{6}|pte.*bits.*58.*55|SSTATUS_RGE|SSTATUS_SRG|SSTATUS_URG|cpu_switch|pmap_pte",
+    "affected_entities": [
+      "sstatus.RGE",
+      "sstatus.SRG",
+      "sstatus.URG",
+      "pte.Y",
+      "pte.YR",
+      "pte.YRG",
+      "pte.YW",
+      "pte.YD",
+      "CHERI Load Capability Fault"
+    ],
+    "summary": "PR #933 replaces single-bit pte.crw with a 4-bit pte.rvy field and renames sstatus.CRGE/UCRG to sstatus.RGE/SRG/URG, adding a supervisor read-generation bit; any FreeBSD RISC-V CHERI port must context-switch the new 3-bit sstatus sub-fields correctly and construct the 4-bit PTE field per the default (Y=bit58 only, bits 57:55 reserved) versus Svyrg-enabled (full 4-bit) semantics to avoid cross-process capability generation state leaks and spurious page faults."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers",
+        "line_start": 103,
+        "line_end": 104,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Full sstatus CSR read via csrr and store to trapframe TF_SSTATUS slot preserves all 64 bits including any hypothetical CHERI YRGE/SYRG/UYRG sub-fields. No masking is applied during save, so Svyrg state would be correctly captured on trap entry.",
+      "snippet": "csrr\tt0, sstatus\nsd\tt0, (TF_SSTATUS)(sp)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 211,
+          "line_end": 241,
+          "excerpt": "Supervisor-mode status (sstatus) register when SXLEN=64 — shows YRGE, SYRG, UYRG fields near SD bit at the top of sstatus."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "load_registers",
+        "line_start": 117,
+        "line_end": 131,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Full sstatus is loaded from trapframe and written via csrw. Bitmask manipulations only touch SIE (bit 1) and SPIE (bit 5) in the low bits, leaving high sstatus bits including hypothetical CHERI YRGE/SYRG/UYRG sub-fields intact through trap return. The per-mode branching (SPIE set for user, SIE clear for supervisor) does not interfere with CHERI bits.",
+      "snippet": "ld\tt0, (TF_SSTATUS)(sp)\n.if \\mode == 0\nli\tt1, SSTATUS_SPIE\nor\tt0, t0, t1\n.else\nli\tt1, ~SSTATUS_SIE\nand\tt0, t0, t1\n.endif\ncsrw\tsstatus, t0",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 44,
+          "line_end": 57,
+          "excerpt": "When pte.YR is set, pte.YRG can be used to trap on capability loads or AMOs when it does not match sstatus.UYRG for userspace pages or sstatus.SYRG for kernel pages."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "sstatus bit definitions",
+        "line_start": 60,
+        "line_end": 80,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "No definitions exist for SSTATUS_YRGE, SSTATUS_SYRG, or SSTATUS_UYRG — the three sstatus sub-fields mandated by Svyrg for capability read generation tracking. On a hypothetical CHERI-RISC-V FreeBSD port, the kernel would have no symbolic names for these bits in the sstatus register, making it impossible to initialize, mask, or context-switch the supervisor/user capability read generation state. Without explicit save/restore awareness, a process's supervisor/user capability read generation could leak into another process.",
+      "snippet": "#define SSTATUS_UIE (1 << 0)\n#define SSTATUS_SIE (1 << 1)\n...\n#define SSTATUS_SUM (1 << 18)\n#define SSTATUS_SD  (1ul << 63)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/attributes.adoc",
+          "line_start": 92,
+          "line_end": 102,
+          "excerpt": "pte_cap_fc_enable = YRGE (enable bit), pte_cap_crg_pte_name = YRG (read generation). cheri_priv_crg_ext = SvyRG. The extension is enabled when sstatus.YRGE is set."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 211,
+          "line_end": 241,
+          "excerpt": "sstatus wavedrom shows YRGE, SYRG, UYRG fields in high bits of sstatus register for SXLEN=64."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pte.h",
+        "function_name": "PTE_HI_MASK definition",
+        "line_start": 131,
+        "line_end": 132,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "PTE_HI_MASK (0xFFC0000000000000ULL) masks bits 63:54 and is used by pmap.c via ~PTE_HI_MASK to extract PPNs from PTEs. This would zero out the 4-bit RVY field (bits 58:55) and the PTE_MA field (bits 62:61) during pmap_kextract/PTE_PPN extraction. On a hypothetical CHERI-RISC-V port with Svyrg enabled, the RVY field carrying YR/YRG/YW/YD per-page capability metadata would be destroyed every time a PTE's physical page number is decoded. The comment 'Bits 63 - 54 are reserved for future use' predates the CHERI reservation of bits 58:55 per the RISC-V privileged spec and the CHERI supervisor spec.",
+      "snippet": "/* Bits 63 - 54 are reserved for future use. */\n#define PTE_HI_MASK\t0xFFC0000000000000ULL",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/supervisor.adoc",
+          "line_start": 1810,
+          "line_end": 1811,
+          "excerpt": "Bits 58-55 are reserved for use by the RV64Y architecture. See section_priv_cheri_vmem for the definition."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-priv-integration.adoc",
+          "line_start": 577,
+          "line_end": 597,
+          "excerpt": "Definition of pte.RVY field: bit 58=Y (enable capability access), bits 57:55=reserved. Under Svyrg, these are redefined as YD(58), YRG(57), YW(56), YR(55)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 333,
+        "line_end": 376,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The supervisor exception dispatch switch handles only base ISA fault causes (0-15, plus standard virtual-instruction causes). There are no cases for CHERI-specific fault types: cause 32 (CHERI Instruction Access Fault), 33 (CHERI Load Access Fault), 34 (CHERI Store/AMO Access Fault), 35 (CHERI Load Capability Fault — Svyrg PTE read-generation mismatch), or 36 (CHERI Store/AMO Page Fault — capability-write-to-non-writable-page). Any such CHERI fault falls through to the default: panic case with 'Unknown kernel exception', crashing the kernel where a SIGSEGV or page-fault recovery path would be expected for Svyrg revocation operations.",
+      "snippet": "case SCAUSE_STORE_PAGE_FAULT:\ncase SCAUSE_LOAD_PAGE_FAULT:\ncase SCAUSE_INST_PAGE_FAULT:\n  page_fault_handler(frame, 0);\n  break;\n...\ndefault:\n  dump_regs(frame);\n  panic(\"Unknown kernel exception %#lx trap value %#lx\",\n    exception, frame->tf_stval);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/attributes.adoc",
+          "line_start": 183,
+          "line_end": 194,
+          "excerpt": "CHERI fault cause values: PC=32, LD=33, ST=34, PTE_LD=35 (CHERI Load Capability Fault), PTE_ST=36 (CHERI Store/AMO Page Fault)."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 51,
+          "line_end": 57,
+          "excerpt": "Implementation raises CHERI Load Capability Fault when pte.YR is set and pte.YRG does not equal sstatus.UYRG (if U=1) or sstatus.SYRG (if U=0)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 411,
+        "line_end": 434,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same as do_trap_supervisor — the user exception handler's switch has no CHERI cause cases and would deliver a SIGILL for CHERI Load Capability Fault (cause 35) via the SCAUSE_ILLEGAL_INSTRUCTION path rather than a proper SIGSEGV. This would break userspace capability-revocation software (e.g., Cornucopia-based allocators) that relies on precise CHERI Load Capability Fault delivery to implement deterministic use-after-reallocation protection.",
+      "snippet": "case SCAUSE_STORE_PAGE_FAULT:\ncase SCAUSE_LOAD_PAGE_FAULT:\ncase SCAUSE_INST_PAGE_FAULT:\n  page_fault_handler(frame, 1);\n  break;\ncase SCAUSE_ECALL_USER:\n  ecall_handler();\n  break;\ncase SCAUSE_ILLEGAL_INSTRUCTION:\n  ...\n  call_trapsignal(td, SIGILL, ...);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 36,
+          "line_end": 42,
+          "excerpt": "Svyrg defines CHERI Load Capability Fault (cause 35). In the case of AMOs that could trigger both a CHERI Store/AMO Page Fault and a CHERI Load Capability Fault, the store fault takes priority per exception priority rules."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/vm_machdep.c",
+        "function_name": "cpu_fork",
+        "line_start": 127,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Spinlock state tracking stores only SSTATUS_SIE bit. This is correct for interrupt-enable tracking: the spinlock_enter/spinlock_exit path uses csrsi/csrci to toggle only SIE, preserving all other sstatus fields including hypothetical CHERI YRGE/SYRG/UYRG bits in hardware. The md_saved_sstatus_ie value is only used by spinlock_exit to decide whether to re-enable interrupts.",
+      "snippet": "td2->td_md.md_spinlock_count = 1;\ntd2->td_md.md_saved_sstatus_ie = (SSTATUS_SIE);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_guest_enter/_Lswitch_return",
+        "line_start": 73,
+        "line_end": 169,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Guest/host sstatus transitions use csrrw (full atomic register swap) at lines 73 and 169, correctly preserving all 64 bits including any hypothetical CHERI YRGE/SYRG/UYRG sub-fields. Guest sstatus is stored to HYP_G_SSTATUS and host sstatus to HYP_H_SSTATUS. No masking is applied that would corrupt CHERI bits.",
+      "snippet": "csrrw\tt0, sstatus, t0    # guest enter: swap sstatus\n...\ncsrrw\tt5, sstatus, t5    # guest exit: swap sstatus back",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 244,
+          "line_end": 272,
+          "excerpt": "vsstatus wavedrom shows YRGE, SYRG, UYRG fields in the same positions as sstatus — virtual supervisor mode requires the same capability read generation tracking."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fork_trampoline",
+        "line_start": 371,
+        "line_end": 376,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Full sstatus loaded from trapframe, SIE cleared via AND with ~SSTATUS_SIE (bit 1 only), then full register written via csrw. All high sstatus bits including hypothetical CHERI YRGE/SYRG/UYRG pass through unmodified from the trapframe into hardware sstatus.",
+      "snippet": "ld\tt0, (TF_SSTATUS)(sp)\nli\tt1, ~SSTATUS_SIE\nand\tt0, t0, t1\ncsrw\tsstatus, t0",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "cpu_switch saves/restores only GPRs (ra, sp, s0-s11) and conditionally FPE state. sstatus is NOT directly manipulated by cpu_switch — it is managed exclusively through the trapframe save/restore in exception.S. This separation is architecturally correct: sstatus context follows the trap entry/exit path rather than the voluntary context-switch path, so no additional CHERI sstatus handling is needed here.",
+      "snippet": "ENTRY(cpu_switch)\n  sd\ta1, PC_CURTHREAD(tp)\n  ld\tx13, TD_PCB(a1)\n  sd\tx13, PC_CURPCB(tp)\n  ld\tx13, TD_PCB(a0)\n  sd\tra, (PCB_RA)(x13)\n  sd\tsp, (PCB_SP)(x13)\n  sd\ts0, (PCB_S + 0 * 8)(x13)\n  ...",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmm_cpuinit",
+        "line_start": 223,
+        "line_end": 225,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Guest sstatus initialization sets only SSTATUS_SPP|SSTATUS_SPIE|SSTATUS_FS_INITIAL. On a hypothetical CHERI-RISC-V system with Svyrg, the YRGE/SYRG/UYRG fields would be left at 0 (the hardware reset value), which is correct initial state. However, the hypctx struct member is hyp_sstatus (a host sstatus), not vsstatus. The hypctx->guest_regs.vsstatus field exists separately at riscv.h:58. There is no code path that initializes or manages the CHERI VS-level read-generation state in vsstatus, which would be needed for a fully virtualized CHERI guest.",
+      "snippet": "hypctx->guest_regs.hyp_sstatus = SSTATUS_SPP | SSTATUS_SPIE;\nhypctx->guest_regs.hyp_sstatus |= SSTATUS_FS_INITIAL;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 244,
+          "line_end": 272,
+          "excerpt": "vsstatus carries YRGE, SYRG, UYRG fields for virtual supervisor mode. The hypervisor must virtualize these fields for guest capability read generation."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

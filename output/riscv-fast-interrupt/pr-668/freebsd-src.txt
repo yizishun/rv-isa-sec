@@ -1,0 +1,117 @@
+PR #668  target=freebsd-src  overall=bug_confirmed
+Spec: Latent: using raw iprio[i] instead of spec-mandated IPRIO (xtopi-reported value) for threshold comparison could unmask interrupts that should be disabled when iprio[i] > 255 or iprio[i]=0, but FreeBSD's hardcoded priority-1/zero-threshold avoids triggering this semantic gap
+Violation: FreeBSD kernel code that reads raw interrupt priority configuration (iprio[i]) directly from APLIC_TARGET or source priority registers and compares it against the hart's xithreshold value bypasses the IPRIO mapping mandated by the spec. Specifically: (1) iprio[i] > 255 is not capped to IPRIO=255, causing threshold comparisons with values exceeding the 8-bit threshold register width; (2) iprio[i]=0 is treated uniformly as the lowest priority, ignoring the platform-defined default-priority semantics (IPRIO=0 for interrupts pinned higher than machine external, IPRIO=255 otherwise). In FreeBSD, this is currently latent because all interrupt sources are programmed with priority=1 and threshold=0, but any future dynamic-priority or threshold-based interrupt masking code would be affected.
+Consequence: denial_of_service
+Pattern: iprio[i].*xithreshold|APLIC_TARGET.*PRIO|sourcecfg.*threshold|(raw.*priority.*threshold)|(unsigned long|uint32_t).*target.*>>.*PRIO_SHIFT
+------------------------------------------------------------
+[bug_confirmed] sys/riscv/vmm/vmm_aplic.c:207-239  aplic_handle_idc_claimi
+  CLAIMI hardcodes interrupt priority to 0 for all claimed interrupts at line 227: '*val = (i << CLAIMI_IRQ_S) | (0 << CLAIMI_PRIO_S)'. Per the ACLIC spec, IPRIO=0 has the semantics of 'lowest priority / disarmed' and when xithreshold > 0, interrupts with IPRIO=0 can never pass the threshold gate (IPRIO >= xithreshold & NIPPRIO_MASK). The actual priority configured in APLIC_TARGET[identity][7:0] is never read. A guest VM relying on priority-based preemption or threshold-based interrupt masking would receive incorrect IPRIO values and thus be unable to implement priority ceiling protocols or nested interrupt handling correctly.
+  | for (i = 0; i < aplic->nirqs; i++) {
+  |     irq = &aplic->irqs[i];
+  |     if (irq->target_hart != cpu_id)
+  |         continue;
+  |     if (irq->state & APLIC_IRQ_STATE_PENDING) {
+  |         *val = (i << CLAIMI_IRQ_S) | (0 << CLAIMI_PRIO_S);  // line 227
+  |         irq->state &= ~APLIC_IRQ_STATE_PENDING;
+  |         found = true;
+  |         break;
+  |     }
+  | }
+
+[bug_confirmed] sys/riscv/vmm/vmm_aplic.c:241-262  aplic_handle_idc
+  Guest writes to IDC_ITHRESHOLD are silently accepted (error=0 at line 250) but the threshold value is never stored. The 'struct aplic' (line 110-117) lacks any per-hart ithreshold field. This means a guest VM cannot raise the interrupt threshold to mask lower-priority interrupts. The ACLIC spec requires that when xithreshold is nonzero, interrupt sources with IPRIO values satisfying 'IPRIO >= xithreshold & NIPPRIO_MASK' be masked. By discarding the guest's ithreshold setting, the VMM violates this requirement, causing all enabled+pending interrupts to always be delivered regardless of threshold.
+  | switch (reg + APLIC_IDC(0)) {
+  |     case IDC_IDELIVERY(0):
+  |     case IDC_IFORCE(0):
+  |     case IDC_ITHRESHOLD(0):    // line 250: accepted but not stored
+  |     case IDC_TOPI(0):
+  |         error = 0;
+  |         break;
+
+[potential_risk] sys/riscv/vmm/vmm_aplic.c:190-205  aplic_handle_target
+  When a guest writes the APLIC_TARGET register, the full value is stored in irq->target and the hart index is extracted (line 199), but the 8-bit priority field (bits [0:7]) is never extracted, validated, or stored separately. The iprio value configured by the guest is simply lost. Combined with the hardcoded priority=0 in CLAIMI, this means any guest-programmed priority is ignored. While the 8-bit mask in APLIC_MK_IRQ_TARGET on the host side already limits to & 0xff, the VMM should validate or at minimum store the priority for use in CLAIMI and threshold arbitration.
+  | if (write) {
+  |     irq->target = *val;
+  |     irq->target_hart = (irq->target >> TARGET_HART_S);
+  | } else
+  |     *val = irq->target;
+
+[bug_confirmed] sys/riscv/vmm/vmm_aplic.c:449-480  aplic_check_pending
+  aplic_check_pending determines VSEIP assertion based solely on whether any interrupt is both enabled and pending (lines 470-471), without comparing the interrupt's iprio against the hart's ithreshold. Per the ACLIC spec, when xithreshold is nonzero, interrupts that do not satisfy 'IPRIO >= xithreshold & NIPPRIO_MASK' must be masked. A guest VM using dynamic threshold values would receive VSEIP for interrupts that should be masked by the threshold, leading to spurious interrupt delivery. Currently latent because all FreeBSD interrupts use priority=1 and threshold=0.
+  | for (i = 0; i < aplic->nirqs; i++) {
+  |     irq = &aplic->irqs[i];
+  |     if (irq->target_hart != hypctx->cpu_id)
+  |         continue;
+  |     if ((irq->state & APLIC_IRQ_STATE_ENABLED) &&
+  |         (irq->state & APLIC_IRQ_STATE_PENDING)) {
+  |         mtx_unlock_spin(&aplic->mtx);
+  |         /* Found. */
+  |         return (1);
+  |     }
+  | }
+
+[potential_risk] sys/riscv/vmm/vmm_aplic.c:482-548  aplic_inject_irq
+  aplic_inject_irq notifies the vCPU when an interrupt has both ENABLED and PENDING bits set (lines 538-545), but does not check the interrupt's iprio against the target hart's ithreshold. This is the same threshold-bypass pattern as aplic_check_pending. A guest expecting threshold-based masking would be interrupted by IRQs that should be masked. Currently latent with all-interrupts-priority-1 and threshold-0, but any guest OS using the AIA priority/threshold mechanism (e.g., for priority ceiling protocol) would be affected.
+  | mask = APLIC_IRQ_STATE_ENABLED | APLIC_IRQ_STATE_PENDING;
+  | if ((irq->state & mask) == mask)
+  |     notify = true;
+  | 
+  | mtx_unlock_spin(&aplic->mtx);
+  | 
+  | if (notify)
+  |     vcpu_notify_event(vm_vcpu(hyp->vm, irq->target_hart));
+
+[potential_risk] sys/riscv/vmm/vmm_aplic.c:100-117  (struct aplic)
+  The 'struct aplic_irq' (lines 100-108) lacks a dedicated iprio field, and 'struct aplic' (lines 110-117) lacks per-hart ithreshold fields. This structural deficiency is the root cause of all VMM-side APLIC priority/threshold violations. The target register's priority field is stored but never extracted; ITHRESHOLD values are never stored; and CLAIMI, check_pending, and inject_irq all lack the data they need to implement correct priority arbitration.
+  | struct aplic_irq {
+  |     uint32_t sourcecfg;
+  |     uint32_t state;
+  |     uint32_t target;
+  |     uint32_t target_hart;
+  | };
+  | 
+  | struct aplic {
+  |     uint32_t mem_start;
+  |     uint32_t mem_end;
+  |     struct mtx mtx;
+  |     struct aplic_irq *irqs;
+  |     int nirqs;
+  |     uint32_t domaincfg;
+  | };
+
+[compliant] sys/riscv/riscv/aplic.c:222-246  aplic_intr
+  The host-side APLIC driver reads CLAIMI from hardware at line 235. The hardware APLIC's IDC logic internally performs the iprio-vs-ithreshold comparison before presenting an interrupt via CLAIMI. The priority value extracted at line 236 is passed to aplic_irq_dispatch where it's unused, but this is acceptable because the hardware has already arbitrated. The host driver does not compare raw iprio against xithreshold — it relies on the hardware's built-in threshold gating, which is correct behavior.
+  | while ((claimi = aplic_read(sc, APLIC_IDC_CLAIMI(sc, cpu))) != 0) {
+  |     prio = APLIC_IDC_CLAIMI_PRIO(claimi);
+  |     irq = APLIC_IDC_CLAIMI_IRQ(claimi);
+  |     KASSERT((irq != 0), ("Invalid IRQ 0"));
+  |     tf = curthread->td_intr_frame;
+  |     aplic_irq_dispatch(sc, irq, prio, tf);
+  | }
+
+[compliant] sys/riscv/riscv/aplic.c:405-411  aplic_setup_direct_mode
+  Host-side initialization sets ITHRESHOLD=0 (APLIC_IDC_ITHRESHOLD_DISABLE) for all CPUs at line 409-410. Per the ACLIC spec (line 817-818): 'When xithreshold is zero, all enabled interrupt sources can contribute to signaling interrupts to the hart.' Since all host interrupts are configured with priority=1 and threshold=0, this creates a single-priority-level system where all interrupts are always delivered — matching FreeBSD's interrupt model where the scheduler handles prioritization, not the interrupt controller. The hardware APLIC correctly gates CLAIMI through IDC threshold logic.
+  | CPU_FOREACH(cpu) {
+  |     aplic_write(sc, APLIC_IDC_IDELIVERY(sc, cpu),
+  |         APLIC_IDC_IDELIVERY_DISABLE);
+  |     aplic_write(sc, APLIC_IDC_ITHRESHOLD(sc, cpu),
+  |         APLIC_IDC_ITHRESHOLD_DISABLE);
+  | }
+
+[compliant] sys/riscv/riscv/aplic.c:209-220  aplic_irq_dispatch
+  The prio parameter is received but unused. This is acceptable on the host side because the APLIC hardware already performed the iprio-vs-ithreshold arbitration in its IDC logic before returning the interrupt via CLAIMI. The hardware-level threshold gating at the APLIC IDC eliminates the need for software-side IPRIO mapping in the interrupt dispatch path. No raw iprio-vs-xithreshold comparison exists here because the hardware already filtered.
+  | static inline void
+  | aplic_irq_dispatch(struct aplic_softc *sc, u_int irq, u_int prio,
+  |     struct trapframe *tf)
+  | {
+  |     struct aplic_irqsrc *src;
+  |     src = &sc->isrcs[irq];
+  |     if (intr_isrc_dispatch(&src->isrc, tf) != 0)
+  |         ...
+  | }
+
+[compliant] sys/riscv/riscv/aplic.c:156-157  (APLIC_MK_IRQ_TARGET macro)
+  The APLIC_MK_IRQ_TARGET macro masks priority to 8 bits ('(_prio) & 0xff'). This is correct for the APLIC_TARGET register format where the priority field is bits [7:0]. The IPRIO specification (8-bit maximum) is directly compatible with the APLIC_TARGET priority field width. There is no >255 overflow concern here because writes to the actual hardware register would be truncated by the APLIC's 8-bit WARL behavior.
+  | #define APLIC_MK_IRQ_TARGET(_sc, _cpu, _prio)\
+  |     (_sc->hart_indices[_cpu] << 18 | ((_prio) & 0xff))
+

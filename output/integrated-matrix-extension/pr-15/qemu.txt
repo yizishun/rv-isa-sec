@@ -1,0 +1,60 @@
+PR #15  target=qemu  overall=compliant
+Spec: IME tile load/store must gate memory access on element-active check BEFORE the TLB/physical access, not after — otherwise inactive/tail element page faults become an observable side channel violating the 'never raise exceptions' guard
+Violation: In QEMU TCG, the helper function for an IME tile load/store instruction (vmtl.v, vmttl.v, vmtts.v) performs the virtual-memory access for an element before checking whether the element is inactive (mask bit = 0) or is a tail element (index >= VL). If the access faults (page fault, PMP violation, access fault), QEMU raises an exception that the guest can observe, leaking information about the physical memory map or host state through the exception side channel, despite the spec requiring that inactive and tail elements 'never raise exceptions' and 'do not update the destination register'.
+Consequence: info_leak
+Pattern: vext_ldst_tile.*\(.*env.*vstart.*vl.*vm.*\).*\{[^}]*ld[ubhw]_tlb[^}]*\}[^}]*if.*vext_set_elem_mask|if.*!vext_elem_mask.*\{[^}]*exception|helper.*vmtl.*\(.*\).*cpu_ld.*before.*vext_check_elem|// BUG: inactive/tail exception check ordered after memory access
+------------------------------------------------------------
+[compliant] target/riscv/insn32.decode:1-1  N/A (decode patterns)
+  No vmtl.v, vmttl.v, or vmtts.v opcode decode patterns exist. No IME tile load/store instructions are decoded in the translator.
+  | (none — no tile load/store decode entries)
+
+[compliant] target/riscv/helper.h:1-1  N/A (helper declarations)
+  No HELPER(vmtl_v), HELPER(vmttl_v), or HELPER(vmtts_v) declarations exist. No tile load/store TCG helpers are registered.
+  | (none — no tile load/store helper declarations)
+
+[compliant] target/riscv/insn_trans/trans_rvv.c.inc:1-1  N/A (translation handlers)
+  No trans_vmtl_v, trans_vmttl_v, or trans_vmtts_v translation handlers exist. The TCG opcode-to-helper dispatch for tile loads/stores is absent.
+  | (none — no tile load/store translation handlers)
+
+[compliant] target/riscv/vector_helper.c:308-340  vext_ldst_stride
+  Demonstrates the CORRECT pattern required by the spec: checks mask (!vm && !vext_elem_mask(v0, i)) at line 325 BEFORE calling ldst_elem() at line 333. Inactive elements are skipped via 'continue' without memory access. Tail handling via vext_set_tail_elems_1s occurs post-loop.
+  | if (!vm && !vext_elem_mask(v0, i)) {
+  |     vext_set_elems_1s(vd, vma, ...);
+  |     k++;
+  |     continue;  // skip memory access
+  | }
+  | ldst_elem(env, adjust_addr(env, addr), ...);
+
+[compliant] target/riscv/vector_helper.c:588-622  vext_ldst_index
+  Same correct pattern: mask check at line 607 BEFORE ldst_elem() at line 615. Inactive elements skip memory access entirely.
+  | if (!vm && !vext_elem_mask(v0, i)) {
+  |     vext_set_elems_1s(vd, vma, ...);
+  |     k++;
+  |     continue;
+  | }
+  | ldst_elem(env, adjust_addr(env, addr), ...);
+
+[compliant] target/riscv/vector_helper.c:678-806  vext_ldff (fault-only-first load)
+  Correct ordering in BOTH the probe loop (line 712: mask check BEFORE probe_pages at 718) and the TLB access path for vm=0 (line 788: mask check BEFORE ldst_tlb at 796). The spec requirement is correctly followed in all paths.
+  | if (!vm && !vext_elem_mask(v0, i)) {
+  |     continue;  // skip probe/access
+  | }
+  | probe_pages(env, addr_i, ...);  // only for active elements
+
+[potential_risk] target/riscv/vector_helper.c:377-427  vext_page_ldst_us
+  Calls probe_pages() at line 392-393 for the full element range BEFORE any mask check, then delegates to vext_continuous_ldst_tlb/ldst_host which also do no mask checking. Currently safe because callers are only unmasked (vm=1) paths: vext_ldst_us (vm hardcoded false at macro level), vext_ldff (only after probe phase confirms vm=1), vext_ldst_whole. However, if future IME tile load/store code reuses this function for masked operations, probe_pages() would fault on pages containing only inactive/tail elements, violating the spec. Needs a documentation comment warning about the unmasked-only contract.
+  | probe_pages(env, addr, size, ra, access_type, mmu_index, &host, &flags, true);
+  | // then loop: ldst_host/ldst_tlb for every element — NO mask check
+
+[potential_risk] target/riscv/vector_helper.c:249-259  vext_continuous_ldst_tlb
+  Iterates vstart-to-evl calling ldst_tlb() for EVERY element with NO mask check. Safe only because called exclusively from vext_page_ldst_us (unmasked-only path). Would silently access inactive/tail elements if any future masked caller invokes it.
+  | for (i = env->vstart; i < evl; env->vstart = ++i, addr += esz) {
+  |     ldst_tlb(env, adjust_addr(env, addr), i, vd, ra);  // NO mask check
+  | }
+
+[potential_risk] target/riscv/vector_helper.c:261-286  vext_continuous_ldst_host
+  Same hazard: processes elements from reg_start to evl without mask filtering. Uses bulk memcpy for byte-size elements. Called exclusively from vext_page_ldst_us. Would silently access masked-out elements if reused for masked IME tile operations.
+  | if (esz == 1) {
+  |     memcpy(vd + byte_offset, host, size);  // bulk copy, no mask filtering
+  | }
+

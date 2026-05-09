@@ -1,0 +1,137 @@
+{
+  "pr_number": 718,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 718,
+    "violation_condition": "In OpenSBI, when the M-mode CLIC trap handler takes an interrupt i and writes mithreshold with iprio[i] (the specific interrupt's priority) instead of IPRIO (the maximum supported priority level), higher-priority interrupts remain unmasked during M-mode interrupt processing, violating the spec-mandated blanket masking of all interrupts on trap entry.",
+    "security_consequence": "race_condition",
+    "vulnerability_pattern": "pattern: CSR write to mithreshold/mintthresh in M-mode trap entry that sources the value from the triggering interrupt's priority (iprio[i], TOPI priority field, or equivalent) rather than the architectural IPRIO constant; also grep for any masking of iprio[i] with non-maximum bounds before writing mithreshold",
+    "affected_entities": [
+      "mithreshold",
+      "mintthresh",
+      "mnxti",
+      "mtopi"
+    ],
+    "summary": "Smnip trap entry must set mithreshold to IPRIO (max priority) not iprio[i] (specific interrupt priority) to ensure all interrupts are masked during M-mode ISR execution, preventing interrupt-induced race conditions during firmware critical sections (PMP reconfig, domain switch, HSM state transitions)"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap.c",
+        "function_name": "sbi_trap_aia_irq",
+        "line_start": 256,
+        "line_end": 286,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The M-mode AIA interrupt handler reads CSR_MTOPI but shifts away the IPRIO field (low 8 bits, TOPI_IPRIO_MASK) and only extracts the IID. It never writes the mithreshold CSR. Under Smnip hardware, the hardware automatically sets xithreshold = iprio_of_interrupt on trap entry (ACLIC spec §Trap behavior), which masks equal-or-lower-priority interrupts but leaves higher-priority interrupts unmasked. OpenSBI currently runs with MIE=0 during M-mode trap processing, so no preemption is possible regardless of threshold. However, if OpenSBI were ever to enable MIE during M-mode IRQ processing (e.g., for nested interrupt handling), higher-priority interrupts would preempt the handler, potentially corrupting shared M-mode state.",
+      "snippet": "while ((mtopi = csr_read(CSR_MTOPI))) {\n\tmtopi = mtopi >> TOPI_IID_SHIFT;  /* IPRIO field (bits 7:0) discarded by shift */\n\tswitch (mtopi) {\n\tcase IRQ_M_TIMER:\n\t\tsbi_timer_process();",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 820,
+          "line_end": 829,
+          "excerpt": "When a trap is taken into level x, the current value of xithreshold is written to xpistatus.pithreshold. Additionally, if the trap was taken on an interrupt, xithreshold is set to IPRIO. This automatically raises the interrupt-enable threshold."
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 704,
+          "line_end": 709,
+          "excerpt": "A new WLRL M-mode CSR, mithreshold, determines the priority cutoff used to mask lower-priority interrupts. Register mithreshold implements exactly IPRIOLEN bits."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "include/sbi/riscv_encoding.h",
+        "function_name": "",
+        "line_start": 767,
+        "line_end": 769,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR_MTOPI is defined at 0xfb0 but the corresponding CSR_MITHRESHOLD (0x347 per ACLIC spec) is missing entirely. TOPI_IPRIO_MASK (0xff) is defined at line 192 but is never used — no code extracts the IPRIO field from MTOPI. The missing CSR definition blocks any Smnip-aware mithreshold programming in the trap handler, HSM save/restore, or domain context management.",
+      "snippet": "/* Machine-Level Interrupts (AIA) */\n#define CSR_MTOPEI\t\t0x35c\n#define CSR_MTOPI\t\t0xfb0\n/* Missing: #define CSR_MITHRESHOLD 0x347 */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 676,
+          "line_end": 682,
+          "excerpt": "Number  Name         Description\n(NEW) 0x346   mpistatus    Previous interrupt context\n(NEW) 0x347   mithreshold  Interrupt enable threshold\n(NEW) 0x348   mipreemptcfg Interrupt preemption configuration"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "hart_detect_features",
+        "line_start": 646,
+        "line_end": 649,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Feature detection probes CSR_MTOPI to detect SBI_HART_EXT_SMAIA, but there is no corresponding probe for CSR_MITHRESHOLD (0x347) to detect Smidctrl/Smnip availability. Any mithreshold programming in the trap handler must be gated on Smidctrl detection; without it, writing CSR 0x347 on non-Smnip hardware would cause an illegal instruction trap. A secondary M-mode trap during interrupt entry would trigger the double-trap handler, likely hanging the hart.",
+      "snippet": "__check_ext_csr(SBI_HART_PRIV_VER_UNKNOWN,\n\t\tCSR_MTOPI, SBI_HART_EXT_SMAIA);\n/* Missing: __check_ext_csr(..., CSR_MITHRESHOLD, SBI_HART_EXT_SMIDCTRL) */\n/* Detect if hart supports stimecmp CSR(Sstc extension) */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 301,
+          "line_end": 305,
+          "excerpt": "Smidctrl depends on the Smcsrind and Smaia extensions. Ssidctrl depends on the Sscsrind and Ssaia extensions."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_save",
+        "line_start": 427,
+        "line_end": 433,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "HSM non-retentive suspend saves MIE, MIP, MEDELEG, MIDELEG, and MENVCFG but does not save mithreshold. Per the ACLIC spec, mithreshold resets to 0 (allow all interrupts). After non-retentive suspend+resume on Smnip hardware, mithreshold is silently reset to 0, discarding any non-default threshold configuration. This is a correctness gap but is mitigated by the fact that sbi_trap_aia_irq() would re-program mithreshold on the next interrupt trap entry if the fix is applied. Without the trap-handler fix, there is no mechanism to restore the lost threshold state.",
+      "snippet": "hdata->saved_mie = csr_read(CSR_MIE);\nhdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);\nhdata->saved_medeleg = csr_read(CSR_MEDELEG);\nhdata->saved_mideleg = csr_read(CSR_MIDELEG);\n/* Missing: hdata->saved_mithreshold = csr_read(CSR_MITHRESHOLD); */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 789,
+          "line_end": 793,
+          "excerpt": "mithreshold resets to zero. The reset behavior of other fields is platform-specific."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/utils/irqchip/imsic.c",
+        "function_name": "imsic_local_irqchip_init",
+        "line_start": 244,
+        "line_end": 253,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "IMSIC init writes 0 to IMSIC_EITHRESHOLD (allow all interrupts), which is correct for AIA-only systems. Under Smnip, the mithreshold CSR replaces eithreshold's threshold functionality, and the CSR would be managed by the trap handler on each entry. The init-time IMSIC_EITHRESHOLD write is harmless on Smnip hardware — the first interrupt trap entry will set mithreshold via hardware or software. No fix needed here as part of the Smnip threshold patch.",
+      "snippet": "csr_read_allowed(CSR_MTOPI, &trap);\nif (trap.cause)\n\treturn;\nimsic_csr_write(IMSIC_EITHRESHOLD, IMSIC_ENABLE_EITHRESHOLD);\nimsic_csr_write(IMSIC_EIDELIVERY, IMSIC_ENABLE_EIDELIVERY);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap.c",
+        "function_name": "sbi_trap_handler",
+        "line_start": 304,
+        "line_end": 325,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The trap dispatch gate correctly checks SBI_HART_EXT_SMAIA to route to sbi_trap_aia_irq() vs sbi_trap_nonaia_irq(). This gate is the correct place to add Smidctrl awareness: when Smidctrl is detected, the trap handler should program mithreshold before dispatching IIDs. The existing condition structure supports adding a nested Smidctrl check without restructuring.",
+      "snippet": "if (mcause & MCAUSE_IRQ_MASK) {\n\tif (sbi_hart_has_extension(sbi_scratch_thishart_ptr(),\n\t\t\t\t   SBI_HART_EXT_SMAIA))\n\t\trc = sbi_trap_aia_irq();\n\telse\n\t\trc = sbi_trap_nonaia_irq(mcause & ~MCAUSE_IRQ_MASK);",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

@@ -1,0 +1,69 @@
+PR #669  target=xiangshan  overall=bug_confirmed
+Spec: Removal of eithreshold/eidelivery from Smidctrl scope and introduction of mithreshold with major+minor identity thresholding creates a semantic mismatch: RTL hardwiring old eidelivery ACLIC-only mode or implementing old priority-only eithreshold will silently break interrupt priority ceiling enforcement, allowing untrusted interrupts to escape threshold gating
+Violation: XiangShan RTL implements Smidctrl/Ssidctrl with hardwired eidelivery=0x20000000 (ACLIC-only mode) and an eithreshold CSR that applies only to interrupt priority levels, but software following the updated spec attempts to use the new mithreshold CSR (which applies to both major and minor interrupt identities) for priority ceiling synchronization. The hardware either (a) ignores writes to mithreshold because the decoder routes threshold through the old eithreshold register, or (b) applies old threshold semantics that do not filter on minor interrupt identities, allowing low-priority minor interrupts to preempt critical sections protected by Priority Ceiling Protocol.
+Consequence: privilege_escape
+Pattern: search for CSR decode logic where (eithreshold CSR address is decoded but mithreshold is not) OR (eidelivery is hardwired to constant 0x20000000 via WireInit/RegInit) OR (interrupt threshold comparator only checks priority bits but not major/minor identity fields)
+------------------------------------------------------------
+[bug_confirmed] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:1-923  CSRs object (address constants)
+  mithreshold CSR (address 0x347 per ACLIC spec Smidctrl section) is NOT defined in the CSR address decode table. The CSR address 0x347 has no entry in CSRs.scala. Software writes to mithreshold will take the default read-as-zero/write-ignored path, meaning the interrupt-enable threshold is permanently zero — all pending-enabled interrupts are always deliverable regardless of priority ceiling. This silently defeats Priority Ceiling Protocol synchronization.
+  | // CSR addresses present in table: 0x345=mnxti, 0x346=mintstatus, 0x348=mscratchcsw
+  | // 0x347 is MISSING — no mithreshold CSR
+  | // No threshold CSRs exist at 0x146 (sintstatus defined, spistatus missing) or 0x147 (sithreshold missing)
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala:160-173  aiaCSRMods
+  The complete AIA CSR module list (aiaCSRMods) contains only miselect, mireg, mtopei, mtopi, siselect, sireg, stopei, stopi, vsiselect, vsireg, vstopi, vstopei. No mithreshold, sithreshold, mpistatus, spistatus, or mipreemptcfg CSR modules exist. Any Smidctrl/Ssidctrl CSR access falls through to the default illegal-instruction or read-as-zero path. The mireg indirect access range declared illegal at 0x40-0x6F blocks the IMSIC-style eithreshold/eidelivery address space — confirming the RTL supports neither IMSIC threshold CSRs nor ACLIC threshold CSRs.
+  | val aiaCSRMods = Seq(
+  |   miselect, mireg, mtopei, mtopi,
+  |   siselect, sireg, stopei, stopi,
+  |   vsiselect, vsireg, vstopi, vstopei,
+  | )
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala:465-481  InterruptFilter (mIRVecTmp/hsIRVecTmp/vsIRVecTmp)
+  Interrupt delivery gating (mIRVecTmp, hsIRVecTmp, vsIRVecTmp) checks ONLY privilege mode (isModeM/isModeHS/isModeVS) and global interrupt-enable bits (mstatusMIE/sstatusSIE/vsstatusSIE). There is NO interrupt threshold comparison. In a spec-compliant Smidctrl/Ssidctrl implementation with mithreshold, an interrupt should be delivered only when IPRIO < xithreshold & NIPPRIO_MASK. The absence of threshold comparison means all pending-enabled interrupts are always deliverable — low-priority interrupts will preempt critical sections protected by Priority Ceiling Protocol with no hardware enforcement.
+  | val mIRVecTmp = Mux(
+  |   privState.isModeM && mstatusMIE || privState < PrivState.ModeM,
+  |   io.out.mtopi.IID.asUInt,
+  |   0.U
+  | )
+  | // Same pattern for hsIRVecTmp (line 471) and vsIRVecTmp (line 477) — no threshold gating anywhere
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala:53-54  InterruptFilter (mtopiIsNotZero)
+  The pending-interrupt check (mtopiIsNotZero) is a pure bitwise AND of mip, mie, and ~mideleg with no threshold filtering. Per the ACLIC spec, when mithreshold is nonzero, interrupts with IPRIO >= mithreshold & NIPPRIO_MASK should be treated as disabled even if their pending and enable bits are set. This check unconditionally reports 'interrupt pending' whenever any enabled interrupt source is pending, regardless of the threshold value.
+  | val mtopiIsNotZero: Bool = (mip & mie & (~mideleg).asUInt) =/= 0.U
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala:624-630  IpriosSort
+  The IpriosSort priority bundle uses a flat 8-bit prioNum without major/minor interrupt identity decomposition. The ACLIC spec defines mithreshold to apply to BOTH major and minor interrupt identities for Priority Ceiling Protocol enforcement (NIPPRIO_MASK filters bits to determine which priority bits participate in preemption decisions). Without major/minor identity fields, threshold comparison cannot distinguish between interrupts in different identity groups that happen to have numerically similar priority values — low-priority minor interrupts within the same major group could bypass threshold filtering.
+  | class IpriosSort extends Bundle {
+  |   val idx = UInt(6.W)
+  |   val enable = Bool()
+  |   val isZero = Bool()
+  |   val greaterThan255 = Bool()
+  |   val prioNum = UInt(8.W)
+  | }
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala:162-189  InterruptFilter (minSelect)
+  The minSelect priority comparator (line 179) compares single flat 8-bit prioNum values: `Mux(left.prioNum <= right.prioNum, left, right)`. With mithreshold/NIPPRIO_MASK semantics, the comparator should apply the preempt mask to filter priority bits before comparing, so that only the bits selected by mipreemptcfg.preemptmsk participate in preemption decisions. Without masked comparison, all 8 priority bits influence preemption decisions regardless of the configured NIPPRIO_MASK.
+  | (!left.greaterThan255 && !right.greaterThan255) -> Mux(left.prioNum <= right.prioNum, left, right),
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala:566-621  InterruptFilterIO
+  The InterruptFilterIO input bundle has no threshold field (no mithreshold value input). The output bundle has no xithreshold update output. Per ACLIC spec, on interrupt entry: xithreshold must be set to IPRIO (automatically raising the threshold), and xpistatus.pithreshold must be set to the previous threshold value. On xRET: xithreshold must be restored from xpistatus.pithreshold. Without these signals in the IO bundle, the hardware cannot implement the spec-mandated automatic threshold management during trap entry/return.
+  | class InterruptFilterIO extends Bundle {
+  |   val in = Input(new Bundle {
+  |     // ...privilege, mip, mie, mideleg, sip, sie, etc...
+  |     // NO threshold field
+  |   })
+  |   val out = Output(new Bundle {
+  |     // ... interruptVec, mtopi, stopi, vstopi ...
+  |     // NO threshold update output
+  |   })
+  | }
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:364-398  NewCSR (InterruptFilter wiring)
+  The InterruptFilter is wired with all standard interrupt signals (mip, mie, mideleg, miprios, hsiprios, mtopei, stopei, vstopei, hvictl, hstatus, hviprio1, hviprio2) but NO threshold CSR is connected because no such CSR exists. The CSR-to-InterruptFilter wiring lacks the essential feedback path where (a) the InterruptFilter reads the current mithreshold value to gate interrupt delivery, and (b) the InterruptFilter updates mithreshold/mpistatus on trap entry/return.
+  | intrMod.io.in.mtopei := mtopei.regOut
+  | intrMod.io.in.stopei := stopei.regOut
+  | intrMod.io.in.vstopei := vstopei.regOut
+  | intrMod.io.in.miprios := Cat(miregiprios.map(_.rdata).reverse)
+  | intrMod.io.in.hsiprios := Cat(siregiprios.map(_.rdata).reverse)
+  | // NO threshold CSR wiring — no mithreshold, mpistatus, or mipreemptcfg connection
+

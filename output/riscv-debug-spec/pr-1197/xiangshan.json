@@ -1,0 +1,59 @@
+{
+  "pr_number": 1197,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 1197,
+    "violation_condition": "When any hart in a halt group halts, the Debug Module asserts hgDebugInt for all other harts in that group (debug_module.adoc:245, Debug.scala:1134). This signal is ORed with hrDebugInt into a single debug interrupt line (Debug.scala:1146). In the CSR trap-entry logic, all debug interrupts unconditionally write dcsr.cause = 3 (Haltreq) via causeIntr = DcsrCause.Haltreq.asUInt (TrapEntryDEvent.scala:57, CSR.scala:1474). The DcsrCause.Group value (6) is defined (DebugLevel.scala:339) but never referenced in any trap-entry code path. The hardware has no mechanism to distinguish halt-group interrupts from direct halt-request interrupts, so it can never set cause=6 for group-induced halts as required by the tightened spec.",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "dcsr.cause.*:=.*(HALTREQ|3\\.U|Haltreq)|hgDebugInt.*\\|.*hrDebugInt|causeIntr.*Haltreq|CAUSE_HALTREQ",
+    "affected_entities": [
+      "dcsr",
+      "DcsrCause.Group",
+      "hgDebugInt",
+      "hrDebugInt"
+    ],
+    "summary": "dcsr.cause always reports 3 (Haltreq) for all debug interrupts; halt-group-induced halts (which must report cause=6 Group per PR #1197) are indistinguishable from direct halt requests because hgDebugInt and hrDebugInt are ORed into a single interrupt line with no sideband cause-differentiation"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryDEvent.scala",
+        "function_name": "TrapEntryDEventModule",
+        "line_start": 57,
+        "line_end": 92,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "All debug interrupts unconditionally write dcsr.cause=3 (Haltreq). The Rocket-chip Debug Module ORs hgDebugInt (halt-group) and hrDebugInt (halt-request) into a single debug interrupt line (Debug.scala:1146), which enters the hart as platformIRP.debugIP as a single boolean (NewCSR.scala:271). The trap-entry logic hardcodes causeIntr = DcsrCause.Haltreq.asUInt (line 57) for ALL debug interrupts via `Mux(hasDebugIntr, causeIntr, causeExp)` (line 92). DcsrCause.Group (value=6) is defined in DebugLevel.scala:339 but is never referenced in any trap-entry code path. The hardware has no mechanism to distinguish halt-group interrupts from direct halt-request interrupts, so dcsr.cause can never be set to 6 (Group) for group-induced halts as required by the tightened spec.",
+      "snippet": "  val causeIntr = DcsrCause.Haltreq.asUInt\n  val causeExp = MuxCase(DcsrCause.None.asUInt, Seq(\n    criticalErrorStateEnterDebug -> DcsrCause.Other.asUInt,\n    triggerEnterDebugMode        -> DcsrCause.Trigger.asUInt,\n    hasDebugEbreakException      -> DcsrCause.Ebreak.asUInt,\n    hasSingleStep                -> DcsrCause.Step.asUInt\n  ))\n  // ...\n  out.dcsr.bits.CAUSE         := Mux(hasDebugIntr, causeIntr, causeExp)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/rocket-chip/src/main/scala/devices/debug/Debug.scala",
+        "function_name": "dmOuter",
+        "line_start": 1146,
+        "line_end": 1146,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hgDebugInt (halt-group interrupt) and hrDebugInt (direct halt-request interrupt) are correctly ORed together to produce a single debug interrupt output per component. This combining itself is architecturally correct (both signals trigger Debug Mode entry), but downstream consumers lose the distinction between them.",
+      "snippet": "    io.hgDebugInt := hgDebugInt | hrDebugInt",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/DebugLevel.scala",
+        "function_name": "DcsrCause",
+        "line_start": 332,
+        "line_end": 341,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "DcsrCause.Group = Value(6.U) is correctly defined per spec, with proper encoding for all 8 possible cause values. The definition itself is correct; the bug is that this value is never used in any trap-entry code path.",
+      "snippet": "object DcsrCause extends CSREnum with ROApply {\n  val None         = Value(0.U)\n  val Ebreak       = Value(1.U)\n  val Trigger      = Value(2.U)\n  val Haltreq      = Value(3.U)\n  val Step         = Value(4.U)\n  val Resethaltreq = Value(5.U)\n  val Group        = Value(6.U)\n  val Other        = Value(7.U)\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

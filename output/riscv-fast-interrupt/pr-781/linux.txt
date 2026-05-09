@@ -1,0 +1,57 @@
+PR #781  target=linux  overall=potential_risk
+Spec: Any CSR write to stvec without corresponding guarantee that the target page has S-mode execute permission via PMP/Smepmp creates a trap-loop DoS: the next interrupt/exception vector fetch faults on instruction access, which itself faults, crashing the kernel.
+Violation: The kernel places the S-mode trap vector page (stvec) at a physical address where PMP/Smepmp does not grant S-mode execute permission — either during boot cpuidle (head.S PMPCFG write with X=0 at that region), through a context switch that changes stvec (KVM), or when M-mode firmware shares a CLIC vector table via xivt/xeivt without ensuring S-mode X permission on the shared table.
+Consequence: denial_of_service
+Pattern: csrw CSR_STVEC, <reg> | csr_write(CSR_STVEC, | csr_write(CSR_TVEC, | csr_write(CSR_VSTVEC,
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/head.S:234-242  _start_kernel
+  Sets PMPCFG0 with X=1 (RWX=111 NAPOT) before any code executes. The PMP rule explicitly grants S-mode execute permission on all of memory. Even though L=0 (unlocked), the X bit is set, so stvec can point anywhere safely. No violation: the PMP setup does NOT create a region where stvec would lack X permission.
+  | la a0, .Lpmp_done
+  | csrw CSR_TVEC, a0
+  | li a0, -1
+  | csrw CSR_PMPADDR0, a0
+  | li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+  | csrw CSR_PMPCFG0, a0
+
+[compliant] arch/riscv/kernel/kexec_relocate.S:45-47  riscv_kexec_relocate
+  Writes CSR_STVEC to the physical address of the relocation loop (label 1f minus VA_PA offset). This address is within the kexec relocation code page, which is kernel text already mapped with execute permission. The stvec is set before SATP is cleared, ensuring the trap vector is valid during the MMU-off transition. No PMP violation because the target is in kernel-owned memory where PMP already grants X.
+  | la s6, 1f
+  | sub s6, s6, s4
+  | csrw CSR_STVEC, s6
+
+[compliant] arch/riscv/kernel/kexec_relocate.S:201-208  riscv_kexec_norelocate
+  Sets CSR_STVEC to the new kernel entry point (a2) before clearing SATP. The comment correctly notes 'This will also trigger a jump to CSR_STVEC'. The target a2 is the physical entry point of the new kernel, which is in memory that PMP must grant X permission for the new kernel to boot. The write itself is standard kexec protocol. No PMP permission check is performed, but the new kernel entry point must have X permission by construction for kexec to function.
+  | /* This will also trigger a jump to CSR_STVEC
+  |  * which in this case is the address of the new kernel. */
+  | csrw CSR_STVEC, a2
+  | csrw CSR_SATP, zero
+
+[compliant] arch/riscv/kernel/suspend.c:49-49  suspend_restore_csrs
+  Restores CSR_TVEC from a saved suspend_context. The value was saved at suspend_save_csrs:19 via csr_read(CSR_TVEC) on the same hart before suspend. This is a strict save/restore cycle — the restored value was the working trap vector before suspend, so PMP permissions are unchanged. No violation.
+  | csr_write(CSR_TVEC, context->tvec);
+
+[compliant] arch/riscv/kvm/vcpu_switch.S:50-61  SAVE_HOST_AND_RESTORE_GUEST_CSRS
+  KVM guest entry: saves host stvec via csrrw and sets stvec to .Lkvm_switch_return (host kernel trap return path). The old host stvec is stored in KVM_ARCH_HOST_STVEC. The new stvec points to kernel text which always has X permission. At guest exit (line 152: SAVE_GUEST_AND_RESTORE_HOST_CSRS), the original host stvec is restored from KVM_ARCH_HOST_STVEC. This is textbook save/restore — no violation.
+  | /* Save Host STVEC and change it to return path */
+  | csrrw t1, CSR_STVEC, t1
+  | ...
+  | REG_S t1, (KVM_ARCH_HOST_STVEC)(a0)
+
+[compliant] arch/riscv/kvm/vcpu_exit.c:75-125  kvm_riscv_vcpu_unpriv_read
+  Temporarily swaps CSR_STVEC to __kvm_riscv_unpriv_trap (line 75) for the duration of an HLV.X unprivileged load, then restores old_stvec (line 125). The temporary stvec points to kernel text (always X-permitted). The paired csr_swap/csr_write ensures correct restore. No violation.
+  | old_stvec = csr_swap(CSR_STVEC, (ulong)&__kvm_riscv_unpriv_trap);
+  | ...
+  | csr_write(CSR_STVEC, old_stvec);
+
+[potential_risk] arch/riscv/kvm/vcpu.c:607-607  kvm_arch_vcpu_load
+  Writes CSR_VSTVEC from csr->vstvec, which is guest-owned CSR state saved at vcpu_put:675 via csr_read(CSR_VSTVEC). The host does NOT validate the guest's vstvec value before writing it to the hardware CSR. If a malicious guest sets vstvec.MODE=11 (CLIC/Smivt interrupt vector table mode), the hardware will switch to CLIC interrupt vectoring in VS-mode. While this does not directly violate the stvec/PMP spec (vstvec controls VS-mode, not host S-mode), the host has no CLIC-aware scause parsing at the trap exit path (line 856 reads CSR_SCAUSE without CLIC decoding), creating a guest-to-host confusion risk. However, this is primarily a KVM guest isolation issue, not a direct PMP-execute violation on the host stvec.
+  | csr_write(CSR_VSTVEC, csr->vstvec);
+
+[potential_risk] arch/riscv/kvm/vcpu.c:588-588  kvm_arch_vcpu_load
+  In the NACL (nested acceleration) path, writes CSR_VSTVEC via nacl_csr_write(nsh, CSR_VSTVEC, csr->vstvec). Same guest-state propagation as the non-NACL path at line 607. No host-side validation of the guest vstvec value. Under nested virtualization, the L1 guest's vstvec propagates to the L0 host's hardware CSR_VSTVEC, meaning a nested-guest-controlled MODE=11 could activate CLIC vectoring in the VS-level hardware. The same guest isolation concern applies.
+  | nacl_csr_write(nsh, CSR_VSTVEC, csr->vstvec);
+
+[potential_risk] arch/riscv/include/asm/csr.h:321-321  
+  CSR_STVEC (0x105) is defined but the CLIC/Smivt CSR constants CSR_SIVT (0x107) and CSR_SEIVT (0x108) are NOT defined anywhere in the kernel. Per the CLIC spec (aclic.adoc:1198-1202), these are the S-mode interrupt vector table base registers required for CLIC IVT mode (stvec.MODE=11). Without these definitions, the kernel structurally cannot validate or configure CLIC shared vector tables. If M-mode firmware shares a CLIC vector table via xivt/xeivt without S-mode X permission on the table memory, the kernel has no mechanism to detect or remediate this. The kernel is blind to CLIC vector table permission state.
+  | #define CSR_STVEC 0x105
+

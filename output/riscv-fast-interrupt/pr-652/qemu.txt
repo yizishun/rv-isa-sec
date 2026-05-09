@@ -1,0 +1,60 @@
+PR #652  target=qemu  overall=compliant
+Spec: PR removes Smaiae (which forced xvip/xvien read-only zero) and promotes ACLIC dependency to full Smaia/Ssaia; QEMU must ensure future ACLIC CSR implementations validate ext_smaia/ext_ssaia with functional mvip/mvien, not the removed Smaiae subset.
+Violation: If QEMU implements ACLIC extensions (Smaclic/Ssaclic/Smnip/Ssnip/Smehv) in the future but gates them on a hypothetical ext_smaiae flag that forces mvip/mvien read-only zero — as the old spec permitted — instead of requiring full ext_smaia/ext_ssaia with functional virtual interrupt CSRs, guest software relying on interrupt filtering through mvip/mvien will receive no interrupts on bits 1, 5, and 9, violating the updated dependency chain.
+Consequence: denial_of_service
+Pattern: ext_smaiae || Smaiae || smaiae — any ACLIC CSR registration (smclic/ssclic/smnip/ssnip/smehv) gated on a removed/non-existent Smaiae flag instead of the full Smaia/Ssaia flag, or mvip_writable_mask/mvien_writable_mask zeroed out when ACLIC features are active.
+------------------------------------------------------------
+[compliant] target/riscv/csr.c:299-306  aia_any
+  M-mode AIA CSR access correctly gated on ext_smaia (not a removed ext_smaiae flag). No ACLIC sub-extensions are implemented, so no risk of gating them on a non-existent flag.
+  | static RISCVException aia_any(CPURISCVState *env, int csrno)
+  | {
+  |     if (!riscv_cpu_cfg(env)->ext_smaia) {
+  |         return RISCV_EXCP_ILLEGAL_INST;
+  |     }
+  |     return any(env, csrno);
+  | }
+
+[compliant] target/riscv/csr.c:353-372  aia_smode
+  S-mode AIA CSR access correctly gated on ext_ssaia. Uses direct ext_ssaia check rather than any removed intermediate flag.
+  | static RISCVException aia_smode(CPURISCVState *env, int csrno)
+  | {
+  |     int ret;
+  |     if (!riscv_cpu_cfg(env)->ext_ssaia) {
+  |         return RISCV_EXCP_ILLEGAL_INST;
+  |     }
+
+[compliant] target/riscv/csr.c:1840-1843  (global scope)
+  mvip_writable_mask and mvien_writable_mask are properly defined with functional interrupt bits (MIP_SSIP, MIP_STIP, MIP_SEIP, LOCAL_INTERRUPTS), not zeroed out. No ext_smaiae flag exists to force them to read-only zero.
+  | static const uint64_t mvip_writable_mask = MIP_SSIP | MIP_STIP | MIP_SEIP |
+  |                                     LOCAL_INTERRUPTS;
+  | static const uint64_t mvien_writable_mask = MIP_SSIP | MIP_SEIP |
+  |                                     LOCAL_INTERRUPTS;
+
+[compliant] target/riscv/csr.c:3879-3898  rmw_mvip
+  rmw_mvip correctly applies mvip_writable_mask for both alias (forwarded to mip) and non-alias bits (stored in env->mvip). No forced read-only zero.
+  | wr_mask_mip = wr_mask & alias_mask & mvip_writable_mask;
+  |     wr_mask_mvip = wr_mask & nalias_mask & mvip_writable_mask;
+  |     ...
+  |     if (wr_mask_mvip) {
+  |         env->mvip = (env->mvip & ~wr_mask_mvip) | (new_val & wr_mask_mvip);
+
+[compliant] target/riscv/csr.c:3459-3493  write_mstateen0
+  SMSTATEEN0 write mask correctly gates SMSTATEEN0_SVSLCT on ext_smaia || ext_smcsrind, and SMSTATEEN0_AIA/IMSIC on ext_smaia alone. Uses the real ext_smaia flag, not a removed ext_smaiae.
+  | if (riscv_cpu_cfg(env)->ext_smaia ||
+  |             riscv_cpu_cfg(env)->ext_smcsrind) {
+  |             wr_mask |= SMSTATEEN0_SVSLCT;
+  |         }
+  |         if (riscv_cpu_cfg(env)->ext_smaia) {
+  |             wr_mask |= (SMSTATEEN0_AIA | SMSTATEEN0_IMSIC);
+  |         }
+
+[compliant] target/riscv/csr.c:2659-2684  rmw_xireg
+  MIREG access gated on ext_smaia, SIREG/VSIREG on ext_ssaia. All correct direct checks — no ext_smaiae intermediate flag.
+  | case CSR_MIREG:
+  |         if (!riscv_cpu_cfg(env)->ext_smaia) {
+  |             goto done;
+  |         }
+  |         ...
+  |     case CSR_SIREG:
+  |         if (!riscv_cpu_cfg(env)->ext_ssaia ||
+

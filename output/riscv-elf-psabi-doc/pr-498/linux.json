@@ -1,0 +1,124 @@
+{
+  "pr_number": 498,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 498,
+    "violation_condition": "Linux kernel loads any RISC-V ELF binary with EF_RISCV_RVY (0x40) set in e_flags, unaware that it targets a CHERI pure-capability ABI, because elf_check_arch at arch/riscv/include/asm/elf.h:37 inspects only e_machine and EI_CLASS — e_flags is completely ignored and no arch_check_elf exists for RISC-V",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "arch/riscv.*elf_check_arch|arch/riscv.*e_flags|CONFIG_ARCH_BINFMT_ELF_STATE.*riscv",
+    "affected_entities": [
+      "e_flags",
+      "EF_RISCV_RVY"
+    ],
+    "summary": "RISC-V kernel has zero e_flags validation: a CHERI pure-capability binary (EF_RISCV_RVY) would silently load on a non-CHERI kernel, executing capability-aware code as bare-pointer code leading to undefined pointer corruption"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/elf.h",
+        "function_name": "elf_check_arch",
+        "line_start": 37,
+        "line_end": 38,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "elf_check_arch inspects only e_machine==EM_RISCV and EI_CLASS but completely ignores e_flags. An ELF binary with EF_RISCV_RVY (0x40) set — targeting the CHERI pure-capability ABI where all memory accesses use hardware capabilities instead of integer addresses — passes this gate unconditionally. No EF_RISCV_* constants are defined anywhere in the kernel tree (git grep returns zero results), so the kernel has no vocabulary to recognize or reject CHERI-ABI binaries.",
+      "snippet": "#define elf_check_arch(x) (((x)->e_machine == EM_RISCV) && \\\n                   ((x)->e_ident[EI_CLASS] == ELF_CLASS))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-hybrid-integration.adoc",
+          "line_start": 19,
+          "line_end": 19,
+          "excerpt": "implementations which do not support {cheri_default_ext_name} are typically referred to as CHERI purecap."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-hybrid-integration.adoc",
+          "line_start": 56,
+          "line_end": 65,
+          "excerpt": "Software is referred to as purecap if it utilizes CHERI capabilities for all memory accesses -- including loads, stores and instruction fetches -- rather than integer addresses. Purecap software requires the CHERI RISC-V hart to support {cheri_base_ext_name}."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "compat_elf_check_arch",
+        "line_start": 119,
+        "line_end": 124,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "compat_elf_check_arch (used for 32-bit compat ELF loading via fs/compat_binfmt_elf.c) also does NOT inspect e_flags. Only checks compat_mode_supported, e_machine==EM_RISCV, and EI_CLASS==ELFCLASS32. A 32-bit CHERI purecap binary with EF_RISCV_RVY set would also pass.",
+      "snippet": "bool compat_elf_check_arch(Elf32_Ehdr *hdr)\n{\n  return compat_mode_supported &&\n         hdr->e_machine == EM_RISCV &&\n         hdr->e_ident[EI_CLASS] == ELFCLASS32;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "fs/binfmt_elf.c",
+        "function_name": "load_elf_binary",
+        "line_start": 1004,
+        "line_end": 1008,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "arch_check_elf() is called here as a second-layer validation gate after the primary elf_check_arch() passes. RISC-V does NOT override arch_check_elf (no arch/riscv/kernel/elf.c exists, no CONFIG_ARCH_BINFMT_ELF_STATE selected in arch/riscv/Kconfig), so the dummy fallback at fs/binfmt_elf.c:616-621 is used, which unconditionally returns 0 (proceed). Contrast: MIPS (arch/mips/kernel/elf.c:135) and ARM64 (arch/arm64/include/asm/elf.h:289) both override arch_check_elf to inspect e_flags before allowing the exec to proceed. This is the missing hook that should have caught EF_RISCV_RVY.",
+      "snippet": "retval = arch_check_elf(elf_ex,\n      !!interpreter, interp_elf_ex,\n      &arch_state);\nif (retval)\n  goto out_free_dentry;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "fs/binfmt_elf.c",
+        "function_name": "arch_check_elf",
+        "line_start": 616,
+        "line_end": 621,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Default/dummy arch_check_elf() — always returns 0 (proceed). Only compiled when the architecture does NOT provide its own override (i.e., CONFIG_ARCH_BINFMT_ELF_STATE is not selected). RISC-V relies on this dummy, meaning no architecture-specific ELF validation occurs after elf_check_arch passes.",
+      "snippet": "static inline int arch_check_elf(struct elfhdr *ehdr, bool has_interp,\n         struct elfhdr *interp_ehdr,\n         struct arch_elf_state *state)\n{\n  /* Dummy implementation, always proceed */\n  return 0;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/Kconfig",
+        "function_name": "(Kconfig RISCV entry)",
+        "line_start": 13,
+        "line_end": 13,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "RISC-V Kconfig does NOT select ARCH_BINFMT_ELF_STATE. This means the struct arch_elf_state is empty (generic dummy), arch_elf_pt_proc() is a dummy that ignores PT_LOPROC..PT_HIPROC phdrs, and arch_check_elf() is the generic always-return-0 stub. Contrast: ARM64 (arch/arm64/Kconfig:16), MIPS (arch/mips/Kconfig:6), and LoongArch (arch/loongarch/Kconfig:11) all select ARCH_BINFMT_ELF_STATE to enable arch-specific ELF validation — specifically to inspect e_flags.",
+      "snippet": "config RISCV\n  def_bool y\n  select ACPI_GENERIC_GSI if ACPI\n  ...",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "fs/binfmt_elf.c",
+        "function_name": "load_elf_binary",
+        "line_start": 863,
+        "line_end": 864,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "First ELF arch-validity check in load_elf_binary(). elf_check_arch(elf_ex) expands to the RISC-V macro that ignores e_flags. An RVY CHERI purecap binary passes this gate and execution continues without any further e_flags inspection at this point.",
+      "snippet": "if (!elf_check_arch(elf_ex))\n  goto out;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "fs/binfmt_elf.c",
+        "function_name": "load_elf_binary",
+        "line_start": 662,
+        "line_end": 664,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Same elf_check_arch() gate applied to the ELF interpreter (ld.so). An RVY purecap dynamic linker would also pass unchecked, meaning the CHERI-ABI dynamic linker would be loaded into a non-CHERI kernel address space.",
+      "snippet": "if (!elf_check_arch(interp_elf_ex) ||\n    elf_check_fdpic(interp_elf_ex))\n  goto out;",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

@@ -1,0 +1,32 @@
+PR #691  target=linux  overall=compliant
+Spec: Removal of cspspush/cspspop from ipush/ipopxret means kernel must not rely on hardware stack-swap for interrupt isolation; interrupt frames always land on the interrupted context's stack
+Violation: Kernel configures xsp as a dedicated interrupt stack (via MSECCFG.Smip enable) expecting hardware to cspspush/cspspop on interrupt entry/exit, but with cspspush/cspspop removed from ipush/ipopxret, interrupt frames land on the interrupted context's stack — if that context is near stack limit, the additional frame causes overflow; if that context is user space, the frame corrupts the user stack.
+Consequence: data_corruption
+Pattern: CSR write to xsp|MSECCFG.*Smip|ipush|ipopxret|cspspush|cspspop
+------------------------------------------------------------
+[compliant] arch/riscv/include/asm/csr.h:245-250  (CSR definitions)
+  Only PMM (pointer masking) bits are defined for MSECCFG. No MIPU/SIPU (Smip enable) bit definitions exist. The kernel never writes to CSR_MSECCFG (0x747) — it only defines PMP-related read fields. The Smip control bits don't even have allocated encodings in the current RISC-V spec.
+  | /* mseccfg bits */
+  | #define MSECCFG_PMM			ENVCFG_PMM
+  | #define MSECCFG_PMM_PMLEN_0		ENVCFG_PMM_PMLEN_0
+  | #define MSECCFG_PMM_PMLEN_7		ENVCFG_PMM_PMLEN_7
+  | #define MSECCFG_PMM_PMLEN_16		ENVCFG_PMM_PMLEN_16
+
+[compliant] arch/riscv/kernel/entry.S:300-317  ret_from_exception
+  Interrupt return uses standard sret, not sipopret/mipopret. The kernel does not rely on hardware cspspush/cspspop for stack management. Registers are saved/restored manually in handle_exception. No xspcs CSR is ever configured, so the conditional stack pointer swap path is never activated even if Smip were implemented in hardware.
+  | csrw CSR_STATUS, a0
+  | csrw CSR_EPC, a2
+  | REG_L x1,  PT_RA(sp)
+  | ...
+  | REG_L x2,  PT_SP(sp)
+  | #ifdef CONFIG_RISCV_M_MODE
+  | mret
+  | #else
+  | sret
+  | #endif
+
+[compliant] arch/riscv/include/asm/csr.h:429-430  (CSR definitions, symbolic)
+  CSR_MSECCFG (0x747) and CSR_MSECCFGH (0x757) are defined but no kernel code writes to them. No xsp/mspcs/sspcs CSR definitions exist, and no cspspush/cspspop/scspspop/mcspspush instruction definitions exist. The entire Smip/Ssip instruction and CSR surface is absent from the kernel.
+  | #define CSR_MSECCFG		0x747
+  | #define CSR_MSECCFGH		0x757
+

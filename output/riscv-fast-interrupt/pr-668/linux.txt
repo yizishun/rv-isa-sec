@@ -1,0 +1,26 @@
+PR #668  target=linux  overall=bug_confirmed
+Spec: APLIC priority 0 (default priority) non-identity remap to IPRIO=0 or IPRIO=255 based on platform default ordering vs M-ext interrupts; kernel KVM emulation and IPRIO consumers assume iprio[i]==IPRIO, broken at priority 0
+Violation: In the Linux kernel's KVM APLIC emulation (aplic_write_target() in arch/riscv/kvm/aia_aplic.c:94-108), a guest VCPU writes iprio[i]=0 to an interrupt target register. The hardware APLIC spec now defines that IPRIO (the value reported in xtopi/xtopei used for threshold comparison) is not necessarily equal to iprio[i] at priority 0 — it may be 0 or 255 depending on the platform's default priority ordering relative to machine external interrupts. KVM stores the raw guest-written value without validating or translating it, so the guest's assumption that priority 0 always maps to the highest effective priority (IPRIO=0) is violated on platforms where the default falls below M-ext interrupts (IPRIO=255). The KVM software stack (imsic_mrif_topei) also does not account for this non-identity mapping, meaning software-computed TOPEI values may diverge from what the hardware APLIC would report.
+Consequence: denial_of_service
+Pattern: iprio.*=\s*0|APLIC_TARGET_IPRIO.*0|aplic_write_target|imsic_mrif_topei
+------------------------------------------------------------
+[bug_confirmed] arch/riscv/kvm/aia_imsic.c:248-281  imsic_mrif_topei
+  imsic_mrif_topei() computes TOPEI priority as the raw interrupt identity number ((i << TOPEI_ID_SHIFT) | i at line 276), completely ignoring APLIC-configured iprio values. The function scans only the IMSIC SW-file's EIP/EIE bits for the lowest-numbered pending-enabled interrupt, then uses that interrupt number as both identity and priority. There is no data path from the APLIC target register's iprio field (stored by aplic_write_target() in aia_aplic.c:108 via irqd->target) to this TOPEI computation — aplic_inject_msi() at aia_aplic.c:232-242 extracts only the EIID from the target register and discards the iprio. Per the AIA/ACLIC specification, TOPEI bits 10:0 must report the 'configured target[identity].iprio', not the raw interrupt number. Guest OSes configuring interrupt priorities through APLIC target registers will receive incorrect priority values in their TOPEI/TOPI CSRs, leading to broken priority-based interrupt ordering, incorrect threshold masking, and potential priority inversion.
+  | for (i = (!imin) ? 1 : imin; i < imax; i++) {
+  | 	if (test_bit(i - imin, eipend))
+  | 		return (i << TOPEI_ID_SHIFT) | i;  // uses raw identity as priority, ignores APLIC iprio
+  | }
+
+[potential_risk] arch/riscv/kvm/aia_aplic.c:94-110  aplic_write_target
+  aplic_write_target() stores the raw guest-written target register value without translating the iprio field. The AIA spec notes that when iprio[i]=0, the effective IPRIO (used for TOPEI/TOPI threshold comparison) is not necessarily 0 — it may be 0 or 255 depending on the platform's default priority ordering relative to machine external interrupts. KVM stores the raw iprio=0 without any translation to the effective IPRIO. While this is currently masked by the fact that imsic_mrif_topei() ignores iprio entirely (bug_confirmed above), once iprio is properly integrated into the TOPEI path, this non-identity mapping must be accounted for to avoid incorrect guest-visible interrupt priority on platforms where default priority places the interrupt below M-ext interrupts.
+  | val &= APLIC_TARGET_EIID_MASK |
+  |        (APLIC_TARGET_HART_IDX_MASK << APLIC_TARGET_HART_IDX_SHIFT) |
+  |        (APLIC_TARGET_GUEST_IDX_MASK << APLIC_TARGET_GUEST_IDX_SHIFT);
+  | raw_spin_lock_irqsave(&irqd->lock, flags);
+  | irqd->target = val;  // raw iprio stored, no IPRIO translation
+
+[compliant] arch/riscv/kvm/aia_aplic.c:232-242  aplic_inject_msi
+  aplic_inject_msi() correctly extracts the EIID, hart_idx, and guest_idx from the target register for MSI delivery. The function's purpose is identity-based MSI routing, not priority propagation. The gap is that no separate mechanism bridges the APLIC iprio to the IMSIC TOPEI path.
+  | eiid = target & APLIC_TARGET_EIID_MASK;
+  | kvm_riscv_aia_inject_msi_by_id(kvm, hart_idx, guest_idx, eiid);
+

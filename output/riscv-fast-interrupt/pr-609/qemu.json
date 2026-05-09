@@ -1,0 +1,112 @@
+{
+  "pr_number": 609,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 609,
+    "violation_condition": "QEMU emulates sourcecfgK as a single flat register without zeroing/remapping fields when the D (delegation) bit transitions between 0 and 1 in M-domain. When D=0, bits 23:16 hold IPRIO and bits 2:0 hold SM; when D=1, bits 9:0 hold Child Index. A guest writes a value in one format, toggles D, then reads back the other format, observing stale bits from the previous format at aliased bit positions.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "sourcecfg.*write.*d_bit|sourcecfg.*delegation.*format|aclic.*sourcecfg.*transition",
+    "affected_entities": [
+      "maclicsourcecfg",
+      "saclicsourcecfg"
+    ],
+    "summary": "ACLIC sourcecfgK register format changes based on D bit — QEMU must zero/remap fields on D-bit transitions or else guest-stashed values in IPRIO/SM positions (D=0) become readable as Child-Index bits (D=1), leaking prior configuration state across delegation boundaries"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_write",
+        "line_start": 741,
+        "line_end": 761,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "QEMU's sourcecfg write uses a full register overwrite (aplic->sourcecfg[irq] = value) after masking the written value based on the new D bit. When D=1, value is masked to (D | CHILDIDX_MASK), zeroing bits 31:11 and 9:3. When D=0, value is masked to (D | SM_MASK), zeroing bits 31:11 and 9:3. Since the entire 32-bit register is replaced each write, no stale bits from a prior format survive across a D-bit toggle. The read path returns the raw stored value, which is safe because only valid-field bits are ever stored.",
+      "snippet": "        if (value & APLIC_SOURCECFG_D) {\n            value &= (APLIC_SOURCECFG_D | APLIC_SOURCECFG_CHILDIDX_MASK);\n        } else {\n            value &= (APLIC_SOURCECFG_D | APLIC_SOURCECFG_SM_MASK);\n        }\n        aplic->sourcecfg[irq] = value;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 539,
+          "line_end": 555,
+          "excerpt": "When accessing the source configuration via indirect CSR, only the lower 16b are accessible, as the rest of the register is reserved... ACLIC simplifies Child Index to always 0 when D=1, and D is always 0 in Supervisor mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_write",
+        "line_start": 744,
+        "line_end": 746,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "When num_children==0, writes with D=1 are forced to 0 (WARL constraint), preventing invalid delegation to a non-existent child domain. This prevents an attacker from setting D=1 on a domain with no children and then observing stale CHILDIDX bits.",
+      "snippet": "        if (!aplic->num_children && (value & APLIC_SOURCECFG_D)) {\n            value = 0;\n        }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_write",
+        "line_start": 752,
+        "line_end": 761,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Post-write side-effects are correct: when D=1 or SM=INACTIVE (sourcecfg==0), pending and enabled bits are atomically cleared. When transitioning to active, the rectified input is re-evaluated and pending is set if appropriate. No side-effect gaps.",
+      "snippet": "        aplic->sourcecfg[irq] = value;\n        if ((aplic->sourcecfg[irq] & APLIC_SOURCECFG_D) ||\n            (aplic->sourcecfg[irq] == 0)) {\n            riscv_aplic_set_pending_raw(aplic, irq, false);\n            riscv_aplic_set_enabled_raw(aplic, irq, false);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_realize",
+        "line_start": 925,
+        "line_end": 925,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sourcecfg array is g_new0-allocated, resetting all entries to 0 (D=0, SM=INACTIVE) as mandated by the spec for inactive sources.",
+      "snippet": "        aplic->sourcecfg = g_new0(uint32_t, aplic->num_irqs);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "vmstate_riscv_aplic",
+        "line_start": 992,
+        "line_end": 994,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sourcecfg array is included in the VMState migration descriptors, ensuring correct live migration of per-source configuration state.",
+      "snippet": "            VMSTATE_VARRAY_UINT32(sourcecfg, RISCVAPLICState,\n                                  num_irqs, 0,\n                                  vmstate_info_uint32, uint32_t),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_aplic.c",
+        "function_name": "riscv_aplic_write",
+        "line_start": 726,
+        "line_end": 883,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "QEMU currently has no ACLIC indirect-CSR interface (Smidctrl/Ssidctrl via xiselect-based ireg2/ireg3 for sourcecfg). If such support is added (in target/riscv/csr.c), the indirect CSR path must implement its own D-bit-aware masking and full-register-replacement semantics, separate from this memory-mapped handler. Currently this is a non-issue since ACLIC CSR emulation does not exist in QEMU.",
+      "snippet": "/* Memory-mapped sourcecfg write — works correctly for APLIC MMIO path.\n * No corresponding indirect-CSR sourcecfg path exists yet in QEMU\n * for ACLIC Smidctrl/Ssidctrl (xiselect range 0x1000). */\n    } else if ((APLIC_SOURCECFG_BASE <= addr) &&",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 539,
+          "line_end": 555,
+          "excerpt": "Source Configuration (sourcecfg): When XLEN=32, xireg2 and xireg3 combined control source configuration of four interrupts. Indirect access to aclicsourcecfg[k] mirrors sourcecfg[k*2][15:0]."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

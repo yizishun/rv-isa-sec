@@ -1,0 +1,189 @@
+{
+  "pr_number": 28,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 28,
+    "violation_condition": "G (matrix group size) is a WARL field whose legal encoding depends on the dynamically-variable parameter W, but cannot reside in vtype. If XiangShan implements G as a hardcoded constant or as a static vtype subfield without runtime recomputation of legal-G bounds upon W changes, software can configure a matrix group exceeding the physical vector register file, causing the matrix engine to index vector registers beyond architectural limits—reading stale register state or corrupting unrelated architectural state.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "WARL.*G|legalG|MatrixGroupSize|matrixGroup|vtype.*group|vreg.*matrix.*index|matrix.*stride|matrix.*regfile|G_.*WARL|enforce.*group.*size",
+    "affected_entities": [
+      "vtype",
+      "vregfile",
+      "matrix_multiply_unit",
+      "vector_decode"
+    ],
+    "summary": "G WARL enforcement depends on dynamic W parameter; incorrect bounds-check hardware enables register file out-of-bounds access via oversized matrix group configuration"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/CSR.scala",
+        "function_name": "class VtypeStruct",
+        "line_start": 120,
+        "line_end": 127,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VtypeStruct contains no G (matrix group size) field. The reserved field spans bits [62:8] with no allocation for G. Zvt requires G to be discoverable and WARL-enforced against W (matrix element width). Without a G field, software cannot configure matrix operations, but if G were carved from 'reserved' without runtime WARL filtering, software could encode an illegal G value that indexes beyond the physical vector register file — reading stale register state or corrupting architectural state.",
+      "snippet": "class VtypeStruct(implicit p: Parameters) extends XSBundle {\n  val vill = UInt(1.W)\n  val reserved = UInt((XLEN - 9).W)  // No G allocation\n  val vma = UInt(1.W)\n  val vta = UInt(1.W)\n  val vsew = UInt(3.W)\n  val vlmul = UInt(3.W)\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/vector/Bundles.scala",
+        "function_name": "class VType",
+        "line_start": 18,
+        "line_end": 24,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The core VType bundle propagated through the entire pipeline (decode→rename→dispatch→issue→execute) has no G field. All factory methods (fromInstVType:46, fromVtypeStruct:56, toVtypeStruct:66, initVtype:76) are G-unaware. Every pipeline consumer of vtype will operate as if G=1 permanently, meaning effective EMUL will be underestimated by factor G, and register overlap checks will miss violations.",
+      "snippet": "class VType(implicit p: Parameters) extends Bundle {\n  val illegal = Bool()\n  val vma     = Bool()\n  val vta     = Bool()\n  val vsew    = VSew()\n  val vlmul   = VLmul()  // No G field\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/vector/Bundles.scala",
+        "function_name": "class VsetVType",
+        "line_start": 32,
+        "line_end": 39,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VsetVType (input from vset immediate to VsetModule) has no G field. Since G depends on W (a dynamically-variable parameter not encodable in vtype's immediate field), VsetVType must carry G computed from side-channel information (e.g., deduced from W which varies per matrix instruction). Neither G extraction from immediate bits nor W-side-channel computation exists.",
+      "snippet": "class VsetVType(implicit p: Parameters) extends XSBundle {\n  val illegal  = Bool()\n  val reserved = UInt((XLEN - 9).W)  // No G\n  val vma      = Bool()\n  val vta      = Bool()\n  val vsew     = VtypeVSew()\n  val vlmul    = VLmul()\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Vsetu.scala",
+        "function_name": "VsetModule VLMAX computation",
+        "line_start": 88,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VLMAX = VLEN * LMUL / SEW (standard V extension formula). With Zvt G parameter, the correct formula is VLMAX = VLEN * G * LMUL / SEW. Without G, vlmax will underestimate the element count, causing the matrix engine to silently truncate operations or — if software embeds G into LMUL encoding — produce an incorrect vl that breaks element-count assumptions.",
+      "snippet": "private val log2Vlmax: UInt = log2Vlen.U(3.W) + log2Vlmul - log2Vsew  // Missing + log2G\nprivate val vlmax = (1.U(vlWidth.W) << log2Vlmax).asUInt",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Vsetu.scala",
+        "function_name": "vtypeIllegal reserved-bits check",
+        "line_start": 100,
+        "line_end": 100,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vtypeIllegal = vtype.reserved.orR. If G bits are carved from the reserved field, this blanket OR-reduce will trigger vill=1 for any non-zero G value, making G effectively unusable. The check must exclude G bits and instead apply G-specific WARL validation (legal G values depend on W, which varies dynamically).",
+      "snippet": "private val vtypeIllegal = vtype.reserved.orR  // Must exclude G bits if G is in this field",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Vsetu.scala",
+        "function_name": "sewIllegal check",
+        "line_start": 98,
+        "line_end": 98,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SEW legality check has no G/W awareness. Zvt requires: when G > 1, SEW must be >= W (matrix element width); when SEW < W, G must be 1. Without this check, software could configure G=4 with SEW=8 when W=32, creating illegal matrix configurations that read from or write to misaligned register groups.",
+      "snippet": "private val sewIllegal = VSew.isReserved(vsew) || (log2Vsew > log2VsewMax)  // No G/W constraint",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Vsetu.scala",
+        "function_name": "keepVlIllegal check",
+        "line_start": 111,
+        "line_end": 113,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vsetvl keep-v legality compares LMUL/SEW ratios only. With G, the effective ratio is G * LMUL / SEW. If G changes between the old and new vtype (even if LMUL and SEW stay the same), the keep-v condition is violated but this check will erroneously pass, allowing a vsetvl to keep vl across an illegal G transition.",
+      "snippet": "private val log2NewRatio = vlmul - vsew  // Missing log2G factor\nprivate val log2OldRatio = oldVt.vlmul - oldVt.vsew  // Missing old log2G factor\nprivate val keepVlIllegal = isKeepVl && (oldVt.illegal || log2NewRatio =/= log2OldRatio)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/VecExceptionGen.scala",
+        "function_name": "object RegNumNotAlign",
+        "line_start": 17,
+        "line_end": 21,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Register alignment check based on EMUL only (mf2→reg[0]==0, m1→always aligned, m2→reg[1:0]==00, etc.). For G>1, alignment must ensure source/destination registers are G * LMUL aligned. With G=2 and LMUL=m1, registers must be paired (vd on even boundary); with G=4 and LMUL=m1, vd must be on 4-register boundary. Current check would permit unaligned G=4 register groups.",
+      "snippet": "object RegNumNotAlign {\n  def apply(reg: UInt, emul: UInt): Bool = {\n    emul === \"b101\".U && reg(0) =/= 0.U || emul === \"b110\".U && reg(1, 0) =/= 0.U || emul === \"b111\".U && reg(2, 0) =/= 0.U\n  }\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/VecExceptionGen.scala",
+        "function_name": "object LmultoRegNum",
+        "line_start": 34,
+        "line_end": 40,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "LmultoRegNum converts LMUL encoding to number of architectural registers. For Zvt with G>1, register count must be G * LmultoRegNum(lmul). This function feeds register range bounds (vs1RegHi, vs2RegHi, vdRegHi at lines 270-274) for overlap detection. With G=4 and LMUL=m1, the function returns 1 register but the matrix operation actually touches 4 registers (vd through vd+3), so overlap detection misses 3 registers of potential corruption.",
+      "snippet": "object LmultoRegNum {\n  def apply(lmul: UInt): UInt = {\n    val numPow = Mux(lmul(2).asBool, lmul(1, 0), 0.U(2.W))\n    val regNum = 1.U << numPow  // Must be G * this for Zvt\n    regNum\n  }\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/VecExceptionGen.scala",
+        "function_name": "Register overlap range bounds",
+        "line_start": 269,
+        "line_end": 274,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Source/destination register range upper bounds (vs1RegHi, vs2RegHi, vdRegHi) are computed using G-unaware LmultoRegNum. With G=4 and LMUL=1, vdRegHi = vd (only 1 register tracked), but the matrix engine writes vd through vd+3. If another instruction uses vd+1/vd+2/vd+3, the overlap is undetected, allowing write-after-read or write-after-write hazards to silently corrupt state.",
+      "snippet": "private val vs1RegHi = inst.VS1 +& LmultoRegNum(vs1Emul) - 1.U  // Underestimates by factor G\nprivate val vs2RegHi = inst.VS2 +& LmultoRegNum(vs2Emul) - 1.U\nprivate val vdRegHi = Mux(lsStrideInst || lsIndexInst, segRegMax - 1.U,\n                          inst.VD + LmultoRegNum(vdEmul) - 1.U)  // Underestimates by factor G",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/VecExceptionGen.scala",
+        "function_name": "EMUL legality aggregator",
+        "line_start": 221,
+        "line_end": 221,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "emulIllegal does not check for G-related violations. With G=4 and LMUL=8, effective EMUL = 32 which exceeds the 32 architectural vector register limit — this would consume every register, leaving none for other live state. A G-dependent check must reject effective EMUL > 8 and total register footprint (G * EMUL * NFIELDS) > 32.",
+      "snippet": "private val emulIllegal = lsEmulIllegal || intExtEmulIllegal || wnEmulIllegal || gather16EmulIllegal || lsSegIllegal  // No G-dependent EMUL bound check",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/VecDecoder.scala",
+        "function_name": "VecDecoder decode table",
+        "line_start": 186,
+        "line_end": 186,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The complete vector instruction decode table (844 lines) has zero Zvt matrix multiply opcodes (e.g., VMMUL.VV, VMFADD.VV, VMFWADD.VV). All matrix instructions would decode as illegal. If matrix opcodes are wired to existing vector ALU/MAC units without G-awareness, the units would operate on single registers with incorrect element grouping, producing wrong results — but at least this is a functional correctness issue rather than a silent corruption vector since it's gated by decode.",
+      "snippet": "object VecDecoder extends DecodeConstants {  // 844-line table, zero matrix opcodes\n  val opivv: Array[(BitPat, XSDecodeBase)] = Array(\n    VADD_VV -> OPIVV(FuType.vialuF, VialuFixType.vadd_vv, T, F, F),\n    ...  // No matrix multiply entries",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/Unprivileged.scala",
+        "function_name": "class CSRVTypeBundle",
+        "line_start": 240,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR read-side bundle for vtype has no G field. Zvt requires G to be discoverable by software — without any discovery mechanism, software cannot determine legal G values and must either assume G=1 (defeating the matrix extension) or probe blindly (potentially causing illegal-instruction traps). Either G must be added here, or a separate discovery CSR is needed.",
+      "snippet": "class CSRVTypeBundle extends CSRBundle {\n  val VILL  = RO(  63).withReset(1.U)\n  val VMA   = RO(   7).withReset(0.U)\n  val VTA   = RO(   6).withReset(0.U)\n  val VSEW  = RO(5, 3).withReset(0.U)\n  val VLMUL = RO(2, 0).withReset(0.U)  // No G field\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

@@ -1,0 +1,132 @@
+{
+  "pr_number": 653,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 653,
+    "violation_condition": "OpenSBI M-mode trap handler returns from interrupts using mret without first restoring the x10-x15 registers and stack frame that Smip hardware automatically pushed on interrupt entry; the handler is also unaware that only interrupts (not exceptions) receive this auto-save, so a unified trap path assumes an incorrect stack layout for synchronous exceptions",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "mret used as interrupt return instead of ipopxret when Smip is implemented; trap handler entry that does not distinguish interrupt vs exception for expected stack frame layout; manual CSR save/restore of mepc/mstatus that conflicts with hardware-preserved values during tail-chaining",
+    "affected_entities": [
+      "mret",
+      "ipopxret",
+      "mstatus",
+      "mepc",
+      "x10",
+      "x11",
+      "x12",
+      "x13",
+      "x14",
+      "x15",
+      "sp"
+    ],
+    "summary": "Smip makes interrupt-entry context push automatic (hardware saves x10-x15 + adjusts SP before handler fetch); returning with mret instead of ipopxret leaks the auto-pushed stack frame and leaves x10-x15 unrestored, corrupting the preempted context on return to S-mode"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/opensbi/firmware/fw_base.S",
+        "function_name": "_trap_handler",
+        "line_start": 690,
+        "line_end": 690,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "mret is used unconditionally as the interrupt return instruction. When the Smip extension is implemented, M-mode interrupt handlers MUST use mipopret (ipopxret) to return from interrupts, because mipopret is the only instruction that (a) restores the hardware-auto-saved x10-x15 registers from the stack, (b) adjusts sp to destroy the hardware-created frame, and (c) conditionally swaps the stack pointer. Using mret skips all stack-frame teardown and register restore that Smip hardware performed on entry, causing register corruption (x10-x15 hold stale/zero values) and stack corruption (sp is misaligned and leaking frames).",
+      "snippet": "_trap_handler:\n\tTRAP_SAVE_AND_SETUP_SP_T0\n\tTRAP_SAVE_MEPC_MSTATUS 0\n\tTRAP_SAVE_GENERAL_REGS_EXCEPT_SP_T0\n\t...\n\tmret",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1495,
+          "line_end": 1507,
+          "excerpt": "When executing an {xipopret} instruction the context saved during the trap is restored and a return is executed. NOTE: An explicit interrupt return instruction is included, rather than modifying the xret behavior, so that the hart does not need to do bookkeeping whether it is in an interrupt or exception context. It performs the following actions in order: * Conditionally performs a stack pointer swap by executing xcspspop sp * Restores registers x10-x15 * Adjust the stack pointer to destroy the stack frame * Executes an xret according to the current level"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/opensbi/firmware/fw_base.S",
+        "function_name": "_trap_handler_hyp",
+        "line_start": 724,
+        "line_end": 724,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Same as _trap_handler: uses mret unconditionally instead of mipopret when Smip is implemented. The H-extension trap handler has the identical vulnerability.",
+      "snippet": "_trap_handler_hyp:\n\tTRAP_SAVE_AND_SETUP_SP_T0\n\t...\n\tmret",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1495,
+          "line_end": 1507,
+          "excerpt": "When executing an {xipopret} instruction the context saved during the trap is restored and a return is executed."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/opensbi/firmware/fw_base.S",
+        "function_name": "_start_warm (trap setup path)",
+        "line_start": 393,
+        "line_end": 401,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CSR_MTVEC is set to a single unified trap handler (_trap_handler or _trap_handler_hyp) without Smip detection. The code loads the handler address via `lla a4, _trap_handler` and writes it directly to CSR_MTVEC. Since the label is 8-byte aligned, mtvec.MODE=0 (Direct mode). The Smip spec explicitly states: 'As this extension modifies interrupt trap behavior but not the behaviour of synchronous exception traps, it should only be used in interrupt handling modes that provide separate entry points for interrupt and synchronous exception traps. Specifically, mtvec.mode = 0 (direct) is incompatible.' A platform implementing Smip would need mtvec.MODE=1 (Vectored) with separate handler vectors for interrupts vs exceptions, because the hardware auto-save only occurs on interrupts, not on synchronous exceptions.",
+      "snippet": "lla\ta4, _trap_handler\ncsrr\ta5, CSR_MISA\nsrli\ta5, a5, ('H' - 'A')\nandi\ta5, a5, 0x1\nbeq\ta5, zero, _skip_trap_handler_hyp\nlla\ta4, _trap_handler_hyp\n_skip_trap_handler_hyp:\ncsrw\tCSR_MTVEC, a4",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1487,
+          "line_end": 1490,
+          "excerpt": "NOTE: As this extension modifies interrupt trap behavior but not the behaviour of synchronous exception traps, it should only be used in interrupt handling modes that provide separate entry points for interrupt and synchronous exception traps. Specifically, mtvec.mode = 0 (direct) is incompatible."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/opensbi/firmware/fw_base.S",
+        "function_name": "TRAP_SAVE_GENERAL_REGS_EXCEPT_SP_T0 (macro)",
+        "line_start": 545,
+        "line_end": 577,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "This macro unconditionally saves all general-purpose registers including x10-x15 (a0-a5) to the software trap frame, for both interrupts and synchronous exceptions. Under Smip, hardware has already auto-saved x10-x15 to the interrupted context's stack on interrupt entry (aclic.adoc lines 1478-1481). The macro does not distinguish interrupt from exception, so for Smip interrupts the software save is redundant at best but creates a conflicting stack layout: the software trap frame has x10-x15 at the software-managed SP offset, while the hardware frame has them at the interrupted context's SP minus the hardware frame. If the C handler modifies the software-saved copies, those modifications are lost because mipopret restores from the hardware frame. Conversely, if mret is used (as currently), the hardware-saved registers are ignored and only software-saved values are restored—both paths produce inconsistency.",
+      "snippet": "REG_S\ta0, SBI_TRAP_REGS_OFFSET(a0)(sp)\nREG_S\ta1, SBI_TRAP_REGS_OFFSET(a1)(sp)\nREG_S\ta2, SBI_TRAP_REGS_OFFSET(a2)(sp)\nREG_S\ta3, SBI_TRAP_REGS_OFFSET(a3)(sp)\nREG_S\ta4, SBI_TRAP_REGS_OFFSET(a4)(sp)\nREG_S\ta5, SBI_TRAP_REGS_OFFSET(a5)(sp)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1478,
+          "line_end": 1481,
+          "excerpt": "It performs the following operations in order: * Save registers x10-x15 (these are the caller saved registers available in RVC) * Adjusts the stack pointer to create the stack frame * Conditionally performs a stack pointer swap by executing xcspspush sp"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/opensbi/firmware/fw_base.S",
+        "function_name": "TRAP_RESTORE_MEPC_MSTATUS (macro)",
+        "line_start": 647,
+        "line_end": 660,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "This macro unconditionally writes software-saved values to CSR_MSTATUS and CSR_MEPC via csrw before returning. Under Smip tail-chaining (aclic.adoc lines 1531-1540), the hardware may abort an in-progress mipopret and start processing a new interrupt, during which 'xepc, xpistatus remain unchanged'—they preserve the values from the first interrupt. By performing explicit csrw to MSTATUS and MEPC from the software trap frame, this macro overwrites the hardware's preserved epc/pistatus, destroying the correct return target for tail-chained interrupts. This would cause tail-chained interrupts to return to the wrong PC and with incorrect privilege state.",
+      "snippet": "REG_L\tt0, SBI_TRAP_REGS_OFFSET(mstatus)(a0)\ncsrw\tCSR_MSTATUS, t0\nREG_L\tt0, SBI_TRAP_REGS_OFFSET(mepc)(a0)\ncsrw\tCSR_MEPC, t0",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1531,
+          "line_end": 1540,
+          "excerpt": "While executing the xipopret instruction, it is allowed for an implementation [...] to optionally check for any pending and enabled interrupts at the current privilege mode. If such an interrupt exists, the hart may abort executing the xipopret instruction and trigger the following actions: [...] Explicitly, {xepc}, {xpistatus} remain unchanged."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

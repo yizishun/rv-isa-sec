@@ -1,0 +1,211 @@
+{
+  "pr_number": 3,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 3,
+    "violation_condition": "QEMU TCG translates vfmmacc.vv / vfwmmacc.vv / vfqwmmacc.vv with a single flat accumulation loop that ignores the implementation-defined sub-dot-product grouping (G) and intermediate rounding model, or uses the same rounding mode for both intermediate group additions and the final accumulation instead of reserving frm for only the final C[m,n] update step as required by the spec's two-tier rounding model",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "fp_add.*acc.*prod|fp_mul_to.*rm|get_fp_rounding_mode|rounding_mode.*frm|softfloat.*muladd|helper_vfmmacc|helper_vfwmmacc|helper_vfqwmmacc",
+    "affected_entities": [
+      "vfmmacc.vv",
+      "vfwmmacc.vv",
+      "vfqwmmacc.vv",
+      "vtype",
+      "frm",
+      "fflags"
+    ],
+    "summary": "TCG must implement two-tier FP rounding (implementation-defined intermediate rounding after each group of G sub-dot-products, frm only for final accumulation); using flat accumulation with frm throughout leaks TCG's internal precision to the guest via fflags/result divergence"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "OPFVV3 macro",
+        "line_start": 3480,
+        "line_end": 3488,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "OPFVV3 macro processes exactly ONE element pair per invocation: reads vs1[i], vs2[i], vd[i], calls OP(s2, s1, d, &env->fp_status), writes vd[i]. The integrated-matrix spec (PR-35 arithmetic-considerations) requires accumulating G sub-dot-products (G x W scalar multiplies) into a partial sum S WITHOUT rounding to C accumulator format inside the group, then optionally rounding S via rnd (rto/frm/xct), and finally accumulating into C via round_frm(C + S). The single-pair-per-rounding OPFVV3 structure cannot express this deferred-rounding accumulation chain. A new macro with an inner reduction loop and configurable intermediate rounding model is needed.",
+      "snippet": "TX1 s1 = *((T1 *)vs1 + HS1(i));\nTX2 s2 = *((T2 *)vs2 + HS2(i));\nTD d = *((TD *)vd + HD(i));\n*((TD *)vd + HD(i)) = OP(s2, s1, d, &env->fp_status);",
+      "spec_citations": [
+        {
+          "spec_repo": "integrated-matrix-extension",
+          "file_path": "pr-35/diff.patch (src/integrated-matrix.adoc arithmetic-considerations)",
+          "line_start": 640,
+          "line_end": 687,
+          "excerpt": "Within each group, the G sub-dot-products jointly define a dot product... If psm=0, the partial sum S is formed using exact computation... without rounding to the C accumulator format... If rnd=frm, S is rounded to C using frm; if rnd=rto, S is rounded to C using round-to-odd; if rnd=xct, no rounding... After each group: C ← round_frm(C + S)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "fmacc16, fmacc32, fmacc64",
+        "line_start": 3496,
+        "line_end": 3509,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The single-width FMACC helpers call floatN_muladd(a, b, d, 0, s) which performs one fused multiply-add with one rounding using the DEFAULT rounding mode in float_status s (set to frm by helper_set_rounding_mode_chkfrm). The integrated-matrix spec mandates a TWO-TIER rounding model: intermediate group partial sums must use implementation-defined rounding (rnd=rto/frm/xct), where xct means NO rounding before final accumulation. Only the final C[i,j] ← round_frm(C[i,j] + S) step uses frm. Reusing these helpers for matrix MACC would apply frm-based rounding to every intermediate update, violating the spec's deferred-rounding contract and producing silently different FP results from compliant hardware.",
+      "snippet": "return float16_muladd(a, b, d, 0, s);  // single rounding, frm-based\nreturn float32_muladd(a, b, d, 0, s);\nreturn float64_muladd(a, b, d, 0, s);",
+      "spec_citations": [
+        {
+          "spec_repo": "integrated-matrix-extension",
+          "file_path": "pr-35/diff.patch (src/integrated-matrix.adoc arithmetic-considerations)",
+          "line_start": 670,
+          "line_end": 677,
+          "excerpt": "After each group, the rounded partial sum S is accumulated into the running value of C[i,j] by computing C[i,j] ← round_frm(C[i,j] + S). The accumulation rounding is performed with the rounding mode from frm. If rnd=xct, the partial sum S is retained in sufficient internal precision so that the only rounding step in the update of C[i,j] by that group is the final round_frm(C[i,j] + S)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "fwmacc16, fwmaccbf16, fwmacc32",
+        "line_start": 3813,
+        "line_end": 3837,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The widening FMACC helpers float32_muladd(float16_to_float32(a), float16_to_float32(b), d, 0, s) perform widening multiply with one fused multiply-add and one rounding. For matrix W=2 (vfwmmacc.vv), the spec requires each sub-dot-product to sum W=2 exact products at internal precision, then accumulate G such sub-dot-products into S before any rounding to C. The SAIL model (fp_group_sum with PSM_EXACT) uses fp_mul_exact + fp_internal_add in a loop — never rounding intermediates. float32_muladd cannot be composed to achieve this: each call intrinsically rounds.",
+      "snippet": "return float32_muladd(float16_to_float32(a, true, s),\n                      float16_to_float32(b, true, s), d, 0, s);",
+      "spec_citations": [
+        {
+          "spec_repo": "integrated-matrix-extension",
+          "file_path": "pr-35/diff.patch (src/integrated-matrix.adoc SAIL model)",
+          "line_start": 690,
+          "line_end": 700,
+          "excerpt": "fp_mul_exact: Exact internal product of two FP operands. No rounding to the C accumulator format is performed here. fp_internal_add: Exact internal addition of two abstract internal FP values."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/fpu_helper.c",
+        "function_name": "helper_set_rounding_mode_chkfrm",
+        "line_start": 83,
+        "line_end": 118,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "This helper sets env->fp_status rounding mode from frm for ALL subsequent FP operations. The integrated-matrix spec requires DIFFERENT rounding modes for different phases: intermediate group reduction uses rnd (rto/frm/xct), while only final accumulation uses frm. Since env->fp_status is a single shared float_status, the emulation would need to either (a) save/restore fp_status rounding mode between phases, (b) use separate float_status objects for intermediate and final rounding, or (c) pass explicit rounding mode flags to softfloat. Currently none of these mechanisms exist — the infrastructure assumes uniform rounding mode per instruction.",
+      "snippet": "set_float_rounding_mode(softrm, &env->fp_status);  // applies frm globally",
+      "spec_citations": [
+        {
+          "spec_repo": "integrated-matrix-extension",
+          "file_path": "pr-35/diff.patch (src/integrated-matrix.adoc)",
+          "line_start": 645,
+          "line_end": 655,
+          "excerpt": "If rnd=frm, the partial sum S is rounded to the C accumulator format using the rounding mode from frm. If rnd=rto, the partial sum S is rounded to the C accumulator format using round-to-odd. If rnd=xct, no rounding to the C accumulator format is applied to the partial sum S before the final accumulation into C."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "GEN_VEXT_VV_ENV",
+        "line_start": 3140,
+        "line_end": 3165,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "GEN_VEXT_VV_ENV generates a flat for-loop over vector elements with a mask check per element, calling do_##NAME once per iteration. The integrated-matrix spec mandates nested iteration: per LMUL=1 step (foreach step), per group (foreach g0 by G), per sub-dot-product within group (inner fp_group_sum). The existing GEN_VEXT_VV_ENV macro flat structure cannot express this hierarchy. Additionally, vstart/vl management is element-granular — the spec requires understanding of tile geometry (M, N, MUL_C dimensions) which the vector-length-iteration loop doesn't model.",
+      "snippet": "for (i = env->vstart; i < vl; i++) {\n    if (!vm && !vext_elem_mask(v0, i)) { ... continue; }\n    do_##NAME(vd, vs1, vs2, i, env);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "integrated-matrix-extension",
+          "file_path": "pr-35/diff.patch (src/integrated-matrix.adoc SAIL fp_gemm)",
+          "line_start": 771,
+          "line_end": 788,
+          "excerpt": "foreach (step from 0 to (g.LMUL - 1)) { foreach (g0 from 0 to (g.lambda - 1) by G) { let S : fp_internal = fp_group_sum(i, j, step, g0, G, ...); match round_group_sum(S, rnd, ...) { ... } } }"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn32.decode",
+        "function_name": "decode patterns (no matrix FP MACC)",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "No decode patterns exist for vfmmacc.vv, vfwmmacc.vv, or vfqmmacc.vv. The existing vfmacc_vv/vfwmacc_vv decode patterns (lines ~546-560) are for the standard vector FMA instructions, not the matrix variants. Matrix MACC instructions use different opcode space (e.g., vfqmmacc.vv uses opcode 0x16 per the spec encoding) and require additional decode fields for W factor, lambda, and altfmt interpretation. Without proper decode patterns, TCG will treat these as illegal instructions — a correctness gap but not a security vulnerability since the instructions simply fail.",
+      "snippet": "# No vfmmacc.vv / vfwmmacc.vv / vfqmmacc.vv decode patterns",
+      "spec_citations": [
+        {
+          "spec_repo": "integrated-matrix-extension",
+          "file_path": "pr-35/diff.patch (src/integrated-matrix.adoc instruction encoding)",
+          "line_start": 947,
+          "line_end": 960,
+          "excerpt": "vfqmmacc.vv encoding: funct6 = 0x16 with vm=1 for FP form; vm=0 enables microscaling."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_vxrm",
+        "line_start": 967,
+        "line_end": 975,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "WARL violation: write_vxrm stores val directly into env->vxrm without applying a bitmask. vxrm has exactly 2 bits (values 0=rne, 1=rtz, 2=rdn, 3=rod), but any arbitrary target_ulong value can be written. If the integrated-matrix spec uses vxrm for the round-to-odd (rto) mode in the intermediate partial-sum rounding step, an out-of-range vxrm could affect dispatch in the rounding path. More critically, vxrm currently does NOT encode round-to-odd (ROD = 5 in frm encoding), which the spec requires as a possible rnd value — the vxrm encoding space would need expansion to support ROD.",
+      "snippet": "env->vxrm = val;  // no WARL mask — should be: env->vxrm = val & 0x3;",
+      "spec_citations": [
+        {
+          "spec_repo": "integrated-matrix-extension",
+          "file_path": "pr-35/diff.patch (src/integrated-matrix.adoc arithmetic-considerations)",
+          "line_start": 647,
+          "line_end": 649,
+          "excerpt": "If rnd=rto, the partial sum S is rounded to the C accumulator format using round-to-odd."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_vector",
+        "line_start": 138,
+        "line_end": 153,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Migration VMSTATE currently serializes vreg[], vxrm, vxsat, vl, vstart, vtype, vill. When the integrated-matrix extension is implemented, new state fields (matrix tile configuration, lambda field in vtype, implementation-defined G/psm/rnd mapping disclosure) must be added. Missing fields cause silent migration corruption — the classic vmstate bug pattern. Specifically, the G/psm/rnd parameters are implementation-defined per (SEW, W, lambda) and must survive live-migration to maintain result consistency on the destination.",
+      "snippet": "VMSTATE_UINTTL(env.vtype, RISCVCPU),\nVMSTATE_BOOL(env.vill, RISCVCPU),\nVMSTATE_END_OF_LIST()\n// no matrix-specific fields",
+      "spec_citations": [
+        {
+          "spec_repo": "integrated-matrix-extension",
+          "file_path": "pr-35/diff.patch (src/integrated-matrix.adoc arithmetic-considerations)",
+          "line_start": 656,
+          "line_end": 659,
+          "excerpt": "Supported values of G, psm, and rnd by an implementation may depend on SEW, W, and lambda. An implementation must disclose all supported combinations by publishing a table of its mappings from (SEW, W, lambda) to (G, psm, rnd)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "VTYPE FIELD definitions",
+        "line_start": 190,
+        "line_end": 195,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VTYPE RESERVED field starts at bit 9 with width covering all remaining bits. The integrated-matrix spec defines lambda, altfmt_A, altfmt_B, altfmt fields within vtype for tile configuration. These fields must be carved out of the current RESERVED range. Without updated FIELD definitions, vtype_reserved() would incorrectly trap valid matrix configurations (setting vill=1), and CSR reads would expose matrix-configuration bits through what guest software expects as read-as-zero reserved space — a potential information leak of implementation-specific matrix capabilities to unprivileged guests.",
+      "snippet": "FIELD(VTYPE, ALTFMT, 8, 1)\nFIELD(VTYPE, RESERVED, 9, sizeof(target_ulong) * 8 - 10)",
+      "spec_citations": [
+        {
+          "spec_repo": "integrated-matrix-extension",
+          "file_path": "pr-35/diff.patch (src/integrated-matrix.adoc vtype fields)",
+          "line_start": 158,
+          "line_end": 175,
+          "excerpt": "New fields in vtype include lambda (tile layout parameter), altfmt_A, altfmt_B (input format selectors), altfmt (accumulator format)."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

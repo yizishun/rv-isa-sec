@@ -1,0 +1,77 @@
+PR #1006  target=linux  overall=bug_confirmed
+Spec: Vector stores silently strip capability tags in memory; kernel memcpy or context-switch save/restore using vector instructions on CHERI will corrupt user/kernel capabilities, breaking compartment isolation
+Violation: Linux kernel uses RISC-V vector instructions (vle/vse) to implement memcpy or context-switch save/restore of capability-rich memory regions on a CHERI hart, where the vector spec explicitly states 'vector stores will always clear ctags in memory' and 'vector load and store instructions must not be used to implement generic memory copying ... that requires capabilities to be preserved'
+Consequence: data_corruption
+Pattern: memcpy.*vector|vector.*memcpy|__arch_copy.*vector|vsetvli|vle\.v|vse\.v|kernel_vector.*memcpy
+------------------------------------------------------------
+[bug_confirmed] arch/riscv/lib/uaccess_vector.S:38-61  __asm_vector_usercopy_sum_enabled
+  This function uses vle8.v/vse8.v to implement a generic memory copy (copy_to_user/copy_from_user) in the kernel. On a CHERI hart, vector stores (vse8.v) will always clear ctags in the destination memory because vector registers do not hold capabilities. The CHERI spec explicitly states: 'vector load and store instructions must not be used to implement generic memory copying in software, such as the memcpy() standard C library function, because the vector registers do not hold capabilities, so the ctags of any copied capabilities will be set to 0 in the destination memory.' This applies to both copy_to_user (corrupts user ctags) and copy_from_user (corrupts kernel ctags).
+  | loop:
+  | 	vsetvli iVL, iNum, e8, ELEM_LMUL_SETTING, ta, ma
+  | 	fixup vle8.v vData, (pSrc), 10f
+  | 	sub iNum, iNum, iVL
+  | 	add pSrc, pSrc, iVL
+  | 	fixup vse8.v vData, (pDst), 11f
+
+[bug_confirmed] arch/riscv/lib/riscv_v_helpers.c:22-49  enter_vector_usercopy
+  This is the C dispatcher that routes copy_to_user/copy_from_user to the vector-based __asm_vector_usercopy path when the copy size exceeds CONFIG_RISCV_ISA_V_UCOPY_THRESHOLD. It calls kernel_vector_begin() then falls into the ASM vector copy loop which uses vse8.v stores that will zero all ctags at the destination. This is the entry point that decides whether to use the vector path for arbitrary user/kernel memory copies.
+  | kern_vector_begin();
+  | remain = enable_sum ? __asm_vector_usercopy(dst, src, n) :
+  |               __asm_vector_usercopy_sum_enabled(dst, src, n);
+  | kernel_vector_end();
+
+[potential_risk] arch/riscv/include/asm/vector.h:196-231  __riscv_v_vstate_save
+  This context-switch save function uses vse8.v to dump all 32 vector registers (v0-v24 in 4 groups at m8) to the task's datap buffer. While not 'generic memory copying,' the vector stores will zero any ctags in the datap buffer memory on a CHERI hart. If the datap buffer is allocated in capability-tagged memory, the ctags of capability data stored there would be silently cleared during every context switch, causing capability corruption.
+  | vsetvli %0, x0, e8, m8, ta, ma
+  | vse8.v  v0, (%1)
+  | add     %1, %1, %0
+  | vse8.v  v8, (%1)
+  | add     %1, %1, %0
+  | vse8.v  v16, (%1)
+  | add     %1, %1, %0
+  | vse8.v  v24, (%1)
+
+[potential_risk] arch/riscv/include/asm/vector.h:233-268  __riscv_v_vstate_restore
+  This context-switch restore function uses vle8.v to load vector registers from the task's datap buffer. Vector loads themselves do not clear ctags in memory, but they bypass CHERI capability checks on the loaded data since vector registers don't hold capabilities. If a future extension allows ctags in vector registers, this restore path would need redesign. The complementary concern is that restored vector state could be used subsequently for stores that clear ctags.
+  | vsetvli %0, x0, e8, m8, ta, ma
+  | vle8.v  v0, (%1)
+  | add     %1, %1, %0
+  | vle8.v  v8, (%1)
+  | add     %1, %1, %0
+  | vle8.v  v16, (%1)
+  | add     %1, %1, %0
+  | vle8.v  v24, (%1)
+
+[potential_risk] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The switch_to macro unconditionally calls __switch_to_vector() on every context switch when vector is supported (line 121). This triggers the vector state save/restore path that uses vse8.v/vle8.v, which on a CHERI hart would clear ctags in the task's datap buffer memory. This is on the critical context-switch hot path, meaning ctag corruption would happen every time a vector-using task is scheduled out.
+  | if (has_vector() || has_xtheadvector())
+  |     __switch_to_vector(__prev, __next);
+
+[potential_risk] arch/riscv/kernel/vec-copy-unaligned.S:38-58  __riscv_copy_vec_bytes_unaligned
+  This function implements a memcpy-like copy using vle8.v/vse8.v vector byte loads/stores. Currently only called from the unaligned access speed benchmarking code (unaligned_access_speed.c), not from the general memcpy path. However, the function is a complete memcpy implementation using vectors — if any future code path calls it for general-purpose copying on a CHERI hart, ctags in destination memory will be silently cleared.
+  | vsetivli t0, 8, e8, m8, ta, ma
+  | vle8.v v0, (a1)
+  | vse8.v v0, (a0)
+
+[potential_risk] arch/riscv/kernel/vec-copy-unaligned.S:16-36  __riscv_copy_vec_words_unaligned
+  Same pattern as the byte variant above, but using vle32.v/vse32.v (32-bit word vector loads/stores). Also a complete memcpy implementation using vector instructions, currently only used in benchmarking. Vector stores will clear ctags at the destination on a CHERI hart.
+  | vsetivli t0, 8, WORD_SEW, m8, ta, ma
+  | VEC_L v0, (a1)
+  | VEC_S v0, (a0)
+
+[bug_confirmed] arch/riscv/lib/uaccess.S:15-23  __asm_copy_to_user
+  This is the entry point for copy_to_user. When CONFIG_RISCV_ISA_V is enabled and the copy size exceeds riscv_v_usercopy_threshold, it tail-calls enter_vector_usercopy which uses vse8.v vector stores. The kernel's primary user-memory copy infrastructure routes to a vector-based implementation that will clear all ctags in destination memory on a CHERI hart. The scalar fallback at fallback_scalar_usercopy is compliant (uses lb/sb and REG_L/REG_S only).
+  | ALTERNATIVE("j fallback_scalar_usercopy", "nop", 0, RISCV_ISA_EXT_ZVE32X, CONFIG_RISCV_ISA_V)
+  | REG_L t0, riscv_v_usercopy_threshold
+  | bltu a2, t0, fallback_scalar_usercopy
+  | li a3, 1
+  | tail enter_vector_usercopy
+
+[compliant] arch/riscv/lib/memcpy.S:10-107  __memcpy
+  The standard kernel memcpy implementation uses only scalar load/store instructions (REG_L/REG_S, lw/sw, lb/sb). No vector instructions are used. On a CHERI hart, scalar loads/stores that are not capability-aware will similarly not preserve ctags, but the CHERI spec's specific prohibition targets vector-based copying because vector registers fundamentally cannot hold ctags. The scalar memcpy is out of scope for this vector-specific audit.
+  | REG_L a4, 0(a1)
+  | REG_S a4, 0(t6)
+  | ...
+  | lb a4, 0(a1)
+  | sb a4, 0(t6)
+

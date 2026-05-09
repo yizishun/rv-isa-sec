@@ -1,0 +1,90 @@
+{
+  "pr_number": 706,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 706,
+    "violation_condition": "Linux kernel context-switches a task with SIPU=1 (automatic interrupt stacking enabled in sstatus) to a task with SIPU=0, or vice versa, without handling the divergent trap frame layouts — the trap entry path in arch/riscv/kernel/entry.S assumes a fixed pt_regs shape, so when SIPU=1 the hardware silently pushes additional state onto the kernel stack, causing the trap handler to load wrong register values (e.g., sepc, sstatus, sp) during save/restore, corrupting execution state on return to the interrupted context.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "arch/riscv/kernel/entry.S handle_exception path that builds a pt_regs frame with a hardcoded layout, plus context-switch code (__switch_to) that saves/restores sstatus without isolating or masking the SIPU bit, allowing per-task SIPU divergence under CONFIG_RISCV_FAST_INTERRUPT or equivalent.",
+    "affected_entities": [
+      "sstatus",
+      "mstatus",
+      "sipopret",
+      "mipopret"
+    ],
+    "summary": "Per-task SIPU bit in sstatus causes divergent hardware trap frame layouts; lack of SIPU-aware dispatch in the trap entry path leads to register corruption and potential privilege escalation when returning from a mis-decoded trap frame."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 125,
+        "line_end": 238,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "handle_exception builds pt_regs with a hardcoded layout (SAVE_ALL via save_from_x6_to_x31 + manual CSR saves at lines 183-194). sstatus is read via csrrc at line 183 and saved to PT_STATUS(sp). This is correct for the current ISA because SIPU/Ssip extension does not exist in this kernel version — no additional hardware stack frame is pushed, so the fixed pt_regs layout matches the hardware trap frame.",
+      "snippet": "csrrc s1, CSR_STATUS, t0            // s1 = old STATUS, clear SR_SUM|SR_FS_VS\nREG_S s1, PT_STATUS(sp)             // save old STATUS to pt_regs\ncsrr s2, CSR_EPC\ncsrr s3, CSR_TVAL\ncsrr s4, CSR_CAUSE",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1462,
+          "line_end": 1468,
+          "excerpt": "If SIPU, is set, a trap taken at Supervisor level due to an interrupt causes automatic stacking. [...] NOTE: These bits do not yet have an allocated encoding. The authors of this specification intend to ask for encoding of these bits in mstatus/sstatus."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 421,
+        "line_end": 471,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "__switch_to saves and restores sstatus only for the SR_SUM bit (lines 442-452). It does not mask or manage SIPU because SIPU has no allocated CSR encoding and is not implemented. Under the current ISA this is correct — context-switching sstatus for the bits that exist (SUM) is sufficient.",
+      "snippet": "csrr  s0, CSR_STATUS\nREG_S s0, TASK_THREAD_SUM_RA(a3)    // save full sstatus\n...\nREG_L s0, TASK_THREAD_SUM_RA(a4)\nli    s1, SR_SUM\nand   s0, s0, s1\ncsrs  CSR_STATUS, s0                // only restore SR_SUM bit",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1462,
+          "line_end": 1468,
+          "excerpt": "If SIPU, is set, a trap taken at Supervisor level due to an interrupt causes automatic stacking. [...] NOTE: These bits do not yet have an allocated encoding."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception",
+        "line_start": 125,
+        "line_end": 238,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Forward-looking risk: If Ssip/SIPU is ratified and hardware implements it, this trap entry path will break. With SIPU=1, hardware would silently push x10-x15 before the first instruction of handle_exception, but the code at lines 160-194 saves registers in the hardcoded pt_regs order (x1, x3, x5, then x6-x31 via macro). The hardware-pushed x10-x15 would overlap or misalign with the pt_regs slots, and the ret_from_exception restore sequence at lines 275-319 would load wrong values into x10-x15 on return — a privilege-escalation primitive (attacker-controlled register corruption on trap return). No mitigation (SIPU masking in __switch_to, SIPU-unaware entry path) exists.",
+      "snippet": "addi sp, sp, -(PT_SIZE_ON_STACK)    // allocate pt_regs — assumes no HW-pushed frame\nsave_from_x6_to_x31 sp, 0           // hardcoded GPR→pt_regs mapping\n// Hardware with SIPU=1 would have already consumed stack space and\n// offset all subsequent saves, corrupting the pt_regs layout",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1472,
+          "line_end": 1493,
+          "excerpt": "Before executing the first instruction of the trap handler, this extension ensures the interrupted context is partially saved. It performs the following operations in order: Save registers x10-x15, Adjusts the stack pointer to create the stack frame, Conditionally performs a stack pointer swap."
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 1487,
+          "line_end": 1490,
+          "excerpt": "As this extension modifies interrupt trap behavior but not the behaviour of synchronous exception traps, it should only be used in interrupt handling modes that provide separate entry points for interrupt and synchronous exception traps. Specifically, mtvec.mode = 0 (direct) is incompatible."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,43 @@
+PR #718  target=linux  overall=potential_risk
+Spec: Spec correction: xithreshold on trap entry must reflect the effective interrupt priority level (IPRIO), not the per-source priority iprio[i]; kernel nested-interrupt and context-switch paths that assume the old behavior are vulnerable to incorrect interrupt masking and handler reentrancy.
+Violation: On hardware implementing the buggy (pre-fix) behavior where xithreshold ← iprio[i] instead of IPRIO, the kernel's nested-interrupt handler executes with an incorrect interrupt-enable threshold. If IPRIO reflects a priority level different from the per-source iprio[i] (e.g., after priority-inheritance, delegation, or selectable priority groups), the wrong threshold either (a) permits lower-priority interrupts to preempt the handler, creating reentrancy races on per-CPU kernel data structures, or (b) masks higher-priority interrupts needed for correctness, such as an IPI or timer tick that must not be deferred indefinitely.
+Consequence: race_condition
+Pattern: xithreshold CSR save/restore in trap entry/exit paths that assumes threshold equals the fixed per-interrupt priority rather than the effective priority level IPRIO; any kernel code reading xithreshold in a nested handler and comparing it against a pre-computed iprio[i] array to decide whether to re-enable interrupts.
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/entry.S:160-238  handle_exception
+  Trap entry saves sstatus/sepc/stval/scause/sscratch (lines 183-194) but does not save sithreshold or spistatus. No cross-check of xithreshold against iprio[i] exists anywhere in the kernel. The kernel has zero Smnip/Ssnip awareness — CSR constants SITHRESHOLD (0x147), SIPSTATUS (0x146) are not defined in csr.h, and no ISA extension entry for SMNIP exists in hwcap.h or cpufeature.c. Since the vulnerability pattern requires kernel code that reads/writes xithreshold in nested handlers, and no such code exists, this path is not currently vulnerable to the xithreshold←iprio[i] hardware bug.
+  | csrrc s1, CSR_STATUS, t0    @ line 183 -- save sstatus
+  | csrr s2, CSR_EPC              @ line 185 -- save sepc
+  | csrr s3, CSR_TVAL             @ line 186 -- save stval
+  | csrr s4, CSR_CAUSE            @ line 187 -- save scause
+  | csrr s5, CSR_SCRATCH          @ line 188 -- save sscratch
+
+[compliant] arch/riscv/kernel/entry.S:247-319  ret_from_exception
+  Trap exit restores sstatus and sepc (lines 301-302) then issues sret. No sithreshold/spistatus restore is performed. The spec (aclic.adoc:838-842) mandates that xRET restores xithreshold from xpistatus.pithreshold — hardware performs this automatically, so software intervention is only needed when the kernel has modified spistatus. Since the kernel never touches spistatus, the hardware auto-restore is sufficient. No vulnerability to the PR bug.
+  | csrw CSR_STATUS, a0         @ line 301 -- restore sstatus
+  | csrw CSR_EPC, a2            @ line 302 -- restore sepc
+  | sret                         @ line 315 -- return
+
+[potential_risk] arch/riscv/kernel/traps.c:173-196  do_trap_insn_illegal
+  User-mode synchronous exception handlers call local_irq_enable() (line 179) which sets sstatus.SIE without touching sithreshold. On Smnip hardware, if a prior interrupt handler set sithreshold to a high (permissive) value and then a synchronous exception occurred (which does NOT modify sithreshold per spec line 834), calling local_irq_enable() would re-enable interrupts at whatever sithreshold was left by the prior interrupt. This becomes a reentrancy risk on buggy hardware where sithreshold was set to iprio[i] instead of IPRIO — the wrong threshold could allow lower-priority interrupts to preempt. The DO_ERROR_INFO macro (line 155), do_trap_misaligned (line 225), and do_trap_break (line 311) have the same pattern.
+  | if (user_mode(regs)) {
+  |     irqentry_enter_from_user_mode(regs);
+  |     local_irq_enable();              // line 179 -- SIE=1, threshold unchanged
+  |     handled = riscv_v_first_use_handler(regs);
+  |     ...
+  |     local_irq_disable();             // line 186
+
+[potential_risk] arch/riscv/kernel/entry.S:421-471  __switch_to
+  Context switch saves/restores only callee-saved GPRs and sstatus.SUM bit (lines 442-451). On Smnip hardware, sithreshold and spistatus are per-hart state that must be saved/restored across context switches to prevent leakage of one task's interrupt threshold context to another. The current code does neither, meaning a task's sithreshold value would persist across context switches.
+  | csrr  s0, CSR_STATUS          @ line 442 -- save sstatus.SUM only
+  | REG_S s0, TASK_THREAD_SUM_RA(a3)
+  | ...
+  | csrs  CSR_STATUS, s0          @ line 451 -- restore sstatus.SUM only
+
+[potential_risk] arch/riscv/kvm/vcpu_switch.S:41-63  SAVE_HOST_AND_RESTORE_GUEST_CSRS
+  KVM VM entry/exit macros swap only sstatus/stvec/sscratch/sepc between host and guest (lines 47-62 for entry, lines 139-161 for exit). On Smnip hardware, vsithreshold/vspistatus (VS-level CSRs) and sithreshold/spistatus (HS-level CSRs) must be swapped to virtualize nested interrupt preemption for guests. The KVM AIA save/restore path (aia.c:146-179) similarly saves only HVIPRIO1/2 and VSISELECT but not spistatus/sithreshold.
+  | csrrw  t0, CSR_SSTATUS, t0    @ line 48 -- swap sstatus (no spistatus)
+  | csrrw  t1, CSR_STVEC, t1      @ line 51 -- swap stvec
+  | csrw   CSR_SEPC, t2            @ line 54 -- restore guest sepc
+  | csrrw  t3, CSR_SSCRATCH, a0    @ line 57 -- swap sscratch
+

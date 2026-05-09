@@ -1,0 +1,37 @@
+PR #606  target=qemu  overall=compliant
+Spec: Removal of mithreshold/sithreshold in favor of unified eithreshold: QEMU must stop exposing per-privilege threshold CSRs and gate all interrupt delivery (including major interrupts from CLINT) through the single eithreshold when ACLIC mode is active, otherwise guest interrupt masking is silently bypassed.
+Violation: When QEMU still implements the now-removed per-privilege interrupt threshold CSRs mithreshold (0xFB1) and sithreshold (0x1B1), or internally consults per-privilege thresholds instead of the unified eithreshold, after this spec PR removes them in favor of a single eithreshold that controls interrupt masking for all interrupt sources (major + external) in ACLIC mode.
+Consequence: denial_of_service
+Pattern: mithreshold|sithreshold|0xFB1|0x1B1|xithreshold.*threshold|threshold.*xs|threshold.*[ms]mode
+------------------------------------------------------------
+[compliant] target/riscv/cpu_bits.h:1-1200  (CSR definitions, file-wide)
+  QEMU does not define the per-privilege interrupt threshold CSRs mithreshold (0x347) or sithreshold (0x147), nor any CSR at addresses 0xFB1/0x1B1. Grep for 'mithreshold', 'sithreshold', '0xFB1', '0x1B1', '0x347', '0x147' returned zero results in target/riscv/. The only threshold mechanism in QEMU is the standard AIA IMSIC eithreshold (ISELECT 0x72) in riscv_imsic.c, which is the page-based ISELECT mechanism, not a standalone CSR. No implementation of Smidctrl/Ssidctrl (ACLIC) extension exists in QEMU, so there are no legacy per-privilege thresholds to remove or unify.
+  | #define ISELECT_IMSIC_EITHRESHOLD          0x72  // cpu_bits.h:1038 — only threshold reference in QEMU
+
+[compliant] target/riscv/csr.c:398-410  scountinhibit_pred
+  The scountinhibit_pred change adds a CDE (Custom Data Extension) check via menvcfg.CDE before allowing S-mode scountinhibit access. This is unrelated to interrupt thresholds — it enforces a missing ISA check for the scountinhibit CSR. No threshold-related regressions introduced.
+  | if (!get_field(env->menvcfg, MENVCFG_CDE)) {
+  |         return RISCV_EXCP_ILLEGAL_INST;
+  |     }
+  | 
+  |     if (env->virt_enabled) {
+  |         return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;
+  |     }
+
+[compliant] hw/riscv/riscv-iommu.c:750-756  riscv_iommu_validate_device_ctx
+  The IOMMU change adds a validation that disallows MSI page table pointer (MSIPTP) being non-OFF when the IOMMU host G-stage address translation pointer (IOHGATP) is in BARE mode. This enforces a hardware constraint (you cannot have MSI remapping without a host translation context) and is unrelated to interrupt threshold CSRs.
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |         get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |         RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |         return false;
+  |     }
+
+[compliant] hw/intc/riscv_imsic.c:108-121  riscv_imsic_eithreshold_rmw
+  This is the standard AIA IMSIC per-privilege eithreshold accessed via ISELECT page mechanism (select 0x72), NOT the Smidctrl/Ssidctrl mithreshold/sithreshold CSRs. The IMSIC eithreshold is NOT in scope of the Smidctrl/Ssidctrl specification per the ACLIC spec itself which states 'The AIA eidelivery and eithreshold CSRs defined for the IMSIC are not included in the scope of Smidctrl/Ssidctrl.' This is the correct, expected implementation.
+  | static int riscv_imsic_eithreshold_rmw(RISCVIMSICState *imsic, uint32_t page,
+  |                                         target_ulong val, target_ulong wr_mask)
+  | {
+  |     target_ulong old_val = imsic->eithreshold[page];
+  |     ...
+  |     imsic->eithreshold[page] = (old_val & ~wr_mask) | (new_val & wr_mask);
+

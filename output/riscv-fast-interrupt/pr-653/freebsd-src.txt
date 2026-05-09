@@ -1,0 +1,63 @@
+PR #653  target=freebsd-src  overall=bug_confirmed
+Spec: FreeBSD's unified trap entry (save_registers/load_registers + sret) is incompatible with Smip's hardware auto-save/auto-restore model: sp is doubly adjusted, the hardware-saved x10-x15 context is silently overwritten by the kernel's manual trapframe stores, and sret on return leaves sp misaligned — the kernel has no code path to detect or use ipopxret
+Violation: FreeBSD boots on hardware implementing Smip. On interrupt entry, Smip hardware automatically adjusts sp and saves x10-x15 to the stack before the first handler instruction executes. FreeBSD's save_registers macro in exception.S then performs a second addi sp, sp, -(TF_SIZE), displacing sp past the hardware-saved context and silently overwriting it with software-saved trapframe data. On return, the kernel uses sret instead of ipopxret, so sp is misaligned by the Smip frame size — the hardware-saved copy is never restored, and the kernel's manually restored x10-x15 values reflect the handler's clobbered registers rather than the interrupted context.
+Consequence: data_corruption
+Pattern: addi sp, sp, -(TF_SIZE) in save_registers macro executed after Smip hardware already adjusted sp; sret used instead of ipopxret for interrupt returns; no misa/Smip detection before trap entry to branch between bare-metal save/restore and Smip-aware path
+------------------------------------------------------------
+[bug_confirmed] sys/riscv/riscv/exception.S:41-42  save_registers (macro)
+  The save_registers macro unconditionally executes 'addi sp, sp, -(TF_SIZE)' as its first instruction. On Smip hardware with SIPU enabled, the hardware has already auto-saved x10-x15 (a0-a5) and adjusted sp by FRAMESIZE before the first handler instruction executes. This second addi displaces sp past the hardware-saved frame, orphaning the hardware-saved context. The subsequent software sd instructions then write the trapframe at the doubly-adjusted sp offset, overwriting whatever lies FRAMESIZE bytes below the hardware frame. The kernel has no SIPU detection to branch between bare-metal and Smip-aware save paths.
+  | save_registers mode:
+  |   addi  sp, sp, -(TF_SIZE)    // unconditional; Smip hardware already adjusted sp
+  |   sd    ra, (TF_RA)(sp)
+  |   ...
+  |   sd    a0, (TF_A + 0*8)(sp)  // overwrites handler's clobbered a0-a5, not hardware-saved values
+
+[bug_confirmed] sys/riscv/riscv/exception.S:219-225  cpu_exception_handler_supervisor
+  The supervisor interrupt return path unconditionally uses 'sret' at line 224. On Smip hardware with SIPU enabled, the interrupt return must use 'sipopret' instead, which: (1) performs scspspop to swap the stack pointer back, (2) restores hardware-saved x10-x15 (a0-a5) from the hardware-managed frame, (3) adjusts sp to destroy the hardware stack frame, and (4) then executes sret. Using raw sret skips all three hardware context-restore steps. The kernel's software-restored a0-a5 in load_registers come from the trapframe written by clobbered handler registers, not the original interrupted context — returning with wrong a0-a5 values is data corruption. sp is also misaligned by FRAMESIZE bytes compared to the interrupted context's expectation.
+  | cpu_exception_handler_supervisor:
+  |   save_registers 1
+  |   mv    a0, sp
+  |   call  do_trap_supervisor
+  |   load_registers 1
+  |   sret                       // should be sipopret for Smip interrupt returns
+
+[bug_confirmed] sys/riscv/riscv/exception.S:227-235  cpu_exception_handler_user
+  The user-mode interrupt return path also unconditionally uses 'sret' at line 234. Same Smip incompatibility as the supervisor path: should use 'sipopret' to restore hardware-saved x10-x15 (a0-a5), perform scspspop, and destroy the hardware frame before returning. The csrrw sp, sscratch, sp on line 233 does not compensate — sscratch holds the kernel sp in user-mode entry, not the Smip hardware-managed sspcs value.
+  | cpu_exception_handler_user:
+  |   save_registers 0
+  |   mv    a0, sp
+  |   call  do_trap_user
+  |   do_ast
+  |   load_registers 0
+  |   csrrw sp, sscratch, sp
+  |   sret                       // should be sipopret for Smip interrupt returns
+
+[bug_confirmed] sys/riscv/riscv/locore.S:230-232  va (boot path) / mpva (secondary CPU path)
+  stvec is configured in DIRECT mode (low 2 bits = 00, since cpu_exception_handler is at a word-aligned address with no OR'd mode bits). The Smip spec explicitly states that DIRECT-mode stvec is incompatible with Smip/Ssip because the hardware cannot distinguish interrupt traps (which need automatic stacking) from synchronous exception traps (which must not have automatic stacking). To support Smip, the kernel must configure stvec to VECTORED mode (low 2 bits = 01) with separate entry points for interrupts and exceptions. The same DIRECT-mode configuration exists at line 386-387 for secondary CPUs.
+  | /* Set the trap vector to the real handler. */
+  | la    t0, cpu_exception_handler
+  | csrw  stvec, t0              // DIRECT mode: all traps share one entry point
+
+[bug_confirmed] sys/riscv/riscv/exception.S:149-181  load_registers (macro)
+  The load_registers macro restores a0-a5 (the x10-x15 registers) from the software trapframe at TF_A offsets (lines 172-179). On Smip hardware, the true interrupted-context values of x10-x15 were saved by hardware at the bottom of the hardware frame (below the kernel's trapframe). The software sd instructions in save_registers wrote the post-handler clobbered values at TF_A. When load_registers restores a0-a5, the interrupted context resumes with the handler's register values — this is silent data corruption of the interrupted context. The sipopret instruction would instead have restored the correct hardware-saved values.
+  | ld    a0, (TF_A + 0 * 8)(sp)  // restores handler-clobbered a0, not hardware-saved a0
+  | ld    a1, (TF_A + 1 * 8)(sp)
+  | ...
+  | ld    a5, (TF_A + 5 * 8)(sp)  // these should be restored by sipopret hardware
+
+[bug_confirmed] sys/riscv/riscv/trap.c:318-322  do_trap_supervisor
+  The interrupt dispatch at the C level (frame->tf_scause & SCAUSE_INTR → intr_irq_handler) correctly identifies interrupts vs exceptions, but this is too late. The save_registers macro in the assembly prologue already executed addi sp, sp, -(TF_SIZE) with the double-stack-adjustment Smip bug before do_trap_supervisor is called. Any Smip-aware fix must happen at the assembly entry point, not in the C handler. Conversely, this means that if stvec were switched to VECTORED mode with a separate interrupt-only entry point that skips save_registers, this C code would still work correctly since it already distinguishes interrupts from exceptions.
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  |   /* Interrupt */
+  |   intr_irq_handler(frame, INTR_ROOT_IRQ);
+  |   return;
+  | }
+
+[bug_confirmed] sys/riscv/riscv/trap.c:399-403  do_trap_user
+  Same C-level late-dispatch issue as do_trap_supervisor. By the time the interrupt is identified at scause check, the assembly save_registers macro has already executed the erroneous double sp adjustment on Smip hardware. The save_registers destruction of the hardware-saved frame is irreversible at this point.
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  |   /* Interrupt */
+  |   intr_irq_handler(frame, INTR_ROOT_IRQ);
+  |   return;
+  | }
+

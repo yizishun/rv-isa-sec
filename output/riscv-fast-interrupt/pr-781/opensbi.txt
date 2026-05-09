@@ -1,0 +1,93 @@
+PR #781  target=opensbi  overall=potential_risk
+Spec: If OpenSBI grants S-mode read access to a shared CLIC vector table via PMP, S-mode can leak M-mode interrupt handler addresses; if write is granted, S-mode can redirect M-mode interrupt handling to arbitrary code.
+Violation: OpenSBI configures PMP/ePMP entries covering a shared interrupt vector table (CLIC/CLINT) that grants S-mode more than execute-only permission (e.g., R=1 or W=1 under L=0 standard PMP, or misconfigured Smepmp L=1 shared-code region), exposing M-mode interrupt handler pointers to lower privilege levels.
+Consequence: privilege_escape
+Pattern: pmp_set|pmpcfg_write|pmpaddr_write.*region.*(?:vector|clic|clint|interrupt).*table|grant.*[rw].*[su]-mode.*(?:xivt|xeivt|vector.table)
+------------------------------------------------------------
+[potential_risk] lib/sbi/sbi_domain.c:950-954  sbi_domain_init
+  Catch-all domain memory region (0x0–~0UL) grants S/U-mode full R/W/X under both standard PMP and Smepmp. On a CLIC platform with Smivt shared vector tables, any mivt/meivt-pointed memory in this region is readable and writable by S-mode, exposing M-mode interrupt handler pointers.
+  | sbi_domain_memregion_init(0, ~0UL,
+  | 			  (SBI_DOMAIN_MEMREGION_SU_READABLE |
+  | 			   SBI_DOMAIN_MEMREGION_SU_WRITABLE |
+  | 			   SBI_DOMAIN_MEMREGION_SU_EXECUTABLE),
+  | 			  &root_memregs[root_memregs_count++]);
+
+[potential_risk] platform/generic/sifive/sifive_dev_platform.c:25-28  sifive_smepmp_setup
+  Entire peripheral port (0x0–0x80000000, 2GiB) is registered as SURW_MRW (shared read/write for M and S/U). Under Smepmp MML=1, this produces pmp_flags = PMP_W|PMP_X, granting S-mode read/write access. If a CLIC vector table (mivt/meivt) resides in this 2GiB range, M-mode interrupt handler pointers are exposed to S-mode.
+  | rc = sbi_domain_root_add_memrange(0x0, 0x80000000, 0x80000000,
+  | 				  SBI_DOMAIN_MEMREGION_MMIO |
+  | 				  SBI_DOMAIN_MEMREGION_SHARED_SURW_MRW);
+
+[potential_risk] platform/generic/sifive/sifive_dev_platform.c:34-38  sifive_smepmp_setup
+  System port region (512GiB–1TiB, RV64 only) is also registered as SURW_MRW shared R/W. Same exposure as the peripheral port: any CLIC vector table in this range grants S-mode read/write access to M-mode interrupt handler pointers.
+  | rc = sbi_domain_root_add_memrange(0x8000000000ULL, 0x8000000000ULL, 0x8000000000ULL,
+  | 				  SBI_DOMAIN_MEMREGION_MMIO |
+  | 				  SBI_DOMAIN_MEMREGION_SHARED_SURW_MRW);
+
+[potential_risk] lib/sbi/sbi_domain.c:167-169  sbi_domain_get_smepmp_flags
+  SUX_MRX shared execute-only-for-S/U encoding (PMP_L|PMP_W|PMP_X) exists in the domain flag system and is the correct Smepmp encoding for protecting a shared interrupt vector table per ACLIC spec (L=1,R=0,W=1,X=0). However, no OpenSBI code uses SUX_MRX to protect any memory region, least of all CLIC vector tables, because OpenSBI has no CLIC/mivt awareness.
+  | else if (SBI_DOMAIN_MEMREGION_IS_SUX_MRX(reg->flags))
+  | 	/* locked region */
+  | 	pmp_flags = (PMP_L | PMP_W | PMP_X);
+
+[potential_risk] lib/sbi/sbi_domain.c:136-141  sbi_domain_get_oldpmp_flags
+  Under standard (non-Smepmp) PMP, SU_READABLE/WRITABLE/EXECUTABLE flags map directly to PMP_R/PMP_W/PMP_X with L=0. This means the catch-all region grants S/U-mode full R/W/X while M-mode retains default full access. For a shared CLIC vector table under standard PMP, the ACLIC spec requires at minimum L=1,R=0,W=0,X=1 (execute-only) to prevent S-mode modification of vector table entries.
+  | if (reg->flags & SBI_DOMAIN_MEMREGION_SU_READABLE)
+  | 	pmp_flags |= PMP_R;
+  | if (reg->flags & SBI_DOMAIN_MEMREGION_SU_WRITABLE)
+  | 	pmp_flags |= PMP_W;
+  | if (reg->flags & SBI_DOMAIN_MEMREGION_SU_EXECUTABLE)
+  | 	pmp_flags |= PMP_X;
+
+[potential_risk] lib/sbi/sbi_hart_pmp.c:184-185  sbi_hart_smepmp_configure
+  csr_set(CSR_MSECCFG, MSECCFG_MML) activates ePMP encoding, but there is no prior audit of whether any shared region covers CLIC vector table memory. Once MML is set, all SURW_MRW regions (shared R/W) that overlap vector table memory grant S-mode read/write access to M-mode interrupt handler pointers with no carve-out possible.
+  | /* Set the MML to enforce new encoding */
+  | csr_set(CSR_MSECCFG, MSECCFG_MML);
+
+[potential_risk] include/sbi/riscv_encoding.h:89-89  (global definitions)
+  CSR definitions for CLIC vector table registers are absent: no CSR_MIVT (0x307), CSR_MEIVT (0x308), CSR_SIVT (0x107), CSR_SEIVT (0x108), or CSR_MNXTI. Without these CSR definitions, OpenSBI cannot detect, configure, or protect CLIC interrupt vector table memory regions.
+  | #define MTVEC_MODE			_UL(0x00000003)
+
+[potential_risk] include/sbi/riscv_encoding.h:858-862  (global definitions)
+  mstateen0 bit definitions exist for IMSIC (bit 58) and AIA (bit 59) but the ACLIC bit (bit 53 per spec) is missing. Without SMSTATEEN0_ACLIC, OpenSBI cannot gate S-mode access to ACLIC indirect CSRs (sivt, seivt, spistatus, sithreshold, sspcs, acliciprio, aclicsourcecfg), and cannot enable ACLIC-specific mstateen0 protections.
+  | #define SMSTATEEN0_IMSIC		(_ULL(1) << SMSTATEEN0_IMSIC_SHIFT)
+  | #define SMSTATEEN0_AIA			(_ULL(1) << SMSTATEEN0_AIA_SHIFT)
+
+[potential_risk] lib/sbi/sbi_hart.c:647-648  hart_detect_features
+  Extension detection probes CSR_MTOPI for SBI_HART_EXT_SMAIA only. There is no detection for Smip/Smaclic/Ssaclic extensions. Without a CLIC-aware feature flag, there is no conditional branch to configure vector-table-aware PMP entries or ACLIC mstateen0 bits.
+  | __check_ext_csr(SBI_HART_PRIV_VER_UNKNOWN,
+  | 		CSR_MTOPI, SBI_HART_EXT_SMAIA);
+
+[potential_risk] firmware/fw_base.S:393-401  _start_warm
+  Trap vector setup unconditionally writes the raw _trap_handler address to CSR_MTVEC (mtvec.MODE=0, Direct mode). No CLIC vector mode (mtvec.MODE=3) is configured. If a prior boot stage set mivt/meivt to point to shared memory, those CSRs remain active but unprotected—OpenSBI neither reads, clears, nor protects them with PMP entries.
+  | lla	a4, _trap_handler
+  | csrr	a5, CSR_MISA
+  | srli	a5, a5, ('H' - 'A')
+  | andi	a5, a5, 0x1
+  | beq	a5, zero, _skip_trap_handler_hyp
+  | lla	a4, _trap_handler_hyp
+  | _skip_trap_handler_hyp:
+  | csrw	CSR_MTVEC, a4
+
+[potential_risk] platform/generic/include/thead/c9xx_encoding.h:110-110  (global definitions)
+  T-Head C9xx defines THEAD_C9XX_CSR_NT_MTVT (0xbe4), a vendor-specific CLIC-style interrupt vector table base CSR. OpenSBI never reads, writes, or protects this CSR with PMP entries. If a prior boot stage configured NT_MTVT to point to memory subsequently mapped as shared R/W, S-mode can read and modify M-mode interrupt handler pointers.
+  | #define THEAD_C9XX_CSR_NT_MTVT		0xbe4
+
+[potential_risk] lib/sbi/sbi_hart_pmp.c:220-224  sbi_hart_smepmp_map_range
+  The dynamic PMP mapping function hardcodes pmp_flags = PMP_W|PMP_X (shared R/W for M and S/U under MML=1). There is no option to create a shared execute-only (SUX_MRX, PMP_L|PMP_W|PMP_X) mapping that would be appropriate for a vector table region. Any use of map_range for vector table memory would inadvertently grant S/U-mode read access.
+  | /* shared R/W access for M and S/U mode */
+  | unsigned int pmp_flags = (PMP_W | PMP_X);
+
+[potential_risk] lib/sbi/sbi_domain.c:425-429  sbi_domain_register
+  Domain registration validates firmware region ordering (fw_region_inited) but performs no overlap check for CLIC/CLINT vector table memory. Any MMIO or shared region can silently overlap the vector table address range, granting S-mode unintended read/write permissions.
+  | if (!dom->fw_region_inited) {
+  | 	sbi_printf("%s: %s does not have firmware region\n",
+  | 		   __func__, dom->name);
+  | 	return SBI_EINVAL;
+  | }
+
+[potential_risk] lib/sbi/sbi_domain.c:176-177  sbi_domain_get_smepmp_flags
+  SURW_MRW flag combination maps to PMP_W|PMP_X under Smepmp MML=1, meaning shared read/write for both M and S/U. This is the encoding used by SiFive and ESWIN platform port configurations for all peripheral MMIO regions. Any CLIC vector table in a SURW_MRW region is fully readable and writable by S-mode.
+  | else if (SBI_DOMAIN_MEMREGION_IS_SURW_MRW(reg->flags))
+  | 	pmp_flags = (PMP_W | PMP_X);
+

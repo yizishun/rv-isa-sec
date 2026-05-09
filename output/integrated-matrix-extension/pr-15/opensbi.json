@@ -1,0 +1,114 @@
+{
+  "pr_number": 15,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 15,
+    "violation_condition": "OpenSBI trap handler or SBI call implementation performs read-modify-write on the vtype CSR (e.g., to set vsew or vlmul for internal vector save/restore) without preserving the IME-specific bit fields—lambda[7:5], altfmt_A[9], altfmt_B[10], and bs[11]—that the S-mode workload had configured for in-flight matrix tile operations.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "csrrs|csrrc|csrrw.*vtype|CSR_(R|W|RW).*VTYPE|vtype.*&=|vtype.*\\|=|SBI_VTYPE",
+    "affected_entities": [
+      "vtype",
+      "frm",
+      "fflags",
+      "vsetvli",
+      "vfmmacc.vv",
+      "vmmacc.vv",
+      "vmtl.v",
+      "vmttl.v",
+      "vmtts.v",
+      "vmts.v"
+    ],
+    "summary": "OpenSBI must preserve IME vtype fields (lambda, altfmt_A/B, bs) and frm across traps; spec now mandates frm-directed rounding for intermediate accumulations instead of implementation-defined rounding, so any frm clobber by M-mode silently corrupts S-mode IME floating-point results."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap_v_ldst.c",
+        "function_name": "sbi_misaligned_v_ld_emulator",
+        "line_start": 140,
+        "line_end": 238,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The emulator reads the full vtype CSR value at line 148 (capturing all IME-specific bits lambda[7:5], altfmt_A[9], altfmt_B[10], bs[11] if present), temporarily clobbers vtype via vsetvli in set_vreg/get_vreg helpers for internal e8/m8 data movement, and then restores the full original vtype via vsetvl at lines 219 (trap-redirect path) and 235 (normal completion path). The IME bit fields are preserved across the entire emulation because the original vtype value is saved before any clobbering and restored exactly via the vsetvl instruction using the saved rs2 operand. No read-modify-write CSR instruction (csrrs/csrrc/csrrw) is used on vtype; all modifications go through the architecturally-defined vsetvl/vsetvli instructions.",
+      "snippet": "ulong vtype = csr_read(CSR_VTYPE);  // line 148: captures full vtype incl. IME bits\n// ... set_vreg/get_vreg clobber vtype with vsetvli e8,m8 internally ...\nvsetvl(vl, vtype);                   // line 235: restores full original vtype",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 161,
+          "line_end": 164,
+          "excerpt": "The vtype register has five fields, vill, vma, vta, vsew[2:0], and vlmul[2:0]. Bits vtype[XLEN-2:8] should be written with zero, and non-zero values in this field are reserved."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 1197,
+          "line_end": 1199,
+          "excerpt": "The vset{i}vl{i} instructions set the vtype and vl CSRs based on their arguments, and write the new value of vl into rd."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap_v_ldst.c",
+        "function_name": "sbi_misaligned_v_st_emulator",
+        "line_start": 240,
+        "line_end": 332,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Identical save/restore pattern as the load emulator. Reads full vtype at line 248, clobbers it temporarily for e8/m8 internal operations, restores full original value at lines 318 (trap-redirect) and 329 (normal completion). IME bit fields are preserved.",
+      "snippet": "ulong vtype = csr_read(CSR_VTYPE);  // line 248: captures full vtype incl. IME bits\n// ... set_vreg/get_vreg clobber vtype with vsetvli e8,m8 internally ...\nvsetvl(vl, vtype);                   // line 329: restores full original vtype",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 1197,
+          "line_end": 1199,
+          "excerpt": "The vset{i}vl{i} instructions set the vtype and vl CSRs based on their arguments, and write the new value of vl into rd."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap_v_ldst.c",
+        "function_name": "set_vreg",
+        "line_start": 24,
+        "line_end": 75,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Helper uses vsetvli x0, ..., e8, m8, tu, ma which writes vtype with bits[11:5] cleared to zero. While the callers (sbi_misaligned_v_ld_emulator, sbi_misaligned_v_st_emulator) save and restore the original vtype, a nested trap or interrupt occurring between this vsetvli and the eventual vsetvl restore (caller lines 235/329) would execute with IME bits zeroed. However, this window is extremely narrow and requires a concurrent trap plus matrix-aware code in the trap handler to be exploitable. No confirmed bug.",
+      "snippet": "asm volatile (\n  \"vsetvli x0, %0, e8, m8, tu, ma\\n\\t\"  // clears IME bits [11:5]\n  :: \"r\" (pos + size));",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap_v_ldst.c",
+        "function_name": "get_vreg",
+        "line_start": 77,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same intermediate window concern as set_vreg—vsetvli at line 86 clears bits[11:5] to zero before the caller's eventual vsetvl restore. Same rationale: callers preserve the original vtype, so only a concurrent nested trap could observe the intermediate state.",
+      "snippet": "asm volatile (\n  \"vsetvli x0, %0, e8, m8, tu, ma\\n\\t\"  // clears IME bits [11:5]\n  :: \"r\" (pos + size));",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_trap_v_ldst.c",
+        "function_name": "vsetvl",
+        "line_start": 130,
+        "line_end": 138,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Thin wrapper around the vsetvl instruction. Used by callers exclusively to restore a previously-saved full vtype value (including IME bits). Correctly passes the full vtype as rs2 to the instruction. No independent vulnerability.",
+      "snippet": "asm volatile (\n  \"vsetvl x0, %0, %1\\n\\t\"  // rs2 = full vtype (IME bits preserved)\n  :: \"r\" (vl), \"r\" (vtype));",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

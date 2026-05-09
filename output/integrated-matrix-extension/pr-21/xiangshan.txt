@@ -1,0 +1,46 @@
+PR #21  target=xiangshan  overall=compliant
+Spec: Splitting Zvvmtls into order-preserving (Zvvmtls) and transposing (Zvvmttls) sub-extensions means the decoder must check two independent extension bits; a single-bit check allows vmttl.v/vmtts.v to execute without Zvvmttls being implemented, enabling unauthorized transposed memory access patterns that bypass the intended ISA feature gate.
+Violation: When XiangShan implements Zvvmtls but not Zvvmttls, the instruction decoder fails to trap vmttl.v/vmtts.v as illegal instructions because the decoder still maps these opcodes under the old Zvvmtls group. Conversely, if the decoder uses a single extension-check bit for both Zvvmtls and Zvvmttls, transposing tile loads/stores execute without the Zvvmttls extension being present, or order-preserving loads/stores incorrectly trap when only Zvvmttls is implemented.
+Consequence: privilege_escape
+Pattern: decoder.*(vmttl|vmtts).*extCheck|extension.*check.*(Zvvmtls|Zvvmttls)|illegalInstruction.*Zvvmttls|TileLoadStore.*decoder|lambda.*override.*vtype.*[23]:0
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/Parameters.scala:292-305  ISAExtensions
+  The Integrated Matrix extension (Zvvmtls/Zvvmttls) is not present in the ISA extension string. Neither extension bit is declared, so no matrix tile instructions can be erroneously enabled.
+  | def ISAExtensions = Seq(
+  |   // single letter extensions, in canonical order
+  |   "i", "m", "a", "f", "d", "c", /* "b", */ "v", "h",
+  |   ...
+  |   "zvl128b", "zvl32b", "zvl64b"
+  | )
+
+[compliant] src/main/scala/xiangshan/backend/decode/DecodeUnit.scala:798-810  decode_table
+  No Integrated Matrix decode table (e.g., MatrixDecode) is aggregated into the instruction decode pipeline. The decode_table only includes: XDecode, FpDecode, BitmanipDecode, ScalarCryptoDecode, XSDebugDecode, CBODecode, SvinvalDecode, HypervisorDecode, VecDecoder, ZicondDecode, ZimopDecode, ZfaDecode. Without a matrix decoder table, no vmttl.v/vmtts.v or tile load/store opcodes are recognized.
+  | val decode_table: Array[(BitPat, List[BitPat])] = XDecode.table ++
+  |   FpDecode.table ++
+  |   ...
+  |   VecDecoder.table ++
+  |   ZicondDecode.table ++
+  |   ZimopDecode.table ++
+  |   ZfaDecode.table
+
+[compliant] src/main/scala/xiangshan/backend/decode/DecodeUnit.scala:50-61  decodeDefault / exceptionII
+  The default decode entry produces SelImm.INVALID_INSTR for any unrecognized opcode (line 61). This is wired into the exceptionII signal at line 878, which sets the illegalInstr exception vector bit at line 915. Any hypothetical matrix extension opcode (vmttl.v, vmtts.v, tile load/store) would correctly trap as an illegal instruction, preventing privilege escape.
+  | def decodeDefault: List[BitPat] = // illegal instruction
+  |   List(SrcType.X, SrcType.X, SrcType.X, FuType.X, FuOpType.X,
+  |        N, N, N, N, N, N, N, UopSplitType.X, SelImm.INVALID_INSTR)
+  | // ...
+  | decodedInst.selImm === SelImm.INVALID_INSTR ||  // line 878: triggers exceptionII
+  | decodedInst.exceptionVec(illegalInstr) := exceptionII || ...  // line 915
+
+[compliant] src/main/scala/xiangshan/backend/decode/VecDecoder.scala:1-842  VecDecoder.table
+  The vector decoder table (VecDecoder) only decodes standard RVV instructions (vset, opivv, opivx, opivi, opmvv, opmvx, opfvv, opfvf, opfff, vls categories). No matrix tile instructions (vmttl.v, vmtts.v, vtilel.v, vtilestore.v) are present in the vector decode table. Combined with decodeDefault logic, these opcodes correctly trap.
+  | VecDecoder.table covers: vset, opivv, opivx, opivi, opmvv, opmvx, opfvv, opfvf, opfff, vls categories only
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:608-633  MisaBundle
+  The misa CSR bundle has no bit defined for the Integrated Matrix extension. Standard misa bits A(0), B(1), C(2), D(3), F(5), H(7), M(12), Q(16), V(21), X(23) are defined, but no Zvvmtls/Zvvmttls bit exists. No matrix-related CSRs (mtilecfg, stilecfg, mstart, msize, mtype) are instantiated in the CSR module hierarchy.
+  | MisaBundle defines bits: A(0), B(1), C(2), D(3), F(5), H(7), M(12), Q(16), V(21), X(23) — no matrix extension bit
+
+[compliant] src/main/scala/xiangshan/backend/fu/CSRCustom.scala:15-67  CSRCustom
+  No matrix tile configuration CSRs (mtilecfg, stilecfg, mstart, msize, mtype) exist in the custom CSR definitions. The only custom CSRs defined are for branch prediction, prefetch, load violation prediction, memory block control, WFI/fusion, and power/flush management.
+  | CSRCustom defines: sbpctl, spfctl, slvpredctl, smblockctl, srnctl, mcorepwr, mflushpwr — no matrix tile CSRs
+

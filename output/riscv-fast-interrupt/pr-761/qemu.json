@@ -1,0 +1,111 @@
+{
+  "pr_number": 761,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 761,
+    "violation_condition": "When QEMU implements the Smidctrl ACLIC indirect CSR access (xiselect range 0x1000-0x10FF for xireg4-xireg6 iprio/sourcecfg) and the upper-bound check uses '<=' or '<=' with the old off-by-one value 0x1100 instead of 0x10FF, xiselect=0x1100 is incorrectly rejected as reserved. Conversely, if the xiselect writable mask (ISELECT_MASK_SXCSRIND=0xfff, which truncates bits 12+) is applied before the range comparison, values like 0x1100 could be aliased to 0x100 and mishandled.",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "off-by-one range boundary: xiselect <= 0x1100 or xiselect < 0x1100 vs correct xiselect <= 0x10FF; also masking xiselect before ACLIC range check causing alias collisions with lower regions",
+    "affected_entities": [
+      "miselect",
+      "siselect",
+      "vsiselect",
+      "mireg4",
+      "mireg5",
+      "mireg6",
+      "sireg4",
+      "sireg5",
+      "sireg6",
+      "vsireg4",
+      "vsireg5",
+      "vsireg6"
+    ],
+    "summary": "PR #761 fixes the Smidctrl xiselect reserved-range upper bound from 0x1100 to 0x10FF (off-by-one correction); QEMU does not yet implement Smidctrl ACLIC indirect access, but when adding it, a boundary comparison using the old <=0x1100 would wrongly trap legitimate access to entry 256, denying functionality"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "",
+        "line_start": 1050,
+        "line_end": 1050,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ISELECT_MASK_SXCSRIND is defined as 0xfff (12 bits), which masks out bit 12 and above. The Smidctrl ACLIC indirect CSR access range is xiselect 0x1000-0x10FF, which requires bit 12 to be set. When smcsrind/sscsrind is enabled, rmw_xiselect() applies wr_mask &= ISELECT_MASK_SXCSRIND (csr.c:2456), silently truncating xiselect=0x1000 to 0x000, xiselect=0x10FF to 0x0FF, and xiselect=0x1100 to 0x100. This would alias Smidctrl ACLIC register accesses to lower register regions (undefined/IMSIC range), causing silent guest state corruption when Smidctrl is implemented.",
+      "snippet": "#define ISELECT_MASK_SXCSRIND              0xfff",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 378,
+          "line_end": 382,
+          "excerpt": "To have full control over the necessary APLIC registers, the following indirect CSR access is added. The registers xireg4 through xireg6 are reserved and raise an illegal instruction exception when xiselect is in the range 0x1000-0x10FF."
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 384,
+          "line_end": 393,
+          "excerpt": "xiselect=0x1000 → acliciprio0 ... xiselect=0x10FF → acliciprio255"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xiselect",
+        "line_start": 2455,
+        "line_end": 2456,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "rmw_xiselect() applies ISELECT_MASK_SXCSRIND (0xfff) unconditionally when smcsrind/sscsrind is enabled, regardless of whether Smidctrl is also enabled. Since 0xfff masks out bit 12, any write of xiselect values in the Smidctrl ACLIC range (0x1000-0x10FF) is silently truncated. Verified: 0x1000 & 0xfff = 0x000, 0x10FF & 0xfff = 0x0FF, 0x1100 & 0xfff = 0x100. When a future Smidctrl implementation is added, the guest will observe miselect/siselect values different from what it wrote, breaking ACLIC register access.",
+      "snippet": "if (riscv_cpu_cfg(env)->ext_smcsrind || riscv_cpu_cfg(env)->ext_sscsrind) {\n    wr_mask &= ISELECT_MASK_SXCSRIND;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 300,
+          "line_end": 303,
+          "excerpt": "Smidctrl depends on the Smcsrind and Smaia extensions."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xireg_csrind",
+        "line_start": 2836,
+        "line_end": 2845,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "rmw_xireg_csrind() correctly returns RISCV_EXCP_ILLEGAL_INST for unimplemented xiselect ranges (the else branch at line 2845). Since Smidctrl ACLIC (0x1000-0x10FF) is not yet implemented, the function properly rejects accesses to this range. The existing CD (0x40-0x5f) and CTR (0x200-0x2FF) ranges are correctly dispatched.",
+      "snippet": "if (xiselect_cd_range(isel)) {\n    ret = rmw_xireg_cd(env, csrno, isel, val, new_val, wr_mask);\n} else if (xiselect_ctr_range(csrno, isel)) {\n    ret = rmw_xireg_ctr(env, csrno, isel, val, new_val, wr_mask);\n} else {\n    return RISCV_EXCP_ILLEGAL_INST;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xiregi",
+        "line_start": 2870,
+        "line_end": 2883,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "rmw_xiregi() dispatches xireg2-xireg6 to rmw_xireg_csrind() without range-checking whether the xiselect value is valid for the specific xireg register. Per spec, xireg4-xireg6 must raise illegal instruction for xiselect 0x1000-0x10FF. Currently this is harmless because rmw_xireg_csrind() rejects unknown ranges. However, when Smidctrl support is added to rmw_xireg_csrind(), an additional check must ensure that the ACLIC range (0x1000-0x10FF) is only accessible via xireg (iprio) and xireg2/xireg3 (sourcecfg), not xireg4-xireg6.",
+      "snippet": "return rmw_xireg_csrind(env, csrno, isel, val, new_val, wr_mask);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 380,
+          "line_end": 382,
+          "excerpt": "The registers xireg4 through xireg6 are reserved and raise an illegal instruction exception when xiselect is in the range 0x1000-0x10FF."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

@@ -1,0 +1,123 @@
+{
+  "pr_number": 609,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 609,
+    "violation_condition": "OpenSBI initializes an ACLIC-configured hart but does not set the appropriate mstateen0 CSR bit (specified as '??' in the spec — bit number undefined) to enable S-mode access to ACLIC CSRs (setipnum, clripnum, setienum, clrienum, idelivery, ithreshold, topi, claimi), causing all S-mode attempts to configure external interrupts to trap with illegal instruction exceptions.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "mstateen0 CSR write operations that omit the ACLIC-enable bit, or conditional paths that assume Smaclic/Ssaclic implies Smaiae CSRs (eidelivery, eip, eie) are present when the spec removes that dependency",
+    "affected_entities": [
+      "mstateen0",
+      "setipnum",
+      "clripnum",
+      "setienum",
+      "clrienum",
+      "idelivery",
+      "ithreshold",
+      "topi",
+      "claimi",
+      "sourcecfgK[D]",
+      "sourcecfgK[SM]"
+    ],
+    "summary": "OpenSBI must configure an undefined mstateen0 bit to gate S-mode ACLIC register access; failure renders S-mode external interrupt management inoperable, and the removed Smaiae dependency means IMSIC CSR access (eidelivery/eip/eie) is no longer valid on ACLIC systems"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "mstatus_init",
+        "line_start": 89,
+        "line_end": 98,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "mstateen0 bits for ACLIC are never set because the code at line 95 gates SMSTATEEN0_AIA (bit 59) and SMSTATEEN0_IMSIC (bit 58) on SBI_HART_EXT_SMAIA. On an ACLIC-only system (Smaclic/Ssaclic without IMSIC), CSR_MTOPI does not exist, so SBI_HART_EXT_SMAIA is never detected, and the else branch at line 98 explicitly clears both bits. Additionally, bit 53 (ACLIC) — the dedicated mstateen0 enable for ACLIC CSRs per the Smaclic/Ssaclic spec — is never set because no SMSTATEEN0_ACLIC define exists in OpenSBI. Per the ACLIC spec section 'State Enable', bit 58 (IMSIC) in mstateen0 is implemented even when IMSIC is not present, gating access to the reused IMSIC CSRs (stopei, eip[k], eie[k]). With both bits 53 and 58 at zero, all S-mode accesses to ACLIC CSRs (setipnum, clripnum, setienum, clrienum, idelivery/ithreshold via indirect CSR, topi, claimi) trap with illegal instruction exceptions, causing denial of service for S-mode external interrupt handling.",
+      "snippet": "if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMAIA))\n\tmstateen_val |= (SMSTATEEN0_AIA | SMSTATEEN0_IMSIC);\nelse\n\tmstateen_val &= ~(SMSTATEEN0_AIA | SMSTATEEN0_IMSIC);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 654,
+          "line_end": 662,
+          "excerpt": "If the Smstateen extension is implemented, then the bit 53 (ACLIC) in mstateen0 is implemented. If bit 53 (ACLIC) of a controlling mstateen0 CSR is zero, then access to the new CSRs (acliciprio[k], aclicsourcecfg[k]) by S-mode or a lower-privilege mode results in an illegal instruction exception. If the Smstateen extension is implemented, then the bit 58 (IMSIC) in mstateen is implemented, even though IMSIC is not present. If bit 58 of a controlling mstateen0 CSR is zero, then access to the CSRs reused from the IMSIC (stopei, eip[k] and eie[k]) by S-mode or a lower-privilege mode results in an illegal instruction exception."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 139,
+          "line_end": 143,
+          "excerpt": "For every bit in an mstateen CSR that is zero (whether read-only zero or set to zero), the same bit appears as read-only zero in the matching hstateen and sstateen CSRs. On reset, all writable mstateen bits are initialized by the hardware to zeros."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "include/sbi/riscv_encoding.h",
+        "function_name": "",
+        "line_start": 857,
+        "line_end": 878,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SMSTATEEN0 bit definitions include bit 58 (IMSIC) and bit 59 (AIA) but lack a definition for bit 53 (ACLIC). The ACLIC specification (src/aclic.adoc:656) assigns bit 53 of mstateen0 as the ACLIC enable bit. Without a SMSTATEEN0_ACLIC macro, any code attempting to enable S-mode ACLIC CSR access has no bit constant to reference. Additionally, the existing SMSTATEEN0_IMSIC (bit 58) comment in riscv_encoding.h describes it as controlling IMSIC access 'provided by the Ssaia extension', but the ACLIC spec clarifies that bit 58 is implemented even without IMSIC and controls the reuse of IMSIC-form CSRs (stopei, eip[k], eie[k]) in ACLIC contexts.",
+      "snippet": "#define SMSTATEEN0_IMSIC_SHIFT\t58\n#define SMSTATEEN0_IMSIC\t\t(_ULL(1) << SMSTATEEN0_IMSIC_SHIFT)\n#define SMSTATEEN0_AIA_SHIFT\t\t59\n#define SMSTATEEN0_AIA\t\t\t(_ULL(1) << SMSTATEEN0_AIA_SHIFT)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 654,
+          "line_end": 662,
+          "excerpt": "If the Smstateen extension is implemented, then the bit 53 (ACLIC) in mstateen0 is implemented. If bit 53 (ACLIC) of a controlling mstateen0 CSR is zero, then access to the new CSRs (acliciprio[k], aclicsourcecfg[k]) by S-mode or a lower-privilege mode results in an illegal instruction exception. If the Smstateen extension is implemented, then the bit 58 (IMSIC) in mstateen is implemented, even though IMSIC is not present."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "include/sbi/sbi_hart.h",
+        "function_name": "",
+        "line_start": 29,
+        "line_end": 79,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The sbi_hart_extensions enum defines SBI_HART_EXT_SMAIA (line 31) for AIA M-mode CSR capability, but has no SBI_HART_EXT_SMACLIC or SBI_HART_EXT_SSACLIC entries. This means OpenSBI has no mechanism to represent that a hart implements the Smaclic/Ssaclic extensions. Without these enum values: (a) hart_detect_features() cannot probe Smaclic presence, (b) mstatus_init() cannot conditionally set ACLIC-related mstateen0 bits, and (c) sbi_trap_handler() cannot distinguish ACLIC from non-AIA interrupt delivery paths.",
+      "snippet": "enum sbi_hart_extensions {\n\tSBI_HART_EXT_SMAIA = 0,\n\tSBI_HART_EXT_SMEPMP,\n\tSBI_HART_EXT_SMSTATEEN,",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "hart_detect_features",
+        "line_start": 646,
+        "line_end": 648,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "hart_detect_features() detects SBI_HART_EXT_SMAIA by probing CSR_MTOPI (line 648). On an ACLIC-only system, CSR_MTOPI is defined by the Smaia extension — not by Smaclic/Ssaclic — so this probe fails. There is no corresponding detection path for Smaclic/Ssaclic via any ACLIC-specific CSR probe, and no entry for 'smaclic' or 'ssaclic' in the sbi_hart_ext[] data table (lines 363-399). Consequently, SBI_HART_EXT_SMAIA is not set on ACLIC systems, and the mstateen0 ACLIC bits are never enabled.",
+      "snippet": "__check_ext_csr(SBI_HART_PRIV_VER_UNKNOWN,\n\tCSR_MTOPI, SBI_HART_EXT_SMAIA);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 338,
+          "line_end": 348,
+          "excerpt": "ACLIC provides access to interrupt pending and enable bits of the hart-local APLIC domains using the same mechanisms as access to interrupt pending and enable bits in the interrupt files of an IMSIC. The AIA eidelivery and eithreshold CSRs defined for the Incoming Message Signaled Interrupt Controller (IMSIC) are not included in the scope of Smidctrl/Ssidctrl. In an ACLIC, registers eip[k] and eie[k] serve the same functionality as with eidelivery = 1 in an IMSIC."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "mstatus_init",
+        "line_start": 116,
+        "line_end": 116,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The CSR_MSTATEEN0 write at line 116 correctly commits the mstateen_val computed by the preceding logic. The write itself is correct and properly encompasses all bits that OpenSBI currently knows about. The root cause is upstream: the mstateen_val computation omits ACLIC bits, not the write itself.",
+      "snippet": "csr_write64(CSR_MSTATEEN0, mstateen_val);",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

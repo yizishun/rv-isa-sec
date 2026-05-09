@@ -1,0 +1,152 @@
+{
+  "pr_number": 633,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 633,
+    "violation_condition": "In XiangShan RTL, any CLIC/IMSIC preemption threshold comparator that directly transcribes the old spec formula 'iprio[i] & NIPPRIO_MASK >= xithreshold' into Chisel/Verilog with HDL-native operator precedence will produce: iprio[i] & (NIPPRIO_MASK >= xithreshold). Since NIPPRIO_MASK is a wide constant (e.g., 0xFF for 8-bit priority) and xithreshold is a CSR-programmed small value, (NIPPRIO_MASK >= xithreshold) is a constant true, reducing the preemption condition to 'iprio[i] != 0' — any non-zero-priority pending interrupt preempts the current handler regardless of the threshold CSR value. Specifically in XiangShan's InterruptFilter, the IpriosSort/minSelect infrastructure at lines 162-189 performs priority comparison (prioNum <= comparison) but feeds into external IMSIC hardware (marked 'Todo: IMSIC' at CSRAIA.scala:197). If that external IMSIC threshold comparator uses the buggy precedence, the xithreshold CSR becomes non-functional for preemption gating.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "xithreshold.*>|>=|threshold.*prio|preempt.*threshold|nipprio.*mask.*threshold|prio.*>=.*threshold|priority.*>=.*thresh",
+    "affected_entities": [
+      "xithreshold",
+      "xnxti",
+      "miselect",
+      "mireg",
+      "iprio",
+      "NIPPRIO_MASK"
+    ],
+    "summary": "Operator precedence bug in CLIC preemption formula (PR #633): iprio[i] & NIPPRIO_MASK >= xithreshold evaluates as iprio[i] & (NIPPRIO_MASK >= xithreshold) in HDL, turning xithreshold into a no-op and allowing unconditional preemption from any non-zero priority interrupt"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala",
+        "function_name": "minSelect",
+        "line_start": 162,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The minSelect recursive priority comparator performs pure prioNum comparison at line 179 (Mux(left.prioNum <= right.prioNum, left, right)) with no preemption threshold qualification. This is the locus where a Smnip threshold comparator (IPRIO & NIPPRIO_MASK >= xithreshold) would be added. If implemented using the spec's raw formula without explicit Scala parentheses, Chisel's operator precedence would parse 'iprio & MASK >= threshold' as 'iprio & (MASK >= threshold)', which is constant-true, reducing preemption gating to 'iprio != 0'. Currently compliant because no threshold CSR wiring exists, but this is a high-risk insertion point for the described vulnerability class.",
+      "snippet": "(!left.isZero && !right.isZero) -> Mux1H(Seq(\n  (left.greaterThan255 && !right.greaterThan255) -> right,\n  (!left.greaterThan255 && right.greaterThan255) -> left,\n  (!left.greaterThan255 && !right.greaterThan255) -> Mux(left.prioNum <= right.prioNum, left, right),\n))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 795,
+          "line_end": 806,
+          "excerpt": "When xithreshold is a nonzero value, an interrupt source is considered disabled irrespective of its interrupt-enable bit, when the following condition holds: IPRIO >= xithreshold & NIPPRIO_MASK"
+        },
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 698,
+          "line_end": 702,
+          "excerpt": "NIPPRIO_MASK = ~(2^(mipreemptcfg.preemptmsk) - 1)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala",
+        "function_name": "IpriosSort",
+        "line_start": 624,
+        "line_end": 630,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The IpriosSort bundle (idx, enable, isZero, greaterThan255, prioNum) lacks threshold comparison fields (e.g., belowThreshold, exceedsThreshold). Adding a threshold field computed as 'prioNum & NIPPRIO_MASK >= mithreshold' without explicit parenthesization '(prioNum & NIPPRIO_MASK) >= mithreshold' would introduce the operator-precedence bug. Currently compliant by absence of any threshold logic.",
+      "snippet": "class IpriosSort extends Bundle {\n  val idx = UInt(6.W)\n  val enable = Bool()\n  val isZero = Bool()\n  val greaterThan255 = Bool()\n  val prioNum = UInt(8.W)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 795,
+          "line_end": 806,
+          "excerpt": "IPRIO >= xithreshold & NIPPRIO_MASK"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala",
+        "function_name": "mipriosSort construction (inline loop)",
+        "line_start": 70,
+        "line_end": 91,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mipriosSort correctly extracts IPRIO fields from miprios CSR array (line 83: 'iprio.prioNum := miprios(7+8*defaultPrio, 8*defaultPrio)') and from mtopei.IPRIO (line 79). Enable is gated on mie bits via mtopigather (line 73). No threshold coparison exists here. Compliant for current non-Smnip state.",
+      "snippet": "when (mtopigather(defaultPrio)) {\n  iprio.enable := true.B\n  iprio.prioNum := miprios(7 + 8 * defaultPrio, 8 * defaultPrio)\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala",
+        "function_name": "mIRVecTmp / hsIRVecTmp / vsIRVecTmp",
+        "line_start": 465,
+        "line_end": 481,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Per-privilege-level interrupt vector gating uses only privilege mode and xIE state bits (mstatusMIE/sstatusSIE/vsstatusSIE). No Smnip threshold qualification. Compliant for current non-Smnip architecture, but would need threshold qualification if Smnip is implemented.",
+      "snippet": "val mIRVecTmp = Mux(\n  privState.isModeM && mstatusMIE || privState < PrivState.ModeM,\n  io.out.mtopi.IID.asUInt, 0.U)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala",
+        "function_name": "irToHS / irToVS arbitration",
+        "line_start": 487,
+        "line_end": 496,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Interrupt-level arbitration is purely privilege-mode-based (M > HS > VS) with hard ordering. No Smnip threshold-based preemption that would allow a lower-level interrupt to preempt a higher-level handler. Compliant for current non-Smnip state.",
+      "snippet": "val irToHS = !mIRNotZero && hsIRNotZero\nval irToVS = !mIRNotZero && !hsIRNotZero && vsIRNotZero",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala",
+        "function_name": "InterruptFilterIO",
+        "line_start": 566,
+        "line_end": 621,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "InterruptFilterIO input bundle lacks threshold CSR fields (mithreshold, mipreemptcfg.preemptmsk, mpistatus.pithreshold) and current-handler-priority fields required for Smnip nested preemption. Adding these fields without proper wiring from CSR modules would result in uninitialized/implicit-zero wires, making the threshold gate always-pass. Integration risk if Smnip CSRs are added.",
+      "snippet": "class InterruptFilterIO extends Bundle {\n  val in = Input(new Bundle {\n    val privState = new PrivState\n    // (no threshold/mipreemptcfg fields)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 677,
+          "line_end": 682,
+          "excerpt": "0x347 mithreshold Interrupt enable threshold; 0x348 mipreemptcfg Interrupt preemption configuration"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "aiaCSRMods registration",
+        "line_start": 160,
+        "line_end": 173,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The AIA CSR module list (aiaCSRMods) registers mtopei/mtopi/stopei/stopi/vstopei/vstopi but no mithreshold or mipreemptcfg CSR modules. If Smnip CSRs are added to this list but omitted from aiaCSRMap/aiaCSROutMap (lines 175-181), or conversely added as modules but their outputs left unwired to InterruptFilterIO, the threshold CSR would be a dead write-only register with no effect on interrupt preemption. Integration risk.",
+      "snippet": "val aiaCSRMods = Seq(\n  miselect, mireg, mtopei, mtopi,\n  siselect, sireg, stopei, stopi,\n  vsiselect, vsireg, vstopi, vstopei,\n)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 677,
+          "line_end": 682,
+          "excerpt": "(NEW) 0x347 mithreshold; (NEW) 0x348 mipreemptcfg"
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

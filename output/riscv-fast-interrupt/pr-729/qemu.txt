@@ -1,0 +1,72 @@
+PR #729  target=qemu  overall=potential_risk
+Spec: IVT mode trap entry must atomically clear the interrupt-pending bit when vectoring; failure to do so causes infinite re-delivery loop (DoS) after mret/sret
+Violation: In QEMU's emulation of smehv IVT (Interrupt Vector Table) mode: when the CPU takes an interrupt trap in IVT mode, it fetches the handler address from VTBASE + XLEN/8 × exccode, sets PC to that address — but does NOT clear the corresponding interrupt-pending bit in mip/sip or the IMSIC eistate. After the handler executes mret/sret, riscv_cpu_interrupt() re-evaluates and finds the same pending bit still set, causing immediate re-delivery of the same interrupt in an infinite loop.
+Consequence: denial_of_service
+Pattern: IVT/hardware-vectored trap entry path that fetches handler address from VTBASE/mivt/sivt and sets PC but lacks a preceding or concurrent write to clear the pending bit (mip CSR or IMSIC EIP/eistate) for the interrupt being taken — search for vtbase, VTBASE, mivt, sivt alongside pc assignment without corresponding pending-bit clear
+------------------------------------------------------------
+[potential_risk] target/riscv/cpu_helper.c:2503-2508  riscv_cpu_do_interrupt
+  M-mode trap dispatch computes PC from mtvec without checking mivt.EHV for hardware-vectored mode. No mivt CSR exists in QEMU, and the interrupt-pending bit is never cleared during trap entry. If IVT mode (xtvec.mode=11) were implemented, the spec requires clearing the corresponding interrupt-pending bit (aclic.adoc lines 1300-1306), but riscv_cpu_do_interrupt() has no code path to do so. The mip/sip bits are only modified through software CSR writes (rmw_mip64/rmw_sip64), never by hardware during interrupt delivery.
+  | if (nnmi_excep) {
+  |     env->pc = env->rnmi_excpvec;
+  | } else {
+  |     env->pc = (env->mtvec >> 2 << 2) +
+  |               ((async && (env->mtvec & 3) == 1) ? cause * 4 : 0);
+  | }
+
+[potential_risk] target/riscv/cpu_helper.c:2421-2422  riscv_cpu_do_interrupt
+  S-mode trap dispatch computes PC from stvec without checking sivt.EHV for hardware-vectored mode. Same issue as M-mode: no sivt CSR exists, no IVT mode (xtvec.mode=11) is implemented, and the pending-bit clear required by spec is absent from the trap delivery path.
+  | env->pc = (env->stvec >> 2 << 2) +
+  |           ((async && (env->stvec & 3) == 1) ? cause * 4 : 0);
+
+[potential_risk] target/riscv/csr.c:3000-3009  write_mtvec
+  write_mtvec only validates xtvec.mode bits [1:0] for values 0 (direct) and 1 (vectored). Mode 11 (IVT, required by Smivt) is treated as reserved and silently ignored with LOG_UNIMP. When IVT mode is implemented, this handler must accept mode=11 and coordinate with the mivt CSR, and the spec requires mode 11 to be valid (aclic.adoc line 1282).
+  | /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
+  | if ((val & 3) < 2) {
+  |     env->mtvec = val;
+  | } else {
+  |     qemu_log_mask(LOG_UNIMP, "CSR_MTVEC: reserved mode not supported\n");
+  | }
+
+[potential_risk] target/riscv/csr.c:4157-4166  write_stvec
+  write_stvec has the same issue as write_mtvec: IVT mode (mode=11) is rejected as reserved. When Ssivt is implemented, this must accept mode=11 for S-mode IVT delivery.
+  | /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
+  | if ((val & 3) < 2) {
+  |     env->stvec = val;
+  | } else {
+  |     qemu_log_mask(LOG_UNIMP, "CSR_STVEC: reserved mode not supported\n");
+  | }
+
+[potential_risk] target/riscv/cpu_bits.h:188-201  
+  Missing CSR_MIVT (0x307), CSR_MEIVT (0x308), CSR_SIVT (0x107), and CSR_SEIVT (0x108) register number definitions. The slot 0x308 is currently occupied by CSR_MVIEN (AIA), creating a spec conflict that must be resolved when implementing IVT. The spec defines mivt at 0x307, meivt at 0x308, sivt at 0x107, seivt at 0x108 (aclic.adoc lines 1196-1202).
+  | /* Virtual Interrupts for Supervisor Level (AIA) */
+  | #define CSR_MVIEN           0x308
+  | #define CSR_MVIP            0x309
+  | /* CSR_MIVT (0x307), CSR_MEIVT (0x308), CSR_SIVT (0x107), CSR_SEIVT (0x108) are absent */
+
+[potential_risk] target/riscv/cpu.h:317-393  
+  CPURISCVState struct has no mivt, meivt, sivt, or seivt fields. Without these fields, the IVT base address and EHV bit cannot be stored or read during trap dispatch. Migration (machine.c), KVM sync (kvm-cpu.c), and reset (cpu.c) all lack corresponding entries.
+  | uint64_t stvec;       /* line 317 */
+  | uint64_t mtvec;       /* line 321 */
+  | uint64_t vstvec;      /* line 379 */
+  | uint64_t stvec_hs;    /* line 393 */
+  | /* uint64_t mivt;     -- MISSING */
+  | /* uint64_t sivt;     -- MISSING */
+
+[compliant] target/riscv/cpu_helper.c:2525-2529  riscv_cpu_do_interrupt
+  The trap dispatch does trigger qemu_plugin_vcpu_interrupt_cb for async interrupts and clears environment flags (two_stage_lookup, two_stage_indirect_lookup). These side-effects are correctly performed. The pending-bit clearing issue is only relevant for the unimplemented IVT mode.
+  | if (async) {
+  |     qemu_plugin_vcpu_interrupt_cb(cs, last_pc);
+  | } else {
+  |     qemu_plugin_vcpu_exception_cb(cs, last_pc);
+  | }
+
+[compliant] hw/intc/riscv_imsic.c:126-148  riscv_imsic_topei_rmw
+  IMSIC TOPEI RMW correctly clears the IMSIC eistate PENDING bit when software writes to claim an interrupt. This is the software claim mechanism (via AIA), not the hardware auto-clear that IVT mode would require. The IMSIC eistate pending bits are properly managed for the current (non-IVT) interrupt delivery model.
+  | if (topei && wr_mask) {
+  |     topei >>= IMSIC_TOPEI_IID_SHIFT;
+  |     base = page * imsic->num_irqs;
+  |     if (topei) {
+  |         qatomic_and(&imsic->eistate[base + topei], ~IMSIC_EISTATE_PENDING);
+  |     }
+  | }
+

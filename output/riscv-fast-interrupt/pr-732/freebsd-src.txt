@@ -1,0 +1,77 @@
+PR #732  target=freebsd-src  overall=compliant
+Spec: Nested exception inside CLIC interrupt handler can corrupt interrupt priority threshold lineage, causing IRQ starvation or spurious preemption when xRET restores wrong threshold
+Violation: In a FreeBSD kernel with CLIC/Smnip enabled, a synchronous exception (page fault, illegal instruction, etc.) occurring inside an interrupt handler corrupts the interrupt priority nesting when hardware implements the pre-fix behavior where xithreshold is unconditionally set on exception entry, or when the kernel's exception path does not correctly distinguish interrupt-from-exception traps in its xpistatus save/restore sequence—leaving xithreshold either stuck at a wrong IPRIO value on exception entry or failing to restore pithreshold lineage on xRET through nested exception+interrupt stacks.
+Consequence: denial_of_service
+Pattern: trap handler saves/restores xpistatus or xithreshold without checking scause.INTR bit first; exception path modifies xithreshold; xRET path reads stale xpistatus.pithreshold after a nested exception+interrupt sequence where the threshold lineage was overwritten by a double-trap in M-mode
+------------------------------------------------------------
+[compliant] sys/riscv/riscv/trap.c:318-323  do_trap_supervisor
+  Trap handler correctly checks scause.INTR bit before dispatch. No Smnip/xpistatus/xithreshold CSRs are accessed anywhere in the kernel — the vulnerability pattern (exception path modifying xithreshold; xRET reading stale pithreshold) cannot occur because Smnip is not implemented. Interrupts route to intr_irq_handler(); exceptions route to the switch-based exception handler. The scause.INTR check at line 319 correctly distinguishes the two paths.
+  | exception = frame->tf_scause & SCAUSE_CODE;
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  | 	/* Interrupt */
+  | 	intr_irq_handler(frame, INTR_ROOT_IRQ);
+  | 	return;
+  | }
+
+[compliant] sys/riscv/riscv/trap.c:399-405  do_trap_user
+  Same pattern as do_trap_supervisor: scause.INTR check at line 400 correctly separates interrupt and exception paths. No Smnip CSR manipulation. The intr_enable() at line 405 only happens on the exception path (after the interrupt handler returns), consistent with standard RISC-V interrupt nesting model.
+  | exception = frame->tf_scause & SCAUSE_CODE;
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  | 	/* Interrupt */
+  | 	intr_irq_handler(frame, INTR_ROOT_IRQ);
+  | 	return;
+  | }
+  | intr_enable();
+
+[compliant] sys/riscv/riscv/exception.S:219-225  cpu_exception_handler_supervisor
+  Assembly trap entry/exit saves/restores only standard CSRs (sscratch, sepc, sstatus, stval, scause). No xpistatus or xithreshold access. The sret at line 224 uses standard supervisor return — in a non-Smnip kernel, sret does not touch xithreshold (the CSR does not exist). No threshold lineage corruption is possible.
+  | ENTRY(cpu_exception_handler_supervisor)
+  | 	save_registers 1
+  | 	mv	a0, sp
+  | 	call	_C_LABEL(do_trap_supervisor)
+  | 	load_registers 1
+  | 	sret
+
+[compliant] sys/riscv/riscv/exception.S:227-235  cpu_exception_handler_user
+  User trap path same as supervisor: standard CSR save/restore only. The sret at line 234 cannot trigger the Smnip vulnerability because xithreshold is not implemented.
+  | ENTRY(cpu_exception_handler_user)
+  | 	save_registers 0
+  | 	mv	a0, sp
+  | 	call	_C_LABEL(do_trap_user)
+  | 	do_ast
+  | 	load_registers 0
+  | 	csrrw	sp, sscratch, sp
+  | 	sret
+
+[compliant] sys/riscv/riscv/swtch.S:258-357  cpu_switch
+  Context switch saves/restores ra, sp, gp, tp, callee-saved registers (s0-s11), and conditionally FPE state. No Smnip CSR save/restore. Since Smnip is not implemented, there are no per-thread xpistatus/xithreshold values to context-switch. When/if Smnip is added, the pcb and cpu_switch would need xpistatus save/restore fields.
+  | ENTRY(cpu_switch)
+  | 	/* Store the new curthread */
+  | 	sd	a1, PC_CURTHREAD(tp)
+  | 	/* And the new pcb */
+  | 	ld	x13, TD_PCB(a1)
+  | 	sd	x13, PC_CURPCB(tp)
+
+[compliant] sys/riscv/riscv/intc.c:263-289  intc_intr
+  Interrupt controller dispatch asserts scause.INTR is set (KASSERT at line 273), confirming the frame came from an interrupt. Uses standard scause-based IRQ identification (line 276: frame->tf_scause & SCAUSE_CODE). No Smnip CSR access. IPRIO-based threshold management is not needed since the hardware doesn't implement Smnip nesting.
+  | KASSERT((frame->tf_scause & SCAUSE_INTR) != 0,
+  |     ("%s: not an interrupt frame", __func__));
+  | active_irq = frame->tf_scause & SCAUSE_CODE;
+
+[compliant] sys/riscv/include/riscvreg.h:38-59  
+  CSR register definitions only define standard scause, sstatus, sie, sip CSRs and exception codes. No xpistatus, xithreshold, xnxti, mpistatus, mithreshold, spistatus, sithreshold, or mipreemptcfg definitions exist. This correctly reflects that Smnip is not enabled in this kernel.
+  | #define	SCAUSE_INTR			(1ul << 63)
+  | #define	SCAUSE_CODE			(~SCAUSE_INTR)
+  | #define	SCAUSE_INST_MISALIGNED		0
+  | ...
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:460-468  riscv_handle_world_switch
+  bhyve VMM code correctly checks scause.INTR bit to distinguish host interrupts from guest exceptions. No Smnip CSR virtualization — consistent with the kernel not implementing Smnip. When/if Smnip virtualization is needed, guest xpistatus/xithreshold CSRs would need save/restore across VM exits.
+  | if (vme->scause & SCAUSE_INTR) {
+  | 	/* Host interrupt? Leave critical section to handle. */
+  | 	vmm_stat_incr(hypctx->vcpu, VMEXIT_IRQ, 1);
+  | 	vme->exitcode = VM_EXITCODE_BOGUS;
+  | 	vme->inst_length = 0;
+  | 	return (handled);
+  | }
+

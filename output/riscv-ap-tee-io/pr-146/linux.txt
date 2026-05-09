@@ -1,0 +1,127 @@
+PR #146  target=linux  overall=potential_risk
+Spec: Smmtt-enforced supervisor domain isolation means the kernel must never assume full physical address space access; any kernel-initiated physical access outside its RDSM-assigned domain is a hardware-level privilege boundary violation that Smmtt will trap
+Violation: Linux kernel S-mode code (or HS-mode KVM host) performs a direct physical memory access, DMA mapping, or /dev/mem read/write to a physical address range that has been excluded from the kernel's supervisor domain by the RDSM-configured Smmtt hardware enforcement, either because the kernel is unaware of domain boundaries or does not consult the domain permission table before issuing the access
+Consequence: privilege_escape
+Pattern: phys_addr_t|__pa\(|virt_to_phys|dma_map_single|dma_alloc_coherent|ioremap|memremap|devmem_is_allowed|read_phys|write_phys
+------------------------------------------------------------
+[potential_risk] arch/riscv/kvm/mmu.c:38-86  kvm_riscv_mmu_ioremap
+  KVM host accepts a raw phys_addr_t hpa from userspace (via KVM device ioctl) and maps it directly into G-stage page tables via pfn_pte(__phys_to_pfn(hpa), ...) without any check against supervisor domain boundaries. If the host-side physical address falls in an MTT-excluded range, the guest gains direct physical access to memory outside the supervisor domain.
+  | int kvm_riscv_mmu_ioremap(struct kvm *kvm, gpa_t gpa, phys_addr_t hpa,
+  |                            unsigned long size, bool writable, bool in_atomic)
+  | {
+  |         ...
+  |         pfn = __phys_to_pfn(hpa);
+  |         ...
+  |             map.pte = pfn_pte(pfn, prot);
+
+[potential_risk] arch/riscv/kvm/gstage.c:166-210  kvm_riscv_gstage_map_page
+  KVM G-stage page mapping takes a raw phys_addr_t hpa (derived from __kvm_faultin_pfn via host userspace HVA) and creates stage-2 PTEs via pfn_pte(PFN_DOWN(hpa), prot). No domain permission table consultation occurs before committing the stage-2 mapping. A host VMA backed by physical memory outside the supervisor domain would be transparently mapped into the guest.
+  | int kvm_riscv_gstage_map_page(struct kvm_gstage *gstage,
+  |                               struct kvm_mmu_memory_cache *pcache,
+  |                               gpa_t gpa, phys_addr_t hpa, unsigned long page_size,
+  |                               bool page_rdonly, bool page_exec,
+  |                               struct kvm_gstage_mapping *out_map)
+  | {
+  |         ...
+  |         out_map->pte = pfn_pte(PFN_DOWN(hpa), prot);
+
+[compliant] arch/riscv/kvm/gstage.c:124-164  kvm_riscv_gstage_set_pte
+  Uses __pa(next_ptep) at line 145 for intermediate G-stage page table pages allocated from kvm_mmu_memory_cache_alloc(). These pages come from the kernel's own page allocator, which only returns memory within the kernel's managed linear mapping region. No domain-excluded memory can be allocated here.
+  | set_pte(ptep, pfn_pte(PFN_DOWN(__pa(next_ptep)),
+  |                       __pgprot(_PAGE_TABLE)));
+
+[potential_risk] arch/riscv/kernel/sbi.c:591-618  sbi_debug_console_write
+  Converts a kernel virtual address to physical via __pa(bytes) and passes the raw physical address to M-mode firmware via SBI DBCN ecall. M-mode has full access to all physical memory, but under RDSM the kernel should not be generating physical addresses for memory outside its supervisor domain. If the buffer pointed to MTT-excluded memory, the kernel would be leaking domain-external PA information to M-mode.
+  | if (is_vmalloc_addr(bytes))
+  |         base_addr = page_to_phys(vmalloc_to_page(bytes)) +
+  |                     offset_in_page(bytes);
+  | else
+  |         base_addr = __pa(bytes);
+
+[potential_risk] arch/riscv/kernel/sbi.c:620-647  sbi_debug_console_read
+  Same pattern as sbi_debug_console_write: converts kernel VA to PA via __pa(bytes) and passes raw physical address to M-mode SBI DBCN. No domain boundary validation.
+  | if (is_vmalloc_addr(bytes))
+  |         base_addr = page_to_phys(vmalloc_to_page(bytes)) +
+  |                     offset_in_page(bytes);
+  | else
+  |         base_addr = __pa(bytes);
+
+[potential_risk] arch/riscv/mm/dma-noncoherent.c:69-96  arch_sync_dma_for_device
+  Accepts phys_addr_t paddr from the DMA API and calls phys_to_virt(paddr) to obtain a kernel virtual address for CMO cache operations. This assumes the physical address is covered by the kernel's linear mapping. Under RDSM, MTT could exclude the physical range from the supervisor domain, making phys_to_virt() meaningless and the CMO operation a potential violation.
+  | void arch_sync_dma_for_device(phys_addr_t paddr, size_t size,
+  |                               enum dma_data_direction dir)
+  | {
+  |         switch (dir) {
+  |         case DMA_TO_DEVICE:
+  |                 arch_dma_cache_wback(paddr, size);
+
+[potential_risk] arch/riscv/mm/dma-noncoherent.c:98-115  arch_sync_dma_for_cpu
+  Same phys_to_virt() assumption as arch_sync_dma_for_device. DMA sync for CPU involves phys_addr_t inputs that may correspond to memory outside the supervisor domain under RDSM enforcement.
+  | void arch_sync_dma_for_cpu(phys_addr_t paddr, size_t size,
+  |                            enum dma_data_direction dir)
+  | {
+  |         ...
+  |         case DMA_FROM_DEVICE:
+  |         case DMA_BIDIRECTIONAL:
+  |                 if (arch_sync_dma_cpu_needs_post_dma_flush())
+  |                         arch_dma_cache_inv(paddr, size);
+
+[potential_risk] arch/riscv/mm/pmem.c:12-21  arch_wb_cache_pmem
+  Converts persistent memory virtual address to physical via virt_to_phys(addr) for nonstandard cache writeback operations. Under RDSM, persistent memory ranges could be in a different domain, making this physical address invalid from the supervisor domain's perspective.
+  | void arch_wb_cache_pmem(void *addr, size_t size)
+  | {
+  | #ifdef CONFIG_RISCV_NONSTANDARD_CACHE_OPS
+  |         if (unlikely(noncoherent_cache_ops.wback)) {
+  |                 noncoherent_cache_ops.wback(virt_to_phys(addr), size);
+
+[potential_risk] arch/riscv/mm/physaddr.c:9-20  __virt_to_phys
+  This is the root translation function for all virt_to_phys/__pa calls. It only validates that the VA is in the linear or kernel mapping range, but performs no domain permission table check. Under RDSM, the linear mapping itself could be partially excluded from the supervisor domain by MTT, yet this function would still return a valid-looking physical address for memory the kernel should not access.
+  | phys_addr_t __virt_to_phys(unsigned long x)
+  | {
+  |         WARN(!is_linear_mapping(x) && !is_kernel_mapping(x),
+  |              "virt_to_phys used for non-linear address: %p (%pS)\n",
+  |              (void *)x, (void *)x);
+  |         return __va_to_pa_nodebug(x);
+  | }
+
+[potential_risk] arch/riscv/mm/init.c:1802-1819  arch_add_memory
+  Memory hotplug receives physical address start/size from the generic memory hotplug subsystem and directly adds it to the kernel's linear mapping via create_linear_mapping_range(). Under RDSM, firmware might reject hotplugged memory that falls outside the supervisor domain, or worse, the kernel might silently map memory that MTT has excluded from its domain.
+  | int __ref arch_add_memory(int nid, u64 start, u64 size, struct mhp_params *params)
+  | {
+  |         int ret = 0;
+  |         create_linear_mapping_range(start, start + size, 0, &params->pgprot);
+  |         ret = __add_pages(nid, start >> PAGE_SHIFT, size >> PAGE_SHIFT, params);
+
+[potential_risk] arch/riscv/mm/init.c:1278-1332  create_linear_mapping_page_table
+  During boot, the kernel iterates over memblock ranges and creates linear mappings for all physical memory. Under RDSM, firmware may have already excluded certain ranges from the supervisor domain via MTT. The kernel has no mechanism to detect this and would attempt to create page table mappings for memory it cannot access.
+  | for_each_mem_range(i, &start, &end) {
+  |         if (start >= end)
+  |                 break;
+  |         if (start <= __pa(PAGE_OFFSET) &&
+  |             __pa(PAGE_OFFSET) < end)
+  |                 start = __pa(PAGE_OFFSET);
+  |         create_linear_mapping_range(start, end, 0, NULL);
+  | }
+
+[potential_risk] arch/riscv/kvm/nacl.c:138-149  kvm_riscv_nacl_init
+  Allocates kernel pages for SBI NACL shared memory and passes the physical address (page_to_phys) directly to M-mode firmware via SBI_EXT_NACL_SET_SHMEM. Under RDSM, the allocated page could be in an MTT-excluded range (if the allocator returns memory from such a region), or the firmware could reject the shared memory because it crosses domain boundaries.
+  | shmem_page = alloc_pages(GFP_KERNEL | __GFP_ZERO,
+  |                          get_order(SBI_NACL_SHMEM_SIZE));
+  | ...
+  | nacl->shmem_phys = page_to_phys(shmem_page);
+
+[potential_risk] drivers/char/mem.c:59-69  devmem_is_allowed
+  RISC-V does not implement the arch-specific devmem_is_allowed() hook. The generic weak implementation returns 1 (allow all) without any domain-aware filtering. Under RDSM, /dev/mem could be used to read/write physical memory outside the supervisor domain, bypassing MTT hardware enforcement entirely.
+  | #ifdef CONFIG_STRICT_DEVMEM
+  | static inline int page_is_allowed(unsigned long pfn)
+  | {
+  |         return devmem_is_allowed(pfn);
+  | }
+
+[compliant] arch/riscv/kvm/aia_imsic.c:1114-1122  kvm_riscv_vcpu_aia_imsic_init
+  Allocates kernel page for IMSIC SW-file and records physical address via page_to_phys(). The page comes from the kernel allocator, which only returns memory within the kernel's managed range. This is internal bookkeeping, not exposed to the guest.
+  | swfile_page = alloc_pages(GFP_KERNEL | __GFP_ZERO,
+  |                           get_order(sizeof(*imsic->swfile)));
+  | ...
+  | imsic->swfile_pa = page_to_phys(swfile_page);
+
