@@ -1,0 +1,153 @@
+PR #617  target=qemu  overall=compliant
+Spec: Unchecked msiptp.MODE when iohgatp.MODE is Bare can route MSI translations without GSCID-bound VM isolation, enabling cross-guest MSI injection via the IOMMU
+Violation:
+  In QEMU, when the IOMMU processes a device context (DC) where iohgatp.MODE
+  is Bare (second-stage translation disabled) but msiptp.MODE is not Off, the
+  emulation violates the new spec requirement that msiptp.MODE must be Off
+  when iohgatp.MODE is Bare. Without this check, MSI address translation would
+  proceed using an MSI page table without a valid GSCID to associate
+  translations with a VM address space. The `riscv_iommu_validate_device_ctx`
+  function in hw/riscv/riscv-iommu.c:753-756 already gates this combination as
+  a misconfiguration, but any path that bypasses DC validation (e.g., direct
+  msiptp write via emulated register injection, snapshot restore, or migration
+  of a VM with a pre-existing invalid DC state) could activate MSI translation
+  in a Bare second-stage context.
+Consequence: function_loss
+Pattern:
+  msiptp.MODE != Off && iohgatp.MODE == Bare && !dc_misconfiguration_check
+------------------------------------------------------------
+[compliant] hw/riscv/riscv-iommu.c:753-757  riscv_iommu_validate_device_ctx
+  The added check correctly gates DCs where iohgatp.MODE is Bare and
+  msiptp.MODE is not Off as a misconfiguration (returns false, causing
+  DDT_MISCONFIGURED fault). This directly enforces the spec requirement: when
+  second-stage translation is disabled (Bare), MSI translation must also be
+  disabled (Off) because there is no valid GSCID to associate MSI translations
+  with a VM address space.
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |     get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |     RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |     return false;
+  | }
+  References:
+    - riscv-iommu/spec reference is at github.com/riscv-non-isa/riscv-iommu (not in spec_ref directory):0-0
+      "The riscv-iommu spec v20250828 (referenced by the PR title)
+      requires msiptp.MODE to be Off when iohgatp.MODE is Bare. The
+      spec_ref directory does not "
+
+[compliant] hw/riscv/riscv-iommu.c:1126-1142  riscv_iommu_ctx_fetch
+  All DC reads go through ctx_fetch, which reads the DC from memory then calls
+  validate_device_ctx at line 1140. Since every DC fetch path is gated by the
+  validation function, there is no code path that can load a DC with
+  msiptp.MODE != Off and iohgatp.MODE == Bare without triggering the
+  misconfiguration check.
+  | ctx->msiptp = le64_to_cpu(dc.msiptp);
+  | ...
+  | if (!riscv_iommu_validate_device_ctx(s, ctx)) {
+  |     return RISCV_IOMMU_FQ_CAUSE_DDT_MISCONFIGURED;
+  | }
+
+[compliant] hw/riscv/riscv-iommu.c:275-295  riscv_iommu_spa_fetch
+  The MSI early check at line 289 requires !en_s (first-stage Bare, meaning
+  IOVA == GPA), which is the correct condition: MSI translation via the MSI
+  page table only applies when there is no first-stage translation. This is
+  per the spec requirement that MSI address matching happens only in the
+  g-stage (or passthrough) path. Combined with the DC validation check, an MSI
+  PTE walk will only proceed when both iohgatp and msiptp are correctly
+  configured.
+  | if (!en_s && (iotlb->perm & IOMMU_WO) &&
+  |     riscv_iommu_msi_check(s, ctx, iotlb->iova)) {
+  |     iotlb->target_as = &s->trap_as;
+  |     ...
+  |     return 0;
+  | }
+
+[compliant] hw/riscv/riscv-iommu.c:221-238  riscv_iommu_msi_check
+  msi_check verifies that MSIPTP.MODE is FLAT before proceeding with MSI
+  address matching. If MODE is Off (the required state when iohgatp is Bare),
+  this returns false and no MSI translation occurs. This is a second layer of
+  defense beyond DC validation.
+  | if (get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |     RISCV_IOMMU_DC_MSIPTP_MODE_FLAT) {
+  |     return false; /* Invalid MSI/MRIF mode */
+  | }
+
+[potential_risk] hw/riscv/riscv-iommu.c:1747-1781  riscv_iommu_process_ddtp
+  When DDTP transitions to a new mode, the context cache (s->ctx_cache) is not
+  invalidated. While the transition rules only allow
+  {OFF,BARE}↔{1LVL,2LVL,3LVL} and OFF/BARE modes never populate the cache, a
+  future spec change or bug in the transition check could leave stale cached
+  DCs from the old DDT. The absence of explicit cache invalidation on DDTP
+  mode change is a defense-in-depth gap, though not currently exploitable with
+  the existing transition rules.
+  | if (ok) {
+  |     new_ddtp = set_field(new_ddtp & RISCV_IOMMU_DDTP_PPN,
+  |                          RISCV_IOMMU_DDTP_MODE, new_mode);
+  | } else {
+  |     new_ddtp = old_ddtp;
+  | }
+  | s->ddtp = new_ddtp;
+
+[compliant] hw/riscv/riscv-iommu-pci.c:146-149  riscv_iommu_vmstate
+  The PCI IOMMU device is marked unmigratable (unmigratable = 1), which
+  prevents live-migration of VMs with this IOMMU. This means the 'snapshot
+  restore of a VM with a pre-existing invalid DC state' attack vector
+  described in the security spec does not apply — a VM snapshot save/load
+  resets the IOMMU state entirely. However, this is a heavy-handed approach:
+  the IOMMU cannot be migrated at all, which limits operational flexibility.
+  | static const VMStateDescription riscv_iommu_vmstate = {
+  |     .name = "riscv-iommu",
+  |     .unmigratable = 1
+  | };
+
+[compliant] hw/riscv/riscv-iommu-sys.c:213-221  riscv_iommu_sys_reset_hold
+  The sysbus reset path calls riscv_iommu_reset which clears the DDTP, all
+  queue CSRs, IPSR, and both ctx_cache and iot_cache. This ensures a clean
+  initial state where no stale DCs can exist. The sysbus variant has no
+  vmstate at all (not even unmigratable), so it also cannot carry stale state
+  across migration.
+  | static void riscv_iommu_sys_reset_hold(Object *obj, ResetType type) {
+  |     ...
+  |     riscv_iommu_reset(iommu);
+  |     trace_riscv_iommu_sys_reset_hold(type);
+  | }
+
+[compliant] hw/riscv/riscv-iommu.c:1291-1342  riscv_iommu_ctx
+  The context cache lookup at line 1305-1306 checks that DDTP mode is not OFF
+  or BARE before returning a cached context. This ensures that if DDTP
+  transitions from an active mode to OFF/BARE, no cached context can be reused
+  — a fresh ctx_fetch is always performed for OFF/BARE modes. This prevents
+  stale DCs with invalid msiptp/iohgatp combinations from being served from
+  the cache after a mode transition.
+  | if (mode != RISCV_IOMMU_DDTP_MODE_OFF &&
+  |     mode != RISCV_IOMMU_DDTP_MODE_BARE) {
+  |     ctx = g_hash_table_lookup(ctx_cache, &key);
+  |     if (ctx && (ctx->tc & RISCV_IOMMU_DC_TC_V)) {
+  |         *ref = ctx_cache;
+  |         return ctx;
+  |     }
+  | }
+
+[compliant] hw/riscv/riscv-iommu.c:1567-1664  riscv_iommu_translate
+  The translate function calls riscv_iommu_get_transtag to determine the
+  translation tag (BY/SS/VG/VN) based on satp and gatp modes, and then calls
+  riscv_iommu_spa_fetch for the actual page table walk. Since translate only
+  operates on contexts that have passed DC validation (via ctx_fetch), the
+  msiptp+iohgatp constraint is already enforced before translate is ever
+  called.
+  | RISCVIOMMUTransTag transtag = riscv_iommu_get_transtag(ctx);
+  | ...
+  | fault = riscv_iommu_spa_fetch(s, ctx, iotlb);
+
+[compliant] hw/riscv/riscv-iommu.c:556-701  riscv_iommu_msi_write
+  msi_write is only called from riscv_iommu_trap_write (line 2424), which is
+  the trap path for MSI GPA writes intercepted by the IOMMU. The trap path is
+  only entered when spa_fetch detects an MSI address match (line 289 or 477),
+  which itself requires the MSI check to pass (msiptp.MODE == FLAT). Since DC
+  validation ensures msiptp.MODE can only be FLAT when iohgatp.MODE is not
+  Bare, the full chain from DC load → validation → translation → MSI check →
+  MSI write is consistent.
+  | uint64_t intn;
+  | intn = riscv_iommu_pext_u64(PPN_DOWN(gpa), ctx->msi_addr_mask);
+  | offset = intn * sizeof(pte);
+  | addr = PPN_PHYS(get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_PPN));
+

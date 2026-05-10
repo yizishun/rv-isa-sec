@@ -1,0 +1,55 @@
+PR #2472  target=freebsd-src  overall=not_implemented
+Spec: FreeBSD S-mode never directly programs PMP CSRs (M-mode only), but must be aware that on RV32 with 34-bit phys, OpenSBI-set TOR PMP entries silently cannot cover the uppermost 4 bytes of physical memory — the kernel's pmap would see those pages as permanently inaccessible to S-mode unless firmware uses NAPOT instead.
+Violation:
+  In an RV32 FreeBSD kernel, M-mode firmware (OpenSBI) configures a TOR-mode
+  PMP entry intending to grant S-mode access to the uppermost word of a 34-bit
+  physical address space; the TOR encoding cannot represent 2^34 as a range
+  top, so the PMP entry either fails to match the intended region or must be
+  reconfigured using NAPOT mode instead.
+Consequence: function_loss
+Pattern:
+  RV32 TOR PMP range top truncation at 2^34-4
+------------------------------------------------------------
+[not_implemented] sys/riscv/riscv/machdep.c:542-606  efi_exclude_sbi_pmp_cb
+  FreeBSD RISC-V kernel does not configure PMP entries directly. PMP is
+  managed entirely by M-mode firmware (OpenSBI). The kernel's only PMP
+  interaction is efi_exclude_sbi_pmp_cb() at machdep.c:542-606, which works
+  around OpenSBI's first PMP entry by excluding the protected EFI
+  BootServicesData region from physmem. The kernel never reads or writes
+  pmpaddr/pmpcfg CSRs. This is by design: PMP configuration is an M-mode
+  responsibility, and FreeBSD runs in S-mode.
+  | /*
+  |  * OpenSBI uses the first PMP entry to prevent buggy supervisor
+  |  * software from overwriting the firmware. However, this
+  |  * region may not be properly marked as reserved, leading
+  |  * to an access violation exception whenever the kernel
+  |  * attempts to write to a page from that region.
+  |  *
+  |  * Fix this by excluding first EFI memory map entry
+  |  * if it is marked as "BootServicesData".
+  |  */
+  | first = true;
+  | efi_map_foreach_entry(efihdr, efi_exclude_sbi_pmp_cb, &first);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3508-3518
+      "It is not possible to represent the address 2^XLEN+2^ as the top of
+      a range, so, for example, in an RV32 system with 34-bit physical
+      addresses, a TOR "
+
+[not_implemented] sys/conf/kern.mk:169-169  (build config)
+  FreeBSD RISC-V build is hardcoded for RV64 only:
+  -march=rv64imafdch_zifencei. RV32 is not a supported build target in
+  kern.mk:169 or anywhere else in the build system. The RV32 TOR PMP
+  vulnerability pattern (inability to represent 2^34 as a TOR top) therefore
+  cannot manifest in any FreeBSD kernel that can be produced by this build
+  system.
+  | CFLAGS+=	-march=rv64imafdch_zifencei
+
+[not_implemented] sys/riscv/include/param.h:45-45  (arch define)
+  MACHINE_ARCH is defined as "riscv64". Combined with kern.mk:169 hardcoding
+  rv64 and the absence of SV32 paging support (vmparam.h:116 notes SV32 exists
+  but is not supported), FreeBSD RISC-V is exclusively 64-bit. The 34-bit TOR
+  PMP truncation issue is architecturally irrelevant for RV64, where PMP
+  address registers encode 56-bit physical addresses.
+  | #define	MACHINE_ARCH	"riscv64"
+

@@ -1,0 +1,45 @@
+PR #2413  target=xiangshan  overall=compliant
+Spec: PR #2413 introduces normative rule 'mmode_req' mandating that all hardware implementations must provide M-mode as the highest privilege level with unfettered machine access. From the XiangShan RTL hardware security audit perspective, this single rule is the foundational requirement upon which all other privilege-based isolation mechanisms depend. If XiangShan were to violate this rule—by omitting M-mode, hardwiring priv_mode to a lower privilege, or failing to enforce M-mode exclusivity for privileged CSR access and instruction execution—the entire RISC-V security architecture collapses: PMP becomes meaningless, CSR access control dissolves, trap delegation is subvertible, and no trusted execution anchor exists. The affected hardware modules span the CSR unit, PMP checker, trap/interrupt controller, instruction decoder, TLB/PTW, reset controller, and multi-core interconnects. Verification of this rule requires confirming that priv_mode resets to M-mode, all M-mode CSR fields are only writable when priv_mode == M, M-mode-privileged instructions trap when executed from lower modes, and PMP configuration is exclusively an M-mode operation. This is priority-critical for XiangShan security assurance.
+Violation:
+  The XiangShan RTL is synthesized or configured such that M-mode (Machine
+  mode, the highest privilege level) is either absent from the privilege
+  architecture, unreachable after reset, or its privileged access rights are
+  not enforced as the maximum authority level. This includes: (a) the hart
+  resetting into a privilege mode other than M-mode, (b) the CSR module
+  failing to instantiate M-mode-only CSRs (e.g., mstatus, mtvec, mepc, mcause,
+  mtval, mie, mip, medeleg, mideleg, pmpcfg*, pmpaddr*), (c) the instruction
+  decoder rejecting or mishandling M-mode-privileged instructions (MRET, WFI
+  when implemented, SFENCE.VMA in M-mode context), or (d) the privilege-level
+  state register (priv_mode in the processor core) being hardwired to a non-M-
+  mode value or lacking the M-mode encoding entirely.
+Consequence: function_loss
+Pattern:
+  PRIVILEGE_ANCHOR_MISSING — The hardware fails to implement the mandatory
+  highest-privilege anchor (M-mode), resulting in a flat privilege hierarchy
+  where every execution context operates at the same effective privilege
+  level. This is a catastrophic architectural vulnerability class that
+  manifests in XiangShan RTL through: (a) Reset vector misconfiguration — the
+  reset state machine in the core's control unit initializes priv_mode to a
+  non-M value, or the mtvec CSR is not properly initialized at reset, causing
+  the first instruction fetch to execute in an unauthorized privilege context.
+  (b) CSR decode gating bugs — the combinational logic in CSR.scala that gates
+  CSR read/write access based on current priv_mode uses incomplete or
+  incorrectly enumerated privilege-level checks, allowing lower-privilege
+  access to M-mode-only CSR fields. (c) PMP enforcement bypass — the PMP
+  checker is instantiated but its enable/disable state or address-matching
+  logic is not gated by M-mode authority; any hart can reconfigure PMP entries
+  because there is no distinction between the configuring agent and the
+  enforcing agent. (d) Trap delegation loop — mideleg/medeleg are writable
+  from non-M-mode, allowing untrusted code to create delegation cycles where
+  traps bounce between privilege levels without ever reaching a trusted
+  handler, leading to denial of service or controlled trap suppression. (e)
+  Instruction privilege check omission — the decoder's privilege-check logic
+  for M-mode-only instructions (MRET, SFENCE.VMA) does not verify that current
+  priv_mode == M, allowing these instructions to execute from S-mode or U-mode
+  and enabling unauthorized privilege transitions. (f) Multi-hart
+  inconsistency — in a multi-core XiangShan configuration, M-mode is present
+  on some harts but absent or misconfigured on others, creating asymmetric
+  trust domains where the compromisable harts can attack the trusted harts
+  through shared cache-coherent memory or inter-hart interrupts without
+  M-mode-level mediation.
+------------------------------------------------------------

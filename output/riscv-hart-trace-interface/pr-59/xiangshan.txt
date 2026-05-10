@@ -1,0 +1,136 @@
+PR #59  target=xiangshan  overall=bug_confirmed
+Spec: tval signal in hart-trace interface must be gated on itype==1 (exception only); outputting tval during interrupt retirement (itype==2) leaks stale CSR data or uninitialized microarchitectural state to the off-core trace encoder — the spec diff splits cause/tval validity so that cause is valid for both exception and interrupt, but tval is valid only for exceptions
+Violation:
+  In XiangShan RTL, when an interrupt trap (itype=2) occurs at retirement, the
+  hart-to-trace-encoder interface (HTI) incorrectly outputs the tval signal as
+  valid data. The RTL must gate tval output on itype==1 (exception) only — if
+  the hardware unconditionally wires the internal mtval/stval CSR register
+  value to the HTI tval port regardless of itype, then during interrupt
+  retirement (itype=2) the trace encoder receives undefined data. This
+  undefined tval may be stale residual state from a prior exception, an
+  uninitialized register pipeline stage, or arbitrary microarchitectural state
+  propagated through unflushed pipeline latches. The spec change corrects the
+  validity window: cause is valid for both itype=1 and itype=2, but tval is
+  valid ONLY for itype=1 (exceptions). Violation occurs if the Chisel/Verilog
+  HTI module lacks the condition `when (io.itype === Itype.exception)` (or
+  equivalent MUX select) on the tval output path, causing the signal to carry
+  live internal state to the off-core trace encoder on every interrupt
+  retirement.
+Consequence: info_leak
+Pattern:
+  Mux(itype === Itype.exception, tval_csr, 0.U) | WireInit(tval, DontCare) |
+  when(!itype_is_exception) { tval := DontCare } | io.hti.tval := tval_reg |
+  Cat(cause, tval).asUInt | Valid(tval) | Output(tval) | TraceIngress.tval
+------------------------------------------------------------
+[bug_confirmed] src/main/scala/xiangshan/backend/CtrlBlock.scala:309-310  CtrlBlock (trace wiring)
+  trap.tval is unconditionally wired from io.fromCSR.traceCSR.tval with no
+  itype-based MUX gate. During interrupt retirement (itype=Interrupt=2), the
+  live mtval/stval CSR register value is forwarded to the trace encoder as
+  valid data. The spec mandates tval=0 for non-exception traps
+  (mtval_other_traps_zero). Missing gate: Mux(itype === Itype.Exception,
+  tval_csr, 0.U).
+  | io.traceCoreInterface.toEncoder.trap.cause := io.fromCSR.traceCSR.cause
+  | io.traceCoreInterface.toEncoder.trap.tval  := io.fromCSR.traceCSR.tval
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2091-2092
+      "[#norm:mtval_other_traps_zero]#For other traps, `mtval` is set to
+      zero#, but a future standard may redefine `mtval`'s setting for
+      other traps."
+
+[bug_confirmed] src/main/scala/xiangshan/L2Top.scala:275-278  L2Top (trace trap bundle registration)
+  The entire trap bundle (containing both cause and tval) is registered
+  through to the tile-level trace encoder using `Itype.isTrap()` as the enable
+  condition. Since isTrap() matches both Exception(1) and Interrupt(2), tval
+  propagates to the off-core encoder during interrupt retirement. The fix
+  requires splitting the trap bundle or adding a separate gate condition for
+  the tval sub-field.
+  | traceToTile.toEncoder.trap := RegEnable(
+  |   traceFromCore.toEncoder.trap,
+  |   traceFromCore.toEncoder.groups(0).valid && Itype.isTrap(traceFromCore.toEncoder.groups(0).bits.itype)
+  | )
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2091-2092
+      "[#norm:mtval_other_traps_zero]#For other traps, `mtval` is set to
+      zero#, but a future standard may redefine `mtval`'s setting for
+      other traps."
+
+[potential_risk] src/main/scala/xiangshan/backend/trace/Interface.scala:50-53  TraceCoreInterface (trap bundle definition)
+  trap.cause and trap.tval are structurally bundled as a paired composite in
+  the TraceCoreInterface. This bundling encourages downstream logic to treat
+  cause and tval as jointly valid, when in fact tval is valid only for
+  exception traps while cause is valid for both exceptions and interrupts. The
+  structural coupling increases the risk that any consumer of the trap bundle
+  will inadvertently forward tval during interrupts.
+  | val trap   = new Bundle{
+  |   val cause = UInt(CauseWidth.W)
+  |   val tval  = UInt(TvalWidth.W)
+  | }
+
+[potential_risk] src/main/scala/xiangshan/backend/trace/Interface.scala:127-127  Itype.isTrap
+  Itype.isTrap() predicate matches both Exception(1) and Interrupt(2),
+  returning true for interrupt retirement. While semantically correct (both
+  are 'traps'), downstream logic (L2Top.scala:275-278) uses this predicate as
+  the enable condition for the entire trap bundle including tval, causing the
+  tval leak. A separate helper such as `isExceptionTrap()` or a `tvalValid()`
+  predicate gating only on Exception would reduce misuse risk.
+  | def isTrap(itype: UInt) = Seq(Exception, Interrupt).map(_ === itype).reduce(_ || _)
+
+[compliant] src/main/scala/xiangshan/backend/trace/Interface.scala:64-67  TraceCoreInterface (itype encoding)
+  Itype encodings are correct: Exception=1, Interrupt=2, ExpIntReturn=3. These
+  match the reference TraceItype enumeration in rocket-chip and the E-Trace
+  spec encoding. The enumeration itself is correct; the vulnerability is
+  downstream usage, not the encoding.
+  | def Exception            = 1.U    //rob
+  | def Interrupt            = 2.U    //rob
+  | def ExpIntReturn         = 3.U    //rename
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1265-1272  NewCSR (traceCSR drive logic)
+  traceCSR.cause and traceCSR.tval are permanently driven from the CSR
+  register files (mcause/scause/vscause and mtval/stval/vstval) via Mux1H by
+  privilege mode. This is correct behavior: the CSR module's role is to expose
+  live CSR state, not to make trace-validity decisions. The validity gating
+  belongs at the trace interface boundary (CtrlBlock).
+  | io.status.traceCSR.tval  := Mux1H(
+  |   Seq(privState.isModeM, privState.isModeHS, privState.isModeVS),
+  |   Seq(mtval.rdata,       stval.rdata,        vstval.rdata)
+  | )
+
+[compliant] src/main/scala/xiangshan/backend/rob/Rob.scala:1287-1293  RobCommit (itype assignment for traps)
+  ROB commit logic correctly classifies traps as itype=Exception(1) or
+  itype=Interrupt(2) based on io.exception.bits.isInterrupt. This is the only
+  place where the exception-vs-interrupt distinction is correctly made. The
+  itype value provides the correct key for downstream gating but is unused by
+  CtrlBlock for tval.
+  | when(io.exception.valid){ // trace exception
+  |   traceBlocks(i).bits.tracePipe.itype := Mux(io.exception.bits.isInterrupt,
+  |     Itype.Interrupt,
+  |     Itype.Exception
+  |   )
+  |   traceValids(i) := true.B
+
+[potential_risk] src/main/scala/top/XSNoCTop.scala:442-443  HasTraceIO (SoC trace output)
+  At the SoC top-level boundary, trap.cause and trap.tval are unconditionally
+  flattened from the internal TraceCoreInterface trap bundle to the external
+  chip I/O (io.traceCoreInterface.toEncoder.tval/cause). This is the final
+  egress point where tval leaves the core. The violation originates upstream
+  in CtrlBlock, but the unconditional passthrough here means there is no
+  defense-in-depth at the chip boundary.
+  | io.traceCoreInterface.toEncoder.cause := traceInterface.toEncoder.trap.cause
+  | io.traceCoreInterface.toEncoder.tval := traceInterface.toEncoder.trap.tval
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2091-2092
+      "[#norm:mtval_other_traps_zero]#For other traps, `mtval` is set to
+      zero#, but a future standard may redefine `mtval`'s setting for
+      other traps."
+
+[compliant] src/main/scala/xiangshan/backend/trace/Trace.scala:28-65  Trace (3-stage pipeline)
+  The Trace module is a 3-stage pipeline (s1: RegEnable from ROB, s2:
+  TraceBuffer compress, s3: RegNext output) that passes trace blocks through
+  without interpreting or gating individual fields. It correctly preserves the
+  itype field set by the ROB. The module itself is not responsible for tval
+  validity gating — that responsibility belongs to CtrlBlock which wires the
+  trap bundle separately.
+  | val s3_out_groups = RegNext(s3_in_groups)
+  | toPcMem := s3_in_groups
+  | io.out.toEncoder := s3_out_groups
+

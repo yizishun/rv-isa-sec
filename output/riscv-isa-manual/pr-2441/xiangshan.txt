@@ -1,0 +1,27 @@
+PR #2441  target=xiangshan  overall=compliant
+Spec: PR editorial: single-copy atomicity now keyed to XLEN threshold — XiangShan must ensure all aligned ≤XLEN-bit mem ops remain a single coherent memory operation; AMOCAS.Q (>XLEN on RV64) decomposition across uops must NOT leak intermediate state between the two sta uop halves when miss path falls through MissQueue
+Violation:
+  In XiangShan RTL, if an aligned memory instruction accessing ≤XLEN (64) bits
+  is decomposed across DCache banks or split into multiple TileLink
+  transactions without coherent atomicity guarantees, the single memory
+  operation rule is violated. Specifically: (1) the DCache MainPipe's unalign
+  bank-split path (NewLoadUnit.scala:1750-1803) decomposes an aligned but
+  cross-bank access into two separate DCache reads that may be interleaved
+  with remote hart stores; (2) the AtomicsUnit FSM for AMOCAS.Q issues 2 sta
+  uops (AtomicsUnit.scala:86-99) for a 128-bit (>XLEN) operation but emits a
+  single M_XA_CASQ DCache command (MainPipe.scala:724-800) — on a cache miss,
+  the MissQueue (MissQueue.scala:56,590) lacks explicit 128-bit atomic
+  TileLink handling, so a decomposed fallback path could violate single-copy
+  atomicity if it silently splits the CAS into two 64-bit bus transactions.
+Consequence: race_condition
+Pattern:
+  search for: (1) DCache main pipe code paths where `s3_req.miss &&
+  s3_req.isAMO` triggers MissQueue enqueue without CASQ-specific atomicity on
+  the TileLink channel (MainPipe.scala:637,846-848; MissQueue.scala:56); (2)
+  bank-split read paths where two dependent DCache reads
+  (NewLoadUnit.scala:1799 `s3ShiftHead | s3ShiftTail`) serve a single aligned
+  instruction and lack cache-line locking between the two reads; (3) any
+  >XLEN-bit aligned memory operation (e.g., FLQ/FSQ, V-extension vector mem
+  ops) that is decomposed into individual bank accesses without inter-access
+  coherency locking
+------------------------------------------------------------

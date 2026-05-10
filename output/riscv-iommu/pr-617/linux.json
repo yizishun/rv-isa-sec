@@ -1,0 +1,100 @@
+{
+  "pr_number": 617,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 617,
+    "violation_condition": "Linux IOMMU driver configures a device context (DC) with iohgatp.MODE=Bare (no second-stage address translation) but msiptp.MODE!=Off, violating the spec requirement that MSI page table translation must be disabled when G-stage translation is absent. Without G-stage, no valid GSCID exists to associate MSI translations with a VM address space, yet the IOMMU may still attempt MSI address translation into an undefined context.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "iohgatp.*Bare|iohgatp.*=.*0[^x].*msiptp|msiptp.*MODE.*(Flat|MRIF).*iohgatp.*Bare|DC.*fsc.*msiptp.*iohgatp",
+    "affected_entities": [
+      "DC.iohgatp.MODE",
+      "DC.msiptp.MODE",
+      "DC.msiptp.PPN",
+      "GSCID",
+      "MSI page table",
+      "Device Context (DC)"
+    ],
+    "summary": "Spec now mandates msiptp.MODE=Off when iohgatp.MODE=Bare; kernel IOMMU driver must enforce this or risk MSIs being translated with no valid GSCID, enabling guest-to-host or cross-VM MSI misdirection"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_iodir_update",
+        "line_start": 1012,
+        "line_end": 1062,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "iodir_update() only writes tc, fsc, and ta fields. Neither dc->iohgatp nor dc->msiptp is written. Both remain at their zero-initialized values: iohgatp.MODE=Bare(0), msiptp.MODE=Off(0). This invariant satisfies the spec requirement: when G-stage translation is absent (Bare), MSI page table translation must be disabled (Off). The driver never violates the iohgatp=Bare ∧ msiptp≠Off condition.",
+      "snippet": "WRITE_ONCE(dc->fsc, fsc);\nWRITE_ONCE(dc->ta, ta & RISCV_IOMMU_PC_TA_PSCID);\ndma_wmb();\nWRITE_ONCE(dc->tc, tc);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_probe_device",
+        "line_start": 1484,
+        "line_end": 1531,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "probe_device() initializes dc->tc but never touches dc->iohgatp or dc->msiptp. DC pages come from zeroed allocations (get_pages uses __GFP_ZERO or memset). Both iohgatp and msiptp stay at 0 across the device lifecycle. No G-stage translation and no MSI translation are ever configured, so the iohgatp=Bare + msiptp=Off invariant holds trivially.",
+      "snippet": "tc = 0;\nif (iommu->caps & RISCV_IOMMU_CAPABILITIES_AMO_HWAD)\n\ttc |= RISCV_IOMMU_DC_TC_SADE;\n/* ... */\nWRITE_ONCE(dc->tc, tc);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_attach_blocking_domain",
+        "line_start": 1429,
+        "line_end": 1442,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Blocking domain attach sets fsc=BARE and ta=0. Does not write iohgatp or msiptp. The DC remains with iohgatp.MODE=Bare and msiptp.MODE=Off. Compliant.",
+      "snippet": "riscv_iommu_iodir_update(iommu, dev, RISCV_IOMMU_FSC_BARE, 0);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_attach_identity_domain",
+        "line_start": 1451,
+        "line_end": 1463,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Identity domain attach sets fsc=BARE and ta=V. Does not write iohgatp or msiptp. The DC remains with iohgatp.MODE=Bare and msiptp.MODE=Off. Compliant.",
+      "snippet": "riscv_iommu_iodir_update(iommu, dev, RISCV_IOMMU_FSC_BARE, RISCV_IOMMU_PC_TA_V);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_attach_paging_domain",
+        "line_start": 1323,
+        "line_end": 1348,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Paging domain attach configures only first-stage context (fsc) with SV39/SV48/SV57 mode and process-scope ID (ta.PSCID). Does not write iohgatp or msiptp. The DC remains with iohgatp.MODE=Bare (no G-stage) and msiptp.MODE=Off (no MSI translation). Compliant.",
+      "snippet": "fsc = FIELD_PREP(RISCV_IOMMU_PC_FSC_MODE, domain->pgd_mode) |\n      FIELD_PREP(RISCV_IOMMU_PC_FSC_PPN, virt_to_pfn(domain->pgd_root));\nriscv_iommu_iodir_update(iommu, dev, fsc, ta);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu-bits.h",
+        "function_name": "struct riscv_iommu_dc",
+        "line_start": 323,
+        "line_end": 332,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The DC struct defines both iohgatp (second-stage context) and msiptp (MSI page table pointer) fields with full register-level bitfield definitions and an MSI PTE struct (riscv_iommu_msipte). The hardware capability bits MSI_FLAT and MSI_MRIF are defined. However, no code writes these fields. If MSI translation support is added in the future, the invariant that msiptp.MODE must be Off when iohgatp.MODE is Bare could be violated unless explicitly enforced. The struct layout and enum definitions create the preconditions for a future bug if MSI virtualization is implemented without a corresponding G-stage implementation.",
+      "snippet": "struct riscv_iommu_dc {\n\tu64 tc;\n\tu64 iohgatp;\n\tu64 ta;\n\tu64 fsc;\n\tu64 msiptp;\n\tu64 msi_addr_mask;\n\tu64 msi_addr_pattern;\n\tu64 _reserved;\n};",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

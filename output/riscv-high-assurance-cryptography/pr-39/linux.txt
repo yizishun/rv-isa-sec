@@ -1,0 +1,71 @@
+PR #39  target=linux  overall=not_implemented
+Spec: Dual ACES gate in V=1 mode (both mstatus.ACES and vsstatus.ACES must be non-Off) diverges from standard FS/VS virtualization semantics where only the virtualized status controls trapping; KVM must explicitly manage host mstatus.ACES for guest ACE support
+Violation:
+  In the Linux kernel KVM, when a guest VM with vsstatus.ACES≠Off executes ACE
+  instructions (V=1), if the host hypervisor's mstatus.ACES=Off (the default
+  for hosts not using ACE), the hardware raises illegal-instruction exceptions
+  on all guest ACE instructions because the new spec requires BOTH
+  mstatus.ACES and vsstatus.ACES to be non-Off — unlike FS/VS where only the
+  virtualized status field controls trapping. The KVM hypervisor must
+  explicitly set mstatus.ACES to a non-Off value before entering a guest that
+  uses ACE, or the guest's ACE functionality is silently broken.
+Consequence: denial_of_service
+Pattern:
+  kvm_arch_vcpu_ioctl_run|kvm_riscv_vcpu_load|__kvm_riscv_switch_to|mstatus.*A
+  CES|vsstatus.*ACES|SR_ACES|ACES_OFF
+------------------------------------------------------------
+[not_implemented] arch/riscv/kvm/vcpu.c:578-641  kvm_arch_vcpu_load
+  ACE/ACES extension is not implemented in this kernel. kvm_arch_vcpu_load()
+  writes guest vsstatus via csr_write(CSR_VSSTATUS, ...) but never reads,
+  writes, or modifies mstatus. The CSR bit definitions in
+  arch/riscv/include/asm/csr.h contain no SR_ACES or ACE-related bits.
+  Consequently, there is no code to set mstatus.ACES to a non-Off value before
+  entering a guest that uses ACE. If ACE support were added, this function
+  would need to ensure the host mstatus.ACES field is non-Off before VCPU
+  entry, since the ACE spec requires both mstatus.ACES and vsstatus.ACES to be
+  non-Off to avoid illegal-instruction traps on guest ACE instructions.
+  | csr_write(CSR_VSSTATUS, csr->vsstatus);
+  | csr_write(CSR_VSIE, csr->vsie);
+  | csr_write(CSR_VSTVEC, csr->vstvec);
+  | // No mstatus write — ACES field never managed
+
+[not_implemented] arch/riscv/kvm/vcpu.c:749-761  kvm_riscv_vcpu_swap_in_guest_state
+  This inline function swaps host/guest scounteren, senvcfg, and optionally
+  sstateen0 CSRs before guest entry, following the standard pattern for other
+  extension state (FS, VS, SMSTATEEN). There is no corresponding swap for
+  mstatus.ACES. The architectural risk is that mstatus is a machine-mode CSR
+  in HS-mode systems, and unlike sstatus/vsstatus which have hardware
+  virtualization support, mstatus bits like ACES would require explicit
+  save/restore by the hypervisor — a pattern that does not yet exist in this
+  codebase.
+  | vcpu->arch.host_scounteren = csr_swap(CSR_SCOUNTEREN, csr->scounteren);
+  | vcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);
+  | // No mstatus swap — ACES field would need similar treatment
+
+[not_implemented] arch/riscv/kvm/vcpu_switch.S:198-219  __kvm_riscv_switch_to
+  The assembly world-switch saves and restores only supervisor-level CSRs
+  (sstatus, stvec, sscratch, sepc) via csrrw instructions. mstatus is never
+  touched. The host hypervisor's mstatus — including any future ACES field —
+  persists unchanged across guest entry/exit. In the standard RISC-V
+  H-extension design, mstatus is not virtualized by hardware (unlike sstatus
+  which is swapped with vsstatus on V=1 transitions), so any mstatus.ACES
+  manipulation would need to be done explicitly by the hypervisor before sret
+  into the guest.
+  | csrrw   t0, CSR_SSTATUS, t0       /* sstatus only, not mstatus */
+  | csrrw   t1, CSR_STVEC, t1
+  | csrw    CSR_SEPC, t2
+  | csrrw   t3, CSR_SSCRATCH, a0
+
+[not_implemented] arch/riscv/include/asm/csr.h:12-66  
+  The status register (sstatus/mstatus) bit definitions include SR_FS (bits
+  13:14), SR_VS (bits 9:10), and SR_XS (bits 15:16) following the standard
+  Off/Initial/Clean/Dirty model, but no SR_ACES definition exists. The ACE
+  extension's status field encoding is not present in this kernel. This is
+  consistent with the ACE ISA extension not yet being ratified or merged into
+  the mainline kernel.
+  | #define SR_FS           _AC(0x00006000, UL)
+  | #define SR_FS_OFF       _AC(0x00000000, UL)
+  | #define SR_VS           _AC(0x00000600, UL)
+  | #define SR_VS_OFF       _AC(0x00000000, UL)
+  | // No SR_ACES, SR_ACES_OFF, etc.
+

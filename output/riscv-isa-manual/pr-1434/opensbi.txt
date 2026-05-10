@@ -1,0 +1,251 @@
+PR #1434  target=opensbi  overall=potential_risk
+Spec: Decomposed memory operations (misaligned stores, wide stores, CMOs) are independently PMP-checked per operation, not per instruction — OpenSBI's PMP configuration must ensure region boundaries are aligned to the largest possible memory operation size, or a single instruction can partially bypass write protections via successful sub-operations
+Violation:
+  OpenSBI configures adjacent PMP regions with differing R/W/X permissions
+  where the boundary between them is not aligned to the maximum memory
+  operation size (cache block size for CMOs, or XLEN for wide stores like FSD
+  on RV32). A misaligned store, wide store, or decomposed CMO (e.g., cbo.zero)
+  that spans the boundary will have each constituent memory operation
+  independently PMP-checked, allowing a partial write to succeed in a region
+  that OpenSBI intended to be write-protected, even as the other half faults.
+Consequence: privilege_escape
+Pattern:
+  PMP region boundary that separates different R/W/X permissions but is not
+  aligned to max(cache_block_size, XLEN_bytes); adjacent PMP entries with
+  differing R/W/X bits where pmpaddr boundary could be crossed by a single
+  decomposed memory operation; CBO handler or PMP setup code that assumes the
+  access-fault is all-or-nothing per instruction rather than per memory
+  operation; missing SFENCE.VMA after PMP reconfiguration that could leave
+  stale PMP cache entries across decomposed operations
+------------------------------------------------------------
+[potential_risk] lib/sbi/sbi_hart_pmp.c:220-250  sbi_hart_smepmp_map_range
+  Temporary SmepMP PMP mapping writes pmpaddr and pmpcfg CSRs via pmp_set() at
+  line 247 but does NOT execute SFENCE.VMA afterward. Under SmepMP, M-mode
+  requires explicit PMP entries to access S/U-mode memory. Without a fence,
+  speculative address translations cached before the map_range call may not
+  reflect the newly granted M-mode access, potentially causing spurious access
+  faults during the temporary mapping window. Conversely, after the paired
+  unmap_range() at line 252-257 (which also lacks a fence), stale cached PMP
+  settings could allow M-mode continued access to memory that should be
+  S/U-only.
+  | sbi_platform_pmp_set(sbi_platform_ptr(scratch), SBI_SMEPMP_RESV_ENTRY,
+  |                      SBI_DOMAIN_MEMREGION_SHARED_SURW_MRW,
+  |                      pmp_flags, base, order);
+  | pmp_set(SBI_SMEPMP_RESV_ENTRY, pmp_flags, base, order);
+  | 
+  | return SBI_OK;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3629-3633
+      "when the PMP settings are modified, M-mode software must
+      synchronize the PMP settings with the virtual memory system and any
+      PMP or address-translatio"
+
+[potential_risk] lib/sbi/sbi_hart_pmp.c:252-257  sbi_hart_smepmp_unmap_range
+  Disables the reserved SmepMP PMP entry 0 via pmp_disable() without executing
+  SFENCE.VMA. After the temporary shared-memory mapping established by
+  map_range() is revoked, a speculative address translation cache could retain
+  the old PMP state granting M-mode read/write access to S/U-mode memory. This
+  stale cached PMP entry allows M-mode to continue accessing S/U-only memory
+  until the cache is naturally evicted or overwritten by a subsequent fence.
+  The sbi_hart_smepmp_configure() path at line 216 correctly fences; the
+  map_range/unmap_range pair should do the same.
+  | static int sbi_hart_smepmp_unmap_range(struct sbi_scratch *scratch,
+  |                                        unsigned long addr, unsigned long size)
+  | {
+  |         sbi_platform_pmp_disable(sbi_platform_ptr(scratch), SBI_SMEPMP_RESV_ENTRY);
+  |         return pmp_disable(SBI_SMEPMP_RESV_ENTRY);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3629-3633
+      "when the PMP settings are modified, M-mode software must
+      synchronize the PMP settings with the virtual memory system and any
+      PMP or address-translatio"
+
+[potential_risk] lib/sbi/sbi_hart_pmp.c:259-298  sbi_hart_oldpmp_configure
+  Domain memory regions are iterated in order and programmed into adjacent PMP
+  entries with potentially different R/W/X permissions (determined by
+  sbi_domain_get_oldpmp_flags). There is no validation that the boundary
+  between adjacent PMP regions with differing permissions is aligned to the
+  maximum memory operation size. On implementations that decompose CBO
+  instructions (cbo.zero, cbo.flush) or support wide stores (FSD on RV32), a
+  single instruction spanning a PMP boundary gets each constituent memory
+  operation independently PMP-checked (per machine.adoc §3.7.2). A 64-byte
+  cbo.zero spanning a boundary where one side is writable and the other is
+  read-only could result in a partial write into the read-only region before
+  the access-fault on the other half, violating the intended protection.
+  | sbi_domain_for_each_memregion(dom, reg) {
+  |         pmp_flags = sbi_domain_get_oldpmp_flags(reg);
+  |         pmp_addr = reg->base >> PMP_SHIFT;
+  |         if (pmp_log2gran <= reg->order && pmp_addr < pmp_addr_max) {
+  |                 pmp_set(pmp_idx++, pmp_flags, reg->base, reg->order);
+  |         }
+  | }
+  | sbi_hart_pmp_fence();
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3567-3574
+      "On some implementations, misaligned loads, stores, and instruction
+      fetches may be decomposed into multiple memory operations... PMP
+      checking is perfor"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:338-345
+      "The access size for CMO instructions is equal to the size of the
+      cache block, however in some cases that access can be decomposed
+      into multiple memory"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:319-325
+      "The PMP access control bits shall be the same for all physical
+      addresses in the cache block, and if write permission is granted by
+      the PMP access cont"
+
+[potential_risk] lib/sbi/sbi_hart_pmp.c:121-218  sbi_hart_smepmp_configure
+  Same cache-block boundary alignment concern as oldpmp_configure. Domain
+  memory regions with different SmepMP-encoded permissions (e.g., M-only
+  regions at lines 145-180 vs shared/SU regions at lines 187-206) are
+  programmed into adjacent PMP entries. Under MML=1, adjacent entries can have
+  substantially different access semantics (M-mode vs S/U-mode). A decomposed
+  memory operation crossing the boundary could have each sub-operation
+  evaluated under different PMP entries, leading to partial success/failure
+  with visible side effects. Additionally, the two-pass approach (M-only
+  regions first with MML=0, then shared regions with MML=1 at line 185) means
+  the MSECCFG.MML write is not followed by a fence — the fence only comes at
+  line 216 after ALL entries are programmed. If a hardware PMP checker caches
+  the MML=0 interpretation for the M-only regions, those cached entries could
+  persist after MML=1 is set.
+  | csr_set(CSR_MSECCFG, MSECCFG_MML);
+  | 
+  | /* Program shared and SU-only regions */
+  | pmp_idx = 0;
+  | sbi_domain_for_each_memregion(dom, reg) {
+  |         pmp_flags = sbi_domain_get_smepmp_flags(reg);
+  |         sbi_hart_smepmp_set(scratch, dom, reg, pmp_idx++, pmp_flags, ...);
+  | }
+  | sbi_hart_pmp_fence();
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:338-345
+      "The access size for CMO instructions is equal to the size of the
+      cache block, however in some cases that access can be decomposed
+      into multiple memory"
+    - riscv-isa-manual/src/priv/machine.adoc:3629-3633
+      "when the PMP settings are modified, M-mode software must
+      synchronize the PMP settings with the virtual memory system and any
+      PMP or address-translatio"
+
+[compliant] lib/sbi/sbi_hart_pmp.c:65-87  sbi_hart_pmp_fence
+  Correctly checks misa_extension('S') before issuing SFENCE.VMA after PMP
+  reconfiguration. When S-mode is present, executes __sbi_sfence_vma_all() to
+  flush speculative address translation caches that may have cached stale PMP
+  settings. Additionally, when Hypervisor extension is present, also executes
+  __sbi_hfence_gvma_all() to flush G-stage translation caches per
+  hypervisor.adoc §hyp-mm-fences. This matches the spec requirement that
+  SFENCE.VMA with rs1=x0 and rs2=x0 synchronizes PMP settings with the virtual
+  memory system.
+  | if (misa_extension('S')) {
+  |         __sbi_sfence_vma_all();
+  |         if (misa_extension('H'))
+  |                 __sbi_hfence_gvma_all();
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3622-3638
+      "Implementations with virtual memory are permitted to perform
+      address translations speculatively... when the PMP settings are
+      modified, M-mode software"
+    - riscv-isa-manual/src/priv/hypervisor.adoc:2094-2107
+      "when PMP settings are modified... M-mode software must synchronize
+      the PMP settings with the virtual memory system. For HS-level
+      address translation, "
+
+[compliant] lib/sbi/riscv_asm.c:333-381  pmp_set
+  CSR write ordering is correct: pmpaddr CSR is written first (line 377), then
+  pmpcfg CSR (line 378). The pmpcfg write is the committing write that enables
+  the PMP entry (sets A field to NAPOT/NA4). Before the pmpcfg write, the old
+  pmpcfg value either has A=OFF (entry disabled, no match) or the previous
+  configuration. Writing pmpaddr first then pmpcfg ensures the entry
+  atomically becomes valid with the correct address range and permissions at
+  the point of the final CSR write. The reverse ordering (pmpcfg first) would
+  be dangerous because the new permissions would briefly apply to the old
+  address range. This is the recommended approach.
+  | /* write csrs */
+  | csr_write_num(pmpaddr_csr, pmpaddr);
+  | csr_write_num(pmpcfg_csr, pmpcfg);
+  | 
+  | return 0;
+
+[compliant] lib/sbi/sbi_hart.c:152-155  hart_detect_features
+  Correctly enables S-mode direct CBO execution via menvcfg bits: CBZE for
+  Zicboz (cbo.zero), CBCFE for Zicbom (cbo.clean/cbo.flush), and CBIE=INV for
+  Zicbom (cbo.inval). OpenSBI does not implement M-mode CBO trap handlers;
+  instead it delegates CBO execution to S-mode by setting these menvcfg enable
+  bits. This delegates responsibility for CBO correctness to S-mode software,
+  which must ensure that CBO targets do not span PMP boundaries with differing
+  permissions. The firmware's role is correctly limited to enabling the
+  architectural mechanism.
+  | __set_menvcfg_ext(SBI_HART_EXT_ZICBOZ, ENVCFG_CBZE)
+  | __set_menvcfg_ext(SBI_HART_EXT_ZICBOM, ENVCFG_CBCFE)
+  | __set_menvcfg_ext(SBI_HART_EXT_ZICBOM,
+  |                   ENVCFG_CBIE_INV << ENVCFG_CBIE_SHIFT)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2241-2269
+      "The Zicboz extension adds the CBZE (Cache Block Zero instruction
+      enable) field to menvcfg... The Zicbom extension adds the CBCFE
+      (Cache Block Clean an"
+
+[potential_risk] lib/sbi/sbi_domain_context.c:126-140  switch_to_next_domain_context
+  Domain context switch calls sbi_hart_protection_unconfigure() at line 127
+  (which disables PMP entries without SFENCE.VMA), then
+  sbi_hart_protection_configure() at line 128 (which programs new entries WITH
+  SFENCE.VMA). Between the two calls, there is an intermediate PMP state where
+  non-firmware entries are disabled. Although the configure() call's internal
+  fence at sbi_hart_pmp.c:216/296 flushes cached PMP state, there is a
+  theoretical window where a hardware PMP check for a speculative translation
+  during the unconfigure→configure gap could cache 'no PMP match' states. The
+  subsequent SATP swap at line 139 is followed by __sbi_sfence_vma_all() at
+  line 140, which provides an additional synchronization point but targets the
+  SATP change rather than the PMP reconfiguration window.
+  | /* Reconfigure PMP settings for the new domain */
+  | sbi_hart_protection_unconfigure(scratch);
+  | sbi_hart_protection_configure(scratch);
+  | 
+  | ctx->satp	= csr_swap(CSR_SATP, dom_ctx->satp);
+  | __sbi_sfence_vma_all();
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3629-3633
+      "when the PMP settings are modified, M-mode software must
+      synchronize the PMP settings with the virtual memory system and any
+      PMP or address-translatio"
+
+[potential_risk] platform/generic/eswin/eic770x.c:357-368  eswin_eic7700_pmp_unconfigure
+  Platform-specific PMP unconfigure writes PMP CSRs via pmp_set() (line 360)
+  and pmp_disable() (lines 364, 367) but does NOT execute SFENCE.VMA
+  afterward. The platform's configure() at line 350 correctly calls
+  sbi_hart_pmp_fence(), but unconfigure() does not. Called via
+  sbi_hart_protection_unconfigure() during domain context switches. The lack
+  of fence means speculative address translations cached between the PMP write
+  and the next fence could reflect stale PMP state.
+  | static void eswin_eic7700_pmp_unconfigure(struct sbi_scratch *scratch)
+  | {
+  |         /* Enable P550 internal + System Port */
+  |         pmp_set(PMP_FREE_A_START + PMP_FREE_A_COUNT - 1, 0, 0,
+  |                 log2roundup(EIC770X_MEMPORT_BASE));
+  | 
+  |         for (unsigned int i = 0; i < PMP_FREE_A_COUNT - 1; i++)
+  |                 pmp_disable(i + PMP_FREE_A_START);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3629-3633
+      "when the PMP settings are modified, M-mode software must
+      synchronize the PMP settings with the virtual memory system and any
+      PMP or address-translatio"
+
+[compliant] lib/sbi/sbi_domain.c:124-144  sbi_domain_get_oldpmp_flags
+  Correctly translates domain memory region flags to PMP R/W/X/L bitmask. L
+  bit is set when ENF_PERMISSIONS flag requires enforcement for all modes.
+  R/W/X bits map directly from SU_READABLE/SU_WRITABLE/SU_EXECUTABLE domain
+  flags. This translation is correct for the old (non-SmepMP) PMP encoding.
+  The PMP entries programmed from these flags may produce adjacent regions
+  with differing permissions, but the permission translation logic itself is
+  compliant.
+  | unsigned int sbi_domain_get_oldpmp_flags(struct sbi_domain_memregion *reg)
+  | {
+  |         unsigned int pmp_flags = 0;
+  |         if (reg->flags & SBI_DOMAIN_MEMREGION_ENF_PERMISSIONS)
+  |                 pmp_flags |= PMP_L;
+  |         if (reg->flags & SBI_DOMAIN_MEMREGION_SU_READABLE)
+  |                 pmp_flags |= PMP_R;
+

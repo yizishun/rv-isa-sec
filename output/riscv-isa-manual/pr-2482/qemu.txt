@@ -1,0 +1,53 @@
+PR #2482  target=qemu  overall=bug_confirmed
+Spec: CBO management instructions in QEMU fall back to write-permission probing when read-permission check fails, raising the wrong exception type (store vs load access-fault) and potentially permitting CBO access on non-readable regions contrary to explicit spec requirement
+Violation:
+  In QEMU, cbo.clean/cbo.flush/cbo.inval (Zicbom) instructions invoke
+  check_zicbom_access() at op_helper.c:211, which first probes for
+  MMU_DATA_LOAD (read) permission, then falls back to probe_write() if read
+  fails. Per the updated spec, cache-block management instructions are
+  explicitly classified as requiring read permission and must raise a load
+  access-fault/load page-fault (machine.adoc:3142-3145,
+  supervisor.adoc:1388-1391). QEMU's write fallback violates this in two ways:
+  (1) the raised exception is a store access-fault rather than the mandated
+  load access-fault, and (2) on a hypothetically write-only region, the access
+  would succeed when the spec requires a load access-fault.
+Consequence: info_leak
+Pattern:
+  check_zicbom_access probe_write fallback path for CBO management
+  instructions when probe_access_flags MMU_DATA_LOAD fails
+------------------------------------------------------------
+[bug_confirmed] target/riscv/op_helper.c:211-250  check_zicbom_access
+  QEMU's check_zicbom_access() follows the CMO spec (cmo.adoc:352-361) which
+  mandates store-type exceptions for cache-block management instructions.
+  However, the updated ISA privilege manual at machine.adoc:3421-3423 and
+  supervisor.adoc:1566-1568 explicitly reclassifies cache-block management
+  instructions alongside loads, requiring load access-fault/load page-fault
+  exceptions when read permission is absent. QEMU's write-fallback path
+  probe_write() at line 249 raises store access-fault
+  (RISCV_EXCP_STORE_AMO_ACCESS_FAULT) or store page-fault
+  (RISCV_EXCP_STORE_PAGE_FAULT) instead of the mandated load access-fault
+  (RISCV_EXCP_LOAD_ACCESS_FAULT) or load page-fault
+  (RISCV_EXCP_LOAD_PAGE_FAULT). Additionally, on a write-only region, the
+  fallback to probe_write succeeds when the spec now requires a load access-
+  fault because read permission is absent.
+  | ret = probe_access_flags(env, address, cbomlen, MMU_DATA_LOAD,
+  |                              mmu_idx, true, &phost, ra);
+  |     if (ret != TLB_INVALID_MASK) {
+  |         /* Success: readable */
+  |         return;
+  |     }
+  |     probe_write(env, address, cbomlen, mmu_idx, ra);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3421-3426
+      "Attempting to execute a load, load-reserved, or cache-block
+      management instruction which accesses a physical address within a
+      PMP region without read "
+    - riscv-isa-manual/src/priv/supervisor.adoc:1566-1571
+      "Attempting to execute a load, load-reserved, or cache-block
+      management instruction whose effective address lies within a page
+      without read permissions"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:352-361
+      "A cache-block management instruction is permitted to access the
+      specified cache block whenever a load instruction or store
+      instruction is permitted to"
+

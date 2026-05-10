@@ -1,0 +1,132 @@
+{
+  "pr_number": 1306,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 1306,
+    "violation_condition": "In XiangShan RTL, when Zvkgs is implemented and the vector execution unit processes vghsh.vs or vgmul.vs instructions, if the decoder/dispatch logic does not check and trap on the reserved encoding where the vd register group overlaps the vs2 scalar element group (holding the Hash Subkey H), the hardware will write partial-hash results back to vd, corrupting the Hash Subkey in vs2 before subsequent element-group iterations can reload it. The Sail pseudocode loads Hinit = brev8(get_velem(vs2, EGW=128, helem)) and re-initializes H from Hinit per element group because the inner GF(2^128) multiplication loop destroys H; if vd overlaps vs2, the set_velem(vd, ...) at the end of each element-group iteration overwrites the Hinit source in-flight, causing subsequent element groups to use a corrupted hash subkey and producing silently wrong GCM/GMAC authentication tags.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "vghsh\\.vs|vgmul\\.vs.*vd.*vs2.*overlap|reserved.*encoding.*vd.*overlap.*vs2|checkRegisterOverlap.*vd.*vs2|illegal_inst.*vgmul.*vs|illegal_inst.*vghsh.*vs",
+    "affected_entities": [
+      "vghsh.vs",
+      "vgmul.vs",
+      "vd",
+      "vs2",
+      "Zvkgs",
+      "vector decode unit",
+      "vector dispatch logic"
+    ],
+    "summary": "vghsh.vs/vgmul.vs reserve vd-vs2 overlap as illegal encoding; XiangShan RTL must trap on this overlap or GCM authentication tags are silently corrupted when software inadvertently aliases partial-hash output (vd) with Hash Subkey scalar element group (vs2)"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/VecExceptionGen.scala",
+        "function_name": "vs2AllowOverlap / vs2vdOverlap / regOverlapIllegal",
+        "line_start": 276,
+        "line_end": 295,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Zvkgs extensions (vghsh.vv, vgmul.vv, and the speculative .vs forms vghsh.vs, vgmul.vs) are not implemented in XiangShan. No BitPat definitions exist in Instructions.scala, no decoder entries exist in VecDecoder.scala, no execution unit implements the GF(2^128) GHASH datapath, and 'zvkgs' is absent from the ISAExtensions list in Parameters.scala:292-305. The existing register overlap checker (VecExceptionGen.scala:276-295) does not contain vghsh/vgmul in its notAllowOverlapInst list, and vs2Constraint1 (line 291) would incorrectly allow vd/vs2 overlap for these instructions if they were added without updating this check. This represents a latent risk if Zvkgs were to be added in the future, but currently there is no code to audit because no Zvkgs implementation exists.",
+      "snippet": "private val notAllowOverlapInst = lsIndexInst && inst.NF =/= 0.U || Seq(VMSBF_M, VMSIF_M, VMSOF_M, VIOTA_M,\n                                    VSLIDEUP_VX, VSLIDEUP_VI, VSLIDE1UP_VX, VFSLIDE1UP_VF, VRGATHER_VV, VRGATHEREI16_VV, VRGATHER_VX, VRGATHER_VI, VCOMPRESS_VM).map(_ === inst.ALL).reduce(_ || _)\n// ...\nprivate val vs2Constraint1 = vs2IsMask && vdIsMask || !vs2IsMask && !vdIsMask && vs2Eew === vdEew\nprivate val vs2AllowOverlap = (vs2Constraint1 || vs2Constraint2 || vs2Constraint3 || vdIsSingleElem) && !notAllowOverlapInst",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/Parameters.scala",
+        "function_name": "ISASpec.extensions",
+        "line_start": 292,
+        "line_end": 305,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The ISAExtensions list includes scalar crypto extensions (zkn, zknd, zkne, zknh, zksed, zksh, zkt) and basic vector extensions (zvbb, zvkt) but does not include zvkg, zvkgs, zvbc32e, or any other vector crypto extensions. This confirms Zvkgs is not enabled in any XiangShan configuration.",
+      "snippet": "\"zksed\", \"zksh\", \"zkt\", \"zvbb\", \"zvfh\", \"zvfhmin\", \"zvkt\", \"zvl128b\", \"zvl32b\", \"zvl64b\"\n)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/VecDecoder.scala",
+        "function_name": "VecDecoder decode tables",
+        "line_start": 14,
+        "line_end": 843,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The vector instruction decoder only imports Zvbb and defines decode entries for Zvbb bit-manipulation instructions. No decode entries exist for Zvkgs (vghsh.vv opcode 101100 in OPMVV, vgmul.vv opcode 101000 in OPMVV with vs1=10001). An attempt to execute these instructions would either decode as an unknown instruction (triggering illegal-instruction exception) or mis-decode as another operation.",
+      "snippet": "import Zvbb._\n// ... decodeArray = vset ++ opivv ++ opivx ++ opivi ++ opmvv ++ opmvx ++ opfvv ++ opfvf ++ opfff ++ vls // no Zvkgs entries",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zvk.adoc",
+          "line_start": 2565,
+          "line_end": 2578,
+          "excerpt": "vghsh.vv encoding: OP-VE | vd | OPMVV | vs1 | vs2 | 1 | 101100. Reserved Encodings: SEW is any value other than 32"
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zvk.adoc",
+          "line_start": 2692,
+          "line_end": 2706,
+          "excerpt": "vgmul.vv encoding: OP-VE | vd | OPMVV | 10001 | vs2 | 1 | 101000. Reserved Encodings: SEW is any value other than 32"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/Instructions.scala",
+        "function_name": "Instruction BitPat definitions",
+        "line_start": 1,
+        "line_end": 27,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Only Zvbb and Zimop instruction BitPat objects are defined. No Zvkgs object exists with BitPat definitions for vghsh.vv (funct6=101100, opcode=OPMVV), vgmul.vv (vs1=10001, funct6=101000, opcode=OPMVV), or any other vector crypto instructions.",
+      "snippet": "object Zvbb { ... }\nobject Zimop { ... }\n// No Zvkgs, Zvkg, Zvknhb, Zvknha, Zvbc32e objects defined",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zvk.adoc",
+          "line_start": 4409,
+          "line_end": 4429,
+          "excerpt": "vghsh funct6=101100 in OPMVV group; vgmul funct6=101000 with vs1=10001"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Bku.scala",
+        "function_name": "Bku (Block Crypto Unit)",
+        "line_start": 161,
+        "line_end": 293,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The Bku (block crypto unit) implements only scalar crypto operations (AES-64 encrypt/decrypt/key-schedule, SHA-256/512 sigma/sum, SM3 P0/P1, SM4 encrypt/decrypt/key-schedule). No vector GHASH GF(2^128) multiply/add-multiply datapath exists. The functional units vialuF, vppu, vimac, vfalu, vfma, vfdiv, vfcvt in the yunsuan library also lack any vector crypto opcodes or execution logic.",
+      "snippet": "// Bku implements scalar crypto: AES-64, SHA-256/512, SM3, SM4\n// No vector crypto (vghsh, vgmul, vaes, vsha2, vsm3, vsm4) operations",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zvk.adoc",
+          "line_start": 2638,
+          "line_end": 2675,
+          "excerpt": "vghsh.vv operation: loads Y=get_velem(vd,EGW=128,i), X=get_velem(vs1,EGW=128,i), H=brev8(get_velem(vs2,EGW=128,i)); computes S=brev8(Y^X); for bit=0 to 127: if S[bit] then Z^=H, H=H<<1, if H[127] then H^=0x87; result=brev8(Z); set_velem(vd,EGW=128,i,result)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/DecodeUnit.scala",
+        "function_name": "ScalarCryptoDecode",
+        "line_start": 373,
+        "line_end": 411,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The DecodeUnit defines ScalarCryptoDecode for scalar Zknd/Zkne/Zknh/Zksed/Zksh instructions dispatched to FuType.bku, but no vector crypto decode logic exists. The overall decode table (line 802) includes scalar crypto but not vector crypto extensions.",
+      "snippet": "object ScalarCryptoDecode {\n  // scalar Zknd, Zkne, Zknh, Zksed, Zksh instructions\n  // dispatched to FuType.bku\n}\n// No VectorCryptoDecode for Zvkgs, Zvknhb, Zvbc32e exists",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

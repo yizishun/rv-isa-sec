@@ -1,0 +1,127 @@
+PR #2397  target=linux  overall=potential_risk
+Spec: PMP all-bytes-match rule now unconditionally supersedes M-mode L=0 bypass: M-mode accesses spanning PMP boundaries fault even on unlocked regions
+Violation:
+  In the Linux kernel, when M-mode code (early boot in head.S before PMP
+  setup, or SBI firmware invoked via ecall) performs a memory access whose
+  bytes are not all covered by the single highest-priority matching PMP entry,
+  the access faults even if all matching entries have L=0 (unlocked). This is
+  because the spec now explicitly says the all-bytes-must-match rule
+  supersedes the M-mode-unlocked-bypass rule.
+Consequence: denial_of_service
+Pattern:
+  M-mode memory accesses (including SBI handler code paths) that cross PMP
+  region boundaries or target addresses not fully contained within any single
+  PMP entry — detectable by auditing PMP configuration writes (CSR_PMPCFGx,
+  CSR_PMPADDRx) for fragmented/partial-coverage setups combined with M-mode
+  load/store paths.
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/head.S:222-242  _start_kernel
+  PMP0 configured as NAPOT covering full address space (addr=-1, A=NAPOT,
+  RWX=111, L=0). Since PMP0 matches all bytes of every M-mode memory
+  operation, the pmp_full_match_required rule is satisfied: all bytes of any
+  access are covered by the single highest-priority matching entry. Per
+  pmp_rwx_check, L=0 + M-mode → operation succeeds. The trap-vector skip trick
+  correctly handles systems without PMP hardware.
+  | li a0, -1
+  | 	csrw CSR_PMPADDR0, a0
+  | 	li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+  | 	csrw CSR_PMPCFG0, a0
+  | .align 2
+  | .Lpmp_done:
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3576-3590
+      "PMP entries are statically prioritized. The lowest-numbered PMP
+      entry that matches any byte of a memory operation determines whether
+      that operation su"
+
+[compliant] arch/riscv/kernel/head.S:226-227  _start_kernel
+  call reset_regs executes before PMP setup. At this point, all PMP entries
+  are in hardware-reset state (A=OFF). Per pmp_no_entry_match (§3.7.1.5), if
+  no PMP entry matches an M-mode memory operation, the operation succeeds.
+  Instruction fetches and stack accesses during reset_regs are therefore safe.
+  | /* Reset all registers except ra, a0, a1 */
+  | 		call reset_regs
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3592-3594
+      "If no PMP entry matches an M-mode memory operation, the operation
+      succeeds. If no PMP entry matches an S-mode or U-mode memory
+      operation, but at least"
+
+[compliant] arch/riscv/kernel/head.S:129-165  secondary_start_sbi
+  SBI HSM secondary boot path does not write PMP CSRs. This is correct
+  behavior: CONFIG_RISCV_SBI depends on !RISCV_M_MODE (Kconfig:290), so
+  secondary_start_sbi always runs in S-mode where PMP CSRs are inaccessible.
+  M-mode firmware (OpenSBI) handles per-hart PMP configuration before starting
+  secondary harts.
+  | secondary_start_sbi:
+  | 		/* Mask all interrupts */
+  | 		csrw CSR_IE, zero
+  | 		csrw CSR_IP, zero
+  | 	...
+  | .Lsecondary_start_common:
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3349-3351
+      "PMP CSRs are only accessible to M-mode."
+
+[potential_risk] arch/riscv/kernel/head.S:370-395  .Lsecondary_start
+  Spinwait secondary boot path does not configure PMP. When
+  CONFIG_RISCV_M_MODE and CONFIG_RISCV_BOOT_SPINWAIT are both set, secondary
+  harts run in M-mode and tail into .Lsecondary_start_common without any PMP
+  setup. Currently benign because PMP entries reset to OFF (allowing all
+  M-mode accesses per pmp_no_entry_match), but fragile: if any firmware or
+  earlier boot stage leaves PMP entries configured with partial coverage
+  before handing off to the spinwait path, M-mode accesses crossing PMP region
+  boundaries would fault even with L=0 entries.
+  | .Lsecondary_start:
+  | 		/* Set trap vector to spin forever to help debug */
+  | 		la a3, .Lsecondary_park
+  | 		csrw CSR_TVEC, a3
+  | 	...
+  | 		tail .Lsecondary_start_common
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3576-3583
+      "The matching PMP entry must match all bytes of a memory operation,
+      or the operation fails, irrespective of the L, R, W, and X bits."
+
+[compliant] arch/riscv/kernel/suspend.c:15-42  suspend_save_csrs
+  suspend_save_csrs() saves ENVCFG, TVEC, IE, STIMECMP, STIMECMPH, SATP — no
+  PMP CSRs. Correct behavior: under normal config (!CONFIG_RISCV_M_MODE),
+  kernel runs in S-mode and cannot access PMP CSRs. PMP save/restore across
+  suspend is the responsibility of M-mode firmware.
+  | suspend_save_csrs:
+  | 	csrr t0, CSR_ENVCFG
+  | 	csrr t1, CSR_TVEC
+  | 	csrr t2, CSR_IE
+  | 	REG_S t0, (...)
+  | 	/* PMP not saved */
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3349-3351
+      "PMP CSRs are only accessible to M-mode."
+
+[not_implemented] arch/riscv/kvm/vcpu.c:584-602  kvm_arch_vcpu_load
+  KVM vcpu_load/vcpu_put does not save/restore or virtualize PMP CSRs. The
+  kvm_riscv_csr ONE_REG structure (kvm.h:75-87) has no PMP fields. NACL CSR
+  sync does not cover PMP. This means guest M-mode code (if supported) sees
+  host PMP state directly — a virtualization hole if the host uses PMP to
+  restrict physical memory access. However, current RISC-V KVM typically only
+  supports VS/VU-mode guests, so PMP virtualization is an unexercised gap
+  rather than an active bug.
+  | kvm_arch_vcpu_load: /* loads VSSTATUS, VSIE, VSTVEC, VSSCRATCH, VSEPC, VSCAUSE, VSTVAL, HEDELEG, HVIP, VSATP, HENVCFG, HSTATEEN0 — no PMP */
+
+[potential_risk] arch/riscv/kernel/head.S:239-240  _start_kernel
+  No read-back verification after CSR_PMPCFG0 write. PMP CSRs are WARL (spec
+  §3.7.1: 'All PMP CSR fields are WARL and may be read-only zero'). If PMPCFG0
+  silently ignores the write (e.g., due to a prior locked PMP entry configured
+  by firmware with partial coverage), the kernel proceeds assuming full memory
+  access but may fault on M-mode loads/stores that cross PMP region
+  boundaries. The trap-vector skip only handles traps from illegal CSR access,
+  not silent WARL write-ignore.
+  | li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+  | 	csrw CSR_PMPCFG0, a0
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3349-3350
+      "All PMP CSR fields are WARL and may be read-only zero."
+    - riscv-isa-manual/src/priv/machine.adoc:3578-3583
+      "The matching PMP entry must match all bytes of a memory operation,
+      or the operation fails, irrespective of the L, R, W, and X bits."
+

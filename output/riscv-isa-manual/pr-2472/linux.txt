@@ -1,0 +1,56 @@
+PR #2472  target=linux  overall=compliant
+Spec: RV32 TOR PMP entries cannot cover the uppermost word of 34-bit physical address space; the kernel must use NAPOT or accept the gap when configuring PMP for the highest physical page
+Violation:
+  On RV32 with 34-bit physical addresses, if the kernel configures a TOR PMP
+  entry intending to cover the top of physical memory (addresses
+  0x3_FFFF_FFFC–0x3_FFFF_FFFF), the pmpaddr register cannot represent 2^34 as
+  the top bound, so the uppermost word is left unmatched by any TOR entry. If
+  this region contains sensitive data (e.g., a page table, trampoline, or
+  device MMIO) and no other PMP entry covers it, S/U-mode accesses to that
+  word will either fail open (if no PMP entry matches, which denies S/U access
+  by default) or fall through to a lower-priority rule, depending on PMP
+  configuration.
+Consequence: function_loss
+Pattern:
+  pmpaddr.*TOR|PMP.*TOR.*top|apply_relocate_add.*pmp|__init_pmp|pmp_init|highe
+  st.*address.*pmp
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/head.S:229-242  _start_kernel (PMP init block)
+  M-mode PMP initialization correctly uses NAPOT encoding (PMP_A_NAPOT) with
+  pmpaddr0=-1 to cover the entire physical address space, avoiding the RV32
+  TOR limitation where the uppermost word (0x3_FFFF_FFFC-0x3_FFFF_FFFF) cannot
+  be matched by any TOR entry because pmpaddr registers cannot represent 2^34
+  as a top bound. The spec note at machine.adoc:3508-3518 explicitly documents
+  this TOR limitation and recommends NAPOT as the workaround — which this code
+  follows.
+  | li a0, -1
+  | csrw CSR_PMPADDR0, a0
+  | li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+  | csrw CSR_PMPCFG0, a0
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3380-3386
+      "[norm:pmp_addr_encoding] Each PMP address register encodes bits
+      33-2 of a 34-bit physical address for RV32"
+    - riscv-isa-manual/src/priv/machine.adoc:3497-3501
+      "[norm:pmp_a_field_tor] If TOR is selected, the associated address
+      register forms the top of the address range, and the preceding PMP
+      address register "
+    - riscv-isa-manual/src/priv/machine.adoc:3508-3518
+      "It is not possible to represent the address 2^34 as the top of a
+      range, so, for example, in an RV32 system with 34-bit physical
+      addresses, a TOR PMP c"
+
+[compliant] arch/riscv/include/asm/csr.h:130-132  N/A (constant definition)
+  PMP_A_TOR (0x08) is defined alongside PMP_A_NA4 (0x10) and PMP_A_NAPOT
+  (0x18) as part of the standard RISC-V PMP address-matching mode constants.
+  TOR is not used anywhere in the kernel code — only NAPOT is used in head.S.
+  The constant's presence does not constitute a bug; it is a faithful
+  definition of the ISA's encoding. Future code that might use TOR on RV32
+  would need to account for the 2^34 top-bound limitation.
+  | #define PMP_A_TOR		0x08
+  | #define PMP_A_NA4		0x10
+  | #define PMP_A_NAPOT		0x18
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3439-3457
+      "A field encoding: TOR (A=1) — Top of range"
+

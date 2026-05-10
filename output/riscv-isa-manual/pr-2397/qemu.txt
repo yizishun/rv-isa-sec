@@ -1,0 +1,317 @@
+PR #2397  target=qemu  overall=compliant
+Spec: QEMU must ensure M-mode access to unlocked PMP regions correctly fails for partially-matching accesses spanning PMP boundaries; the spec clarification confirms the priority/matching-all-bytes rule takes precedence over the M-mode unlocked bypass.
+Violation:
+  In QEMU pmp_hart_has_privs() at pmp.c:435, an M-mode access matching a PMP
+  entry with L bit clear returns success with full R/W/X permissions
+  regardless of the entry's R/W/X bits. The spec clarification states the 'If
+  the L bit is clear and the privilege mode of the access is M, the access
+  succeeds' rule does NOT supersede the priority-and-matching rule: an access
+  that is partially matched (spans a PMP boundary) must fail even for M-mode
+  to an unlocked region. QEMU correctly enforces partial-match failures
+  (pmp.c:413-418) before checking the L bit, but the sequential logic at lines
+  424-517 must ensure that once a PMP entry matches all bytes, the L-cleared
+  M-mode bypass at line 435 does not incorrectly override the all-bytes-
+  matching requirement for accesses crossing into regions with different PMP
+  entries.
+Consequence: privilege_escape
+Pattern:
+  pmp_hart_has_privs.*mode.*!=.*PRV_M.*pmp_is_locked
+------------------------------------------------------------
+[compliant] target/riscv/pmp.c:375-523  pmp_hart_has_privs
+  The PMP priority-and-matching logic correctly enforces the spec's ordering
+  requirements. Partial-match checks (lines 413-418: s+e==1) execute BEFORE
+  the L-cleared M-mode bypass (lines 434-437), so boundary-crossing accesses
+  always fail irrespective of privilege mode or L-bit state. The loop iterates
+  from lowest-numbered entry to highest (the priority order mandated by
+  norm:pmp_entry_priority), and the first matching entry (either partial or
+  full) determines the outcome. A partial match at any priority level
+  immediately returns false with allowed_privs=0, correctly implementing
+  norm:pmp_full_match_required.
+  | for (i = 0; i < pmp_regions; i++) {
+  |     s = pmp_is_in_range(env, i, addr);
+  |     e = pmp_is_in_range(env, i, addr + pmp_size - 1);
+  |     /* partially inside */
+  |     if ((s + e) == 1) {
+  |         qemu_log_mask(LOG_GUEST_ERROR,
+  |                           "pmp violation - access is partially inside\n");
+  |         *allowed_privs = 0;
+  |         return false;
+  |     }
+  |     /* fully inside */
+  |     const uint8_t a_field =
+  |         pmp_get_a_field(env->pmp_state.pmp[i].cfg_reg);
+  |     if (((s + e) == 2) && (PMP_AMATCH_OFF != a_field)) {
+  |         if (!MSECCFG_MML_ISSET(env)) {
+  |             *allowed_privs = PMP_READ | PMP_WRITE | PMP_EXEC;
+  |             if ((mode != PRV_M) || pmp_is_locked(env, i)) {
+  |                 *allowed_privs &= env->pmp_state.pmp[i].cfg_reg;
+  |             }
+  |         }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3576-3579
+      "PMP entries are statically prioritized. The lowest-numbered PMP
+      entry that matches any byte of a memory operation determines whether
+      that operation su"
+    - riscv-isa-manual/src/priv/machine.adoc:3558-3563
+      "When the L bit is set, these permissions are enforced for all
+      privilege modes. When the L bit is clear, any M-mode access matching
+      the PMP entry will "
+    - riscv-isa-manual/src/priv/machine.adoc:3585-3590
+      "If a PMP entry matches all bytes of a memory operation, then the L,
+      R, W, and X bits determine whether the operation succeeds or fails.
+      If the L bit i"
+
+[compliant] target/riscv/pmp.c:429-437  pmp_hart_has_privs
+  The standard PMP privilege check at lines 434-437 correctly implements the
+  spec's L-bit M-mode behavior: M-mode accesses to unlocked regions (L=0)
+  succeed with full R/W/X permissions regardless of the entry's R/W/X bits,
+  while locked regions (L=1) and non-M-mode accesses are gated by the cfg_reg
+  R/W/X bits. The allowed_privs mask is initialized to P READ|WRITE|EXEC
+  (0x07), so the logical-AND with cfg_reg only extracts bits 0-2 (R/W/X). The
+  L bit at position 7 and A field at positions 3-4 in cfg_reg do not interfere
+  with the permission check.
+  | if (!MSECCFG_MML_ISSET(env)) {
+  |     *allowed_privs = PMP_READ | PMP_WRITE | PMP_EXEC;
+  |     if ((mode != PRV_M) || pmp_is_locked(env, i)) {
+  |         *allowed_privs &= env->pmp_state.pmp[i].cfg_reg;
+  |     }
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3560-3563
+      "When the L bit is set, these permissions are enforced for all
+      privilege modes. When the L bit is clear, any M-mode access matching
+      the PMP entry will "
+
+[compliant] target/riscv/pmp.c:408-418  pmp_hart_has_privs
+  The partial-match enforcement at lines 413-418 correctly captures the
+  norm:pmp_full_match_required rule. When s+e==1 (the start and end addresses
+  of the access are not both in or both out of the PMP entry), the function
+  immediately returns false with allowed_privs=0. This runs before any
+  privilege-mode or L-bit check, so M-mode accesses crossing PMP boundaries
+  always fail. This logic correctly handles the scenario described in the spec
+  example: an 8-byte access to 0x8-0xF spanning a 4-byte entry at 0xC-0xF will
+  be detected as partially matching that entry and will fail.
+  | /* partially inside */
+  |         if ((s + e) == 1) {
+  |             qemu_log_mask(LOG_GUEST_ERROR,
+  |                           "pmp violation - access is partially inside\n");
+  |             *allowed_privs = 0;
+  |             return false;
+  |         }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3578-3583
+      "The matching PMP entry must match all bytes of a memory operation,
+      or the operation fails, irrespective of the L, R, W, and X bits. For
+      example, if a "
+
+[compliant] target/riscv/pmp.c:438-509  pmp_hart_has_privs
+  The Smepmp (MML=1) privilege check at lines 438-509 correctly implements the
+  Smepmp truth table from the spec. The pmp_get_smepmp_operation() function
+  extracts a 4-bit operation code from cfg_reg bits: ((L>>4) | (R<<2) | W |
+  (X>>2)). The M-mode switch (lines 446-475) and S/U-mode switch (lines
+  476-508) map all 16 possible operation codes to the correct allowed_privs
+  values per the Smepmp spec truth table. For example: operation 0 (LRWX=0000)
+  → allowed_privs=0 for both M and S/U (inaccessible); operation 2 (LRWX=0010)
+  → PMP_READ|PMP_WRITE for M, PMP_READ for S/U (shared data, read/write on M,
+  read-only on S/U); operation 9 (LRWX=1001) → PMP_EXEC for M, 0 for S/U
+  (locked execute-only).
+  | } else {
+  |                 const uint8_t smepmp_operation =
+  |                     pmp_get_smepmp_operation(env->pmp_state.pmp[i].cfg_reg);
+  |                 if (mode == PRV_M) {
+  |                     switch (smepmp_operation) {
+  |                     case 0:
+  |                     case 1:
+  |                     case 4:
+  |                     case 5:
+  |                     case 6:
+  |                     case 7:
+  |                     case 8:
+  |                         *allowed_privs = 0;
+  |                         break;
+  |                     case 2:
+  |                     case 3:
+  |                     case 14:
+  |                         *allowed_privs = PMP_READ | PMP_WRITE;
+  |                         break;
+  |                     case 9:
+  |                     case 10:
+  |                         *allowed_privs = PMP_EXEC;
+  |                         break;
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:44-66
+      "The physical memory protection rules when mseccfg.MML is set to 1
+      are summarized in the truth table below. [columns: L|R|W|X, M Mode,
+      S/U Mode] ... 0|"
+    - riscv-isa-manual/src/priv/machine.adoc:2426-2460
+      "When mseccfg.MML is set: The meaning of pmpcfg.L changes: Instead
+      of marking a rule as locked and enforced in all modes, it now marks
+      a rule as M-mode"
+
+[compliant] target/riscv/pmp.c:420-424  pmp_hart_has_privs
+  PMP entries with A=OFF are correctly skipped during address-matching. Line
+  424 checks '(PMP_AMATCH_OFF != a_field)' before entering the privilege check
+  block, so disabled PMP entries (A=OFF) never participate in address
+  matching. This is correct because A=OFF entries have sa=0, ea=-1 (matching
+  all addresses) but are not valid PMP rules per the spec definition. If A=OFF
+  entries were not skipped, they would match every access and block lower-
+  priority entries from ever being evaluated.
+  | if (((s + e) == 2) && (PMP_AMATCH_OFF != a_field)) {
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3596-3600
+      "If at least one PMP entry is implemented, but all PMP entries' A
+      fields are set to OFF, then all S-mode and U-mode memory accesses
+      will fail."
+
+[compliant] target/riscv/pmp.c:311-359  pmp_hart_has_privs_default
+  The default (no-match) privilege logic correctly handles all spec-mandated
+  cases: (1) MMWP set → deny all including M-mode; (2) MML set → M-mode
+  allowed only for non-execute accesses (READ|WRITE), others denied; (3)
+  Standard PMP: M-mode or no PMP implemented → full access, S/U-mode with any
+  PMP rules → denied. This correctly implements norms pmp_no_entry_match
+  (M-mode access succeeds when no entry matches), mseccfg_mmwp_op (default
+  deny for M-mode when MMWP set), and mseccfg_mml_exec_code (M-mode code
+  execution restricted under MML).
+  | if (MSECCFG_MMWP_ISSET(env)) {
+  |         *allowed_privs = 0;
+  |         return false;
+  |     } else if (MSECCFG_MML_ISSET(env)) {
+  |         if (mode == PRV_M && !(privs & PMP_EXEC)) {
+  |             ret = true;
+  |             *allowed_privs = PMP_READ | PMP_WRITE;
+  |         } else {
+  |             ret = false;
+  |             *allowed_privs = 0;
+  |         }
+  |         return ret;
+  |     }
+  |     if (!riscv_cpu_cfg(env)->pmp || (mode == PRV_M)) {
+  |         ret = true;
+  |         *allowed_privs = PMP_READ | PMP_WRITE | PMP_EXEC;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3592-3594
+      "If no PMP entry matches an M-mode memory operation, the operation
+      succeeds. If no PMP entry matches an S-mode or U-mode memory
+      operation, but at least"
+    - riscv-isa-manual/src/priv/machine.adoc:2414-2418
+      "When [mseccfg.MMWP] is set it changes the default PMP policy for
+      M-mode when accessing memory regions that don't have a matching PMP
+      rule, to denied i"
+    - riscv-isa-manual/src/priv/machine.adoc:2467-2469
+      "Executing code with Machine mode privileges is only possible from
+      memory regions with a matching M-mode-only rule or a locked Shared-
+      Region rule with "
+
+[compliant] target/riscv/pmp.c:528-548  pmpcfg_csr_write
+  CSR write to pmpcfg correctly triggers TLB flush when any PMP configuration
+  is modified. The function iterates through all 4 or 8 configurations in the
+  CSR (depending on MXL), applies each via pmp_write_cfg which validates
+  locks, Smepmp restrictions, and PMP_MTMATCH. On any modification
+  (modified=true), it calls pmp_update_rule_nums() to recount active rules and
+  tlb_flush() to invalidate all TLB entries. This correctly implements the
+  norm:pmp_sfence_required rule that PMP changes must synchronize with the
+  virtual memory system via SFENCE.VMA — in QEMU's software TLB model,
+  tlb_flush() is the equivalent of the hardware SFENCE.VMA required by the
+  spec.
+  | for (i = 0; i < pmpcfg_nums; i++) {
+  |         cfg_val = (val >> 8 * i)  & 0xff;
+  |         modified |= pmp_write_cfg(env, (reg_index * 4) + i, cfg_val);
+  |     }
+  |     if (modified) {
+  |         pmp_update_rule_nums(env);
+  |         tlb_flush(env_cpu(env));
+  |     }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3629-3633
+      "when the PMP settings are modified, M-mode software must
+      synchronize the PMP settings with the virtual memory system and any
+      PMP or address-translatio"
+
+[compliant] target/riscv/pmp.c:574-620  pmpaddr_csr_write
+  CSR write to pmpaddr correctly validates lock bits, including the TOR
+  dependency where entry i's lock state also affects writes to pmpaddr[i-1]
+  (lines 591-599). On modification, pmp_update_rule_addr recalculates SA/EA
+  for the affected entry (and the next entry if it uses TOR), and tlb_flush
+  synchronizes the TLB. The validation ensures that writes to locked entries
+  are silently ignored per norm:pmp_l_bit_function and
+  norm:pmp_l_bit_write_protection.
+  | if (addr_index + 1 < pmp_regions) {
+  |             uint8_t pmp_cfg = env->pmp_state.pmp[addr_index + 1].cfg_reg;
+  |             is_next_cfg_tor = PMP_AMATCH_TOR == pmp_get_a_field(pmp_cfg);
+  |             if (pmp_is_readonly(env, addr_index + 1) && is_next_cfg_tor) {
+  |                 qemu_log_mask(LOG_GUEST_ERROR,
+  |                               "ignoring pmpaddr write - pmpcfg+1 read only\n");
+  |                 return;
+  |             }
+  |         }
+  |         if (!pmp_is_readonly(env, addr_index)) {
+  |             env->pmp_state.pmp[addr_index].addr_reg = val;
+  |             pmp_update_rule_addr(env, addr_index);
+  |             if (is_next_cfg_tor) {
+  |                 pmp_update_rule_addr(env, addr_index + 1);
+  |             }
+  |             tlb_flush(env_cpu(env));
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3545-3550
+      "The L bit indicates that the PMP entry is locked, i.e., writes to
+      the configuration register and associated address registers are
+      ignored. If PMP entr"
+
+[compliant] target/riscv/pmp.c:660-703  mseccfg_csr_write
+  mseccfg CSR write correctly implements sticky-bit semantics for MMWP and MML
+  fields (once set, cannot be cleared until PMP reset), and the RLB re-lock
+  prevention (RLB cannot be set if any PMP entries are locked). When MMWP or
+  MML state changes, tlb_flush is triggered. Lines 686-688: the existing
+  sticky bits value is preserved by OR-ing them back into the new value, and
+  any change in sticky bit state triggers a TLB flush. This matches the
+  norm:mseccfg_mmwp_op_warl (MMWP is sticky, reset to 0 only on PMP reset) and
+  norm:mseccfg_mml_sticky (MML is sticky) rules.
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |             /* Sticky bits */
+  |             val |= (env->mseccfg & mask);
+  |             if ((val ^ env->mseccfg) & mask) {
+  |                 tlb_flush(env_cpu(env));
+  |             }
+  |         }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2414-2418
+      "The mseccfg.MMWP is a WARL field. This is a sticky bit, meaning
+      that once set it cannot be unset until a PMP reset."
+    - riscv-isa-manual/src/priv/machine.adoc:2420-2423
+      "The mseccfg.MML is a WARL field. This is a sticky bit, meaning that
+      once set it cannot be unset until a PMP reset."
+
+[compliant] target/riscv/machine.c:49-71  vmstate_pmp
+  PMP state is correctly included in the VMState migration structure. The
+  vmstate_pmp_entry records both addr_reg (UINTTL) and cfg_reg (UINT8) for
+  each PMP entry. The vmstate_pmp uses pmp_needed() to conditionally include
+  PMP state only when PMP is configured, and pmp_post_load() to recalculate
+  SA/EA addresses and rule counts after migration. This ensures that PMP
+  settings survive live migration correctly, preventing silent privilege
+  escalation that would occur if PMP state were lost during migration.
+  | static const VMStateDescription vmstate_pmp_entry = {
+  |     .name = "cpu/pmp/entry",
+  |     .version_id = 1,
+  |     .minimum_version_id = 1,
+  |     .fields = (const VMStateField[]) {
+  |         VMSTATE_UINTTL(addr_reg, pmp_entry_t),
+  |         VMSTATE_UINT8(cfg_reg, pmp_entry_t),
+  |         VMSTATE_END_OF_LIST()
+  |     }
+  | };
+  | static const VMStateDescription vmstate_pmp = {
+  |     .name = "cpu/pmp",
+  |     .version_id = 1,
+  |     .minimum_version_id = 1,
+  |     .needed = pmp_needed,
+  |     .post_load = pmp_post_load,
+  |     .fields = (const VMStateField[]) {
+  |         VMSTATE_STRUCT_ARRAY(env.pmp_state.pmp, RISCVCPU, MAX_RISCV_PMPS,
+  |                              0, vmstate_pmp_entry, pmp_entry_t),
+  |         VMSTATE_END_OF_LIST()
+  |     }
+  | };
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3545-3546
+      "Locked PMP entries remain locked until the hart is reset."
+

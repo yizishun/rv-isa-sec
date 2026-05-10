@@ -1,0 +1,189 @@
+{
+  "pr_number": 15,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 15,
+    "violation_condition": "In XiangShan RTL, when the notrace[1] (security inhibit) signal is driven by a CSR bit or internal state that is writable by software running below machine mode (e.g., supervisor or user mode), or when the reserved encoding notrace=2'b11 is not properly handled and defaults to tracing-uninhibited behavior, an attacker can suppress trace output during privilege escalation or side-channel exploitation, making the attack invisible to external trace-based security monitors. Additionally, if backwards-compatibility wiring (wiring halted to notrace[0], tying notrace[1] to 0) is hardcoded in the RTL, the security inhibit dimension is permanently disabled, violating the sdsec extension's security intent.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "notrace[1] assigned from software-writable CSR without M-mode-only write protection; notrace == 2'b11 defaulting to 2'b00; trace_enable gated only on debug_mode without security_inhibit signal path",
+    "affected_entities": [
+      "notrace",
+      "halted",
+      "trace_encoder_interface",
+      "debug_module"
+    ],
+    "summary": "Hardware notrace[1] security-inhibit signal driven by insufficiently privileged software state enables attackers to selectively blind trace-based security monitoring during exploits"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/trace/Interface.scala",
+        "function_name": "FromEncoder",
+        "line_start": 37,
+        "line_end": 40,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "FromEncoder bundle defines only enable:Bool and stall:Bool — two 1-bit control signals. The Sdsec 'notrace' 2-bit semantic (notrace[0]=halted, notrace[1]=security inhibit) is entirely absent from this interface. There is no path for the external trace encoder to convey halt-or-security inhibit intent, and no path for the core to signal security-critical trace-suppression events to the encoder. This is the root interface surface where notrace must be defined. The effective behavior is equivalent to hardcoded notrace=2'b00 — both halt-inhibit and security-inhibit dimensions are permanently deasserted.",
+      "snippet": "class FromEncoder extends Bundle {\n  val enable = Bool()\n  val stall  = Bool()\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/trace/Interface.scala",
+        "function_name": "TraceCoreInterface.fromEncoder",
+        "line_start": 42,
+        "line_end": 46,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "TraceCoreInterface.fromEncoder port uses an inline Bundle (enable:Bool, stall:Bool) as Input — NOT the FromEncoder class. This is the boundary between the external trace encoder (XSTOP) and the XiangShan core. Any notrace field added must be replicated here. The port currently carries no notrace semantics. This is the SoC-level integration point where notrace signals cross from the encoder into the core's trace subsystem.",
+      "snippet": "val fromEncoder = Input(new Bundle {\n  val enable = Bool()\n  val stall  = Bool()\n})",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/trace/TraceBuffer.scala",
+        "function_name": "TraceBuffer (blockCommit gating)",
+        "line_start": 61,
+        "line_end": 62,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "blockCommit is the single choke-point gating trace backpressure to the ROB: `blockCommit := io.in.fromEncoder.enable && (canNotTraceAll || io.in.fromEncoder.stall)`. This logic only considers enable (trace on/off) and stall (buffer backpressure). There is NO notrace[1] (security inhibit) input that would suppress trace output without backpressuring the ROB. For Sdsec, a notrace[1] assertion during security-sensitive execution (trap handling, privilege transition) should prevent trace packet emission WITHOUT stalling the commit pipeline. Currently, the only way to suppress trace is to deassert enable, which requires an external decision — the core has no internal security-state awareness to auto-suppress trace.",
+      "snippet": "val canNotTraceAll = distanceBetween(enqPtrNext, deqPtrNext) > 0.U\nblockCommit := io.in.fromEncoder.enable && (canNotTraceAll || io.in.fromEncoder.stall)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/CtrlBlock.scala",
+        "function_name": "CtrlBlock (trace fromEncoder wiring)",
+        "line_start": 291,
+        "line_end": 295,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "CtrlBlock wires io.traceCoreInterface.fromEncoder.{enable,stall} directly to Trace module inputs. Any new notrace field must be routed here. This is where core-internal security state (debugMode, privilege level, trap-in-progress, CSR security bits) could be combined with the external notrace signal to create a merged security-inhibit decision. Currently, the core blindly passes external enable/stall through with no awareness of its own security posture.",
+      "snippet": "trace.io.in.fromEncoder.stall  := io.traceCoreInterface.fromEncoder.stall\ntrace.io.in.fromEncoder.enable := io.traceCoreInterface.fromEncoder.enable\ntrace.io.in.fromRob            := rob.io.trace.traceCommitInfo\nrob.io.trace.blockCommit       := trace.io.out.blockRobCommit",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/trace/Trace.scala",
+        "function_name": "Trace (fromEncoder routing to TraceBuffer)",
+        "line_start": 52,
+        "line_end": 56,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The Trace module passes fromEncoder (enable+stall) to TraceBuffer as a whole bundle (line 53: `traceBuffer.io.in.fromEncoder := fromEncoder`). The Trace pipeline (s1→s2→s3) has no per-instruction or per-group notrace filtering. Trace data flows from ROB commit through RegEnable, TraceBuffer compress/dequeue, and RegNext output unconditionally whenever enable is asserted. For Sdsec, a notrace[1] security inhibit should either prevent trace entries from being enqueued in TraceBuffer, or gate trace output at the final toEncoder stage, without backpressuring ROB.",
+      "snippet": "val traceBuffer = Module(new TraceBuffer)\ntraceBuffer.io.in.fromEncoder := fromEncoder\ntraceBuffer.io.in.fromRob := s2_in\nval s2_out_groups = traceBuffer.io.out.groups\nblockCommit := traceBuffer.io.out.blockCommit",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/DebugLevel.scala",
+        "function_name": "TrigAction.isLegal",
+        "line_start": 245,
+        "line_end": 256,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "TrigAction.isLegal() explicitly restricts legal trigger actions to only BreakpointExp(0) and DebugMode(1). Any CSR write to tdata1.ACTION with value TraceOn(2), TraceOff(3), or TraceNotify(4) is silently legalized to BreakpointExp by the legalize() method (lines 252-253). This means a debugger or M-mode software CANNOT use Sdtrig triggers to control trace. For Sdsec, the TraceOff trigger action could be a legitimate mechanism to assert notrace[1] (security inhibit) under software control, but this path does not reach hardware.",
+      "snippet": "override def isLegal(enumeration: CSREnumType, dmode: Bool): Bool = enumeration.isOneOf(BreakpointExp) || enumeration.isOneOf(DebugMode) && dmode\n// ...\noverride def legalize(enumeration: CSREnumType, dmode: Bool): CSREnumType = {\n  val res = WireInit(enumeration)\n  when(!enumeration.isLegal(dmode)){\n    res := BreakpointExp\n  }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/DebugLevel.scala",
+        "function_name": "triggerActionGen",
+        "line_start": 406,
+        "line_end": 417,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "triggerActionGen() resolves trigger actions exclusively to DebugMode or BreakpointExp. Lines 407-408 compute fireDebugModeVec and fireBreakpointExpVec but never compute fireTraceOnVec, fireTraceOffVec, or fireTraceNotifyVec. The comment at line 412 (`// todo: add more for trace`) explicitly acknowledges this gap. For Sdsec, without TraceOff trigger action support, M-mode cannot use the trigger infrastructure to suppress trace output during security-critical code sequences.",
+      "snippet": "// todo: add more for trace\ntriggerAction := MuxCase(TriggerAction.None, Seq(\n  fireDebugMode -> TriggerAction.DebugMode,\n  breakPointExp -> TriggerAction.BreakpointExp,\n))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/Bundle.scala",
+        "function_name": "TriggerAction (trace enum values)",
+        "line_start": 715,
+        "line_end": 727,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The TriggerAction object in Bundle.scala defines TraceOn=2, TraceOff=3, TraceNotify=4 as UInt values. These exist only to satisfy RISC-V Debug spec enum completeness. They are referenced by the TrigAction CSREnum in DebugLevel.scala (which legalizes them away to BreakpointExp) and by nothing else in the hardware. A grep for TriggerAction.(TraceOn|TraceOff|TraceNotify) returns zero active wiring references beyond the enum definition and the legalization code. These constants are dead code — they have no functional effect on trace behavior.",
+      "snippet": "def TraceOn       = 2.U(width.W)\ndef TraceOff      = 3.U(width.W)\ndef TraceNotify   = 4.U(width.W)\ndef None          = 15.U(width.W)\ndef isExp(action: UInt)   = action === BreakpointExp\ndef isDmode(action: UInt) = action === DebugMode\ndef isNone(action: UInt)  = action === None",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (privForTrace, no security-aware gating)",
+        "line_start": 1251,
+        "line_end": 1273,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "privForTrace selects Priv.D when debugMode is active, otherwise maps privState to trace privilege encoding (M/HS/VS/HU/VU). There is NO notrace-related logic here — no CSR bit for security inhibit, no privilege-level gating of trace output, and no M-mode-only write-protection mechanism. The traceCSR CSR bundle (cause, tval, mstatus, lastPriv, currentPriv) flows unconditionally to the toEncoder output. For Sdsec, this is where a notrace[1] CSR bit would be read and where M-mode write protection would be enforced.",
+      "snippet": "val privForTrace = Mux(debugMode,\n  Priv.D,\n  Mux1H(\n    Seq(privState.isModeM, privState.isModeHS, privState.isModeVS, privState.isModeHU, privState.isModeVU),\n    Seq(Priv.M,            Priv.HS,            Priv.VS,            Priv.HU,            Priv.VU)\n  )\n)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (no notrace CSR in csrRwMap)",
+        "line_start": 1021,
+        "line_end": 1023,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "csrRwMap contains no notrace-related CSR. The noCSRIllegal check at line 1021 would trigger an illegal-instruction exception for any CSR address not in the map. For Sdsec, a new CSR entry (e.g., for a hypothetical mnotrace or trTeControl.notrace field) must be added to csrRwMap. The existing CSR access control framework (CSRPermitModule) would need explicit M-mode-only write protection to prevent S/U-mode software from asserting security inhibit.",
+      "snippet": "private val noCSRIllegal = (ren || wen) && Cat(csrRwMap.keys.toSeq.sorted.map(csrAddr => !(addr === csrAddr.U))).andR",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/XSTileWrap.scala",
+        "function_name": "XSTileWrap (fromEncoder async sync)",
+        "line_start": 154,
+        "line_end": 160,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "XSTileWrap applies a 3-cycle AsyncResetSynchronizerShiftReg to fromEncoder.enable and fromEncoder.stall (lines 155-158) before passing them to the tile. toEncoder data passes through directly (line 160). There is NO notrace field in this async crossing. If the external encoder asserts notrace, it would not reach the core's trace subsystem. The 3-cycle synchronization latency means any added notrace signal would also need synchronization, adding latency to security-inhibit assertion/deassertion.",
+      "snippet": "withClockAndReset(clock, reset_sync) {\n  tile.module.io.traceCoreInterface.fromEncoder.enable := \n    AsyncResetSynchronizerShiftReg(io.traceCoreInterface.fromEncoder.enable, 3, 0)\n  tile.module.io.traceCoreInterface.fromEncoder.stall := \n    AsyncResetSynchronizerShiftReg(io.traceCoreInterface.fromEncoder.stall, 3, 0)\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/top/Top.scala",
+        "function_name": "Top (trace IO, no notrace)",
+        "line_start": 348,
+        "line_end": 360,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Top.scala's traceCoreInterface loop wires fromEncoder from external IO and toEncoder to external IO per hart. The toEncoder output is flattened into individual bit-vector signals (valid, iaddr, itype, iretire, ilastsize). There is NO notrace signal in the top-level IO definition. For Sdsec, the top-level IO must be extended to carry notrace per hart, and the signal must be propagated through the trace interface. Currently, the notrace control channel between the external XSTOP encoder and the core does not exist at the SoC boundary.",
+      "snippet": "traceInterface.fromEncoder := io.traceCoreInterface(i).fromEncoder\nio.traceCoreInterface(i).toEncoder.priv := traceInterface.toEncoder.priv\nio.traceCoreInterface(i).toEncoder.cause := traceInterface.toEncoder.trap.cause\nio.traceCoreInterface(i).toEncoder.tval := traceInterface.toEncoder.trap.tval\nio.traceCoreInterface(i).toEncoder.mstatus := traceInterface.toEncoder.mstatus\nio.traceCoreInterface(i).toEncoder.valid := VecInit(traceInterface.toEncoder.groups.map(_.valid)).asUInt\nio.traceCoreInterface(i).toEncoder.iaddr := VecInit(traceInterface.toEncoder.groups.map(_.bits.iaddr)).asUInt\nio.traceCoreInterface(i).toEncoder.itype := VecInit(traceInterface.toEncoder.groups.map(_.bits.itype)).asUInt\nio.traceCoreInterface(i).toEncoder.iretire := VecInit(traceInterface.toEncoder.groups.map(_.bits.iretire)).asUInt\nio.traceCoreInterface(i).toEncoder.ilastsize := VecInit(traceInterface.toEncoder.groups.map(_.bits.ilastsize)).asUInt",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/rob/Rob.scala",
+        "function_name": "Rob (trace commit, no per-instruction notrace)",
+        "line_start": 1278,
+        "line_end": 1296,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Rob generates trace commit info for every committed instruction, with exception/interrupt override for block(0) when io.exception.valid fires. There is NO per-instruction notrace flag — every committed instruction unconditionally becomes a trace entry candidate. For Sdsec security inhibit, certain instructions (trap handlers, security-critical CSR writes) should be marked as not-to-be-traced. Currently, the Rob has no mechanism to attach a 'suppress trace' attribute to individual instructions or to gate traceValids based on security state.",
+      "snippet": "for (i <- 0 until CommitWidth) {\n  traceBlocks(i).bits.ftqIdx.foreach(_ := rawInfo(i).ftqIdx)\n  traceBlocks(i).bits.ftqOffset.foreach(_ := rawInfo(i).ftqOffset)\n  traceBlockInPipe(i).itype := rawInfo(i).traceBlockInPipe.itype\n  traceBlockInPipe(i).iretire := iretireCommit(i)\n  traceBlockInPipe(i).ilastsize := rawInfo(i).traceBlockInPipe.ilastsize\n  traceValids(i) := io.commits.isCommit && io.commits.commitValid(i)\n  if(i == 0) {\n    when(io.exception.valid){\n      traceBlocks(i).bits.tracePipe.itype := Mux(io.exception.bits.isInterrupt,\n        Itype.Interrupt,\n        Itype.Exception\n      )\n      traceValids(i) := true.B\n      traceBlockInPipe(i).iretire := 0.U\n    }\n  }\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

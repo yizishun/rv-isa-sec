@@ -1,0 +1,357 @@
+{
+  "pr_number": 1879,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 1879,
+    "violation_condition": "",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "",
+    "affected_entities": [],
+    "summary": "JSON decode error"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 121,
+        "line_end": 218,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Two-phase PMP programming is correctly implemented: Phase 1 (MML=0, RLB=1) programs M-mode-only regions with L=1, then MML is set to enforce Smepmp encoding, then Phase 2 programs shared and SU-only regions. After all entries are programmed, RLB is intentionally kept set for dynamic mappings, and sbi_hart_pmp_fence() is called to flush translation caches.",
+      "snippet": "csr_set(CSR_MSECCFG, MSECCFG_RLB);\n/* Program M-only regions when MML is not set. */\n...\ncsr_set(CSR_MSECCFG, MSECCFG_MML);\n/* Program shared and SU-only regions */\n...\nsbi_hart_pmp_fence();",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2391,
+          "line_end": 2397,
+          "excerpt": "When mseccfg.RLB is 1, locked PMP rules may be removed or modified and locked PMP rules may be edited."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2420,
+          "line_end": 2424,
+          "excerpt": "The MML bit changes the interpretation of the pmpcfg.L bit... When mseccfg.MML is set... the meaning of pmpcfg.L changes: Instead of marking a rule as locked... it now marks a rule as M-mode-only when set and S/U-mode-only when unset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 213,
+        "line_end": 216,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "RLB is intentionally kept set to 1 after PMP configuration completes (line 213-214 comment confirms this is deliberate). According to mseccfg.RLB spec, RLB=1 means any M-mode code can modify or remove locked PMP entries, permanently weakening the defense-in-depth that PMP locking provides. The firmware region entries (M-mode-only with L=1) could be subverted by any M-mode code that can reach csr_write to mseccfg or pmpcfg CSRs.",
+      "snippet": "/*\n * All entries are programmed.\n * Keep the RLB bit so that dynamic mappings can be done.\n */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2391,
+          "line_end": 2397,
+          "excerpt": "When mseccfg.RLB is 1, locked PMP rules may be removed or modified and locked PMP rules may be edited. When mseccfg.RLB is 0 and pmpcfg.L is 1 in any rule or entry, then mseccfg.RLB remains 0 and any further modifications to mseccfg.RLB are ignored until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_map_range",
+        "line_start": 220,
+        "line_end": 250,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sbi_hart_smepmp_map_range() and sbi_hart_smepmp_unmap_range() do not call sbi_hart_pmp_fence() after programming or disabling the reserved PMP entry 0. Per sbi_hart_pmp_fence() own comment (lines 67-76), PMP translations can be speculatively cached, and SFENCE.VMA is needed to flush these caches after PMP changes. Without a fence, stale PMP translation caches could temporarily allow access through a just-disabled entry.",
+      "snippet": "pmp_set(SBI_SMEPMP_RESV_ENTRY, pmp_flags, base, order);\nreturn SBI_OK;\n...\nreturn pmp_disable(SBI_SMEPMP_RESV_ENTRY);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2196,
+          "line_end": 2198,
+          "excerpt": "After changing menvcfg.PBMTE, executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0 suffices to synchronize address-translation caches with respect to the altered interpretation."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain.c",
+        "function_name": "sbi_domain_get_smepmp_flags",
+        "line_start": 146,
+        "line_end": 218,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Smepmp flag translation correctly maps all domain memory region permission combinations to the Smepmp truth table encodings: SUR_MR→LRWX=1111 (locked shared read-only both modes), SUX_MRX→LRWX=1011 (locked shared code X-for-SU/RX-for-M), SUX_MX→LRWX=1010 (locked shared code X-both), SURW_MRW→LRWX=0011 (shared data R/W both), SUR_MRW→LRWX=0010 (shared data R/W-M R/O-SU). M_RWX is correctly rejected as unsupported. M-mode-only regions always set L-bit per Smepmp. All 10 entries match the normative truth table.",
+      "snippet": "if (SBI_DOMAIN_MEMREGION_IS_SUR_MR(reg->flags))\n  pmp_flags = (PMP_L | PMP_R | PMP_W | PMP_X);\nelse if (SBI_DOMAIN_MEMREGION_IS_SUX_MRX(reg->flags))\n  pmp_flags = (PMP_L | PMP_W | PMP_X);\nelse if (SBI_DOMAIN_MEMREGION_IS_SUX_MX(reg->flags))\n  pmp_flags = (PMP_L | PMP_W);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smepmp.adoc",
+          "line_start": 44,
+          "line_end": 66,
+          "excerpt": "The physical memory protection rules when mseccfg.MML is set to 1 are summarized in the truth table... |1|1|1|1|Locked Shared data region: Read only on both M and S/U mode|  |1|0|1|1|Locked Shared code region: Execute only on S/U mode, read/execute on M mode|  |1|0|1|0|Locked Shared code region: Execute only on both M and S/U mode|  |0|0|1|1|Shared data region: Read/write for both M and S/U mode|  |0|0|1|0|Shared data region: Read/write on M mode, read-only on S/U mode"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain_context.c",
+        "function_name": "switch_to_next_domain_context",
+        "line_start": 126,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Domain context switch correctly calls sbi_hart_protection_unconfigure() before reconfiguring. The unconfigure function skips firmware PMP entries (those tracked in fw_smepmp_ids bitmap), preserving M-mode's ability to access firmware code and data throughout the domain switch. After unconfigure, sbi_hart_protection_configure() rebuilds all PMP entries using the new domain's memory regions. The two-phase Smepmp configure call properly handles this reconfiguration.",
+      "snippet": "/* Reconfigure PMP settings for the new domain */\nsbi_hart_protection_unconfigure(scratch);\nsbi_hart_protection_configure(scratch);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2462,
+          "line_end": 2465,
+          "excerpt": "Adding a rule with executable privileges that either is M-mode-only or a locked Shared-Region is not possible and such pmpcfg writes are ignored... This restriction can be temporarily lifted by setting mseccfg.RLB e.g. during the boot process."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "hart_detect_features",
+        "line_start": 698,
+        "line_end": 706,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "OpenSBI correctly rejects platforms where the previous booting stage has already set mseccfg.MML=1 before entering OpenSBI. Since mseccfg.MML is a sticky bit (once set, cannot be unset until PMP reset per spec norm:mseccfg_mml_sticky), OpenSBI must enter with MML=0 to configure its own M-mode-only regions. The check returns SBI_EILL if MML is already set, preventing OpenSBI from running on a platform where it cannot properly configure Smepmp.",
+      "snippet": "if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMEPMP) &&\n    (csr_read(CSR_MSECCFG) & MSECCFG_MML))\n    return SBI_EILL;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2420,
+          "line_end": 2423,
+          "excerpt": "The mseccfg.MML (Machine Mode Lockdown) is a WARL field... This is a sticky bit, meaning that once set it cannot be unset until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_init.c",
+        "function_name": "init_warm_resume",
+        "line_start": 483,
+        "line_end": 499,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The suspend/resume path correctly reconfigures PMP after resume. sbi_hart_reinit() restores mstatus and FP state, then sbi_hart_protection_configure() calls sbi_hart_smepmp_configure() which does the full two-phase PMP reprogramming (MML=0 for M-only, then MML=1 for shared/SU). Since non-retentive suspend loses PMP CSR state, this full reconstruction is necessary and correctly implemented.",
+      "snippet": "sbi_hsm_hart_resume_start(scratch);\nrc = sbi_hart_reinit(scratch);\n...\nrc = sbi_hart_protection_configure(scratch);\n...\nsbi_hsm_hart_resume_finish(scratch, hartid);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2797,
+          "line_end": 2798,
+          "excerpt": "The MML, MMWP, and RLB fields of the mseccfg register are set to 0, unless the platform mandates a different reset value."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_pmp_unconfigure",
+        "line_start": 300,
+        "line_end": 312,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sbi_hart_pmp_unconfigure() correctly skips firmware PMP entries when disabling PMP entries for domain context switch. The sbi_hart_smepmp_is_fw_region() check ensures that M-mode's access to firmware code/data (via locked M-mode-only PMP entries) is never revoked during domain transitions. If this were not done, the firmware would instantly lose access to its own memory during the domain switch, causing unrecoverable faults.",
+      "snippet": "for (i = 0; i < pmp_count; i++) {\n  if (sbi_hart_smepmp_is_fw_region(i))\n    continue;\n  pmp_disable(i);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 182,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fw_smepmp_ids_inited is set to true on line 182 after Phase 1 (M-only regions) completes. If Phase 2 (shared/SU regions) encounters an error and returns early (e.g., is_valid_pmp_idx fails at line 193), the bitmap is already marked as initialized. On a subsequent hart's configure call, the consistency check (lines 167-170) would pass even though Phase 2 never completed on the first hart. Additionally, the static global fw_smepmp_ids bitmap is shared across all harts with no hart-indexing — if different harts ever have different domain assignments with different firmware regions, the bitmap would be incorrect.",
+      "snippet": "fw_smepmp_ids_inited = true;\n/* Set the MML to enforce new encoding */\ncsr_set(CSR_MSECCFG, MSECCFG_MML);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 139,
+        "line_end": 139,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "RLB is set via csr_set(CSR_MSECCFG, MSECCFG_RLB) as the very first step of sbi_hart_smepmp_configure(), before any locked PMP entries are programmed. This ordering is critical because the spec says RLB cannot be set if any locked PMP entry already exists and RLB=0. Since no locked entries exist at this point (PMPs are in reset state on cold boot, or were properly unconfigured), the RLB write succeeds and persists through the entire programming sequence.",
+      "snippet": "csr_set(CSR_MSECCFG, MSECCFG_RLB);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2391,
+          "line_end": 2397,
+          "excerpt": "When mseccfg.RLB is 0 and pmpcfg.L is 1 in any rule or entry (including disabled entries), then mseccfg.RLB remains 0 and any further modifications to mseccfg.RLB are ignored until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "hart_detect_features",
+        "line_start": 698,
+        "line_end": 706,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "OpenSBI only checks for mseccfg.MML=1 from the previous boot stage, but does not check mseccfg.MMWP. The MMWP bit (Machine-Mode Whitelist Policy) is also sticky once set per spec norm:mseccfg_mmwp_op_warl. If a previous boot stage set MMWP=1, M-mode's default access policy becomes 'denied' for regions without matching PMP rules. If during any gap between PMP unconfiguration and reconfiguration (e.g., domain context switch), M-mode code accesses memory not covered by an explicit PMP rule, it will fault. While this is unlikely in practice (firmware regions cover necessary code/data), the lack of detection leaves this scenario untested.",
+      "snippet": "if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMEPMP) &&\n    (csr_read(CSR_MSECCFG) & MSECCFG_MML))\n    return SBI_EILL;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2412,
+          "line_end": 2418,
+          "excerpt": "The mseccfg.MMWP (Machine-Mode Allowlist Policy) is a WARL field. This field changes the default PMP policy for Machine mode... This is a sticky bit, meaning that once set it cannot be unset until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/riscv_asm.c",
+        "function_name": "pmp_set",
+        "line_start": 333,
+        "line_end": 381,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PMP entry programming follows the required CSR write order: pmpaddr CSR is written first, then pmpcfg CSR. This ensures that when the entry becomes active (via pmpcfg.A bits being set to NAPOT), the pmpaddr already holds the correct address. The address matching mode is forced to NAPOT (except for 4-byte regions which use NA4), preventing TOR mode which would have ordering dependencies with adjacent entries.",
+      "snippet": "csr_write_num(pmpaddr_csr, pmpaddr);\ncsr_write_num(pmpcfg_csr, pmpcfg);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain.c",
+        "function_name": "is_region_before",
+        "line_start": 299,
+        "line_end": 324,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Domain memory region sorting correctly prioritizes firmware regions first, ensuring consistent PMP entry indices across all harts. This is essential for Smepmp because firmware PMP entries must occupy the same indices on every hart for the fw_smepmp_ids bitmap to remain valid during domain context switches. Without this ordering guarantee, the bitmap-based firmware entry preservation in sbi_hart_pmp_unconfigure() would break.",
+      "snippet": "if (SBI_DOMAIN_MEMREGION_IS_FIRMWARE(regA->flags) &&\n   !SBI_DOMAIN_MEMREGION_IS_FIRMWARE(regB->flags))\n  return true;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "sbi_hart_init",
+        "line_start": 724,
+        "line_end": 758,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sbi_hart_pmp_init() is only called during cold boot (cold_boot=true path). On warm boot, the PMP module is not re-initialized, which is correct since the epmp_protection/pmp_protection structs are already registered globally. MIP CSR is cleared before any other init to prevent spurious interrupts. The hart features detection (including Smepmp) happens before PMP init, and the MML=0 check is part of feature detection, ensuring Smepmp availability is known before PMP configuration begins.",
+      "snippet": "if (cold_boot) {\n  rc = sbi_hart_pmp_init(scratch);\n  if (rc)\n    return rc;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_is_fw_region",
+        "line_start": 57,
+        "line_end": 63,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When fw_smepmp_ids_inited is false, sbi_hart_smepmp_is_fw_region() unconditionally returns false for all PMP indices. This is called by sbi_hart_pmp_unconfigure() during domain context switches. If a domain switch occurs before the first hart finishes PMP initialization (fw_smepmp_ids_inited still false), unconfigure would disable ALL PMP entries including firmware entries, potentially causing M-mode to lose access to its own code and crash.",
+      "snippet": "if (!fw_smepmp_ids_inited)\n  return false;\nreturn bitmap_test(fw_smepmp_ids, pmp_idx) ? true : false;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 145,
+        "line_end": 206,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The two-pass iteration through domain memory regions correctly separates M-mode-only programming (Phase 1, MML=0) from shared/SU-mode programming (Phase 2, MML=1). Both phases iterate from pmp_idx=0 and skip reserved entry 0. Critically, each phase increments pmp_idx for ALL regions (both skipped and programmed), ensuring Phase 2 indices do not overlap with Phase 1 indices. For example, if regions are [M-only-fw, M-only, Shared, SU-only]: Phase 1 programs at indices [1,2], Phase 2 programs at indices [3,4], with no overlap.",
+      "snippet": "/* Phase 1: Program M-only regions when MML is not set */\npmp_idx = 0;\nsbi_domain_for_each_memregion(dom, reg) {\n  ...\n  if (!SBI_DOMAIN_MEMREGION_M_ONLY_ACCESS(reg->flags)) {\n    pmp_idx++;\n    continue;\n  }\n  sbi_hart_smepmp_set(..., pmp_idx++, ...);\n}\ncsr_set(CSR_MSECCFG, MSECCFG_MML);\n/* Phase 2: Program shared and SU-only regions */\npmp_idx = 0;\nsbi_domain_for_each_memregion(dom, reg) {\n  ...\n  if (SBI_DOMAIN_MEMREGION_M_ONLY_ACCESS(reg->flags)) {\n    pmp_idx++;\n    continue;\n  }\n  sbi_hart_smepmp_set(..., pmp_idx++, ...);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 166,
+        "line_end": 174,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Firmware PMP entry tracking and consistency checking across harts is correctly implemented: on first initialization (fw_smepmp_ids_inited=false), firmware PMP indices are recorded in the global bitmap. On subsequent harts (fw_smepmp_ids_inited=true), the code verifies that firmware regions map to the same PMP indices, returning SBI_EINVAL if they differ. This cross-hart consistency check prevents misconfiguration where one hart's firmware region would be at a different PMP index than another's, which would break the unconfigure skip logic during domain context switches.",
+      "snippet": "if (fw_smepmp_ids_inited) {\n  if (!sbi_hart_smepmp_is_fw_region(pmp_idx))\n    return SBI_EINVAL;\n} else {\n  bitmap_set(fw_smepmp_ids, pmp_idx, 1);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_map_range",
+        "line_start": 220,
+        "line_end": 250,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sbi_hart_smepmp_map_range() correctly implements the dynamic shared memory access pattern using reserved PMP entry 0. It prevents concurrent mappings via is_pmp_entry_mapped() check, finds a naturally-aligned power-of-two region covering the requested range, and programs entry 0 as a non-locked shared data region (pmp_flags=PMP_W|PMP_X, which under Smepmp MML=1 encodes LRWX=0011: 'Shared data region: Read/write for both M and S/U mode'). The caller is expected to do map-work-unmap in sequence.",
+      "snippet": "if (is_pmp_entry_mapped(SBI_SMEPMP_RESV_ENTRY))\n  return SBI_ENOSPC;\n...\npmp_set(SBI_SMEPMP_RESV_ENTRY, pmp_flags, base, order);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smepmp.adoc",
+          "line_start": 53,
+          "line_end": 53,
+          "excerpt": "0|0|1|1|Shared data region: Read/write for both M and S/U mode"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain_context.c",
+        "function_name": "switch_to_next_domain_context",
+        "line_start": 139,
+        "line_end": 140,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "When switching the SATP CSR during domain context switch, the code correctly executes __sbi_sfence_vma_all() immediately after the csr_swap of SATP. This SFENCE.VMA ensures that any cached address translations from the old address space are invalidated before the new domain's code executes, preventing TLB-based cross-domain information leaks.",
+      "snippet": "ctx->satp = csr_swap(CSR_SATP, dom_ctx->satp);\n__sbi_sfence_vma_all();",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2196,
+          "line_end": 2198,
+          "excerpt": "After changing menvcfg.PBMTE, executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0 suffices to synchronize address-translation caches."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

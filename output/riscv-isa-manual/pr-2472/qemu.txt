@@ -1,0 +1,100 @@
+PR #2472  target=qemu  overall=bug_confirmed
+Spec: RV32 TOR PMP << 2 overflow truncates physical addresses >= 4 GiB, aliasing PMP protections into low memory and defeating access control
+Violation:
+  On RV32 QEMU (TARGET_LONG_BITS=32), pmp_update_rule_addr() at pmp.c:256-257
+  computes sa = prev_addr << 2 and ea = (this_addr << 2) - 1u, where
+  prev_addr/this_addr are 32-bit target_ulong but sa/ea are 64-bit hwaddr. The
+  << 2 is evaluated in 32-bit arithmetic before assignment. For pmpaddr values
+  representing physical addresses above 4 GiB (pmpaddr >= 0x40000000, i.e.
+  pa[33:32] != 00), the shift overflows 32 bits, truncating the high address
+  bits. The PMP range aliases into low 4 GiB space or becomes empty (sa > ea),
+  violating the spec requirement that TOR PMP correctly addresses up to
+  2^XLEN+2.
+Consequence: privilege_escape
+Pattern:
+  pmp_update_rule_addr.*<< 2|target_ulong.*<< 2.*hwaddr
+------------------------------------------------------------
+[bug_confirmed] target/riscv/pmp.c:256-257  pmp_update_rule_addr
+  Integer overflow in TOR PMP address computation: prev_addr and this_addr are
+  target_ulong (uint32_t on RV32), but the << 2 shift is evaluated in 32-bit
+  arithmetic before assignment to 64-bit hwaddr sa/ea. For pmpaddr values
+  representing physical addresses above 4 GiB (pmpaddr >= 0x40000000, i.e.
+  pa[33:32] != 00), the shift overflows 32 bits, truncating the high bits. The
+  PMP range aliases into low 4 GiB space, violating the spec requirement
+  (machine.adoc:3390-3392) that RV32 PMP must support 34-bit physical
+  addresses. This allows attacker-controlled M-mode code to bypass PMP
+  protections on high physical memory.
+  | sa = prev_addr << 2; /* shift up from [xx:0] to [xx+2:2] */
+  |         ea = (this_addr << 2) - 1u;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3390-3396
+      "The Sv32 page-based virtual-memory scheme described in <<sv32>>
+      supports 34-bit physical addresses for RV32, so the PMP scheme must
+      support addresses "
+    - riscv-isa-manual/src/priv/machine.adoc:3508-3518
+      "It is not possible to represent the address 2^XLEN+2 as the top of
+      a range, so, for example, in an RV32 system with 34-bit physical
+      addresses, a TOR P"
+    - riscv-isa-manual/src/priv/images/bytefield/pmpaddr-rv32.edn:11-11
+      "draw-box "address[33:2]" — RV32 pmpaddr register encodes physical
+      address bits [33:2], confirming 34-bit physical address support."
+
+[bug_confirmed] target/riscv/pmp.c:261-262  pmp_update_rule_addr
+  Same integer overflow in NA4 PMP address computation: this_addr is
+  target_ulong (uint32_t on RV32), so this_addr << 2 is evaluated in 32-bit
+  arithmetic. For pmpaddr >= 0x40000000 on RV32, the NA4 region aliases into
+  low 4 GiB space. Unlike TOR (which also has a prev_addr shift), NA4 only has
+  one shift, but the same overflow applies.
+  | sa = this_addr << 2; /* shift up from [xx:0] to [xx+2:2] */
+  |         ea = (sa + 4u) - 1u;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3390-3392
+      "The Sv32 page-based virtual-memory scheme described in <<sv32>>
+      supports 34-bit physical addresses for RV32, so the PMP scheme must
+      support addresses "
+
+[compliant] target/riscv/pmp.c:222-224  pmp_decode_napot
+  NAPOT path is safe: pmp_decode_napot receives this_addr as hwaddr (uint64_t)
+  due to implicit integer promotion of target_ulong to hwaddr at the call site
+  (line 266). The shift a = (a << 2) | 0x3 operates on 64-bit hwaddr,
+  correctly handling physical addresses above 4 GiB on RV32.
+  | a = (a << 2) | 0x3;
+  |     *sa = a & (a + 1);
+  |     *ea = a | (a + 1);
+
+[potential_risk] target/riscv/pmp.c:624-657  pmpaddr_csr_write
+  pmpaddr_csr_read() returns pmpaddr values as target_ulong (32-bit on RV32),
+  matching the 32-bit CSR register width. This is architecturally correct (the
+  CSR is 32 bits wide on RV32) and the read-masking logic for OFF/TOR/NAPOT
+  modes is correct. However, the write path at line 603 stores the raw
+  target_ulong value without range validation. While the spec defines pmpaddr
+  as WARL, QEMU does not enforce the WARL constraint that high bits beyond the
+  physical address width should be read-only zero. This is not a security bug
+  per se (the pmpaddr register is architecturally 32-bit), but means guest
+  software could observe inconsistent behavior if it writes values with upper
+  bits set and expects them to be masked.
+  | target_ulong pmpaddr_csr_read(CPURISCVState *env, uint32_t addr_index)
+  | {
+  |     target_ulong val = 0;
+  | ...
+  |         val = env->pmp_state.pmp[addr_index].addr_reg;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3399-3401
+      "PMP address register format, RV32 — the register holds
+      address[33:2] in 32 bits, so no WARL masking beyond G bits is
+      needed; the CSR width itself is t"
+
+[compliant] target/riscv/pmp.c:248-250  pmp_update_rule_addr
+  The G-bit masking for TOR correctly uses 1ULL (64-bit unsigned long long) on
+  both prev_addr and this_addr, ensuring the bitmask is 64-bit and properly
+  clearing low G bits before comparison. This masking is safe regardless of
+  XLEN.
+  | if (g >= 1) {
+  |             prev_addr &= ~((1ULL << g) - 1ULL);
+  |             this_addr &= ~((1ULL << g) - 1ULL);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3526-3529
+      "When G >= 1 and pmpcfg_i.A[1] is clear, i.e. the mode is OFF or
+      TOR, then bits pmpaddr_i[G-1:0] read as all zeros. Bits
+      pmpaddr_i[G-1:0] do not affect"
+

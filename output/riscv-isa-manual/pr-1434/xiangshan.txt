@@ -1,0 +1,382 @@
+PR #1434  target=xiangshan  overall=potential_risk
+Spec: PR 1434 requires per-memory-operation PMP checking: misaligned/cross-boundary accesses and CMO instructions must decompose into independent memory operations each checked against PMP—a single-range PMP check in XiangShan would be a privilege-escape bug allowing writes into protected PMP regions at sub-access granularity
+Violation:
+  When XiangShan's PMP checker evaluates the entire instruction-level memory
+  access as one atomic range (single base-address to base+size check) rather
+  than decomposing misaligned/cross-PMP-boundary accesses into independent
+  memory operations, each checked separately. Specifically: (1) a misaligned
+  store spanning two PMP regions is checked with a single PMP lookup on the
+  full byte range, allowing the highest-priority matching entry to govern all
+  bytes; (2) CMO instructions (cbo.zero, cbo.clean, cbo.flush, cbo.inval) that
+  cross PMP region boundaries are checked once for the entire cache-block-
+  sized access rather than per-decomposed-memory-operation; (3) stores wider
+  than XLEN (e.g., FSD in RV32D) crossing PMP boundaries are checked
+  atomically.
+Consequence: privilege_escape
+Pattern:
+  PMP address matching logic that computes a single (start_addr, size) pair
+  per instruction and passes it to the PMP checker, with no mechanism to split
+  the check across PMP region boundaries or to re-check after LSU decomposes
+  the access into sub-operations. Search for PMP check functions that take a
+  single address range, or PMP hit logic that exits after the first matching
+  entry without per-byte/per-sub-operation iteration.
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/mem/pipeline/NewStoreUnit.scala:96-111  S0 CBO store issue (scalarIssue logic)
+  CBO instructions issue with full cacheline mask Fill(VLEN/8, 1.U), treating
+  the entire cache-block access as a single monolithic memory operation. The
+  spec change requires that CMOs crossing PMP region boundaries be decomposed
+  into independent memory operations, each PMP-checked separately. The full-
+  mask approach precludes sub-operation decomposition because the mask encodes
+  a single 64-byte access that feeds downstream as one PMPReqBundle.
+  | scalarIssue.bits.mask := Mux(
+  |   LSUOpType.isCboAll(stinUop.fuOpType),
+  |   Fill(VLEN/8, 1.U(1.W)),
+  |   genVWmask128(stinVAddr, stinSize)
+  | ) // CBO operations always cover the whole cache line
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:337-344
+      "The access size for CMO instructions is equal to the size of the
+      cache block, however in some cases that access can be decomposed
+      into multiple memory"
+
+[potential_risk] src/main/scala/xiangshan/mem/pipeline/NewStoreUnit.scala:155-186  S0 unalign/CBO decomposition bypass
+  CBOs and HW prefetch unconditionally bypass alignment decomposition: isCbo
+  forces align=true, unalignHead=false, cross16Byte=false. This means CBOs
+  that would legally decompose into sub-operations crossing PMP region
+  boundaries (per the spec change) cannot do so — the unalignHead path that
+  generates decomposition tails is explicitly blocked. Line 398 also contains
+  a hard assertion that CBO and unaligned tail injection are mutually
+  exclusive.
+  | sink.bits.align.get := Mux(isCbo || isHWPrefetch, true.B, Mux(isUnalignTail, false.B, align))
+  | sink.bits.unalignHead.get := Mux(isCbo || isHWPrefetch || isUnalignTail, false.B, cross4KPage)
+  | sink.bits.cross16Byte.get := Mux(isCbo || isHWPrefetch, false.B, Mux(isUnalignTail, true.B, cross16Byte))
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:337-344
+      "The access size for CMO instructions is equal to the size of the
+      cache block, however in some cases that access can be decomposed
+      into multiple memory"
+
+[potential_risk] src/main/scala/xiangshan/mem/pipeline/NewStoreUnit.scala:615-642  S2 PMP check (store pipeline)
+  PMP check uses a single PMP response (io.pmp) from the DTLB: pmpInaccessible
+  = pmp.st || pmp.ld && isCboNoZero. The PMP response was generated for the
+  original head-address with the full TLB-request size — it is not re-checked
+  after any decomposition. For CBOs crossing PMP region boundaries, a single
+  head-address PMP result cannot represent the permissions of all bytes in the
+  cache block. Additionally, cbo.zero is checked via pmp.ld (isCboNoZero), but
+  per spec cbo.zero requires write permission (W-bit), not just read.
+  | val pmpInaccessible = tlbHit && (pmp.st || pmp.ld && isCboNoZero)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3421-3426
+      "Attempting to execute a store, store-conditional, AMO, or cache-
+      block zero instruction which accesses a physical address within a
+      PMP region without w"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:319-321
+      "The PMP access control bits shall be the same for all physical
+      addresses in the cache block, and if write permission is granted by
+      the PMP access cont"
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:248-259  PMPMatchMethod.aligned
+  The aligned() straddle check correctly ANDs permissions with false.B when an
+  access spans a PMP boundary, denying the access. This operates on a single
+  (addr, lgSize) pair and correctly enforces that a single access cannot
+  straddle a PMP boundary. The logic itself is spec-compliant — the issue is
+  upstream where CMOs should be decomposed into sub-operations before reaching
+  aligned(). The aligned() check correctly blocks straddling accesses; it
+  simply doesn't know about CMO decomposition.
+  | def aligned(paddr: UInt, lgSize: UInt, lgMaxSize: Int, last: PMPEntry) = {
+  |   ...
+  |   val torAligned = !(lowerBound || upperBound)
+  |   val napotAligned = (lowBitsMask & ~mask(lgMaxSize-1, 0)) === 0.U
+  |   Mux(cfg.na4_napot, napotAligned, torAligned)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:556-617  PMPChecker
+  The PMPChecker correctly implements single (addr, size) PMP checking with
+  first-match resolution. It takes a PMPReqBundle, runs pmp_match_res across
+  all entries, applies pmp_check for permission mapping, and combines with PMA
+  and keyid checks. The checker itself is compliant — it correctly checks
+  whatever (addr, size) pair it receives. The spec-change concern is not in
+  this module but upstream where CMOs should be decomposed before feeding sub-
+  operation (addr, size) pairs to this checker.
+  | val res_pmp = pmp_match_res(leaveHitMux, io.req.valid)(check_addr, req.size, io.check_env.pmp, io.check_env.mode, lgMaxSize)
+  | val res_pma = pma_match_res(leaveHitMux, io.req.valid)(check_addr, req.size, io.check_env.pma, io.check_env.mode, lgMaxSize)
+  | val resp = if (pmpUsed) (resp_pmp | resp_pma | resp_keyid) else (resp_pma | resp_keyid)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3329-3341
+      "PMP checks are applied to all accesses whose effective privilege
+      mode is S or U... PMP violations are always trapped precisely at the
+      processor."
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:414-457  PMPCheckMethod.pmp_match_res
+  Correct first-match PMP resolution: iterates over all PMP entries, applies
+  is_match() and aligned(), ANDs aligned with permission bits (denying when
+  straddling), and uses ParallelPriorityMux for first-match semantics with
+  pass-through default. The logic correctly implements the RISC-V PMP matching
+  algorithm including M-mode pass-through (mode > 1), locked-entry bypass via
+  ignore flag, and default-deny when no entries are implemented.
+  | pmpEntries.zip(pmpDefault +: pmpEntries.take(num-1)).zipWithIndex.foreach{ case ((pmp, last_pmp), i) =>
+  |   val is_match = pmp.is_match(addr, size, lgMaxSize, last_pmp)
+  |   val ignore = passThrough && !pmp.cfg.l
+  |   val aligned = pmp.aligned(addr, size, lgMaxSize, last_pmp)
+  |   val cur = WireInit(pmp)
+  |   cur.cfg.r := aligned && (pmp.cfg.r || ignore)
+  |   cur.cfg.w := aligned && (pmp.cfg.w || ignore)
+  |   cur.cfg.x := aligned && (pmp.cfg.x || ignore)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3329-3339
+      "PMP checks are applied to all accesses whose effective privilege
+      mode is S or U..."
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:404-412  PMPCheckMethod.pmp_check
+  Correct TLB-command-to-PMP-permission mapping: read cmds require R bit,
+  write/amo cmds require W bit, exec cmds require X bit. The CBO-specific
+  permission mapping is done upstream (NewStoreUnit dispatches read for CBO-
+  nonzero, write for cbo.zero). This function itself is correctly
+  parameterized and doesn't need CBO awareness.
+  | resp.ld := TlbCmd.isRead(cmd) && !TlbCmd.isAmo(cmd) && !cfg.r
+  | resp.st := (TlbCmd.isWrite(cmd) || TlbCmd.isAmo(cmd)) && !cfg.w
+  | resp.instr := TlbCmd.isExec(cmd) && !cfg.x
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3419-3426
+      "Attempting to execute a load ... which accesses a physical address
+      within a PMP region without read permissions raises a load access-
+      fault exception. "
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/PMP.scala:368-383  PMPReqBundle
+  PMPReqBundle encodes a single (addr, size, cmd) triple, inherently assuming
+  a single contiguous address range per PMP check. The spec change implying
+  CMO decomposition into multiple sub-operations would require extending this
+  interface to support checking multiple (addr, size) pairs per instruction.
+  The single-range interface limits the PMP checker to one check per TLB
+  response, making per-sub-operation checking infeasible without architectural
+  changes.
+  | class PMPReqBundle(lgMaxSize: Int = 3)(implicit p: Parameters) extends PMPBundle {
+  |   val addr = Output(UInt(PMPAddrBits.W))
+  |   val size = Output(UInt(log2Ceil(lgMaxSize+1).W))
+  |   val cmd = Output(TlbCmd())
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:200-203  PMPMatchMethod.is_match
+  Correctly dispatches to NAPOT match (cfg.na4_napot) or TOR match (cfg.tor),
+  or returns false (entry disabled/OFF). The dispatch is based on the A field
+  encoding from the PMP config register. Compliance confirmed: OFF=0 matches
+  nothing (false), TOR=1 uses torMatch, NA4/NAPOT use napotMatch.
+  | def is_match(paddr: UInt, lgSize: UInt, lgMaxSize: Int, last_pmp: PMPEntry): Bool = {
+  |   Mux(cfg.na4_napot, napotMatch(paddr, lgSize, lgMaxSize),
+  |     Mux(cfg.tor, torMatch(paddr, lgSize, lgMaxSize, last_pmp), false.B))
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3430-3437
+      "The A field in a PMP entry's configuration register encodes the
+      address-matching mode... naturally aligned power-of-2 regions
+      (NAPOT), including the s"
+
+[potential_risk] src/main/scala/xiangshan/mem/pipeline/NewLoadUnit.scala:897-926  S2 PMP check (load pipeline)
+  Load-side PMP uses single pmp.ld result: pmpUnaccessable = pmp.ld && tlbHit.
+  CBO loads (cbo.clean/flush/inval) flow through here with the original head-
+  address PMP result. Same single-PMP-result pattern as store pipeline. If a
+  CBO load crosses PMP boundaries, per-byte permissions can differ, but only
+  one PMP result (from the head address) is applied. Line 922 (afTagError) and
+  921 (afUnalignMMIO) show no CBO-specific decomposition handling either.
+  | val pmpUnaccessable = pmp.ld && tlbHit
+  | val isMMIO = tlbHit && tlbAccessable && (Pbmt.isIO(pbmt) || Pbmt.isPMA(pbmt) && pmp.mmio)
+  | val af = afUnaccessable || afVectorUncache || afUnalignMMIO || afTagError || afForwardDenied || afBypassDenied
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:352-361
+      "A cache-block management instruction is permitted to access the
+      specified cache block whenever a load instruction or store
+      instruction is permitted to"
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:41-61  PMPConfig
+  PMPConfig correctly defines the standard RISC-V PMP configuration byte
+  layout: L(bit7), C(bit6, reserved), atomic(bit5, reserved), A(bit4:3),
+  X(bit2), W(bit1), R(bit0). The address-matching mode helper methods (off,
+  tor, na4, napot) correctly decode the 2-bit A field, including CoarserGrain
+  handling where NA4 is unavailable and NAPOT uses a(1) instead of full 2-bit
+  equality.
+  | val l = Bool(); val c = Bool(); val atomic = Bool()
+  | val a = UInt(2.W); val x = Bool(); val w = Bool(); val r = Bool()
+  | def napot = { if (CoarserGrain) a(1).asBool else a === 3.U }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3407-3416
+      "The R, W, and X bits, when set, indicate that the PMP entry permits
+      read, write, and instruction execution, respectively."
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPMP.scala:15-78  CSRPMP trait (pmpcfg generation)
+  CSR PMP register generation is compliant. pmpcfg0-15 CSR addresses match
+  spec at 0x3a0-0x3af. pmpaddr0-63 at 0x3b0-0x3ef. For RV64, only even-
+  numbered pmpcfg CSRs are created (odd addresses are illegal per spec).
+  Unimplemented PMP entries (beyond NumPMPReal=32) are read-only zero. The
+  R=0,W=1 reserved encoding is rejected (line 34: w.wdata(0)=0 && w.wdata(1)=1
+  returns early without writing W). NA4 is remapped to NAPOT at coarser grain
+  (line 39: wdata(4,3)===2 maps to 3).
+  | val pmpcfg: Seq[CSRModule[_]] = Range(0, p(PMParameKey).NumPMP/4-1, 2).map(num => ...)
+  | // read condition
+  | regOut := cfgRData
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3345-3361
+      "PMP entries are described by an 8-bit configuration register and
+      one MXLEN-bit address register... For RV64, eight even-numbered
+      CSRs, pmpcfg0, pmpcfg"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPMP.scala:80-88  PMPCfgBundle
+  PMPCfgBundle correctly defines the 8-bit PMP configuration register fields:
+  R(WARL, bit0), W(WARL, bit1), X(WARL, bit2), A(PMPCfgAField, bits4:3),
+  ATOMIC(RO, bit5), C(RO, bit6), L(PMPCfgLField, bit7). The WARL fields
+  implement write-any-read-legal semantics via the CSR framework's wNoFilter
+  write path. ATOMIC and C are Read-Only zero as they are reserved/unused in
+  PMP. Fields include correct reset values (all false/OFF/UNLOCKED).
+  | val R = WARL(0, wNoFilter).withReset(false.B)
+  | val W = WARL(1, wNoFilter).withReset(false.B)
+  | val X = WARL(2, wNoFilter).withReset(false.B)
+  | val A = PMPCfgAField(4, 3, wNoFilter).withReset(PMPCfgAField.OFF)
+  | val L = PMPCfgLField(7, wNoFilter).withReset(PMPCfgLField.UNLOCKED)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3407-3412
+      "The R, W, and X bits, when set, indicate that the PMP entry permits
+      read, write, and instruction execution... The R, W, and X fields
+      form a collective"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPMP.scala:101-117  PMPCfgAField
+  PMPCfgAField correctly enumerates address-matching modes:
+  OFF(0)/TOR(1)/NA4(2)/NAPOT(3). Helper methods (off, tor, na4, napot)
+  correctly handle CoarserGrain: when PlatformGrain > PMPOffBits, NA4 is
+  unavailable (always returns false), and NAPOT uses a(1) bit detection
+  instead of full equality with 3. The isOffOrTor/isNa4OrNapot methods use
+  a(1) bit test, which is correct for all grain sizes. Legal values validation
+  includes all four modes.
+  | val OFF = Value(0.U); val TOR = Value(1.U); val NA4 = Value(2.U); val NAPOT = Value(3.U)
+  | def na4(cfg: PMPCfgBundle): Bool = { if (CoarserGrain) false.B else cfg.A.asUInt === 2.U }
+  | def napot(cfg: PMPCfgBundle): Bool = { if (CoarserGrain) cfg.A.asUInt(1) else cfg.A.asUInt === 3.U }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3430-3437
+      "The A field in a PMP entry's configuration register encodes the
+      address-matching mode... When A=0, this PMP entry is disabled and
+      matches no addresses"
+
+[compliant] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:171-250  CSR address constants
+  CSR address constants match the RISC-V privileged spec: pmpcfg0-15 at
+  0x3a0-0x3af (16 consecutive addresses), pmpaddr0-63 at 0x3b0-0x3ef (64
+  consecutive addresses). RV64 convention is respected with even-numbered
+  pmpcfg registers used for 8 PMP entries each. Addresses are contiguous and
+  correctly placed in the machine-mode CSR address space (0x300-0x3ff).
+  | val pmpcfg0 = 0x3a0
+  | val pmpcfg1 = 0x3a1
+  | ...
+  | val pmpaddr0 = 0x3b0
+  | ...
+  | val pmpaddr63 = 0x3ef
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3353-3361
+      "For RV32, sixteen CSRs, pmpcfg0–pmpcfg15, hold the configurations
+      pmp0cfg–pmp63cfg for the 64 PMP entries... For RV64, eight even-
+      numbered CSRs, pmpcf"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/PMPEntryModule.scala:18-87  PMPEntryHandleModule
+  CSR read/write handling correctly implements PMP WARL semantics. Writes: (1)
+  lock bits enforced (line 45: !cfgOldTmp.L.asBool gate prevents writes to
+  locked entries); (2) W=1 requires R=1 (line 47: cfgVec(j).W := cfgNewTmp.W
+  && cfgNewTmp.R); (3) NA4 remapped to NAPOT at coarser grain (line 48-50);
+  (4) NAPOT mask computed on write (lines 51-53, 71). Reads: addresses
+  returned with grain-bit masking (line 81: pmpEntry(i).readAddr). TOR entry
+  address locking: last entry uses addrLocked(this), others use
+  addrLocked(this, next).
+  | when (!cfgOldTmp.L.asBool) {
+  |   cfgVec(j) := cfgNewTmp
+  |   cfgVec(j).W := cfgNewTmp.W.asBool && cfgNewTmp.R.asBool
+  |   ...
+  |   pmpMask(i) := Mux(!addrNextLocked, pmpEntry(i).matchMask(wdata), pmpEntry(i).mask)
+  |   pmpAddrW(i) := Mux(!addrNextLocked, wdata, pmpEntry(i).addr.ADDRESS.asUInt)
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3341-3350
+      "All PMP CSR fields are WARL and may be read-only zero."
+
+[compliant] src/main/scala/xiangshan/PMParameters.scala:27-60  PMParameters / HasPMParameters
+  PMP parameters are compliant: NumPMP=64 (full spec support), NumPMPReal=32
+  (platform-implemented entries, first 32 of 64 are implemented per spec
+  requirement that lowest-numbered entries must be implemented first),
+  PlatformGrain=4KB (a normal page, standard granularity). PMPAddrBits derived
+  from SoC PAddrBits (correct). The NumPMA parallel structure matches NumPMP.
+  KeyIDBits for memory encryption correctly separated from physical address
+  bits.
+  | NumPMP: Int = 64,
+  | NumPMA: Int = 64,
+  | NumPMPReal: Int = 32,
+  | PlatformGrain: Int = log2Ceil(4*1024), // 4KB
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3345-3350
+      "Up to 64 PMP entries are supported. Implementations may implement
+      zero, 16, or 64 PMP entries; the lowest-numbered PMP entries must be
+      implemented fir"
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:345-367  PMP (top-level module)
+  Top-level PMP module correctly manages PMP and PMA entry state. Uses
+  MaskedRegMap for CSR-based read/write generation to pmpcfg/pmpaddr
+  registers. Exports Vec(NumPMPReal, PMPEntry) and Vec(NumPMAReal, PMPEntry)
+  to downstream PMPChecker instances. The pmp_gen_mapping pattern with
+  pmp_init produces proper register mappings for the CSR register file. No
+  issues found in state management or wiring.
+  | val pmp = Wire(Vec(NumPMPReal, new PMPEntry()))
+  | val pma = Wire(Vec(NumPMAReal, new PMPEntry()))
+  | val pmpMapping = pmp_gen_mapping(pmp_init, NumPMPReal, CSRs.pmpcfg0, CSRs.pmpaddr0, pmp)
+  | MaskedRegMap.generate(mapping, w.bits.addr, rdata, w.valid, w.bits.data)
+  | io.pmp := pmp
+  | io.pma := pma
+
+[potential_risk] src/main/scala/xiangshan/cache/mmu/TLB.scala:386-391  TLB.pmp_check
+  The TLB's pmp_check function sends a single (addr, size, cmd) to the PMP
+  checker. The addr is derived from the TLB hit result (pmp_addr) and the size
+  is the original request size from the TLB req. For CBOs where the TLB
+  translates with a full cacheline size, the PMP check gets that same full
+  size — there is no mechanism to split the PMP check into sub-operation sizes
+  before passing to the PMP checker. This is structurally consistent with the
+  rest of the design but represents the same single-range limitation.
+  | def pmp_check(addr: UInt, size: UInt, cmd: UInt, noTranslate: Bool, idx: Int): Unit = {
+  |   pmp(idx).valid := resp(idx).valid || noTranslate
+  |   pmp(idx).bits.addr := addr
+  |   pmp(idx).bits.size := size
+  |   pmp(idx).bits.cmd := cmd
+  | }
+
+[compliant] src/main/scala/xiangshan/mem/MemBlock.scala:693-710  PMP topology (MemBlock)
+  PMP instantiation topology is compliant: one PMP module (state holder),
+  DTlbSize × PMPChecker instances (one per DTLB port), each wired with
+  lgMaxSize=4 (max 16-byte check). The leaveHitMux=true parameter pipelines
+  the hit-mux for timing. KeyID and CMODE CSR bindings correct for memory
+  encryption support. The checker-per-TLB-port design provides independent PMP
+  checking per translation port.
+  | val pmp = Module(new PMP())
+  | val pmp_checkers = Seq.fill(DTlbSize)(Module(new PMPChecker(4, leaveHitMux = true)))
+  | val pmp_check = pmp_checkers.map(_.io)
+  | for ((p,d) <- pmp_check zip dtlb_pmps) {
+  |   p.apply(tlbcsr.priv.dmode, pmp.io.pmp, pmp.io.pma, d)
+  | }
+
+[potential_risk] src/main/scala/xiangshan/mem/vector/VSegmentUnit.scala:508-542  PMP check (vector segment load/store)
+  Vector segment PMP check uses a single PMP response (io.pmpResp) and masks
+  PMP faults when page faults also exist (line 511: exceptionWithPf gates the
+  PMP result). For vector segment loads/stores that can access multiple pages,
+  a single PMP result cannot represent per-segment-element permissions.
+  Additionally, vector CBO instructions would face the same decomposition gap
+  as scalar CBOs. The single-PMP-response pattern with page-fault masking
+  (pmp.st || pmp.ld || pmp.mmio at line 535) could suppress PMP violations
+  when page faults are present.
+  | val exceptionWithPf = exceptionVec(storePageFault) || exceptionVec(loadPageFault) || exceptionVec(storeGuestPageFault) || exceptionVec(loadGuestPageFault)
+  | val pmp = (io.pmpResp.asUInt & Fill(io.pmpResp.asUInt.getWidth, !exceptionWithPf)).asTypeOf(new PMPRespBundle())
+  | exceptionVec(loadAccessFault) := (exceptionVec(loadAccessFault) || pmp.ld || pmp.mmio) && isVSegLoad && canTriggerException
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3341-3341
+      "PMP violations are always trapped precisely at the processor."
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:620-656  PMPCheckerv2
+  PMPCheckerv2 is a variant that returns combined PMP+PMA config (AND of both
+  permission bits) rather than separate response bundles. Uses same
+  pmp_match_res and pma_match_res with parallel-priority-mux. The single
+  (addr, size) assumption is the same as PMPChecker — the checker logic itself
+  is correct; the limitation is at the interface/RTL architecture level where
+  CMO decomposition would need to happen before reaching this module.
+  | val res_pmp = pmp_match_res(leaveHitMux, io.req.valid)(req.addr, req.size, io.check_env.pmp, io.check_env.mode, lgMaxSize)
+  | val res_pma = pma_match_res(leaveHitMux, io.req.valid)(req.addr, req.size, io.check_env.pma, io.check_env.mode, lgMaxSize)
+  | val resp = and(res_pmp, res_pma)
+

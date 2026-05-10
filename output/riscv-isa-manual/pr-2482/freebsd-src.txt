@@ -1,0 +1,245 @@
+PR #2482  target=freebsd-src  overall=bug_confirmed
+Spec: CBO instructions now explicitly require page-table/PMP permission checks: cbo.zero needs write (store fault), others need read (load fault); FreeBSD kernel S-mode usage is safe since it operates on owned kernel pages, but bhyve lacks any CBO emulation, and U-mode CBO is gated behind senvcfg bits that FreeBSD never sets — the gap is that if either is ever enabled without updating the fault-classification paths, wrong fault types would be delivered
+Violation:
+  bhyve VMM takes no action on VS-mode CBO instructions — it neither emulates
+  the page-table permission check (cbo.zero → store page-fault,
+  cbo.clean/flush/inval → load page-fault) nor injects a virtual illegal-
+  instruction exception. A guest executing cbo.zero on a read-only page
+  receives no store page-fault and may corrupt guest-physical memory.
+  Additionally, if FreeBSD ever sets senvcfg.CBIE/CBCFE/CBZE to permit U-mode
+  CBO without updating the trap handler to distinguish CBO-origin faults, a
+  U-mode cbo.zero passing the fault check on a writable page but violating PMP
+  write permission would be misclassified as a load access-fault instead of
+  store access-fault.
+Consequence: privilege_escape
+Pattern:
+  bhyve CBO instruction emulation gap: grepping for
+  cbo\.(clean|flush|inval|zero) in vmm/ yields no results; henvcfg
+  CBIE/CBCFE/CBZE bits are defined but never programmed
+------------------------------------------------------------
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:630-635  riscv_handle_world_switch
+  VM entry unconditionally writes henvcfg with only HENVCFG_STCE set via
+  csr_write(), clearing CBO control bits CBZE (bit 7), CBCFE (bit 6), and CBIE
+  (bits 4-5) to zero. Per the RISC-V hypervisor spec [henvcfg_cbze,
+  henvcfg_cbcfe, henvcfg_cbie], this disables all VS/VU-mode CBO instruction
+  execution: cbo.zero raises virtual-instruction exception, cbo.clean/flush
+  raise virtual-instruction exception, cbo.inval raises virtual-instruction
+  exception. The VMM does not emulate CBO instructions and does not inject the
+  virtual-instruction exception to the guest — the handler at line 507 only
+  decodes WFI, leaving CBO-origin virtual-instruction exits unhandled
+  (VM_EXITCODE_BOGUS). No read-modify-write preserves other henvcfg fields;
+  the prior host value is destroyed.
+  | csr_write(hgatp, pmap->pm_satp);
+  | 		if (has_sstc)
+  | 			csr_write(henvcfg, HENVCFG_STCE);
+  | 		csr_write(hie, HIE_VSEIE | HIE_VSSIE | HIE_SGEIE);
+  | 		csr_write(hcounteren, HCOUNTEREN_CY | HCOUNTEREN_TM);
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:753-761
+      "The Zicboz extension adds the CBZE field to henvcfg. The CBZE field
+      applies to execution of the cache block zero instruction (CBO.ZERO)
+      in privilege m"
+    - riscv-isa-manual/src/priv/hypervisor.adoc:763-770
+      "The Zicbom extension adds the CBCFE field to henvcfg. When V=1, if
+      the CBO.CLEAN and CBO.FLUSH instructions are not HS-qualified, they
+      raise an illega"
+    - riscv-isa-manual/src/priv/hypervisor.adoc:772-788
+      "The Zicbom extension adds the CBIE WARL field to henvcfg... When
+      V=1, if the CBO.INVAL instruction is not HS-qualified, it raises an
+      illegal-instructi"
+
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:507-514  riscv_handle_world_switch
+  The SCAUSE_VIRTUAL_INSTRUCTION handler only decodes WFI. All other virtual-
+  instruction exceptions — including those raised by CBO instructions
+  (cbo.zero, cbo.clean, cbo.flush, cbo.inval) when henvcfg.CBZE/CBCFE/CBIE=0
+  per the hypervisor spec — fall through to the else branch and return
+  VM_EXITCODE_BOGUS. The guest receives no proper exception injection. The VMM
+  should either a) set henvcfg.CBZE/CBCFE/CBIE to 1 for guests that support
+  the Zicboz/Zicbom extensions (passthrough), or b) emulate the CBO page-table
+  permission checks (cbo.zero→store page-fault, cbo.clean/flush/inval→load
+  page-fault) and inject the exception.
+  | case SCAUSE_VIRTUAL_INSTRUCTION:
+  | 			insn = vme->stval;
+  | 			if (m_op(insn, MATCH_WFI, MASK_WFI))
+  | 				vme->exitcode = VM_EXITCODE_WFI;
+  | 			else
+  | 				vme->exitcode = VM_EXITCODE_BOGUS;
+  | 			handled = false;
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:753-788
+      "If the instruction is HS-qualified and the CBZE field is set to 1,
+      the instruction is enabled for execution; otherwise, if the CBZE
+      field is set to 0,"
+
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:489-498  riscv_handle_world_switch
+  The SCAUSE_ILLEGAL_INSTRUCTION handler in the VMM prints a message and
+  returns VM_EXITCODE_BOGUS with handled=false. Per the hypervisor spec, CBO
+  instructions that are not HS-qualified (i.e., executed as VS/VU not
+  intercepted by hstatus.HU=0) raise illegal-instruction exceptions. If a
+  guest VS-mode executes CBO instructions on hardware that supports the
+  extensions, and the henvcfg bits are 0, these become either virtual-
+  instruction or illegal-instruction exceptions, neither of which is properly
+  handled. The guest is left in an undefined state.
+  | case SCAUSE_ILLEGAL_INSTRUCTION:
+  | 			printf("%s: Illegal instruction at %lx stval 0x%lx htval 0x%lx\n",
+  | 			    __func__, vme->sepc, vme->stval, vme->htval);
+  | 			vmm_stat_incr(hypctx->vcpu, VMEXIT_UNHANDLED, 1);
+  | 			vme->exitcode = VM_EXITCODE_BOGUS;
+  | 			handled = false;
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:753-788
+      "When V=1, if the CBO.CLEAN and CBO.FLUSH instructions are not HS-
+      qualified, they raise an illegal-instruction exception."
+
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:180-195  vmmops_vcpu_save_csrs
+  The vCPU CSR save path reads 9 CSRs (vsstatus, vsie, vstvec, vsscratch,
+  vsepc, vscause, vstval, hvip, vsatp) but does NOT save henvcfg. There is no
+  csr_read(henvcfg) anywhere in the kernel. The hardware henvcfg value on VM
+  exit is never captured, so the host value modified at VM entry (line 632) is
+  permanently lost. This means host CBO operations executed between VM entries
+  on the same hart operate with degraded semantics: henvcfg.CBIE=0 downgrades
+  cbo.inval to flush-only per the spec.
+  | csrs->vsstatus = csr_read(vsstatus);
+  | 		csrs->vsie = csr_read(vsie);
+  | 		csrs->vstvec = csr_read(vstvec);
+  | 		/* ... 9 CSRs saved, henvcfg NOT saved */
+  | 		csrs->vsatp = csr_read(vsatp);
+
+[bug_confirmed] sys/riscv/vmm/vmm_riscv.c:162-177  vmmops_vcpu_restore_csrs
+  The vCPU CSR restore path writes 9 CSRs but does NOT restore henvcfg.
+  Instead, henvcfg is unconditionally written to HENVCFG_STCE at line 632 in
+  the VM entry path. This means there is no per-vCPU henvcfg state — all vCPUs
+  share a single hardcoded value. If CBO passthrough were implemented,
+  different guests would need different CBZE/CBCFE/CBIE settings based on
+  their ISA string, which the current design cannot support.
+  | csr_write(vsstatus, csrs->vsstatus);
+  | 		csr_write(vsie, csrs->vsie);
+  | 		csr_write(vstvec, csrs->vstvec);
+  | 		/* ... 9 CSRs restored, henvcfg NOT restored */
+  | 		csr_write(vsatp, csrs->vsatp);
+
+[bug_confirmed] sys/riscv/vmm/vmm_switch.S:67-84  vmm_switch
+  The atomic world-switch swaps sstatus, hstatus, scounteren, sscratch, stvec,
+  and sepc via csrrw, but does NOT swap henvcfg. Since the host henvcfg value
+  is destroyed by the unconditional csr_write at line 632 of vmm_riscv.c, the
+  assembly world-switch is the wrong place to fix this (the value is already
+  lost). However, if henvcfg were to be properly virtualized per-vCPU, the
+  csrrw pattern used for sstatus/hstatus would be the correct model for
+  swapping host and guest henvcfg values on each world-switch.
+  | csrrw	t0, sstatus, t0
+  | 		csrrw	t1, hstatus, t1
+  | 		csrrw	t2, scounteren, t2
+  | 		csrrw	t3, sscratch, a0
+  | 		csrrw	t4, stvec, t4
+  | 		csrw	sepc, t5
+  | 		/* henvcfg NOT swapped */
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:2114-2117
+      "By contrast, if the PBMTE or ADUE bits in henvcfg are changed,
+      executing an HFENCE.VVMA with rs1=x0 and rs2=x0 suffices to
+      synchronize with respect to"
+
+[bug_confirmed] sys/riscv/vmm/riscv.h:56-68  hypcsr (struct)
+  struct hypcsr has no henvcfg field. Fields for hvip, vsstatus, vsie, vstvec,
+  vsscratch, vsepc, vscause, vstval, vsatp, scounteren, and senvcfg are
+  defined, but henvcfg is absent. Without this field, per-vCPU henvcfg state
+  cannot be stored or restored, making CBO virtualization impossible. The
+  existing senvcfg field (line 67) is itself dead code — never read or written
+  by any save/restore function — indicating the CSR virtualzation design is
+  incomplete.
+  | struct hypcsr {
+  | 		uint64_t hvip;
+  | 		uint64_t vsstatus;
+  | 		/* ... */
+  | 		uint64_t scounteren;
+  | 		uint64_t senvcfg;  /* dead: never saved/restored */
+  | 	};  /* no henvcfg field */
+
+[bug_confirmed] sys/riscv/vmm/vmm_instruction_emul.c:59-109  vmm_emulate_instruction
+  The instruction emulation framework (vmm_emulate_instruction,
+  vmm_emulate_register) has no CBO-specific emulation code. No MATCH/MASK
+  definitions for CBO opcodes exist anywhere in the kernel. The
+  riscv_gen_inst_emul_data() function in vmm_riscv.c (line 327) only handles
+  standard load/store instructions and returns -2 for unknown instructions. If
+  a guest cbo.zero on a read-only page should raise a store page-fault (per
+  spec: cbo.zero performs stores of zeros and requires write permission), the
+  current emulation framework cannot decode the instruction to inject the
+  correct fault type.
+  | int vmm_emulate_instruction(...) { /* load/store only, no CBO opcodes */ }
+  | int vmm_emulate_register(...) { /* CSR only */ }
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:373-381
+      "A cache-block zero instruction is permitted to access the specified
+      cache block whenever a store instruction is permitted to access the
+      corresponding "
+    - riscv-isa-manual/src/unpriv/cmo.adoc:352-361
+      "A cache-block management instruction is permitted to access the
+      specified cache block whenever a load instruction or store
+      instruction is permitted to"
+
+[potential_risk] sys/riscv/riscv/trap.c:255-262  page_fault_handler
+  The page fault handler determines fault type solely from scause
+  (STORE_PAGE_FAULT → VM_PROT_WRITE, LOAD_PAGE_FAULT → VM_PROT_READ). It never
+  inspects stval to decode whether the faulting instruction was a CBO
+  instruction. The hardware reports the correct scause for CBO faults
+  (cbo.zero → STORE, cbo.clean/flush/inval → LOAD/STORE), so by coincidence
+  this mapping is correct when CBO instructions are executed from S-mode.
+  However, if senvcfg.CBZE were ever enabled for U-mode (currently disabled
+  since senvcfg is never written), and a U-mode cbo.zero on a writable page
+  faulted due to PMP write permissions, the handler would correctly report the
+  fault via scause. The risk is forward-looking: if someone adds senvcfg
+  configuration without adding CBO-aware checks, the existing handler has no
+  defense-in-depth to catch misclassification.
+  | if (frame->tf_scause == SCAUSE_STORE_PAGE_FAULT) {
+  | 			ftype = VM_PROT_WRITE;
+  | 		} else if (frame->tf_scause == SCAUSE_INST_PAGE_FAULT) {
+  | 			ftype = VM_PROT_EXECUTE;
+  | 		} else {
+  | 			ftype = VM_PROT_READ;
+  | 		}
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:958-962
+      "A cbo.zero instruction performs stores of zeros to the full set of
+      bytes corresponding to the cache block... On faults, the faulting
+      virtual address i"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:391-393
+      "When a page-fault, guest-page-fault, or access-fault exception is
+      taken, the relevant *tval CSR is written with the faulting effective
+      address (i.e. t"
+
+[not_implemented] sys/riscv/riscv/machdep.c:557-678  initriscv
+  initriscv() and locore.S contain no CSR writes to senvcfg or henvcfg. The
+  kernel never configures senvcfg.CBZE/CBCFE/CBIE, so U-mode CBO instructions
+  are always disabled (per spec, when these bits are 0, CBO instructions in
+  U-mode raise illegal-instruction exceptions). This is currently the safe
+  default — no risk of misclassified CBO-faults in U-mode — but represents a
+  feature gap: user-mode applications on CPUs with Zicboz/Zicbom cannot use
+  CBO instructions. The henvcfg CSR is also never initialized at boot (only
+  written in the VMM), so the host HS-mode CBO behavior depends entirely on
+  firmware default values for henvcfg reset state.
+  | void initriscv(void) {
+  | 		/* ... no senvcfg/henvcfg CSR writes ... */
+  | 	}
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:894-900
+      "The Zicboz extension adds the CBZE field to senvcfg. The CBZE field
+      controls execution of the cache block zero instruction (CBO.ZERO) in
+      U-mode. Execu"
+    - riscv-isa-manual/src/priv/supervisor.adoc:902-908
+      "The Zicbom extension adds the CBCFE field to senvcfg to control
+      execution of the CBO.CLEAN and CBO.FLUSH instructions in U-mode.
+      Execution of these in"
+
+[not_implemented] sys/riscv/include/riscvreg.h:176-182  (header definitions)
+  HENVCFG_CBZE, HENVCFG_CBCFE, HENVCFG_CBIE_S, HENVCFG_CBIE_M constants are
+  defined but never referenced by any code outside this header. No
+  corresponding SENVCFG_* macros exist. The CSR number for henvcfg is not
+  defined in encoding.h — it's only used via the csr_write(henvcfg, ...) macro
+  which relies on LLVM's built-in CSR definitions. This means the header
+  infrastructure for CBO virtualization exists but has no consumers,
+  confirming the feature gap.
+  | #define	HENVCFG_CBZE	(1UL << 7)
+  | #define	HENVCFG_CBCFE	(1UL << 6)
+  | #define	HENVCFG_CBIE_S	4
+  | #define	HENVCFG_CBIE_M	(0x3 << HENVCFG_CBIE_S)
+

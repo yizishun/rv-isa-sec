@@ -1,0 +1,282 @@
+PR #1434  target=qemu  overall=bug_confirmed
+Spec: Memory-operation-granularity PMP: QEMU must decompose CMO cache-block accesses and misaligned/wide memory accesses into individual memory operations, applying independent PMP checks per operation with partial-store-visibility semantics, not a single monolithic check at instruction-access granularity
+Violation:
+  QEMU performs a single monolithic PMP check at the granularity of the
+  architectural instruction access (e.g., cache-block size for CMOs, or full
+  operand width for misaligned loads/stores) rather than independently
+  checking PMP for each decomposed memory operation. For CMO instructions
+  (cbo.zero, cbo.clean, cbo.flush), QEMU must decompose the cache-block access
+  into potentially smaller memory operations and apply PMP checks per-
+  operation, allowing partial success/failure where an operation spanning two
+  PMP regions may succeed if both regions grant identical permissions at the
+  memory-operation granularity. For misaligned loads/stores and wide stores
+  (e.g., FSD on RV32D), QEMU must apply PMP checks to each naturally-aligned
+  sub-operation independently, and must allow partial store visibility—bytes
+  that pass PMP becoming architecturally visible—even when a subsequent sub-
+  operation faults.
+Consequence: privilege_escape
+Pattern:
+  pmp_check.*size|pmp_hart_has_privs|pmp_is_range_in_range|pmp_get_tlb_size|pm
+  p_access_size|cache_block_size.*pmp|cbo.*pmp|target_ulong.*pmp.*check|pmp.*a
+  ccess.*len|pmp.*addr.*size
+------------------------------------------------------------
+[bug_confirmed] target/riscv/op_helper.c:164-201  helper_cbo_zero
+  cbo.zero performs a single monolithic PMP check at the full cache-block
+  granularity via probe_write(env, address, cbozlen, ...) at line 181. The PMP
+  check function pmp_hart_has_privs() receives the full cbozlen (e.g. 64
+  bytes) and rejects any access that is 'partially inside' a PMP region
+  (pmp.c:412-418). This means a cbo.zero targeting a cache block that spans
+  two PMP regions will always fault, even if both regions grant identical
+  store permissions and the access could succeed when decomposed into per-
+  region memory operations. Per the updated spec, PMP checks must be applied
+  to each memory operation independently, not at instruction granularity. The
+  NOTE in cmo.adoc:338-344 explicitly states that a 64-byte cbo.zero spanning
+  two 32-byte PMP regions 'would succeed if it was decomposed into two 32-byte
+  memory operations.' The I/O fallback path (lines 197-199) correctly checks
+  each byte independently, but the RAM fast-path (line 184, memset) bypasses
+  per-operation PMP checks entirely.
+  | mem = probe_write(env, address, cbozlen, mmu_idx, ra);
+  | 
+  |     if (likely(mem)) {
+  |         memset(mem, 0, cbozlen);
+  |     } else {
+  |         for (int i = 0; i < cbozlen; i++) {
+  |             cpu_stb_mmuidx_ra(env, address + i, 0, mmu_idx, ra);
+  |         }
+  |     }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3567-3574
+      "On some implementations, misaligned loads, stores, and instruction
+      fetches may be decomposed into multiple memory operations, some of
+      which may succee"
+    - riscv-isa-manual/src/priv/machine.adoc:3602-3608
+      "Failed memory operations generate an instruction, load, or store
+      access-fault exception. Note that a single instruction may generate
+      multiple memory o"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:336-345
+      "The access size for CMO instructions is equal to the size of the
+      cache block, however in some cases that access can be decomposed
+      into multiple memory"
+
+[bug_confirmed] target/riscv/op_helper.c:211-250  check_zicbom_access
+  check_zicbom_access() performs a single monolithic PMP check for
+  cbo.clean/cbo.flush/cbo.inval at the full cache-block granularity via
+  probe_access_flags(env, address, cbomlen, MMU_DATA_LOAD, ...) at line 236
+  and fallback probe_write(env, address, cbomlen, ...) at line 249. Both pass
+  the full cbomlen as the size parameter. The PMP check function
+  pmp_hart_has_privs() will reject any cache-block access that is 'partially
+  inside' a PMP region (pmp.c:413-418). Same vulnerability pattern as
+  cbo.zero: PMP checks are per-instruction rather than per-memory-operation.
+  The spec mandates per-memory-operation PMP checking (machine.adoc:3567-3570,
+  cmo.adoc:338-344).
+  | ret = probe_access_flags(env, address, cbomlen, MMU_DATA_LOAD,
+  |                              mmu_idx, true, &phost, ra);
+  |     if (ret != TLB_INVALID_MASK) {
+  |         return;
+  |     }
+  |     probe_write(env, address, cbomlen, mmu_idx, ra);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3567-3574
+      "On some implementations, misaligned loads, stores, and instruction
+      fetches may be decomposed into multiple memory operations... PMP
+      checking is perfor"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:336-345
+      "The access size for CMO instructions is equal to the size of the
+      cache block, however in some cases that access can be decomposed
+      into multiple memory"
+
+[compliant] target/riscv/pmp.c:375-523  pmp_hart_has_privs
+  pmp_hart_has_privs() correctly implements per-memory-operation PMP checking.
+  It checks whether a given [addr, addr+size) range is fully contained within
+  a matching PMP entry, rejects partially-contained ranges (lines 412-418),
+  and iterates through entries in priority order. The function is correct for
+  its intended purpose of checking a single memory operation. The bug is in
+  the callers (CMO helpers) that pass overly large size values representing
+  full cache blocks instead of decomposing into smaller memory operations
+  first.
+  | for (i = 0; i < pmp_regions; i++) {
+  |         s = pmp_is_in_range(env, i, addr);
+  |         e = pmp_is_in_range(env, i, addr + pmp_size - 1);
+  | 
+  |         /* partially inside */
+  |         if ((s + e) == 1) {
+  |             qemu_log_mask(LOG_GUEST_ERROR,
+  |                           "pmp violation - access is partially inside\n");
+  |             *allowed_privs = 0;
+  |             return false;
+  |         }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3576-3579
+      "PMP entries are statically prioritized. The lowest-numbered PMP
+      entry that matches any byte of a memory operation determines whether
+      that operation su"
+
+[compliant] target/riscv/insn_trans/trans_rvd.c.inc:73-94  trans_fsd
+  FSD on RV32D correctly uses MO_ATOM_NONE (line 82), which instructs the TCG
+  softmmu to decompose the 64-bit store into multiple 32-bit memory
+  operations. Each sub-operation independently goes through
+  riscv_cpu_tlb_fill() → get_physical_address_pmp() → pmp_hart_has_privs()
+  with its own size. This correctly implements per-memory-operation PMP
+  checking for stores wider than XLEN bits, as required by
+  machine.adoc:3573-3574 ('The same behavior may manifest for stores wider
+  than XLEN bits (e.g., the FSD instruction in RV32D), even when the store
+  address is naturally aligned').
+  | if (get_xl_max(ctx) == MXL_RV32) {
+  |         memop |= MO_ATOM_NONE;
+  |     } else if (ctx->cfg_ptr->ext_zama16b) {
+  |         memop |= MO_ATOM_WITHIN16;
+  |     } else {
+  |         memop |= MO_ATOM_IFALIGN;
+  |     }
+  |     memop |= mo_endian(ctx);
+  | 
+  |     decode_save_opc(ctx, 0);
+  |     addr = get_address(ctx, a->rs1, a->imm);
+  |     tcg_gen_qemu_st_i64(cpu_fpr[a->rs2], addr, ctx->mem_idx, memop);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3567-3574
+      "On some implementations, misaligned loads, stores, and instruction
+      fetches may be decomposed into multiple memory operations... PMP
+      checking is perfor"
+
+[compliant] target/riscv/cpu_helper.c:1814-1950  riscv_cpu_tlb_fill
+  riscv_cpu_tlb_fill() correctly performs PMP checks via
+  get_physical_address_pmp() for each TLB fill operation. For misaligned
+  accesses decomposed by the TCG softmmu into aligned sub-accesses, each sub-
+  access triggers its own TLB fill → PMP check independently. The size
+  parameter passed to get_physical_address_pmp() correctly reflects the
+  individual sub-operation size, not the original instruction size. This is
+  correct per-machine.adoc:3567-3570.
+  | if (ret == TRANSLATE_SUCCESS) {
+  |             ret = get_physical_address_pmp(env, &prot_pmp, pa,
+  |                                            size, access_type, mode);
+  |             tlb_size = pmp_get_tlb_size(env, pa);
+  | 
+  |             qemu_log_mask(CPU_LOG_MMU,
+  |                           "%s PMP address=" HWADDR_FMT_plx " ret %d prot"
+  |                           " %d tlb_size %" HWADDR_PRIu "\n",
+  |                           __func__, pa, ret, prot_pmp, tlb_size);
+  | 
+  |             prot &= prot_pmp;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3567-3570
+      "On some implementations, misaligned loads, stores, and instruction
+      fetches may be decomposed into multiple memory operations... PMP
+      checking is perfor"
+
+[compliant] target/riscv/cpu_helper.c:1142-1164  get_physical_address_pmp
+  get_physical_address_pmp() correctly translates the MMUAccessType to a
+  pmp_priv_t bit and delegates to pmp_hart_has_privs(). It properly handles
+  the case where PMP is not configured (returns full access). The function
+  itself is correct—it checks PMP for whatever size it receives. The
+  vulnerability is in callers that pass inappropriately large size values.
+  | pmp_has_privs = pmp_hart_has_privs(env, addr, size, 1 << access_type,
+  |                                        &pmp_priv, mode);
+  |     if (!pmp_has_privs) {
+  |         *prot = 0;
+  |         return TRANSLATE_PMP_FAIL;
+  |     }
+  | 
+  |     *prot = pmp_priv_to_page_prot(pmp_priv);
+  | 
+  |     return TRANSLATE_SUCCESS;
+
+[compliant] target/riscv/pmp.c:311-359  pmp_hart_has_privs_default
+  pmp_hart_has_privs_default() correctly implements the default PMP behavior
+  when no PMP entry matches: M-mode accesses succeed (unless MMWP is set),
+  S/U-mode accesses fail if any PMP entries exist but none match. Correctly
+  handles MML (Machine Mode Lockdown) and MMWP (Machine Mode Whitelist Policy)
+  bits per the Smepmp specification.
+  | if (MSECCFG_MMWP_ISSET(env)) {
+  |         *allowed_privs = 0;
+  |         return false;
+  |     } else if (MSECCFG_MML_ISSET(env)) {
+  |         if (mode == PRV_M && !(privs & PMP_EXEC)) {
+  |             ret = true;
+  |             *allowed_privs = PMP_READ | PMP_WRITE;
+  |         } else {
+  |             ret = false;
+  |             *allowed_privs = 0;
+  |         }
+  |         return ret;
+
+[compliant] target/riscv/pmp.c:727-777  pmp_get_tlb_size
+  pmp_get_tlb_size() correctly calculates the maximum TLB entry size that can
+  be safely cached without violating PMP region boundaries. When a PMP region
+  only partially covers a TLB page, it returns 1 (no caching) to ensure
+  subsequent accesses within the same page still receive independent PMP
+  checks. This prevents the caching of PMP check results across PMP region
+  boundaries.
+  | if (pmp_sa <= tlb_sa && pmp_ea >= tlb_ea) {
+  |             return TARGET_PAGE_SIZE;
+  |         } else if ((pmp_sa >= tlb_sa && pmp_sa <= tlb_ea) ||
+  |                    (pmp_ea >= tlb_sa && pmp_ea <= tlb_ea)) {
+  |             return 1;
+  |         }
+
+[compliant] target/riscv/pmp.c:150-198  pmp_write_cfg
+  pmp_write_cfg() correctly enforces PMP configuration write constraints:
+  locked entries are read-only, invalid Smepmp configurations are rejected,
+  reserved MT field values when Smpmpmt is not supported are cleared, and NA4
+  mode is rejected when granularity exceeds 4 bytes. Returns true only when
+  the configuration actually changed, enabling proper TLB flush triggering in
+  pmpcfg_csr_write().
+  | if (pmp_is_readonly(env, pmp_index)) {
+  |             qemu_log_mask(LOG_GUEST_ERROR,
+  |                           "ignoring pmpcfg write - read only\n");
+  |         } else if (pmp_is_invalid_smepmp_cfg(env, val)) {
+  |             qemu_log_mask(LOG_GUEST_ERROR,
+  |                           "ignoring pmpcfg write - invalid\n");
+  |         } else {
+
+[compliant] target/riscv/op_helper.c:270-282  helper_sc_probe_write
+  helper_sc_probe_write() correctly checks PMP write permissions for the
+  failed SC (store-conditional) path. It first validates alignment (line
+  276-278), then calls probe_write() which goes through the TLB fill → PMP
+  check path. This is used when SC fails its address comparison and needs to
+  verify write permission independently of the actual store.
+  | if (addr & (size - 1)) {
+  |         env->badaddr = addr;
+  |         riscv_raise_exception(env, RISCV_EXCP_STORE_AMO_ADDR_MIS, ra);
+  |     }
+  | 
+  |     probe_write(env, addr, size, mmu_idx, ra);
+
+[compliant] target/riscv/cpu_helper.c:1759-1789  riscv_cpu_do_unaligned_access
+  riscv_cpu_do_unaligned_access() correctly translates MMU access types to
+  RISC-V exception codes for misaligned accesses that cannot be decomposed by
+  the softmmu. Instruction fetches → INST_ADDR_MIS, loads → LOAD_ADDR_MIS,
+  stores → STORE_AMO_ADDR_MIS. Shadow stack accesses correctly raise access-
+  fault exceptions instead of misaligned exceptions.
+  | switch (access_type) {
+  |     case MMU_INST_FETCH:
+  |         cs->exception_index = RISCV_EXCP_INST_ADDR_MIS;
+  |         break;
+  |     case MMU_DATA_LOAD:
+  |         cs->exception_index = RISCV_EXCP_LOAD_ADDR_MIS;
+
+[potential_risk] target/riscv/op_helper.c:211-250  check_zicbom_access
+  check_zicbom_access() first tries probe_access_flags() with MMU_DATA_LOAD,
+  then falls back to probe_write() with MMU_DATA_STORE. This implements the
+  spec requirement (cmo.adoc:352-361) that cbo.clean/cbo.flush/cbo.inval need
+  either load OR store permission. However, the spec also states that 'if
+  neither a load instruction nor store instruction is permitted... but an
+  instruction fetch is permitted... whether a cache-block management
+  instruction is permitted to access the cache block is UNSPECIFIED.' QEMU
+  does not check execute permission as a third fallback, which is consistent
+  with the UNSPECIFIED designation, but means instruction-fetch-only regions
+  will incorrectly fault on CBO instructions if this unspecified behavior is
+  later defined to permit access.
+  | ret = probe_access_flags(env, address, cbomlen, MMU_DATA_LOAD,
+  |                              mmu_idx, true, &phost, ra);
+  |     if (ret != TLB_INVALID_MASK) {
+  |         /* Success: readable */
+  |         return;
+  |     }
+  |     probe_write(env, address, cbomlen, mmu_idx, ra);
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:352-361
+      "A cache-block management instruction is permitted to access the
+      specified cache block whenever a load instruction or store
+      instruction is permitted to"
+

@@ -1,0 +1,71 @@
+PR #2369  target=xiangshan  overall=not_implemented
+Spec: Missing vd/vs2 register overlap trap on vghsh.vs/vgmul.vs allows scalar subkey corruption during GHASH, breaking GCM authentication and enabling forged ciphertext acceptance
+Violation:
+  In XiangShan RTL, when the vector execution unit processes vghsh.vs or
+  vgmul.vs instructions, if the hardware does not check and trap on the
+  condition where the vd register group overlaps the vs2 scalar element group
+  (spec norm:vghsh-vs_vdovlpvs2_rsv and norm:vgmul-vs_vdovlpvs2_rsv), the
+  scalar subkey H held in vs2 can be overwritten by partial result writes to
+  vd before all element group iterations consume H. This creates a write-
+  after-read hazard where later element groups use a corrupted hash subkey,
+  producing incorrect GCM/GMAC authentication tags. The overlap check must
+  consider VLEN-dependent EMUL: for VLEN >= 128, vs2 is a single register; for
+  VLEN < 128, vs2 is a register group spanning ceil(128/VLEN) registers. The
+  decoder or issue logic must raise an illegal-instruction exception when
+  overlap is detected, per the spec's 'reserved encoding' classification.
+Consequence: privilege_escape
+Pattern:
+  vd.*vs2.*overlap|vdovlp|register.*overlap.*check|illegal.*instruction.*vghsh
+  .*vs|illegal.*instruction.*vgmul.*vs|scalar.*element.*group.*overlap|vs2.*vd
+  .*hazard
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/backend/decode/Instructions.scala:1-22  (none)
+  vghsh.vs and vgmul.vs are NOT implemented in XiangShan RTL. The instructions
+  file defines only Zvbb bit-patterns (VANDN_VV through VWSLL_VX). No Zvkg or
+  Zvkgs BitPat objects exist. The only vector crypto extension implemented is
+  Zvbb. vghsh.vv and vgmul.vv are also not implemented. Furthermore, the
+  RISC-V specification (zvk.adoc lines 2631-2636, 2752-2757) explicitly states
+  that .vs forms of vghsh and vgmul are NOT part of the current specification
+  — they are listed as hypothetical 'future extension' possibilities in non-
+  normative NOTE blocks. The generic .vs overlap constraint table (zvk.adoc
+  lines 331-346) enumerates the instructions subject to vd/vs2 overlap checks
+  and neither vghsh nor vgmul appear in that table. The normative rule tags
+  cited in the security spec (norm:vghsh-vs_vdovlpvs2_rsv, norm:vgmul-
+  vs_vdovlpvs2_rsv) do not exist in the current specification.
+  | object Zvbb {
+  |   def VANDN_VV = BitPat("b000001???????????000?????1010111")
+  |   def VANDN_VX = BitPat("b000001???????????100?????1010111")
+  |   // ... Zvbb only, no Zvkg/Zvkgs definitions
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zvk.adoc:2631-2636
+      "NOTE: Since the same hash subkey H will typically be used
+      repeatedly on a given message, a future extension might define a
+      vector-scalar version of th"
+    - riscv-isa-manual/src/unpriv/zvk.adoc:2752-2757
+      "NOTE: Since the same multiplicand will typically be used repeatedly
+      on a given message, a future extension might define a vector-scalar
+      version of thi"
+    - riscv-isa-manual/src/unpriv/zvk.adoc:331-346
+      "Table of .vs instructions where vd must not overlap vs2: vaes*.vs,
+      vsm4r.vs, vsha2c[hl], vsha2ms, vsm3me, vsm3c. Neither vghsh nor
+      vgmul appear in thi"
+
+[potential_risk] src/main/scala/xiangshan/backend/decode/VecExceptionGen.scala:276-277  VecExceptionGen
+  The notAllowOverlapInst exclusion list in VecExceptionGen does not include
+  vghsh or vgmul. If these instructions were added in the future (either .vv
+  or hypothetical .vs forms), the existing overlap-checking infrastructure
+  would silently permit vd/vs2 overlap because vs2Constraint1 (EEW equality
+  for non-mask instructions) would evaluate to true for these EEW=32
+  instructions, and the absence from notAllowOverlapInst means vs2AllowOverlap
+  would be true. This is a defense-in-depth gap: the overlap detection logic
+  has no forward-compatible safeguard for Zvkgs instructions that inherently
+  require non-overlapping vd and vs2.
+  | private val notAllowOverlapInst = lsIndexInst && inst.NF =/= 0.U || Seq(VMSBF_M, VMSIF_M, VMSOF_M, VIOTA_M,
+  |     VSLIDEUP_VX, VSLIDEUP_VI, VSLIDE1UP_VX, VFSLIDE1UP_VF, VRGATHER_VV, VRGATHEREI16_VV, VRGATHER_VX, VRGATHER_VI, VCOMPRESS_VM).map(_ === inst.ALL).reduce(_ || _)
+  References:
+    - riscv-isa-manual/src/unpriv/zvk.adoc:324-329
+      "For implementations with VLEN >= 128, vs2 refers to a single
+      register. Thus, the vd register group must not overlap the vs2
+      register. However, in impl"
+

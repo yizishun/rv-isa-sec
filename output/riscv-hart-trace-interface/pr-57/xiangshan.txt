@@ -1,0 +1,181 @@
+PR #57  target=xiangshan  overall=not_implemented
+Spec: When dretire fires without iretire for multi-access vec/Zcmp instructions, instruction-trace context signals must remain valid; current ROB commit-to-trace path in XiangShan invalidates context on iretire boundaries only, causing trace decoder to misattribute data accesses to wrong instructions
+Violation:
+  In XiangShan RTL, the instruction trace interface (TraceCoreInterface)
+  signals (itype, iaddr, ilastsize, priv) are only updated and valid when a
+  new instruction block retires (iretire non-zero). If data trace were
+  implemented with dretire for multi-memory-access instructions (vector
+  load/store, Zcmp cm.push/cm.pop), the instruction context signals would be
+  stale or invalid during cycles where dretire is asserted without iretire,
+  because XiangShan currently ties all instruction context validity to iretire
+  > 0 in the ROB commit path (Rob.scala:1284: traceValids(i) :=
+  io.commits.isCommit && io.commits.commitValid(i)). There is no mechanism to
+  hold/latch instruction trace context across cycles when only data sub-
+  accesses retire without corresponding instruction retirement.
+Consequence: info_leak
+Pattern:
+  dretire asserted without corresponding iretire context validity; multi-
+  memory-access instruction trace context not preserved/stalled during split
+  data retirement; trace instruction context signals (itype/iaddr/ilastsize)
+  not qualified by dretire-only validity window
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/backend/trace/Interface.scala:20-24  TracePipe (Bundle definition)
+  TracePipe defines only itype, iretire, and ilastsize — there is NO dretire
+  (data retirement) field. The entire XiangShan trace subsystem is a one-
+  dimensional instruction-retirement-only architecture. The vulnerability
+  condition (dretire asserted without iretire context) cannot manifest because
+  dretire does not exist as a concept anywhere in this RTL. For vector
+  load/store or Zcmp cm.push/cm.pop instructions, each instruction commits
+  once through the ROB and emits a single iretire entry with an instruction-
+  retirement count — there is no per-element or per-access data-retirement
+  tracking.
+  | class TracePipe(iretireWidth: Int)(implicit val p: Parameters) extends Bundle with HasXSParameter {
+  |   val itype     = Itype()
+  |   val iretire   = UInt(iretireWidth.W)
+  |   val ilastsize = Ilastsize()
+  | }
+
+[not_implemented] src/main/scala/xiangshan/backend/trace/Interface.scala:47-61  TraceCoreInterface.toEncoder (output Bundle)
+  The TraceCoreInterface output to the external encoder carries per-group
+  {iaddr, itype, iretire, ilastsize} but has NO dretire or dtype field. This
+  is the core-to-encoder boundary. If an external trace encoder (e.g., XSTOP)
+  were to interpret iretire as an E-Trace format-level 'Instruction
+  Retirement' packet, it would have no visibility into whether constituent
+  data accesses have completed. However, since Zcmp is not decoded in the
+  trace path and vector ld/st produce itype=None entries, the interface is
+  internally consistent for its current one-dimensional use case.
+  | val groups = Vec(TraceGroupNum, ValidIO(new Bundle{
+  |   val iaddr     = UInt(IaddrWidth.W)
+  |   val itype     = UInt(ItypeWidth.W)
+  |   val iretire   = UInt(IretireWidthCompressed.W)
+  |   val ilastsize = UInt(IlastsizeWidth.W)
+  | }))
+
+[compliant] src/main/scala/xiangshan/backend/rob/Rob.scala:1278-1296  RobImp trace output assignment
+  The ROB commit stage correctly drives traceCommitInfo signals (itype,
+  iretire, ilastsize, ftqIdx, ftqOffset) for each commit slot. traceValids(i)
+  is gated on io.commits.isCommit && io.commits.commitValid(i), which is the
+  instruction-commit validity window. There is NO stale or invalid state
+  because XiangShan does not implement dretire-only retirement cycles. The ROB
+  state machine has only s_idle and s_walk states — no mechanism for data-only
+  retirement cycles. Exception handling (lines 1287-1294) correctly forces
+  itype to Exception/Interrupt, iretire to 0, and validity to true. This logic
+  is internally self-consistent.
+  | traceBlockInPipe(i).itype := rawInfo(i).traceBlockInPipe.itype
+  | traceBlockInPipe(i).iretire := iretireCommit(i)
+  | traceBlockInPipe(i).ilastsize := rawInfo(i).traceBlockInPipe.ilastsize
+  | traceValids(i) := io.commits.isCommit && io.commits.commitValid(i)
+  | when(io.exception.valid){ // trace exception
+  |   traceBlocks(i).bits.tracePipe.itype := Mux(io.exception.bits.isInterrupt,
+  |     Itype.Interrupt, Itype.Exception)
+  |   traceValids(i) := true.B
+  |   traceBlockInPipe(i).iretire := 0.U
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/rob/Rob.scala:799-804  RobImp commit state machine (isCommit gating)
+  io.commits.isCommit is defined as state === s_idle && !blockCommit. The ROB
+  state machine has exactly two states: s_idle (normal operation) and s_walk
+  (TLB walk). There is no s_dretire state or any mechanism for data-only
+  retirement cycles, because data-retirement as a separate concept does not
+  exist in XiangShan. The blockCommit signal incorporates traceBlock
+  backpressure from the TraceBuffer. All commit-validity signaling is tied to
+  instruction retirement — there is no split between instruction-side and
+  data-side retirement.
+  | val traceBlock = io.trace.blockCommit
+  | val blockCommit = misPredBlock || lastCycleFlush || hasWFI || io.redirect.valid ||
+  |   (deqNeedFlush && !deqHasFlushed) || deqFlushBlock || criticalErrorState || traceBlock
+  | io.commits.isWalk := state === s_walk
+  | io.commits.isCommit := state === s_idle && !blockCommit
+
+[compliant] src/main/scala/xiangshan/backend/rob/Rob.scala:1086-1090  RobImp branch-taken trace feedback (dynamic itype update)
+  The only dynamic trace update in the ROB writeback path is the branch-taken
+  correction: NonTaken (4) → Taken (5) when a conditional branch resolves as
+  taken. There is NO analogous post-commit update for data-side completion.
+  This is consistent with the one-dimensional architecture — once an
+  instruction retires from the ROB, its trace metadata is final. No stale-
+  context vulnerability because data-retirement tracking is not attempted in
+  the first place.
+  | val taken = branchWBs.map(writeback => writeback.valid && writeback.bits.robIdx.value === i.U && writeback.bits.redirect.get.bits.taken).reduce(_ || _)
+  | when(robEntries(i).valid && Itype.isNonTaken(robEntries(i).traceBlockInPipe.itype) && taken){
+  |   robEntries(i).traceBlockInPipe.itype := Itype.Taken
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/rob/Rob.scala:283-302  RobImp iretireCommit decoder
+  The iretireCommit decoder translates encoded iretire values (from Rename)
+  into scalar instruction retirement counts per commit slot. There is no data-
+  retire count decoder because the concept does not exist. The truth table
+  maps (instrNum, nonRVCNum) → scalar instruction count, consistent with the
+  instruction-retirement-only model. Verified the encoding matches the Rename-
+  stage encode table.
+  | val iretireCommit = Wire(Vec(CommitWidth, UInt(IretireWidthCommited.W)))
+  | iretire := chisel3.util.experimental.decode.decoder(
+  |   raw.traceBlockInPipe.iretire,
+  |   TruthTable(instrSizeTable.zipWithIndex.map{case(table, encode) =>
+  |     (BitPat((encode + 1).U(IretireWidthEncoded.W)), BitPat(table._2.U(IretireWidthCommited.W)))},
+  |     BitPat.N(IretireWidthCommited)))
+
+[compliant] src/main/scala/xiangshan/backend/trace/Interface.scala:64-80  Itype (NamedUInt enumeration)
+  The Itype enumeration uses 4-bit values (0-15) and correctly matches the
+  E-Trace/Smctr transfer type encoding (referenced in smctr.adoc 'transfer-
+  type-defs' table at lines 574-596). Encodings: None=0, Exception=1,
+  Interrupt=2, ExpIntReturn=3, NonTaken=4, Taken=5, UninferableJump=6,
+  reserved=7, UninferableCall=8, InferableCall=9, UninferableTailCall=10,
+  InferableTailCall=11, CoRoutineSwap=12, FunctionReturn=13,
+  OtherUninferableJump=14, OtherInferableJump=15. There are NO Zcmp-specific
+  itype values, confirming XiangShan does not implement Zcmp trace
+  classification. The itype width is fully saturated (4 bits, all 16 slots
+  used), so adding Zcmp would require extending itype width.
+  | object Itype extends NamedUInt(4) {
+  |   def None = 0.U; def Exception = 1.U; def Interrupt = 2.U; def ExpIntReturn = 3.U
+  |   def NonTaken = 4.U; def Taken = 5.U; def UninferableJump = 6.U; def reserved = 7.U
+  |   def UninferableCall = 8.U; def InferableCall = 9.U; def UninferableTailCall = 10.U
+  |   def InferableTailCall = 11.U; def CoRoutineSwap = 12.U; def FunctionReturn = 13.U
+  |   def OtherUninferableJump = 14.U; def OtherInferableJump = 15.U
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/rename/Rename.scala:647-658  Rename trace field generation (itype assignment)
+  Rename generates itype via Itype.jumpTypeGen() which classifies only
+  branch/jump instructions per the E-Trace transfer type definitions. For
+  vector load/store and other non-branch/non-jump instructions (including Zcmp
+  if decoded), jumpTypeGen returns 0.U (None). There is no Zcmp-specific
+  decode path in Rename — Zcmp cm.push/cm.pop instructions are not explicitly
+  handled. IsXret detection for trap returns (ExpIntReturn=3) correctly checks
+  CSR address bits (11,1).orR. The ilastsize assignment correctly uses
+  Mux(lastIsRVC, HalfWord, Word). For fused instructions, itype/ilastsize
+  correctly forward from the next uop.
+  | uops(i).traceBlockInPipe.itype := Mux(
+  |   isXret,
+  |   Itype.ExpIntReturn,
+  |   Itype.jumpTypeGen(inVec(i).fuType, inVec(i).fuOpType, ...)
+  | )
+
+[compliant] src/main/scala/xiangshan/backend/CtrlBlock.scala:313-320  CtrlBlockImp trace wiring to TraceCoreInterface
+  CtrlBlock maps TraceBuffer output to TraceCoreInterface as a pure identity
+  pass-through for iretire, itype, and ilastsize. The only transformations
+  are: (a) iaddr resolution via pcMem lookup using ftqIdx+ftqOffset (lines
+  296-302); (b) priv determination via Mux(Itype.isTrapOrXret, lastPriv,
+  currentPriv) at lines 305-308. The mstatus, trap.cause, and trap.tval come
+  from the CSR block (io.fromCSR.traceCSR). There is no dretire bypass or
+  data-trace path because none exists. These connections are correct for the
+  current one-dimensional architecture.
+  | io.traceCoreInterface.toEncoder.groups(i).bits.itype := trace.io.out.toEncoder.blocks(i).bits.tracePipe.itype
+  | io.traceCoreInterface.toEncoder.groups(i).bits.iretire := trace.io.out.toEncoder.blocks(i).bits.tracePipe.iretire
+  | io.traceCoreInterface.toEncoder.groups(i).bits.ilastsize := trace.io.out.toEncoder.blocks(i).bits.tracePipe.ilastsize
+
+[compliant] src/main/scala/xiangshan/backend/trace/TraceBuffer.scala:31-84  TraceBuffer compression and enqueue/dequeue logic
+  TraceBuffer compresses adjacent trace blocks by accumulating iretire counts
+  when consecutive blocks don't need separate PC entries (needPcVec driven by
+  inTypeIsNotNoneVec). Compression only preserves iretire and ftqIdx/ftqOffset
+  from the first block. The circular queue (enqPtr/deqPtr) manages TraceEntry
+  storage. blockCommit backpressure stalls the ROB when the buffer can't
+  accept more entries. There is no separate data-retirement entry type or
+  ordering constraint between iretire and dretire events — because dretire
+  events don't exist. The enqueue/dequeue logic operates on a single event
+  type. Internally consistent with the one-dimensional architecture.
+  | when(!needPcVec(i-1)){
+  |   blocksUpdate(i).bits.tracePipe.iretire := blocksUpdate(i - 1).bits.tracePipe.iretire + io.in.fromRob.blocks(i).bits.tracePipe.iretire
+  |   blocksUpdate(i).bits.ftqOffset.get := blocksUpdate(i - 1).bits.ftqOffset.get
+  |   blocksUpdate(i).bits.ftqIdx.get := blocksUpdate(i - 1).bits.ftqIdx.get
+  | }
+  | blockCommit := io.in.fromEncoder.enable && (canNotTraceAll || io.in.fromEncoder.stall)
+

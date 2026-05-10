@@ -1,0 +1,54 @@
+PR #29  target=linux  overall=not_implemented
+Spec: ACE CCs are non-renamed per-hart resources whose state persists across context switches unless explicitly exported/cleared; the kernel must save SCC via ace.export on switch-out and restore via ace.import on switch-in, and must ace.clear CCs on task exit to prevent cross-process cryptographic state leakage
+Violation:
+  The kernel performs a context switch from a task that has executed
+  ace.enable (setting the ACE-used CSR bit) without first issuing ace.export
+  for each live CC to save its SCC to a per-task buffer, OR the kernel
+  allocates a CC index to a new task without issuing ace.clear on any CC index
+  previously owned by a now-exited task, thereby leaking the prior task's
+  cryptographic context state to the incoming task.
+Consequence: info_leak
+Pattern:
+  switch_to|__switch_to|context_switch|schedule.*ace|ace_export|ace_init|ace_c
+  lear|CC_USED|acecsr|SCC.*save|SCC.*restore|crypto.*context.*switch
+------------------------------------------------------------
+[not_implemented] arch/riscv/include/asm/switch_to.h:113-126  switch_to (macro)
+  The ACE cryptographic extension is not implemented in this kernel. The
+  switch_to macro handles FPU (__switch_to_fpu) and Vector
+  (__switch_to_vector) state save/restore, but has no ACE context-switch
+  logic. No ace_export, ace_clear, or CC-index management exists. Since the
+  ACE ISA extension is absent, the spec violation conditions (leaking SCC to
+  incoming task via missing ace_export/ace_clear across context switches)
+  cannot be triggered.
+  | #define switch_to(prev, next, last)
+  |     do {
+  |         ...
+  |         if (has_fpu())
+  |             __switch_to_fpu(__prev, __next);
+  |         if (has_vector() || has_xtheadvector())
+  |             __switch_to_vector(__prev, __next);
+  |         ...
+  |         __switch_to_envcfg(__next);
+  |         ((last) = __switch_to(__prev, __next));
+  |     } while (0)
+
+[not_implemented] arch/riscv/include/asm/csr.h:1-1  N/A
+  No ACE CSR definitions (acecsr, sacecsr, or any CC-index management CSRs)
+  exist in the kernel's CSR header. Without CSR definitions, no kernel code
+  can access ACE hardware state.
+
+[not_implemented] arch/riscv/kvm/vcpu.c:970-1005  kvm_arch_vcpu_ioctl_run
+  KVM VCPU run loop has no ACE context save/restore or virtualization. No ACE
+  CSR trapping, no SCC save on VM exit, no SCC restore on VM entry. Since ACE
+  is not implemented, this is expected.
+  | trace_kvm_entry(vcpu);
+  | guest_state_enter_irqoff();
+  | __kvm_riscv_switch_to(&vcpu->arch);
+  | guest_state_exit_irqoff();
+  | trace_kvm_exit(&trap);
+
+[not_implemented] arch/riscv/include/asm/processor.h:1-1  struct thread_struct
+  The task's thread_struct has no ACE state fields (no SCC buffer, no CC-index
+  allocation table, no ACE-used bit). Without per-task ACE state storage,
+  there is nothing to save/restore across context switches.
+

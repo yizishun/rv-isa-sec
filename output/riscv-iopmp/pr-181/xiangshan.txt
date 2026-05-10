@@ -1,0 +1,141 @@
+PR #181  target=xiangshan  overall=compliant
+Spec: JSON decode error
+Violation:
+
+Consequence: function_loss
+Pattern:
+
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala:67-81  TageTable (usefulCtrSram construction)
+  FoldedSRAMTemplate for useful counters uses shouldReset=true, ensuring SRAM
+  is properly initialized at reset. The fold width NumUsefulCtrSramFolds=8
+  divides evenly into NumSets (512 for 4-bank, 2-way, 4096-entry tables): 512
+  % 8 == 0, satisfying FoldedSRAMTemplate's require(set % width == 0). No
+  correctness issue.
+  | private val usefulCtrSram =
+  |     Seq.tabulate(NumBanks, NumWays) { (bankIdx, wayIdx) =>
+  |       Module(new FoldedSRAMTemplate(
+  |         UsefulCounter(),
+  |         set = NumSets,
+  |         width = NumUsefulCtrSramFolds,
+
+[potential_risk] src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala:176-199  TageTable (useful reset protocol)
+  The useful-counter reset progression at line 179 uses
+  bank.head.io.w.req.fire to advance the reset setIdx. Each bank contains
+  NumWays separate FoldedSRAMTemplate instances. The reset writes apply to ALL
+  ways simultaneously (line 188-196 with usefulResetValid=True for all ways),
+  but only the first way's (.head) write-fire signal gates the setIdx
+  increment. If different ways have different SRAM ready timings, some ways
+  could miss a reset write for a particular set before the index advances.
+  This would leave stale useful counter state un-zeroed. While this doesn't
+  affect ISA compliance (branch predictors are microarchitectural), it
+  deviates from the intended 'reset all useful counters' behavior. Consider
+  accumulating all ways' fire signals: bank.map(_.io.w.req.fire).reduce(_ &&
+  _).
+  | }.elsewhen(usefulResetInFlightMask(bankIdx) && bank.head.io.w.req.fire) {
+  |       when(usefulResetSetIdx(bankIdx) === (NumSets - 1).U) {
+  |         usefulResetInFlightMask(bankIdx) := false.B
+  |         usefulResetSetIdx(bankIdx)       := 0.U
+  |       }.otherwise {
+  |         usefulResetSetIdx(bankIdx) := usefulResetSetIdx(bankIdx) + 1.U
+
+[compliant] src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala:201-217  TageTable (read response during reset)
+  During useful-reset-in-flight, reads from usefulCtrSram are suppressed (line
+  130: && !usefulResetInFlightMask(bankIdx)), and the read response returns
+  Zero for usefulCtrs via the Mux on readDuringUsefulResetNext (line 209-215).
+  This correctly prevents stale/partial data from being observed during a
+  reset sweep. The reset read bypass returning zero is architecturally safe
+  because the TAGE predictor treats zero useful counters as having no
+  confident prediction, and the prediction pipeline can proceed with stale-
+  but-safe counter values.
+  | resp.usefulCtrs := Mux(
+  |       readDuringUsefulResetNext,
+  |       VecInit.fill(NumWays)(UsefulCounter.Zero),
+  |       Mux1H(
+  |         readBankMaskNext,
+  |         usefulCtrSram.map(bank => VecInit(bank.map(way => way.io.r.resp.data.head)))
+
+[compliant] src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala:118-133  TageTable (read conflict arbitration)
+  The single-port entry SRAM multiplexes two read ports (predict read at index
+  0, train read at index 1) with priority given to the predictor read via
+  Mux(readValid(0), ...). A hard assert at line 133 catches simultaneous read
+  requests to the same bank. Since the parent Tage.scala gates train reads
+  when a predict read would conflict (Tage.scala line 209-210: io.trainReady
+  := !t0_readBankConflict), this assert should never fire during normal
+  operation. The OOO priority (using Mux(readValid(0), ...) without
+  arbitration) is acceptable because the parent module guarantees mutual
+  exclusion.
+  | val readValid = VecInit(
+  |       io.readReq(0).valid && io.readReq(0).bits.bankMask(bankIdx),
+  |       io.readReq(1).valid && io.readReq(1).bits.bankMask(bankIdx)
+  |     )
+  |     val readSetIdx = Mux(readValid(0), io.readReq(0).bits.setIdx, io.readReq(1).bits.setIdx)
+
+[compliant] src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala:571-581  Tage (usefulResetCtr logic)
+  The usefulResetCtr increment condition at line 579 adds a
+  !usefulResetInFlight guard: usefulResetCtr.selfIncrease() is now gated by
+  !usefulResetInFlight (prevents incrementing while a reset is already in
+  flight). Combined with the handshake (line 571-574: usefulResetInFlight is
+  set when t2_usefulResetStart, cleared when all tables report
+  !usefulResetInFlight), this correctly prevents the degenerate case where the
+  reset counter could overflow/loop rapidly, causing back-to-back reset sweeps
+  that never complete.
+  | when(t2_usefulResetStart) {
+  |     usefulResetInFlight := true.B
+  |   }.elsewhen(usefulResetInFlight && !tables.map(_.io.usefulResetInFlight).reduce(_ || _)) {
+  |     usefulResetInFlight := false.B
+  |   }
+  | 
+  |   when(t2_usefulResetStart) {
+  |     usefulResetCtr.resetZero()
+  |   }.elsewhen(t2_fire && t2_needAllocate && !t2_canAllocate && !usefulResetInFlight) {
+  |     usefulResetCtr.selfIncrease()
+  |   }
+
+[compliant] src/main/scala/xiangshan/frontend/bpu/tage/Bundles.scala:91-96  EntrySramWriteReq
+  EntrySramWriteReq was refactored from a combined entry+useful bundle to an
+  entry-only bundle (usefulCtr fields moved to separate UsefulCtrSramWriteReq
+  at line 98-101). The WriteBuffer for entry SRAM now writes only entry
+  fields, and useful counter writes use a separate Queue-based write buffer.
+  This separation is correct: it eliminates unnecessary dependencies between
+  entry updates and useful counter updates that were previously coupled in the
+  same write buffer entry. No spec violation.
+  | class EntrySramWriteReq(implicit p: Parameters, info: TageTableInfo) extends WriteReqBundle with HasTageParameters {
+  |   val setIdx:       UInt                    = UInt(SetIdxWidth.W)
+  |   val entry:        TageEntry               = new TageEntry
+  |   override def tag: Option[UInt]            = Some(entry.tag)
+  |   override def cnt: Option[SaturateCounter] = Some(entry.takenCtr)
+  | }
+
+[compliant] src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala:140-173  TageTable (entry SRAM write path)
+  The entry SRAM write path correctly gates writes when reads are in flight
+  (!way.io.r.req.valid) to prevent read-write conflicts on the single-port
+  SRAM. The write buffer outputs (bufferOut) provide backpressure
+  (bufferOut.ready := way.io.w.req.ready && !way.io.r.req.valid), stalling
+  buffer drains during reads. This is correct single-port SRAM arbitration.
+  | way.io.w.apply(
+  |         bufferOut.valid && !way.io.r.req.valid,
+  |         bufferOut.bits.entry,
+  |         bufferOut.bits.setIdx,
+  |         1.U(1.W) // way mask
+  |       )
+  |       bufferOut.ready := way.io.w.req.ready && !way.io.r.req.valid
+
+[compliant] src/main/scala/xiangshan/frontend/bpu/tage/Parameters.scala:23-47  TageParameters
+  New parameter NumUsefulCtrSramFolds=8 was added with a reasonable default.
+  The comment at line 26 clarifies the Size=NumSets*NumWays*NumBanks
+  relationship. The fold count of 8 is appropriate: each useful counter is 2
+  bits (UsefulCtrWidth), so a fold of 8 maps to a physical SRAM data width of
+  8*2=16 bits, which is efficient for standard SRAM compilers. No correctness
+  or security concern.
+  | NumUsefulCtrSramFolds: Int = 8,
+  |     WriteBufferSize:       Int = 4,
+  |     UsefulResetCtrWidth:   Int = 8,
+
+[compliant] src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala:146-146  Tage (useProvider logic)
+  The useProvider condition changed from (!useAltOnNa ||
+  !provider.takenCtr.isWeak) to !(useAltOnNa && provider.takenCtr.isWeak). By
+  De Morgan's law these are logically equivalent: !A || !B == !(A && B). This
+  is a pure refactoring, no behavioral change.
+  | val useProvider = hasProvider && !(useAltOnNa && provider.takenCtr.isWeak)
+

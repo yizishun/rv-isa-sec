@@ -1,0 +1,77 @@
+PR #694  target=qemu  overall=bug_confirmed
+Spec: IOMMU iohgatp.MODE uses shared encoding 8 for both Sv32x4 and Sv39x4, disambiguated by fctl.GXL; stale value 1 for Sv32x4 or missing GXL check causes G-stage walks to misinterpret page table format, leading to wrong SPA translations for DMA
+Violation:
+  QEMU's IOMMU emulation defines IOHGATP_Sv32x4 as 1 (the old hgatp-style
+  value) instead of 8, OR uses MODE=8 exclusively for Sv39x4 without checking
+  fctl.GXL to disambiguate between Sv32x4 (GXL=1) and Sv39x4 (GXL=0)
+Consequence: data_corruption
+Pattern:
+  IOHGATP_Sv32x4|iohgatp.*MODE.*==.*1|Sv32x4.*=.*1|MODE.*8.*Sv39|gxl.*MODE|fct
+  l.*gxl.*iohgatp
+------------------------------------------------------------
+[bug_confirmed] hw/riscv/riscv-iommu.c:785-789  riscv_iommu_validate_device_ctx
+  Line 786 compares fsc_mode against RISCV_IOMMU_CAP_SV32 (BIT_ULL(8)=256)
+  instead of RISCV_IOMMU_DC_FSC_IOSATP_MODE_SV32 (=8). The condition 'fsc_mode
+  == RISCV_IOMMU_CAP_SV32' is always false, making the SXL=1 first-stage SV32
+  capability check dead code. Any fsc_mode value (including unsupported modes)
+  passes validation when SXL=1. The validate_process_ctx() function (line 853)
+  correctly uses RISCV_IOMMU_DC_FSC_IOSATP_MODE_SV32 for the same check.
+  | if (ctx->tc & RISCV_IOMMU_DC_TC_SXL) {
+  |     if (fsc_mode == RISCV_IOMMU_CAP_SV32 &&
+  |         !(s->cap & RISCV_IOMMU_CAP_SV32)) {
+  |         return false;
+  |     }
+  References:
+    - riscv-isa-manual/src/priv/sv.adoc:0-0
+      "Sv32 vs Sv39 mode (both MODE=8) disambiguated by hardware XLEN
+      (GXL/SXL field). Hardware must validate supported modes against
+      capabilities register."
+
+[potential_risk] hw/riscv/riscv-iommu.c:747-757  riscv_iommu_validate_device_ctx
+  validate_device_ctx() validates only BARE-mode interactions with T2GPA and
+  MSIPTP but does NOT validate whether the G-stage (IOHGATP) mode value
+  (8/9/10) is supported by s->cap hardware capabilities or within valid range.
+  By contrast, first-stage (FSC) mode validation is performed at lines
+  759-808. G-stage mode validation is deferred to the actual page-table walk
+  in riscv_iommu_spa_fetch() and pdt_memory_read(), which catch unsupported
+  modes only at translation time rather than at context-fetch time. A
+  malicious guest could install an unsupported G-stage mode in a device
+  context, which would be silently cached and only rejected on access.
+  | gatp = get_field(ctx->gatp, RISCV_IOMMU_ATP_MODE_FIELD);
+  | if (ctx->tc & RISCV_IOMMU_DC_TC_T2GPA &&
+  |     gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE) {
+  |     return false;
+  | }
+  | if (gatp == RISCV_IOMMU_DC_IOHGATP_MODE_BARE &&
+  |     get_field(ctx->msiptp, RISCV_IOMMU_DC_MSIPTP_MODE) !=
+  |     RISCV_IOMMU_DC_MSIPTP_MODE_OFF) {
+  |     return false;
+  | }
+
+[compliant] hw/riscv/riscv-iommu.c:311-331  riscv_iommu_spa_fetch
+  The G-stage (pass=1) MODE=8 disambiguation correctly uses s->fctl &
+  RISCV_IOMMU_FCTL_GXL: when GXL=1 selects Sv32X4 (32-bit,
+  levels=2/ptesize=4), when GXL=0 selects Sv39X4 (64-bit, levels=3/ptesize=8).
+  This correctly disambiguates Sv32x4 vs Sv39x4 which share the IOHGATP MODE
+  encoding value 8.
+  | if (pass ? (s->fctl & RISCV_IOMMU_FCTL_GXL) :
+  |     (ctx->tc & RISCV_IOMMU_DC_TC_SXL)) {
+  |     /* 32bit mode for GXL/SXL == 1 */
+  |     switch (pass ? gatp : satp) {
+  |     case RISCV_IOMMU_DC_IOHGATP_MODE_BARE:
+  |     ...
+  |     case RISCV_IOMMU_DC_IOHGATP_MODE_SV32X4:
+
+[compliant] hw/riscv/riscv-iommu-bits.h:311-317  enum riscv_iommu_dc_iohgatp_modes
+  IOHGATP mode enum correctly defines Sv32x4=8 (not the old hgatp-style value
+  1). Sv32x4 and Sv39x4 both map to MODE=8 per RISC-V IOMMU spec, requiring
+  GXL-based disambiguation in the page-table walkers. The Sv48x4=9 and
+  Sv57x4=10 values are also correct.
+  | enum riscv_iommu_dc_iohgatp_modes {
+  |     RISCV_IOMMU_DC_IOHGATP_MODE_BARE = 0,
+  |     RISCV_IOMMU_DC_IOHGATP_MODE_SV32X4 = 8,
+  |     RISCV_IOMMU_DC_IOHGATP_MODE_SV39X4 = 8,
+  |     RISCV_IOMMU_DC_IOHGATP_MODE_SV48X4 = 9,
+  |     RISCV_IOMMU_DC_IOHGATP_MODE_SV57X4 = 10
+  | };
+

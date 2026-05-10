@@ -1,0 +1,164 @@
+{
+  "pr_number": 193,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 193,
+    "violation_condition": "In XiangShan RTL, the err_cfg.stall_violation_en CSR field is unconditionally writable regardless of hwcfg2.stall_en. Software writes to stall_violation_en when stall_en=0 are accepted and take effect, creating a state where IOPMP faults transactions for 'stalled transaction' violations even though the stall mechanism is globally disabled and no transactions are actually stalled.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "stall_violation_en.*write|err_cfg.*stall|hwcfg2.stall_en.*gate|when.*stall_en.*else|stall_violation_en.*:=|stallViolationEn.*writeEnable",
+    "affected_entities": [
+      "IOPMP_err_cfg",
+      "IOPMP_hwcfg2",
+      "mdstall"
+    ],
+    "summary": "PR adds write-gating: err_cfg.stall_violation_en must only accept writes when hwcfg2.stall_en=1; hardware that lacks this gate allows software to inject spurious transaction faults via misconfigured stall_violation_en when stalling is globally disabled."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMap — ERR_CFG write handler",
+        "line_start": 822,
+        "line_end": 833,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ERR_CFG.stall_violation_en (bit 4) accepts writes unconditionally when the lock bit is 0, with zero gating on hwcfg.stall_en. The reference model at iopmp_reg.c:712-713 explicitly gates the write: 'if (iopmp->reg_file.hwcfg2.stall_en) { iopmp->reg_file.err_cfg.stall_violation_en = ...; }'. Since stall_en is hardwired to 0 (stall feature not implemented), stall_violation_en must behave as read-only-zero per WARL semantics. The RTL instead accepts any written value and returns it on read-back, creating a semantically invalid CSR state where software sees stall_violation_en=1 despite the stall mechanism being globally absent. Compare with the prio_entry field in HWCFG2 (line 813) which correctly gates on prient_prog===1 — the same gating pattern used in the reference model but absent here.",
+      "snippet": "when(io.regcfg.v && io.regcfg.rw && addrhit_errcfg) {\n    val w = io.regcfg.din.asTypeOf(new RegErrcfg)\n    reg_errcfg.l := reg_errcfg.l | w.l  // W1SS\n    when(reg_errcfg.l === 0.U) {\n      ...\n      reg_errcfg.stall_violation_en := w.stall_violation_en  // WARL — UNCONDITIONAL, no stall_en gate\n      ...\n    }\n  }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "iopmp_ref_model/src/iopmp_reg.c",
+          "line_start": 703,
+          "line_end": 718,
+          "excerpt": "case ERR_CFG_OFFSET:\n    if (!iopmp->reg_file.err_cfg.l) {\n        iopmp->reg_file.err_cfg.l |= err_cfg_temp.l;\n        iopmp->reg_file.err_cfg.ie = err_cfg_temp.ie;\n        iopmp->reg_file.err_cfg.rs = err_cfg_temp.rs;\n        if (iopmp->reg_file.hwcfg2.msi_en) {\n            iopmp->reg_file.err_cfg.msi_sel = err_cfg_temp.msi_sel;\n            iopmp->reg_file.err_cfg.msidata = err_cfg_temp.msidata;\n        }\n        if (iopmp->reg_file.hwcfg2.stall_en) {\n            iopmp->reg_file.err_cfg.stall_violation_en = err_cfg_temp.stall_violation_en;\n        }\n        ...\n    }\n    break;"
+        },
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/registers.adoc",
+          "line_start": 106,
+          "line_end": 107,
+          "excerpt": "|`stall_en` |30:30 |R |IMP |Indicate if the IOPMP implements stall-related features, which are `MDSTALL`, `MDSTALLH`, `RRIDSCP`, and `ERR_CFG.stall_violation_en`."
+        },
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/registers.adoc",
+          "line_start": 179,
+          "line_end": 180,
+          "excerpt": "|`stall_violation_en` |4:4 |WARL |IMP |Indicates whether the IOPMP faults stalled transactions. When the bit is set, the IOPMP faults the transactions if the corresponding RRID is not exempt from stall."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMapIO — inter-module signal bundle",
+        "line_start": 737,
+        "line_end": 757,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "RegMapIO exports o_reg_errcfg_ie, o_reg_errcfg_rs, o_reg_errcfg_msi_en, and o_reg_errcfg_msidata to the Ctrl module, but stall_violation_en is entirely absent. There is no o_reg_errcfg_stall_violation_en output port and no wiring assignment. The Ctrl FSM (states at line 1035-1037: sIdle, sSrcmd, sMdcfg, sMdcfgPre, sEntry, sPriority, sMatching, sErr, sDone) never reads stall_violation_en. The etype signal in Ctrl only generates error codes 0x1-0x6 (illegal read/write, partial hit, no hit, unknown RRID) — etype 0x07 (stalled transaction error) is never produced. This means the writable stall_violation_en CSR field is dead storage: software can write 1 and read it back, but it has zero functional effect on hardware behavior. While this mitigates the severity of the missing write-gate, it creates a semantic gap where software setting stall_violation_en=1 expects stalled-transaction faulting but silently gets no such behavior.",
+      "snippet": "class RegMapIO extends Bundle {\n  // logic in\n  val i_errinfo_v = Input(UInt(1.W))\n  ...\n  //logic out\n  val o_reg_hwcfg0_enable = Output(UInt(1.W))\n  ...\n  val o_reg_errcfg_ie = Output(UInt(1.W))\n  val o_reg_errcfg_rs = Output(UInt(1.W))\n  val o_reg_errcfg_msi_en = Output(UInt(1.W))\n  val o_reg_errcfg_msidata = Output(UInt(11.W))\n  // NOTE: no o_reg_errcfg_stall_violation_en output\n  val o_reg_errinfo_v = Output(UInt(1.W))\n  val o_reg_errinfo_ttype = Output(UInt(2.W))\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/registers.adoc",
+          "line_start": 209,
+          "line_end": 211,
+          "excerpt": "- 0x07 = error due to a stalled transaction. It should not happen when `ERR_CFG.stall_violation_en` is 0."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "IopmpChecker — stall signal generation",
+        "line_start": 1356,
+        "line_end": 1356,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The only 'stall' signal in the IopmpChecker is a primitive APB-write-in-progress gate: 'val stall = io.regcfg.v && io.regcfg.rw'. This is not MDSTALL.is_busy. It correctly matches the current implementation where stall_en=0 and no MDSTALL/RRIDSCP infrastructure exists. The reference model at iopmp_reg.c:610 places MDSTALL writes behind 'if (iopmp->reg_file.hwcfg2.stall_en)', and the RTL has no MDSTALL register instantiation at all, so this stall signal is only used to pause the FSM during APB register writes in sSrcmd state (line 1092-1095), which is functionally correct for a non-stall-capable implementation.",
+      "snippet": "val stall = io.regcfg.v && io.regcfg.rw",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "IopmpParams — stall_en default",
+        "line_start": 41,
+        "line_end": 41,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "IopmpParams.stall_en is hardwired to 0, correctly advertising that the IOPMP does not implement stall-related features (MDSTALL, MDSTALLH, RRIDSCP). This is read-only in HWCFG0 at bit 13 (line 503: 'val stall_en = UInt(1.W) // [R]'), with no write path in the HWCFG0 write handler (lines 796-806). This correctly follows the spec requirement that stall_en is a read-only IMP field reflecting implementation capabilities.",
+      "snippet": "val stall_en           = 0    // [R   ] stall feature is not imp",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/registers.adoc",
+          "line_start": 106,
+          "line_end": 106,
+          "excerpt": "|`stall_en` |30:30 |R |IMP |Indicate if the IOPMP implements stall-related features"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMap — ERR_CFG msi_en write handler",
+        "line_start": 829,
+        "line_end": 831,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "ERR_CFG.msi_en (bit 3) and ERR_CFG.msidata (bits 18:8) are written unconditionally when the lock bit is 0, with no gating on hwcfg.msi_en. The reference model at iopmp_reg.c:708-711 gates both msi_sel and msidata on 'if (iopmp->reg_file.hwcfg2.msi_en)'. The RTL parameter IopmpParams.msi_en=0 (line 53) means MSI is not implemented, but the register's msi_en field is still writable. This is the same WARL-gating-vs-unconditional-write pattern as stall_violation_en, though the RTL's RegErrcfg.msi_en field (bit 3) is the old spec's 'msi_en' not the new spec's 'msi_sel', indicating a spec-version mismatch in field naming.",
+      "snippet": "reg_errcfg.msi_en := w.msi_en  // WARL — UNCONDITIONAL, no hwcfg.msi_en gate\n      reg_errcfg.stall_violation_en := w.stall_violation_en  // WARL\n      reg_errcfg.msidata := w.msidata  // WARL — UNCONDITIONAL, no hwcfg.msi_en gate",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "iopmp_ref_model/src/iopmp_reg.c",
+          "line_start": 708,
+          "line_end": 711,
+          "excerpt": "if (iopmp->reg_file.hwcfg2.msi_en) {\n    iopmp->reg_file.err_cfg.msi_sel = err_cfg_temp.msi_sel;\n    iopmp->reg_file.err_cfg.msidata = err_cfg_temp.msidata;\n}"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl FSM — error type generation",
+        "line_start": 1083,
+        "line_end": 1142,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The Ctrl FSM correctly produces etype values 0x1 (illegal read), 0x2 (illegal write/AMO), 0x4 (partial hit on priority rule), 0x5 (no hit), and 0x6 (unknown RRID). It never generates etype 0x07 (stalled transaction error), which is consistent with stall_en=0 per the spec note: 'It should not happen when ERR_CFG.stall_violation_en is 0' (registers.adoc:210). This demonstrates that the hardware behavior correctly reflects the non-implementation of stall features, even though the CSR register field allows misleading write values.",
+      "snippet": "etype := 0x6.U // 0x6: unknown RRID\n  ...\n  etype := 0x5.U // 0x5 : not hit any rule\n  ...\n  etype := 0x4.U // 0x4 : partial hit on a priority rule\n  ...\n  etype := 0x2.U // 0x2 : illegal write access/AMO\n  ...\n  etype := 0x1.U // 0x1 : illegal read access\n// NOTE: etype 0x07 (stalled transaction) is never assigned",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/registers.adoc",
+          "line_start": 209,
+          "line_end": 211,
+          "excerpt": "- 0x07 = error due to a stalled transaction. It should not happen when `ERR_CFG.stall_violation_en` is 0."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMap — HWCFG2 prio_entry write handler (comparison)",
+        "line_start": 809,
+        "line_end": 820,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The prio_entry field in HWCFG2 correctly demonstrates the WARL gating pattern: writes are accepted only when 'reg_hwcfg0.prient_prog === 1.U' (line 813). This is the pattern that the reference model uses for all feature-gated fields and that should have been applied to stall_violation_en (gated on hwcfg.stall_en) and msi_en/msidata (gated on hwcfg.msi_en). This confirms the gating pattern exists in the RTL codebase but was simply not applied to the ERR_CFG fields.",
+      "snippet": "when(io.regcfg.v && io.regcfg.rw && addrhit_hwcfg2) {\n    val w = io.regcfg.din.asTypeOf(new RegHwcfg2)\n    when(reg_hwcfg0.prient_prog === 1.U) {\n      reg_hwcfg2.prio_entry := w.prio_entry  // WARL — correctly gated\n    }\n  }",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

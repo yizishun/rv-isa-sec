@@ -1,0 +1,171 @@
+PR #2432  target=linux  overall=bug_confirmed
+Spec: Failed to parse agent output as JSON
+Violation:
+
+Consequence: function_loss
+Pattern:
+
+------------------------------------------------------------
+[bug_confirmed] arch/riscv/kvm/vcpu.c:554-555  kvm_riscv_vcpu_setup_config
+  KVM unconditionally grants guest VMs full CBIE=INV (cbo.inval with true
+  invalidate semantics, ENVCFG_CBIE=0x3<<4=INV) when ZICBOM is available.
+  Meanwhile, host userspace is deliberately restricted to only CBCFE
+  (clean/flush) and cbo.inval is left as ILLEGAL (CBIE=00). The RISC-V spec
+  explicitly warns (cmo.adoc:584-597) that granting lower-privilege software
+  true invalidate capability 'may result in a security hole if lower
+  privileged level software performs an invalidate operation and accesses
+  sensitive information in memory.' The spec recommends either trapping
+  cbo.inval or configuring it to perform a flush operation. KVM guests' VU-
+  mode userspace thus has a cache-invalidate primitive that host userspace
+  does not, violating the principle that a VM should not have capabilities
+  exceeding its host process. The fix would be to either (a) set henvcfg.CBIE
+  to FLUSH (01b) instead of INV (11b), making cbo.inval in guests perform a
+  flush operation rather than true invalidate, or (b) gate the CBIE value on a
+  user-configurable policy.
+  | if (riscv_isa_extension_available(isa, ZICBOM))
+  | 	cfg->henvcfg |= (ENVCFG_CBIE | ENVCFG_CBCFE);
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:545-597
+      "A cbo.inval instruction executes or raises either an illegal-
+      instruction exception or a virtual-instruction exception based on
+      the state of the envcfg"
+    - riscv-isa-manual/src/priv/hypervisor.adoc:772-793
+      "The Zicbom extension adds the CBIE WARL field to henvcfg. The CBIE
+      field controls execution of the cache block invalidate instruction
+      (CBO.INVAL) in p"
+
+[potential_risk] arch/riscv/mm/cacheflush.c:136-139  cbo_get_block_size
+  Cross-hart CBO block size mismatch is only logged via pr_warn() but does not
+  prevent boot. If one hart reports 64-byte blocks and another reports
+  128-byte blocks, tasks migrated between harts would use the first-discovered
+  hart's block size for CBO operations on the destination hart. This could
+  cause incomplete cache maintenance (flush only half a cache block) or
+  incorrect zeroing (cbo.zero covering wrong range), leading to silent data
+  corruption in DMA or clear_page paths. The pr_warn is insufficient; the
+  kernel should either refuse to enable the mismatched extension or enforce
+  the minimum common block size across all harts.
+  | } else if (*block_size != val) {
+  | 	pr_warn("%s mismatched between harts %lu and %lu\n",
+  | 		name, *first_hartid, hartid);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:89-93
+      "norm:cache_block_size: The size of a cache block is implementation-
+      defined. Software can discover the cache block size for CBO
+      instructions through th"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:528-537
+      "Software can discover the cache block size for each CBO instruction
+      and the supported values of the CBIE field through the execution
+      environment disco"
+
+[potential_risk] arch/riscv/errata/andes/errata.c:60-62  errata_probe_iocp
+  Andes errata sets riscv_cbom_block_size = 1 with the comment 'Set this just
+  to make core cbo code happy.' While 1 technically passes the is_power_of_2()
+  check in riscv_ext_zicbom_validate() (since 2^0 = 1), it does not represent
+  any real hardware cache block size. Using block_size=1 in ALT_CMO_OP loops
+  means address masking with (size - 1) = 0, so block alignment is a no-op and
+  every byte iteration emits a full CBO instruction. On hardware where actual
+  cache blocks are 64 bytes, this causes 64x more CBO instructions than needed
+  — severe performance degradation. More critically, if this value is ever
+  used for cbo.zero via clear_page.S (which uses riscv_cboz_block_size, NOT
+  riscv_cbom_block_size, so not directly affected), the incorrect alignment
+  assumption could lead to memory corruption. The block_size=1 should be
+  replaced with the actual Andes AX45MP cache line size (typically 64 bytes)
+  discovered through the proper hardware probing mechanism.
+  | /* Set this just to make core cbo code happy */
+  | riscv_cbom_block_size = 1;
+  | riscv_noncoherent_supported();
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:89-93
+      "norm:cache_block_size: The size of a cache block is implementation-
+      defined and must be discovered through the execution environment."
+
+[compliant] arch/riscv/kernel/cpufeature.c:1171-1186  riscv_user_isa_enable
+  riscv_user_isa_enable() correctly enables only ENVCFG_CBCFE
+  (cbo.clean/cbo.flush) and ENVCFG_CBZE (cbo.zero) for host userspace, while
+  deliberately leaving CBIE at its reset value of ILLEGAL (00). This follows
+  the RISC-V spec's security guidance (cmo.adoc:584-597) that cbo.inval should
+  either trap or perform flush in lower privilege levels. Userspace can
+  perform clean/flush/zero but cannot invalidate cache blocks. When any CMO
+  extension is not available on all harts, a pr_warn is emitted and the
+  extension is disabled globally — correct heterogeneous-SMP handling. Zicbop
+  (prefetch) has no ENVCFG control bits, which is correct per the spec since
+  prefetch instructions are 'may-be-operations' that never fault.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOZ))
+  | 	current->thread.envcfg |= ENVCFG_CBZE;
+  | ...
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOM))
+  | 	current->thread.envcfg |= ENVCFG_CBCFE;
+  | ...
+  | if (!riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOP) &&
+  |     any_cpu_has_zicbop)
+  | 	pr_warn("Zicbop disabled as it is unavailable on some harts\n");
+
+[compliant] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The context-switch path correctly saves and restores ENVCFG CSR on task
+  switch via __switch_to_envcfg() at switch_to.h:124. The helper reads
+  next->thread.envcfg and writes it to CSR_ENVCFG using an ALTERNATIVE that
+  becomes NOP when XLINUXENVCFG is unavailable (e.g., on systems without the
+  ENVCFG CSR). The envcfg_update_bits() helper at switch_to.h:73-82 also
+  correctly handles immediate CSR write when modifying current's envcfg.
+  Suspend/resume (suspend.h:16-48) independently saves/restores ENVCFG, which
+  is correct because the suspend path bypasses normal context switch. Signal
+  delivery does not need explicit ENVCFG save/restore because thread.envcfg
+  persists across signals through the task_struct; a signal handler's any
+  ENVCFG-modifying operation goes through envcfg_update_bits() which updates
+  thread.envcfg directly.
+  | #define switch_to(prev, next, last)			\
+  | do {							\
+  | 	...						\
+  | 	__switch_to_envcfg(__next);			\
+  | 	((last) = __switch_to(__prev, __next));		\
+  | } while (0)
+
+[compliant] arch/riscv/kvm/vcpu.c:749-761  kvm_riscv_vcpu_swap_in_guest_state
+  KVM correctly uses csr_swap() to atomically exchange host SENVCFG with guest
+  SENVCFG on vCPU load, and swaps back on vCPU put
+  (kvm_riscv_vcpu_swap_in_host_state at vcpu.c:763-775). This ensures the host
+  kernel's ENVCFG settings (including CBZE and CBCFE for userspace) are
+  preserved while the guest runs, and the guest's own SENVCFG is in effect
+  during guest execution. HENVCFG (the hypervisor-level control) is separately
+  written in kvm_arch_vcpu_load() (vcpu.c:615/596) and governs whether guest
+  CBO instructions are HS-qualified and at what privilege they execute. The
+  SMSTATEEN0_HSENVCFG bit is also correctly set (vcpu.c:565) to allow guest
+  access to HENVCFG when SMSTATEEN is implemented.
+  | vcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);
+
+[compliant] arch/riscv/include/asm/errata_list.h:101-111  ALT_CMO_OP
+  The ALT_CMO_OP macro correctly implements alternative-based CBO operations.
+  When ZICBOM is available, it patches in a CBO loop (cbo.clean/flush/inval);
+  when unavailable, it falls back to __nops(5), making the call a no-op. The
+  no-op fallback is safe because: (a) arch_setup_dma_ops() at dma-
+  noncoherent.c:139-141 already WARN_TAINTs when a non-coherent device is used
+  without noncoherent support; (b) dma-noncoherent.c:148-151 additionally
+  warns if riscv_noncoherent_supported() was called without a block size; (c)
+  dma_cache_alignment is set to 1 when noncoherent is unsupported (dma-
+  noncoherent.c:153-157), preventing incorrect alignment assumptions. The
+  T-Head errata path (thead/errata.c:103-107) provides non-standard cache ops
+  via a separate function pointer mechanism (riscv_nonstd_cache_ops) that is
+  checked before ALT_CMO_OP in dma-noncoherent.c:22-28.
+  | #define ALT_CMO_OP(_op, _start, _size, _cachesize)	\
+  | asm volatile(ALTERNATIVE(				\
+  | 	__nops(5),					\
+  | 	"mv a0, %1\n\t"				\
+  | 	"j 2f\n\t"					\
+  | 	"3:\n\t"					\
+  | 	CBO_##_op(a0)					\
+  | 	...
+  | 	0, RISCV_ISA_EXT_ZICBOM, CONFIG_RISCV_ISA_ZICBOM)
+
+[compliant] arch/riscv/kernel/signal.c:1-50  (signal delivery path)
+  signal.c has no explicit ENVCFG save/restore in the signal frame. This is
+  compliant because ENVCFG is maintained as part of thread.envcfg in the
+  task_struct and is restored by __switch_to_envcfg() on context switch
+  (switch_to.h:124). A signal handler that modifies ENVCFG (e.g., via a prctl
+  that calls envcfg_update_bits) writes to task->thread.envcfg, which persists
+  correctly after signal return. The only risk would be if a signal handler
+  directly executed CSRRW to ENVCFG — but userspace cannot write ENVCFG CSR
+  directly (it's an S-mode CSR), so this is not possible. No signal-frame
+  changes are needed.
+  | /* signal.c: no ENVCFG handling needed — thread.envcfg persists across signals */
+

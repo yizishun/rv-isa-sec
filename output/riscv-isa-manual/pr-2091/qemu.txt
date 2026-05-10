@@ -1,0 +1,147 @@
+PR #2091  target=qemu  overall=compliant
+Spec: Zalasr load-acquire/store-release instructions require TCG to emit host acquire/release barriers and guarantee single-memory-operation atomicity; failure would break guest SMP synchronization, causing silent data corruption and race conditions in multi-hart emulated guests
+Violation:
+  QEMU TCG translates Zalasr load-acquire (lb.aq/aqrl, lh.aq/aqrl, lw.aq/aqrl,
+  ld.aq/aqrl) or store-release (sb.rl/aqrl, sh.rl/aqrl, sw.rl/aqrl,
+  sd.rl/aqrl) as plain host loads/stores without emitting the required
+  acquire/release memory barriers, OR QEMU's decoder accepts RESERVED
+  encodings (loads with aq=0, stores with rl=0) and executes them as valid
+  operations, OR QEMU allows ld.aq/aqrl and sd.rl/aqrl on RV32 where they must
+  raise illegal instruction exceptions, OR QEMU TCG fails to enforce the
+  atomicity guarantee — the instruction must appear as a single memory
+  operation for RVWMO purposes rather than decomposing into multiple sub-
+  accesses.
+Consequence: race_condition
+Pattern:
+  trans_*_atomic|gen_helper_atomic|tcg_gen_qemu_ld|tcg_gen_qemu_st|OPC_ATOMIC|
+  decode_amo|amo_handler|RISCV_ATOMIC|atomic_load|atomic_store|tcg_mo_acquire|
+  tcg_mo_release|TCG_BAR_ACQ|TCG_BAR_REL
+------------------------------------------------------------
+[compliant] target/riscv/insn_trans/trans_rvzalasr.c.inc:27-30  gen_load_acquire
+  Correctly rejects RESERVED encodings: returns false (→ illegal instruction)
+  when aq=0, per spec norm:ldaq_no_aq_reserved which states 'The versions
+  without the _aq_ bit set are RESERVED.'
+  | /* Check that AQ is set, as this is mandatory */
+  |     if (!a->aq) {
+  |         return false;
+  |     }
+  References:
+    - riscv-isa-manual/src/unpriv/zalasr.adoc:71-71
+      "[#norm:ldaq_no_aq_reserved]#The versions without the _aq_ bit set
+      are RESERVED.#"
+
+[compliant] target/riscv/insn_trans/trans_rvzalasr.c.inc:77-80  gen_store_release
+  Correctly rejects RESERVED encodings: returns false (→ illegal instruction)
+  when rl=0, per spec norm:sdrl_no_rl_reserved which states 'The versions
+  without the _rl_ bit set are RESERVED.'
+  | /* Check that RL is set, as this is mandatory */
+  |     if (!a->rl) {
+  |         return false;
+  |     }
+  References:
+    - riscv-isa-manual/src/unpriv/zalasr.adoc:125-125
+      "[#norm:sdrl_no_rl_reserved]#The versions without the _rl_ bit set
+      are RESERVED.#"
+
+[compliant] target/riscv/insn_trans/trans_rvzalasr.c.inc:62-67  trans_ld_aqrl
+  REQUIRE_64BIT(ctx) guards ld.aq/aqrl before REQUIRE_ZALASR(ctx), correctly
+  raising illegal instruction on RV32 per spec norm:ldaq_rv64_only:
+  'insn:ld.{aq,aqrl}[] is RV64-only.'
+  | static bool trans_ld_aqrl(DisasContext *ctx, arg_ld_aqrl *a)
+  | {
+  |     REQUIRE_64BIT(ctx);
+  |     REQUIRE_ZALASR(ctx);
+  |     return gen_load_acquire(ctx, a, MO_UQ);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zalasr.adoc:72-72
+      "[#norm:ldaq_rv64_only]#insn:ld.{aq,aqrl}[] is RV64-only.#"
+
+[compliant] target/riscv/insn_trans/trans_rvzalasr.c.inc:110-115  trans_sd_aqrl
+  REQUIRE_64BIT(ctx) guards sd.rl/aqrl before REQUIRE_ZALASR(ctx), correctly
+  raising illegal instruction on RV32 per spec norm:sdrl_rv64_only:
+  'insn:sd.{rl,aqrl}[] is RV64-only.'
+  | static bool trans_sd_aqrl(DisasContext *ctx, arg_sd_aqrl *a)
+  | {
+  |     REQUIRE_64BIT(ctx);
+  |     REQUIRE_ZALASR(ctx);
+  |     return gen_store_release(ctx, a, MO_UQ);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zalasr.adoc:126-126
+      "[#norm:sdrl_rv64_only]#insn:sd.{rl,aqrl}[] is RV64-only.#"
+
+[compliant] target/riscv/insn_trans/trans_rvzalasr.c.inc:25-39  gen_load_acquire
+  Correct barrier semantics: acquire barrier (TCG_BAR_LDAQ) emitted AFTER the
+  load, with optional release (TCG_BAR_STRL) when rl=1 giving seq_cst
+  (TCG_BAR_SC=0x30). Per spec norm:ldaq_rcsc_semantics: 'The instruction
+  always has an acquire-RCsc annotation, and if _rl_ is set the instruction
+  has a release-RCsc annotation.'
+  | TCGBar bar = (a->rl) ? TCG_BAR_STRL : 0;
+  |     ...
+  |     tcg_gen_qemu_ld_tl(dest, addr, ctx->mem_idx, memop);
+  |     gen_set_gpr(ctx, a->rd, dest);
+  |     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ | bar);
+  References:
+    - riscv-isa-manual/src/unpriv/zalasr.adoc:69-69
+      "[#norm:ldaq_rcsc_semantics]#The instruction always has an acquire-
+      RCsc annotation, and if the bit _rl_ is set the instruction has a
+      release-RCsc annot"
+
+[compliant] target/riscv/insn_trans/trans_rvzalasr.c.inc:75-89  gen_store_release
+  Correct barrier semantics: release barrier (TCG_BAR_STRL) emitted BEFORE the
+  store, with optional acquire (TCG_BAR_LDAQ) when aq=1 giving seq_cst
+  (TCG_BAR_SC=0x30). Per spec norm:sdrl_rcsc_semantics: 'The instruction
+  always has a release-RCsc annotation, and if _aq_ is set the instruction has
+  a acquire-RCsc annotation.'
+  | TCGBar bar = (a->aq) ? TCG_BAR_LDAQ : 0;
+  |     ...
+  |     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL | bar);
+  |     tcg_gen_qemu_st_tl(data, addr, ctx->mem_idx, memop);
+  References:
+    - riscv-isa-manual/src/unpriv/zalasr.adoc:123-123
+      "[#norm:sdrl_rcsc_semantics]#The instruction always has an release-
+      RCsc annotation, and if the bit _aq_ is set the instruction has a
+      acquire-RCsc annot"
+
+[compliant] target/riscv/insn_trans/trans_rvzalasr.c.inc:19-42  gen_load_acquire
+  decode_save_opc(ctx, 0) correctly used for load-acquire (pure load, no store
+  side). Does NOT use RISCV_UW2_ALWAYS_STORE_AMO, which would incorrectly
+  promote load page faults to store-AMO faults in two-stage translation.
+  Contrast with gen_amo() which uses RISCV_UW2_ALWAYS_STORE_AMO because AMOs
+  both load and store.
+  | decode_save_opc(ctx, 0);
+  |     TCGv addr = get_address(ctx, a->rs1, 0);
+  |     TCGv dest = get_gpr(ctx, a->rd, EXT_NONE);
+
+[compliant] target/riscv/insn_trans/trans_rvzalasr.c.inc:44-67  gen_load_acquire
+  Sign extension correct: lb.aqrl uses MO_SB, lh.aqrl uses MO_SW, lw.aqrl uses
+  MO_SL (all sign-extend to XLEN), ld.aqrl uses MO_UQ (fills full 64-bit). Per
+  spec norm:ldaq_signext_rule which requires sign-extension for sizes less
+  than XLEN.
+  | static bool trans_lb_aqrl(...) { return gen_load_acquire(ctx, a, MO_SB); }
+  | static bool trans_lh_aqrl(...) { return gen_load_acquire(ctx, a, MO_SW); }
+  | static bool trans_lw_aqrl(...) { return gen_load_acquire(ctx, a, MO_SL); }
+  | static bool trans_ld_aqrl(...) { REQUIRE_64BIT(ctx); ... return gen_load_acquire(ctx, a, MO_UQ); }
+  References:
+    - riscv-isa-manual/src/unpriv/zalasr.adoc:67-67
+      "[#norm:ldaq_signext_rule]#If the size (2^width+3^) is less than
+      XLEN, it is sign-extended to fill the destination register.#"
+
+[compliant] target/riscv/insn_trans/trans_rvzalasr.c.inc:32-33  gen_load_acquire
+  MO_ALIGN enforces natural alignment per spec norm:zalasr_natural_align.
+  MO_ATOM_WITHIN16 provides zama16b misaligned atomicity granule relaxation
+  per norm:zalasr_misaligned_pma_relax. The atomic load via tcg_gen_qemu_ld_tl
+  with MO_ALIGN guarantees single-memory-operation atomicity on aligned
+  addresses per norm:zalasr_atomic_ordered.
+  | memop |= MO_ALIGN | mo_endian(ctx);
+  |     memop |= (ctx->cfg_ptr->ext_zama16b) ? MO_ATOM_WITHIN16 : 0;
+  References:
+    - riscv-isa-manual/src/unpriv/zalasr.adoc:23-24
+      "[#norm:zalasr_natural_align]#The instructions in the ext:zalasr[]
+      extension require that the address held in _rs1_ be naturally
+      aligned to the size in"
+    - riscv-isa-manual/src/unpriv/zalasr.adoc:17-17
+      "[#norm:zalasr_atomic_ordered]#The ext:zalasr[] instructions are
+      atomic loads and stores that support ordering annotations.#"
+

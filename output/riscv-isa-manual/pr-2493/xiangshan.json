@@ -1,0 +1,196 @@
+{
+  "pr_number": 2493,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2493,
+    "violation_condition": "In XiangShan RTL, the PMP CSR write logic in the mseccfg CSR module does not enforce the sticky-bit behavior of mseccfg.MMWP and mseccfg.MML. Specifically, after either bit transitions from 0→1, a subsequent CSR write (CSRRW/CSRRS/CSRRC) targeting mseccfg that attempts to clear these bits succeeds—the hardware writes the new value without blocking the 1→0 transition. The PMP reset signal (which should be the only mechanism to clear these bits) is not gating the write-enable of these sticky fields. This violates the spec requirement that MMWP and MML 'cannot be unset until a PMP reset.'",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "mseccfg.*MMWP.*write|mseccfg.*MML.*write|sticky.*bit.*not.*enforced|CSRRW.*mseccfg.*no.*sticky.*check|mseccfg_reg.*:=.*Cat|when.*mseccfg.*MML.*0.*:=|mseccfg.*wen.*!.*pmp_reset",
+    "affected_entities": [
+      "mseccfg",
+      "CSRRW",
+      "CSRRS",
+      "CSRRC",
+      "PMP_checker"
+    ],
+    "summary": "mseccfg.MMWP and mseccfg.MML are sticky bits that must remain set once written to 1, only clearable by PMP reset; hardware that allows software CSR writes to clear these bits after they are set enables M-mode to silently escape Smepmp lockdown, reverting to permissive M-mode memory access"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "mseccfg CSRModule definition",
+        "line_start": 319,
+        "line_end": 327,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "MML (bit 0), MMWP (bit 1), and RLB (bit 2) are declared as RO(0) — the ROType class uses wfn=wNoEffect, meaning every CSR write to these bits is silently discarded. Software can NEVER set MML=1 or MMWP=1. The spec (machine.adoc §norm:mseccfg_mml_sticky, §norm:mseccfg_mmwp_op_warl) requires these to be WARL sticky bits: writes of 1 must take effect, writes of 0 must be ignored (blocking the 1→0 transition) until a PMP reset. The hardware is not just lacking sticky semantics — it refuses ALL writes, making Smepmp entirely non-functional.",
+      "snippet": "val RLB   = RO( 2).withDescription(\"Rule-locking bypass control from the Smepmp extension.\")\nval MMWP  = RO( 1).withDescription(\"Machine-mode whitelist policy control from the Smepmp extension.\")\nval MML   = RO( 0).withDescription(\"Machine-mode lock-down control from the Smepmp extension.\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2412,
+          "line_end": 2424,
+          "excerpt": "The mseccfg.MMWP is a WARL field. This is a sticky bit, meaning that once set it cannot be unset until a PMP reset. ... The mseccfg.MML is a WARL field. This is a sticky bit, meaning that once set it cannot be unset until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRFields.scala",
+        "function_name": "ROType",
+        "line_start": 43,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ROType.wfn is hardcoded to wNoEffect (line 46) and CSRModule line 38-39 does case ROType(_) => (empty — no update logic), meaning any CSR write is silently discarded with zero side effects. There is no 'sticky WARL' field type in the codebase — one whose write function checks the current register value and blocks 1→0 transitions unless a PMP reset signal is asserted. Without such a type, the spec's required sticky-bit behavior for MML and MMWP cannot be implemented.",
+      "snippet": "case class ROType(\n  override var rfn: CSRRfnType = null,\n) extends CSRRWType {\n  override final val wfn: CSRWfnType = wNoEffect\n\n...\ncase ROType(_) =>",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2412,
+          "line_end": 2424,
+          "excerpt": "The mseccfg.MMWP is a WARL field. This is a sticky bit ... The mseccfg.MML is a WARL field. This is a sticky bit, meaning that once set it cannot be unset until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "pmp_match_res.passThrough",
+        "line_start": 424,
+        "line_end": 424,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "`val passThrough = if (pmpEntries.isEmpty) true.B else (mode > 1.U)` — M-mode (mode=3.U) unconditionally gets passThrough=true, granting full r/w/x to every non-locked PMP region. Per Smepmp spec §3.2, when mseccfg.MML=1, M-mode must be checked identically to S/U mode — no passThrough, no ignore. This passThrough computation has zero dependency on MML state.",
+      "snippet": "val passThrough = if (pmpEntries.isEmpty) true.B else (mode > 1.U)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smepmp.adoc",
+          "line_start": 44,
+          "line_end": 66,
+          "excerpt": "The physical memory protection rules when mseccfg.MML is set to 1 are summarized in the truth table below."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2424,
+          "line_end": 2440,
+          "excerpt": "When mseccfg.MML is set ... M-mode-only rule is enforced on Machine mode and denied in Supervisor or User mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "pmp_match_res default fallback",
+        "line_start": 425,
+        "line_end": 428,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The default PMP entry (fallback when no rule matches) assigns r=w=x=passThrough. For M-mode this yields allow-all (r=w=x=1). Per Smepmp §norm:mseccfg_mmwp_op_warl, when MMWP=1 with MML=1, the default policy for unenumerated regions must be deny-all. This unconditional allow-all default is a privilege-escape vector.",
+      "snippet": "val pmpDefault = WireInit(0.U.asTypeOf(new PMPEntry()))\npmpDefault.cfg.r := passThrough\npmpDefault.cfg.w := passThrough\npmpDefault.cfg.x := passThrough",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2412,
+          "line_end": 2418,
+          "excerpt": "The mseccfg.MMWP ... changes the default PMP policy for Machine mode when accessing memory regions that don't have a matching PMP rule. When set it changes the default PMP policy for M-mode ... to denied instead of ignored."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "PMPCheckerEnv",
+        "line_start": 460,
+        "line_end": 490,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "PMPCheckerEnv carries keyIDen, cmode, mode, pmp, pma — but no MML, MMWP, or RLB fields. The PMP checker hardware has zero visibility into Smepmp configuration. This is architecturally impossible to fix with CSR changes alone — the PMP check data-path itself needs a widening to carry Smepmp state from CSR→TLB→PMP checker.",
+      "snippet": "class PMPCheckerEnv(implicit p: Parameters) extends PMPBundle {\n  val keyIDen = Bool()\n  val cmode = Bool()\n  val mode = UInt(2.W)\n  val pmp = Vec(NumPMPReal, new PMPEntry())\n  val pma = Vec(NumPMAReal, new PMPEntry())",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smepmp.adoc",
+          "line_start": 39,
+          "line_end": 42,
+          "excerpt": "This extension introduces the RLB, MMWP, and MML fields in the mseccfg CSR and their associated rules."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "CSR-to-TLB mseccfg wiring",
+        "line_start": 1482,
+        "line_end": 1482,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Only PMM (bits 33:32) is wired to the TLB: `io.tlb.pmm.mseccfg := RegNext(mseccfg.regOut.PMM.asUInt)`. The symbols mseccfg.regOut.MML, .MMWP, .RLB are never referenced — nor could they be, since the TlbCsrIO.pmm.mseccfg port is only `UInt(2.W)` (line 217). Smepmp configuration bits have no hardware path to the PMP checker.",
+      "snippet": "io.tlb.pmm.mseccfg := RegNext(mseccfg.regOut.PMM.asUInt)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smepmp.adoc",
+          "line_start": 39,
+          "line_end": 42,
+          "excerpt": "This extension introduces the RLB, MMWP, and MML fields in the mseccfg CSR and their associated rules."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "PMPChecker (full module)",
+        "line_start": 556,
+        "line_end": 617,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The PMPChecker composes pmp_match_res + pma_match_res + keyid_check + pmp_check. None have Smepmp awareness: (a) no MML-gated passThrough/ignore/default control, (b) no Smepmp Table 3 RWX encoding re-interpretation in pmp_check, (c) no MMWP-driven default-deny whitelist, (d) no RLB bypass control for locked entries. The entire PMP enforcement path is Smepmp-unaware.",
+      "snippet": "val res_pmp = pmp_match_res(...)(check_addr, req.size, io.check_env.pmp, io.check_env.mode, lgMaxSize)\nval resp_pmp = pmp_check(cmd, res_pmp.cfg)\nval resp = if (pmpUsed) (resp_pmp | resp_pma | resp_keyid) else (resp_pma | resp_keyid)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smepmp.adoc",
+          "line_start": 44,
+          "line_end": 68,
+          "excerpt": "The physical memory protection rules when mseccfg.MML is set to 1 are summarized in the truth table below."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "pmp_match_res ignore logic",
+        "line_start": 435,
+        "line_end": 441,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "`val ignore = passThrough && !pmp.cfg.l` — for M-mode (passThrough=true), every non-locked PMP entry grants full r/w/x. In Smepmp with MML=1, non-locked (S/U-mode-only) PMP rules must deny M-mode access, not grant it. The ignore signal lacks any MML-gating.",
+      "snippet": "val ignore = passThrough && !pmp.cfg.l\nval cur = WireInit(pmp)\ncur.cfg.r := aligned && (pmp.cfg.r || ignore)\ncur.cfg.w := aligned && (pmp.cfg.w || ignore)\ncur.cfg.x := aligned && (pmp.cfg.x || ignore)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2437,
+          "line_end": 2439,
+          "excerpt": "An S/U-mode-only rule is enforced on Supervisor and User modes and denied on Machine mode."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

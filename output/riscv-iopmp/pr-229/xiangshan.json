@@ -1,0 +1,138 @@
+{
+  "pr_number": 229,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 229,
+    "violation_condition": "In XiangShan IOPMP RTL, if ERR_CFG.stall_violation_en is writable and the hardware does not gate or defer the write when MDSTALL.is_busy == 1 (i.e., during Steps 1-3 of the atomic programming sequence), the stall/fault decision logic may change mid-update. Specifically, a transaction that was previously marked as stalled (awaiting resume) could be retroactively faulted with etype=0x07, or a transaction that should have been faulted due to buffer exhaustion passes through unchecked because stall_violation_en was cleared mid-sequence.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "stall_violation_en write not gated by (MDSTALL.is_busy || stall_state != IDLE); stall_violation_en sampled in check path without synchronization to programming FSM state",
+    "affected_entities": [
+      "ERR_CFG",
+      "ERR_CFG.stall_violation_en",
+      "MDSTALL",
+      "MDSTALL.is_busy",
+      "ERR_INFO.etype"
+    ],
+    "summary": "Updating ERR_CFG.stall_violation_en during Steps 1-3 has UNDEFINED behavior per spec; RTL must either hardwire it, gate writes during busy, or flush the stall pipeline on change — otherwise transactions may bypass IOPMP checks during atomic rule updates, creating a hardware-level privilege escape"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMap (write handler for ERR_CFG)",
+        "line_start": 822,
+        "line_end": 833,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "ERR_CFG.stall_violation_en is writable via MMIO (line 830) despite HWCFG0.stall_en being hardwired to 0, indicating stall features are not implemented. Per spec (extensions/programming.adoc:126): 'If whole MDSTALL is not implemented, MDSTALL, MDSTALLH, RRIDSCP and ERR_CFG.stall_violation_en should always return zero.' The RTL does not enforce WARL-returns-zero behavior: any value written is stored verbatim and read back. Though the field is dead storage (not exported from RegMapIO to Ctrl, never consumed), the writability violates the spec's WARL rule and could mislead software into believing stall_violation_en is active.",
+      "snippet": "when(reg_errcfg.l === 0.U) {\n  reg_errcfg.ie := w.ie  // RW\n  reg_errcfg.rs := w.rs  // WARL\n  reg_errcfg.msi_en := w.msi_en  // WARL\n  reg_errcfg.stall_violation_en := w.stall_violation_en  // WARL\n  reg_errcfg.msidata := w.msidata  // WARL\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/programming.adoc",
+          "line_start": 126,
+          "line_end": 126,
+          "excerpt": "If whole MDSTALL is not implemented, MDSTALL, MDSTALLH, RRIDSCP and ERR_CFG.stall_violation_en should always return zero."
+        },
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/registers.adoc",
+          "line_start": 179,
+          "line_end": 179,
+          "excerpt": "stall_violation_en | 4:4 | WARL | IMP | Indicates whether the IOPMP faults stalled transactions. When the bit is set, the IOPMP faults the transactions if the corresponding RRID is not exempt from stall."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMapIO (output signals)",
+        "line_start": 737,
+        "line_end": 757,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "RegMapIO does NOT export o_reg_errcfg_stall_violation_en to Ctrl. The only exported ERR_CFG fields are ie, rs, msi_en, and msidata (lines 876-879). Since stall_violation_en is never consumed by the check or error-generation logic, the security-spec vulnerability (stall_violation_en sampled mid-sequence, retroactively faulting stalled transactions) cannot occur. The field is functionally dead storage. However, this also means that even if software attempted to use stall-based programming, it would have no effect — which is consistent with HWCFG0.stall_en=0 advertising stall features as not implemented.",
+      "snippet": "io.bits.o_reg_errcfg_ie          := reg_errcfg.ie\nio.bits.o_reg_errcfg_rs          := reg_errcfg.rs\nio.bits.o_reg_errcfg_msi_en      := reg_errcfg.msi_en\nio.bits.o_reg_errcfg_msidata     := reg_errcfg.msidata\n// NOTE: stall_violation_en is NOT exported here",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegHwcfg0 (stall_en field)",
+        "line_start": 41,
+        "line_end": 42,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "IopmpParams.stall_en is hardwired to 0 and HWCFG0.stall_en is read-only (line 503), correctly advertising that MDSTALL, MDSTALLH, RRIDSCP, and stall_violation_en stall features are not implemented. This is the correct disclosure mechanism per spec.",
+      "snippet": "val stall_en           = 0    // [R   ] stall feature is not imp",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/registers.adoc",
+          "line_start": 106,
+          "line_end": 106,
+          "excerpt": "stall_en | 30:30 | R | IMP | Indicate if the IOPMP implements stall-related features, which are MDSTALL, MDSTALLH, RRIDSCP, and ERR_CFG.stall_violation_en."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegMdstall / RegMdstallh (commented out)",
+        "line_start": 565,
+        "line_end": 616,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "RegMdstall and RegMdstallh Bundle definitions, along with RegRridscp, RegMdlck, RegMdlckh, RegMdcfglck, and RegEntrylck, are entirely commented out (lines 565-616, '/* not implemented begin ... not implemented end */'). Only address-offset constants remain (lines 81-82). The entire MD-based stall infrastructure (Steps 1-3 of the atomic programming sequence) is not present in hardware. The security-spec vulnerability pattern (ERR_CFG.stall_violation_en write not gated by MDSTALL.is_busy) is therefore inapplicable: there is no is_busy signal, no stall FSM state machine, and no MDSTALL register to be busy in the first place.",
+      "snippet": "/* not implemented begin\nclass RegMdstall extends Bundle {\n  val is_stalled        = UInt(1.W)  // [R   ] ...\n  val md                = UInt(31.W) // [WARL] ...\n  val exempt            = UInt(1.W)  // [W   ] ...\n}\n...\nnot implemented end */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/registers.adoc",
+          "line_start": 111,
+          "line_end": 129,
+          "excerpt": "MDSTALL is optional and used to support atomicity issue while programming the IOPMP... is_busy | 0:0 | R | 0 | Indicates the status of previous writing MDSTALL and RRIDSCP"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl FSM (etype=0x07)",
+        "line_start": 1075,
+        "line_end": 1109,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The Ctrl FSM generates etype values 0x1-0x3 (rule violation hit), 0x5 (no rule matched), and 0x6 (unknown RRID), but never generates etype=0x07 ('error due to a stalled transaction'). This is correct since stall features are not implemented: etype=0x07 should only be generated when stall_violation_en is active and the IOPMP cannot accommodate more stalled transactions. Since stall_en=0, no etype=0x07 should ever occur.",
+      "snippet": "is(State.sMdcfg) {\n  when(srcmd_s_en_d === true.B) { ... }\n  .elsewhen(md_hasTask) { ... }\n  .otherwise { // no md hit\n    etype := 0x5.U // 0x5 : not hit any rule\n    state := State.sErr\n  }\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "extensions/registers.adoc",
+          "line_start": 210,
+          "line_end": 210,
+          "excerpt": "0x07 = error due to a stalled transaction. It should not happen when ERR_CFG.stall_violation_en is 0."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "IopmpChecker (stall signal)",
+        "line_start": 1356,
+        "line_end": 1356,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The only 'stall' signal in the entire IOPMP checker is at line 1356: 'val stall = io.regcfg.v && io.regcfg.rw'. This is an APB-configuration-write-in-progress gate, not the IOPMP transaction-stall mechanism. It gates the Ctrl FSM at sSrcmd (line 1093) to prevent reading SRAM while configuration registers are being updated. This is a correct internal protection mechanism distinct from the MD-based transaction stall feature. The security-spec vulnerability pattern conflates this configuration-bus stall with the MD transaction stall — they are unrelated.",
+      "snippet": "val stall = io.regcfg.v && io.regcfg.rw",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

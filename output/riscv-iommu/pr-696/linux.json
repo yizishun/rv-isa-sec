@@ -1,0 +1,99 @@
+{
+  "pr_number": 696,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 696,
+    "violation_condition": "Linux kernel RISC-V IOMMU driver submits an ATS command (ATC_INVAL or PRGR) to the IOMMU command queue without first verifying that capabilities.ATS == 1, causing the hardware to raise a cmd_ill fault and stall the command queue",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "ats_command|riscv_iommu.*ats|ATS.*inval|PRGR.*command|iommu_command.*ATS without prior check of IOMMU_CAPABILITIES.ats or equivalent driver cached caps field",
+    "affected_entities": [
+      "ATS (IOMMU command opcode)",
+      "INVAL (ATS func3=0)",
+      "PRGR (ATS func3=1)",
+      "capabilities.ATS (IOMMU register field)",
+      "CQCSR.cmd_ill"
+    ],
+    "summary": "Kernel must gate all ATS command submissions on capabilities.ATS; submitting ATS commands to a non-ATS-capable IOMMU causes an unrecoverable command-queue illegal-command fault, halting all DMA translation updates"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_cmd_send",
+        "line_start": 486,
+        "line_end": 490,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "ATS command submission (opcode 4, ATC_INVAL/PRGR) is not implemented. The driver never builds or sends ATS commands via riscv_iommu_cmd_send(). No command builder functions exist for ATS (cf. riscv_iommu_cmd_inval_vma for IOTINVAL, riscv_iommu_cmd_iofence for IOFENCE, riscv_iommu_cmd_iodir_inval_ddt for IODIR). The specific vulnerability pattern (submitting ATS without caps.ATS check) cannot trigger because the ATS code path does not exist.",
+      "snippet": "static void riscv_iommu_cmd_send(struct riscv_iommu_device *iommu,\n                                 struct riscv_iommu_command *cmd)\n{\n        riscv_iommu_queue_send(&iommu->cmdq, cmd, sizeof(*cmd));\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_iotlb_inval",
+        "line_start": 925,
+        "line_end": 996,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "TLB invalidation path only issues IOTINVAL.VMA commands for the IOMMU's internal IOTLB, but never issues ATS.INVAL (ATC_INVAL) to invalidate endpoint device ATCs. The comment at line 830 explicitly states 'Protection domain requiring IOATC and DevATC translation cache invalidations', acknowledging the need, yet no ATC invalidation is performed. If endpoint ATS were enabled (which it currently isn't), stale device ATC entries could allow DMA to old/stale translations. This is a prerequisite gap before enabling ATS support.",
+      "snippet": "riscv_iommu_cmd_inval_vma(&cmd);\nriscv_iommu_cmd_inval_set_pscid(&cmd, domain->pscid);\nif (len && len < RISCV_IOMMU_IOTLB_INVAL_LIMIT) {\n        for (iova = start; iova < end; iova += PAGE_SIZE) {\n                riscv_iommu_cmd_inval_set_addr(&cmd, iova);\n                riscv_iommu_cmd_send(iommu, &cmd);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_probe_device",
+        "line_start": 1484,
+        "line_end": 1531,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Device context tc initialization at line 1514 only sets SADE (swap AMO) based on AMO_HWAD capability. RISCV_IOMMU_DC_TC_EN_ATS (BIT_ULL(1)) is never set, meaning endpoint ATS is never enabled in the device context, even when the IOMMU hardware signals capabilities.ATS == 1. The driver also never calls pci_enable_ats() for PCIe endpoints, so endpoint ATS is left disabled at both the IOMMU and PCIe levels.",
+      "snippet": "tc = 0;\nif (iommu->caps & RISCV_IOMMU_CAPABILITIES_AMO_HWAD)\n        tc |= RISCV_IOMMU_DC_TC_SADE;\nfor (i = 0; i < fwspec->num_ids; i++) {\n        dc = riscv_iommu_get_dc(iommu, fwspec->ids[i]);\n        WRITE_ONCE(dc->tc, tc);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu.c",
+        "function_name": "riscv_iommu_cmdq_process",
+        "line_start": 458,
+        "line_end": 483,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The CMD_ILL (command illegal) interrupt handler at line 466 only logs a warning and clears the error bits. It does not attempt to recover the command queue (e.g., reset the queue pointers, drain pending commands, or reinitialize). If an illegal command (such as a future ATS command on hardware without ATS support) were queued, the queue would stall with only a warning emitted — resulting in denial of service for the IOMMU command queue.",
+      "snippet": "if (ctrl & (RISCV_IOMMU_CQCSR_CQMF | RISCV_IOMMU_CQCSR_CMD_TO |\n            RISCV_IOMMU_CQCSR_CMD_ILL | RISCV_IOMMU_CQCSR_FENCE_W_IP)) {\n        riscv_iommu_writel(queue->iommu, queue->qcr, ctrl);\n        dev_warn(queue->iommu->dev,\n                 \"Queue #%u error; fault:%d timeout:%d illegal:%d fence_w_ip:%d\\n\",",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu-bits.h",
+        "function_name": "RISCV_IOMMU_CAPABILITIES_ATS",
+        "line_start": 55,
+        "line_end": 55,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "RISCV_IOMMU_CAPABILITIES_ATS (BIT_ULL(25)) is defined in the hardware register layout but is never tested against iommu->caps anywhere in the driver. The caps field is populated at probe time (iommu-pci.c:64, iommu-platform.c:68) but the ATS bit is never read or checked. Any future code that submits ATS commands must gate on this capability check to avoid cmd_ill.",
+      "snippet": "#define RISCV_IOMMU_CAPABILITIES_ATS    BIT_ULL(25)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "drivers/iommu/riscv/iommu-bits.h",
+        "function_name": "ATS command opcode definitions",
+        "line_start": 499,
+        "line_end": 522,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Complete ATS command opcode, function, and payload bitfield definitions exist (opcode 4, INVAL/PRGR sub-functions, PID/RID/DSEG fields, INVAL.G/S/UADDR, PRGR.PRG_INDEX/RESP_CODE/DST_ID) but no command builder inline functions exist to use them. Contrast with IOTINVAL (iommu-bits.h:711-737), IOFENCE (iommu-bits.h:739-755), and IODIR (iommu-bits.h:757-782) which all have complete builder functions. Without builder functions, any future ATS command submission code must be written from scratch.",
+      "snippet": "/* 3.1.4 IOMMU PCIe ATS */\n#define RISCV_IOMMU_CMD_ATS_OPCODE      4\n#define RISCV_IOMMU_CMD_ATS_FUNC_INVAL      0\n#define RISCV_IOMMU_CMD_ATS_FUNC_PRGR       1",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

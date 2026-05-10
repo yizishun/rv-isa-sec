@@ -1,0 +1,106 @@
+PR #1306  target=qemu  overall=not_implemented
+Spec: Zvkgs vghsh.vs/vgmul.vs: missing vd/vs2 overlap check causes silent GCM tag corruption since vs2 scalar subkey H is mutated in-place during GF(2^128) reduction and must not alias the output register group
+Violation:
+  QEMU executes vghsh.vs or vgmul.vs without checking that the vd register
+  group overlaps the vs2 scalar element group. The spec marks this overlap as
+  a reserved encoding because vs2 holds the Hash Subkey (H) that the inner
+  GF(2^128) multiplication loop destroys and must reset per iteration; if vd
+  overlaps vs2, writing partial-hash results to vd corrupts H mid-computation,
+  producing silently incorrect GHASH outputs.
+Consequence: data_corruption
+Pattern:
+  trans_vghsh_vs|trans_vgmul_vs|vext_check_overlap_mask.*vs2|require_noover.*v
+  d.*vs2.*vghsh|OPMVE.*100011.*overlap|s->vstart.*EGS.*vghsh
+------------------------------------------------------------
+[not_implemented] target/riscv/insn32.decode:1022-1024  N/A (decode table)
+  Only vghsh_vv and vgmul_vv are decoded. No vghsh_vs or vgmul_vs encodings
+  exist. The .vs variants (Zvkgs extension) are not implemented at all, so the
+  vd-vs2 overlap vulnerability cannot manifest — there is no code path to
+  execute these instructions.
+  | vghsh_vv    101100 1 ..... ..... 010 ..... 1110111 @r_vm_1
+  | vgmul_vv    101000 1 ..... 10001 010 ..... 1110111 @r2_vm_1
+
+[not_implemented] target/riscv/insn_trans/trans_rvvk.c.inc:533-544  vgmul_check
+  vgmul_check() handles only the .vv variant using vext_check_ss(), which
+  checks alignment and mask overlap but does not (and should not for .vv)
+  check vd-vs2 register overlap. No .vs check function exists for vgmul. The
+  .vs overlap concern only applies to a Zvkgs implementation that does not
+  exist.
+  | static bool vgmul_check(DisasContext *s, arg_rmr *a)
+  | {
+  |     int egw_bytes = ZVKG_EGS << s->sew;
+  |     return s->cfg_ptr->ext_zvkg == true &&
+  |            vext_check_isa_ill(s) &&
+  |            require_rvv(s) &&
+  |            MAXSZ(s) >= egw_bytes &&
+  |            vext_check_ss(s, a->rd, a->rs2, a->vm) &&
+  |            s->sew == MO_32;
+  | }
+
+[not_implemented] target/riscv/insn_trans/trans_rvvk.c.inc:546-555  vghsh_check
+  vghsh_check() handles only the .vv variant via opivv_check(). No .vs check
+  function exists for vghsh. The vd-vs2 overlap vulnerability described in the
+  security spec applies solely to a hypothetical Zvkgs .vs implementation,
+  which does not exist in the current code.
+  | static bool vghsh_check(DisasContext *s, arg_rmrr *a)
+  | {
+  |     int egw_bytes = ZVKG_EGS << s->sew;
+  |     return s->cfg_ptr->ext_zvkg == true &&
+  |            opivv_check(s, a) &&
+  |            MAXSZ(s) >= egw_bytes &&
+  |            s->sew == MO_32;
+  | }
+
+[not_implemented] target/riscv/vcrypto_helper.c:795-833  HELPER(vghsh_vv)
+  HELPER(vghsh_vv) reads vs2 per-element-group (vs2[i*2+0], vs2[i*2+1]) as a
+  full vector source. No .vs helper exists that would read vs2 from element
+  group 0 and broadcast the hash subkey H to all iterations. The security-
+  critical pattern (vd overlapping scalar vs2 corrupting H mid-computation)
+  cannot occur because the .vs helper does not exist.
+  | void HELPER(vghsh_vv)(void *vd_vptr, void *vs1_vptr, void *vs2_vptr,
+  |                        CPURISCVState *env, uint32_t desc)
+
+[not_implemented] target/riscv/vcrypto_helper.c:835-869  HELPER(vgmul_vv)
+  HELPER(vgmul_vv) reads vs2 per-element-group as a full vector source. No .vs
+  helper exists for vgmul. The vd-vs2 overlap data corruption risk is absent
+  because the instruction is not implemented.
+  | void HELPER(vgmul_vv)(void *vd_vptr, void *vs2_vptr,
+  |                        CPURISCVState *env, uint32_t desc)
+
+[not_implemented] target/riscv/helper.h:1343-1344  N/A (helper declarations)
+  Only DEF_HELPER_5(vghsh_vv, ...) and DEF_HELPER_4(vgmul_vv, ...) are
+  declared. No vghsh_vs or vgmul_vs helper declarations exist.
+  | DEF_HELPER_5(vghsh_vv, void, ptr, ptr, ptr, env, i32)
+  | DEF_HELPER_4(vgmul_vv, void, ptr, ptr, env, i32)
+
+[not_implemented] target/riscv/cpu_cfg_fields.h.inc:89-89  N/A (config fields)
+  Only BOOL_FIELD(ext_zvkg) exists. No ext_zvkgs field is defined, meaning the
+  Zvkgs extension cannot be enabled and no .vs code path is reachable.
+  | BOOL_FIELD(ext_zvkg)
+
+[not_implemented] target/riscv/cpu.c:198-198  N/A (ISA extension table)
+  Only ZVKG is registered in the ISA extension table. ZVKGS is absent — no
+  ISA_EXT_DATA_ENTRY or MULTI_EXT_CFG_BOOL for zvkgs exists.
+  | ISA_EXT_DATA_ENTRY(zvkg, PRIV_VERSION_1_12_0, ext_zvkg),
+
+[not_implemented] target/riscv/tcg/tcg-cpu.c:791-797  riscv_tcg_cpu_validate_zvkgs_dependencies
+  TCG dependency validation exists for ext_zvkg (requires Zve32x) but no
+  ext_zvkgs validation exists. If Zvkgs is added, it must be validated to
+  depend on both Zvkg and Zve32x.
+  | /* Zvkg requires Zve32x */
+  | if (cfg->ext_zvkg && !cfg->ext_zve32x) {
+  |     error_setg(errp, "Zvkg requires Zve32x");
+  |     return;
+  | }
+
+[not_implemented] target/riscv/kvm/kvm-cpu.c:337-337  N/A (KVM extension map)
+  KVM extension mapping exists for zvkg → KVM_RISCV_ISA_EXT_ZVKG. No zvkgs KVM
+  mapping exists.
+  | KVM_EXT_CFG("zvkg", ext_zvkg, KVM_RISCV_ISA_EXT_ZVKG),
+
+[not_implemented] disas/riscv.c:2156-2157  N/A (disassembler table)
+  Disassembler recognizes only vghsh.vv and vgmul.vv mnemonics. No vghsh.vs or
+  vgmul.vs disassembly entries exist.
+  | { "vghsh.vv", rv_codec_v_r, rv_fmt_vd_vs2_vs1, NULL, 0, 0, 0 },
+  | { "vgmul.vv", rv_codec_v_r, rv_fmt_vd_vs2, NULL, 0, 0, 0 },
+

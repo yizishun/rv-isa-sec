@@ -1,0 +1,117 @@
+PR #2369  target=qemu  overall=not_implemented
+Spec: Zvkgs adds .vs variants of vghsh/vgmul where vs2 is a scalar element group broadcast to all vd element groups; QEMU must enforce the vd/vs2 non-overlap constraint or the scalar key is corrupted during in-place updates
+Violation:
+  QEMU executes vghsh.vs or vgmul.vs without checking that the vd register
+  group overlaps the vs2 scalar element group. In the .vs form, vs2 holds a
+  single 128-bit scalar element group (the hash subkey H or multiplicand)
+  broadcast across all element groups of vd. If vd overlaps vs2, the in-place
+  read-modify-write of vd corrupts the scalar key material before it is
+  applied to all element groups, producing incorrect GHASH results.
+Consequence: data_corruption
+Pattern:
+  trans_vghsh_vs|trans_vgmul_vs|gen_vghsh|gen_vgmul|vext_vv_rmw|vcrypto_vs_ove
+  rlap|require_noover_vd_vs2
+------------------------------------------------------------
+[not_implemented] target/riscv/insn_trans/trans_rvvk.c.inc:533-544  vgmul_check
+  QEMU only implements vgmul.vv (the .vv form from Zvkg). The Zvkgs extension,
+  which adds vgmul.vs (the .vs scalar element group form), is not implemented.
+  No vgmul.vs encoding exists in insn32.decode, no trans_vgmul_vs function
+  exists, no ext_zvkgs config flag exists, and no HELPER(vgmul_vs) exists. The
+  vgmul.vv form reads vs2 per-element-group (vs2[i*2+0], vs2[i*2+1]) and does
+  not require the .vs-specific vd-vs2 overlap check. The spec itself notes at
+  zvk.adoc:2752-2757 that .vs variants are described as a 'future extension'.
+  Since the .vs instructions do not exist in QEMU, the vulnerability described
+  in the security spec (vd overlapping vs2 scalar element group in .vs form)
+  cannot occur.
+  | static bool vgmul_check(DisasContext *s, arg_rmr *a)
+  | {
+  |     int egw_bytes = ZVKG_EGS << s->sew;
+  |     return s->cfg_ptr->ext_zvkg == true &&
+  |            vext_check_isa_ill(s) &&
+  |            require_rvv(s) &&
+  |            MAXSZ(s) >= egw_bytes &&
+  |            vext_check_ss(s, a->rd, a->rs2, a->vm) &&
+  |            s->sew == MO_32;
+  | }
+  | 
+  | GEN_V_UNMASKED_TRANS(vgmul_vv, vgmul_check, ZVKG_EGS)
+  References:
+    - riscv-isa-manual/src/unpriv/zvk.adoc:324-329
+      "[#norm:veccrypto_vsins_vs2]#In the case of the `.vs` instructions
+      defined in this specification, `vs2` holds a 128-bit scalar element
+      group.# [#norm:v"
+    - riscv-isa-manual/src/unpriv/zvk.adoc:2752-2757
+      "Since the same hash subkey `H` will typically be used repeatedly on
+      a given message, a future extension might define a vector-scalar
+      version of this i"
+
+[not_implemented] target/riscv/insn_trans/trans_rvvk.c.inc:546-555  vghsh_check
+  QEMU only implements vghsh.vv (the .vv form from Zvkg). The Zvkgs extension,
+  which adds vghsh.vs (the .vs scalar element group form), is not implemented.
+  No vghsh.vs encoding exists in insn32.decode, no trans_vghsh_vs function
+  exists, no HELPER(vghsh_vs) exists. The vghsh.vv form reads vs2 per-element-
+  group (vs2[i*2+0], vs2[i*2+1] at vcrypto_helper.c:808) and writes vd per-
+  element-group (vd[i*2+0], vd[i*2+1] at vcrypto_helper.c:827). In the .vv
+  form, vs2 is a full vector register group consumed in lockstep with vd, so
+  the .vs-specific scalar-overlap concern does not apply. The spec explicitly
+  describes .vs as a future extension at zvk.adoc:2633-2636.
+  | static bool vghsh_check(DisasContext *s, arg_rmrr *a)
+  | {
+  |     int egw_bytes = ZVKG_EGS << s->sew;
+  |     return s->cfg_ptr->ext_zvkg == true &&
+  |            opivv_check(s, a) &&
+  |            MAXSZ(s) >= egw_bytes &&
+  |            s->sew == MO_32;
+  | }
+  | 
+  | GEN_VV_UNMASKED_TRANS(vghsh_vv, vghsh_check, ZVKG_EGS)
+  References:
+    - riscv-isa-manual/src/unpriv/zvk.adoc:2631-2636
+      "Since the same hash subkey `H` will typically be used repeatedly on
+      a given message, a future extension might define a vector-scalar
+      version of this i"
+    - riscv-isa-manual/src/unpriv/zvk.adoc:324-329
+      "In the case of the `.vs` instructions defined in this
+      specification, `vs2` holds a 128-bit scalar element group. ... the
+      `vd` register group must not "
+
+[not_implemented] target/riscv/vcrypto_helper.c:795-833  HELPER(vghsh_vv)
+  This helper implements the .vv form correctly: it reads vs2 per-element-
+  group at line 808 (vs2[i*2+0], vs2[i*2+1]), so each 128-bit element group
+  gets its own copy of the hash subkey H. The .vs form (Zvkgs) would require a
+  different helper that reads vs2 only once at indices [0] and [1] and
+  broadcasts that single scalar element group across all vd element groups. No
+  such HELPER(vghsh_vs) exists. The existing HELPER(vghsh_vv) correctly
+  implements the Zvkg .vv specification (zvk.adoc:2638-2675).
+  | void HELPER(vghsh_vv)(void *vd_vptr, void *vs1_vptr, void *vs2_vptr,
+  |                       CPURISCVState *env, uint32_t desc)
+  | {
+  |     ...
+  |     for (uint32_t i = env->vstart / 4; i < env->vl / 4; i++) {
+  |         uint64_t Y[2] = {vd[i * 2 + 0], vd[i * 2 + 1]};
+  |         uint64_t H[2] = {brev8(vs2[i * 2 + 0]), brev8(vs2[i * 2 + 1])};
+  |         ...
+  |         vd[i * 2 + 0] = brev8(Z[0]);
+  |         vd[i * 2 + 1] = brev8(Z[1]);
+  |     }
+
+[not_implemented] target/riscv/vcrypto_helper.c:835-869  HELPER(vgmul_vv)
+  This helper implements the .vv form correctly: it reads vs2 per-element-
+  group at line 847 (vs2[i*2+0], vs2[i*2+1]), so each 128-bit element group
+  gets its own copy of the multiplicand H. The .vs form (Zvkgs) would require
+  a different helper that reads vs2 only once at indices [0] and [1] and
+  broadcasts that single scalar element group across all vd element groups. No
+  such HELPER(vgmul_vs) exists. The existing HELPER(vgmul_vv) correctly
+  implements the Zvkg .vv specification (zvk.adoc:2769-2795).
+  | void HELPER(vgmul_vv)(void *vd_vptr, void *vs2_vptr, CPURISCVState *env,
+  |                       uint32_t desc)
+  | {
+  |     ...
+  |     for (uint32_t i = env->vstart / 4; i < env->vl / 4; i++) {
+  |         uint64_t Y[2] = {brev8(vd[i * 2 + 0]), brev8(vd[i * 2 + 1])};
+  |         uint64_t H[2] = {brev8(vs2[i * 2 + 0]), brev8(vs2[i * 2 + 1])};
+  |         ...
+  |         vd[i * 2 + 0] = brev8(Z[0]);
+  |         vd[i * 2 + 1] = brev8(Z[1]);
+  |     }
+

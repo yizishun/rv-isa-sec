@@ -1,0 +1,55 @@
+PR #1581  target=linux  overall=compliant
+Spec: pmpaddr[n][G-1] reads-as-0 but underlying value may be 1; CSRRS/CSRRC RMW will read 0, write it back, corrupting the underlying bit and silently weakening the PMP memory protection region
+Violation:
+  The kernel uses CSRRS, CSRRC, CSRS, CSRC, CSRRSI, or CSRRCI (any read-
+  modify-write CSR instruction) on a pmpaddr CSR, because the RMW cycle reads
+  back the architectural 'reads as' value of bits like pmpaddr[G-1], not the
+  underlying physical value, and writes that back — silently corrupting the
+  underlying bit. This also applies to the kernel's csr_set(), csr_clear(),
+  csr_read_set(), and csr_read_clear() macros when passed a pmpaddr CSR
+  number.
+Consequence: data_corruption
+Pattern:
+  csr_set|csr_clear|csr_read_set|csr_read_clear|__ASM_STR(csrrs|csrrc|csrs|csr
+  c|csrrsi|csrrci).*PMPADDR|CSR_PMPADDR.*csr_(set|clear|read_set|read_clear)|p
+  mpaddr.*read.modify.write
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/head.S:237-240  _start_kernel (CONFIG_RISCV_M_MODE path)
+  The kernel uses csrw (write-only CSR write) not CSRRS/CSRRC (RMW) to
+  configure PMPADDR0. The value -1 is written directly to CSR_PMPADDR0, then
+  PMPCFG0 is configured with NAPOT+RWX. The write-only csrw instruction does
+  not read back the architectural 'reads as' value, so there is no risk of
+  corrupting the underlying pmpaddr bits. An exception handler at .Lpmp_done
+  safely handles the case where PMPs are not implemented.
+  | li a0, -1
+  | csrw CSR_PMPADDR0, a0
+  | li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+  | csrw CSR_PMPCFG0, a0
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3523-3535
+      "When G ≥ 2 and pmpcfg.A[1] is set (NAPOT), then bits pmpaddr[G-2:0]
+      read as all ones. When G ≥ 1 and pmpcfg.A[1] is clear (OFF/TOR),
+      then bits pmpaddr"
+
+[compliant] arch/riscv/include/asm/csr.h:575-607  csr_set / csr_clear / csr_read_set / csr_read_clear macros
+  The csr_set(), csr_clear(), csr_read_set(), and csr_read_clear() macros emit
+  CSRRS/CSRC/CSRRS/CSRRC (RMW) instructions respectively. While these macros
+  WOULD be dangerous if called with a pmpaddr CSR number, a comprehensive
+  search of arch/riscv/ confirms no call site ever passes CSR_PMPADDR0 (or any
+  computed pmpaddr CSR number) to any of these macros. All callers use safe
+  CSRs: CSR_SSTATUS, CSR_ENVCFG, CSR_IP, CSR_HGEIE, CSR_HEDELEG, CSR_HENVCFG,
+  CSR_HIE, CSR_HVIEN, CSR_VSIREG.
+  | #define csr_read_set(csr, val) ({           \
+  |     __asm__ __volatile__ ("csrrs %0, " __ASM_STR(csr) ", %1" ...); \
+  | })
+  | #define csr_set(csr, val) ({                 \
+  |     __asm__ __volatile__ ("csrs " __ASM_STR(csr) ", %0" ...); \
+  | })
+
+[compliant] arch/riscv/include/asm/csr.h:428-428  CSR_PMPADDR0 definition
+  Only CSR_PMPADDR0 is defined (0x3b0). No CSR_PMPADDR1-63 definitions exist.
+  The kernel has no dynamic PMP management code — it only configures PMP entry
+  0 once during early M-mode boot to allow all memory access. No post-boot PMP
+  manipulation code exists in the kernel.
+  | #define CSR_PMPADDR0    0x3b0
+

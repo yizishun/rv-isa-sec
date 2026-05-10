@@ -1,0 +1,80 @@
+PR #617  target=linux  overall=compliant
+Spec: Spec now mandates msiptp.MODE=Off when iohgatp.MODE=Bare; kernel IOMMU driver must enforce this or risk MSIs being translated with no valid GSCID, enabling guest-to-host or cross-VM MSI misdirection
+Violation:
+  Linux IOMMU driver configures a device context (DC) with iohgatp.MODE=Bare
+  (no second-stage address translation) but msiptp.MODE!=Off, violating the
+  spec requirement that MSI page table translation must be disabled when
+  G-stage translation is absent. Without G-stage, no valid GSCID exists to
+  associate MSI translations with a VM address space, yet the IOMMU may still
+  attempt MSI address translation into an undefined context.
+Consequence: privilege_escape
+Pattern:
+  iohgatp.*Bare|iohgatp.*=.*0[^x].*msiptp|msiptp.*MODE.*(Flat|MRIF).*iohgatp.*
+  Bare|DC.*fsc.*msiptp.*iohgatp
+------------------------------------------------------------
+[compliant] drivers/iommu/riscv/iommu.c:1012-1062  riscv_iommu_iodir_update
+  iodir_update() only writes tc, fsc, and ta fields. Neither dc->iohgatp nor
+  dc->msiptp is written. Both remain at their zero-initialized values:
+  iohgatp.MODE=Bare(0), msiptp.MODE=Off(0). This invariant satisfies the spec
+  requirement: when G-stage translation is absent (Bare), MSI page table
+  translation must be disabled (Off). The driver never violates the
+  iohgatp=Bare ∧ msiptp≠Off condition.
+  | WRITE_ONCE(dc->fsc, fsc);
+  | WRITE_ONCE(dc->ta, ta & RISCV_IOMMU_PC_TA_PSCID);
+  | dma_wmb();
+  | WRITE_ONCE(dc->tc, tc);
+
+[compliant] drivers/iommu/riscv/iommu.c:1484-1531  riscv_iommu_probe_device
+  probe_device() initializes dc->tc but never touches dc->iohgatp or
+  dc->msiptp. DC pages come from zeroed allocations (get_pages uses __GFP_ZERO
+  or memset). Both iohgatp and msiptp stay at 0 across the device lifecycle.
+  No G-stage translation and no MSI translation are ever configured, so the
+  iohgatp=Bare + msiptp=Off invariant holds trivially.
+  | tc = 0;
+  | if (iommu->caps & RISCV_IOMMU_CAPABILITIES_AMO_HWAD)
+  | 	tc |= RISCV_IOMMU_DC_TC_SADE;
+  | /* ... */
+  | WRITE_ONCE(dc->tc, tc);
+
+[compliant] drivers/iommu/riscv/iommu.c:1429-1442  riscv_iommu_attach_blocking_domain
+  Blocking domain attach sets fsc=BARE and ta=0. Does not write iohgatp or
+  msiptp. The DC remains with iohgatp.MODE=Bare and msiptp.MODE=Off.
+  Compliant.
+  | riscv_iommu_iodir_update(iommu, dev, RISCV_IOMMU_FSC_BARE, 0);
+
+[compliant] drivers/iommu/riscv/iommu.c:1451-1463  riscv_iommu_attach_identity_domain
+  Identity domain attach sets fsc=BARE and ta=V. Does not write iohgatp or
+  msiptp. The DC remains with iohgatp.MODE=Bare and msiptp.MODE=Off.
+  Compliant.
+  | riscv_iommu_iodir_update(iommu, dev, RISCV_IOMMU_FSC_BARE, RISCV_IOMMU_PC_TA_V);
+
+[compliant] drivers/iommu/riscv/iommu.c:1323-1348  riscv_iommu_attach_paging_domain
+  Paging domain attach configures only first-stage context (fsc) with
+  SV39/SV48/SV57 mode and process-scope ID (ta.PSCID). Does not write iohgatp
+  or msiptp. The DC remains with iohgatp.MODE=Bare (no G-stage) and
+  msiptp.MODE=Off (no MSI translation). Compliant.
+  | fsc = FIELD_PREP(RISCV_IOMMU_PC_FSC_MODE, domain->pgd_mode) |
+  |       FIELD_PREP(RISCV_IOMMU_PC_FSC_PPN, virt_to_pfn(domain->pgd_root));
+  | riscv_iommu_iodir_update(iommu, dev, fsc, ta);
+
+[potential_risk] drivers/iommu/riscv/iommu-bits.h:323-332  struct riscv_iommu_dc
+  The DC struct defines both iohgatp (second-stage context) and msiptp (MSI
+  page table pointer) fields with full register-level bitfield definitions and
+  an MSI PTE struct (riscv_iommu_msipte). The hardware capability bits
+  MSI_FLAT and MSI_MRIF are defined. However, no code writes these fields. If
+  MSI translation support is added in the future, the invariant that
+  msiptp.MODE must be Off when iohgatp.MODE is Bare could be violated unless
+  explicitly enforced. The struct layout and enum definitions create the
+  preconditions for a future bug if MSI virtualization is implemented without
+  a corresponding G-stage implementation.
+  | struct riscv_iommu_dc {
+  | 	u64 tc;
+  | 	u64 iohgatp;
+  | 	u64 ta;
+  | 	u64 fsc;
+  | 	u64 msiptp;
+  | 	u64 msi_addr_mask;
+  | 	u64 msi_addr_pattern;
+  | 	u64 _reserved;
+  | };
+

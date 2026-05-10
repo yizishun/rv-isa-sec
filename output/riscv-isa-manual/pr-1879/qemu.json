@@ -1,0 +1,194 @@
+{
+  "pr_number": 1879,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1879,
+    "violation_condition": "QEMU reset logic for mseccfg CSR does not clear bits MML(0), MMAP(1), and RLB(2) to 0 on hart reset, OR QEMU still references the old field name MMWP at bit 1 instead of the renamed MMAP, OR QEMU fails to enforce that MML and MMAP are sticky bits (writable-1-to-0 ignored until reset), allowing guest M-mode to clear them after lockdown and silently bypass Smepmp memory access restrictions.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "mseccfg.*reset|mseccfg.*MMWP|mseccfg.*MMAP|mseccfg.*sticky|mseccfg.*warl.*MML|mseccfg.*warl.*RLB|pmpcfg.*lock.*mseccfg|pmp_is_smepmp|sempmp_locked",
+    "affected_entities": [
+      "mseccfg",
+      "pmpcfg",
+      "pmpaddr"
+    ],
+    "summary": "Smepmp spec renames MMWP→MMAP at mseccfg bit 1 and mandates mseccfg.MML/MMAP/RLB reset to 0; QEMU must match this bit-exact, enforce sticky-bit write semantics for MML/MMAP, and enforce RLB lock-on-L behavior to prevent guest M-mode from downgrading PMP isolation after lockdown."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_reset",
+        "line_start": 757,
+        "line_end": 764,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CPU reset correctly clears mseccfg to 0 when ext_smepmp is enabled. This clears MML(bit 0), MMWP(bit 1), and RLB(bit 2) to 0 per spec requirement norm:mseccfg_mml_mmwp_rlb_rst. pmp_unlock_entries() is also called to reset all PMP entries. The comment correctly references that this is allowed per priv and smepmp specifications.",
+      "snippet": "if (riscv_cpu_cfg(env)->ext_smepmp) {\n    env->mseccfg = 0;\n}\npmp_unlock_entries(env);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2797,
+          "line_end": 2798,
+          "excerpt": "The MML, MMWP, and RLB fields of the mseccfg register are set to 0, unless the platform mandates a different reset value."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.h",
+        "function_name": "mseccfg_field_t",
+        "line_start": 44,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "QEMU uses the field name MSECCFG_MMWP at bit 1, which matches the current RISC-V privileged specification. The spec in machine.adoc (norm:mseccfg_rlb_mmwp_mml_presence, norm:mseccfg_mmwp_op_warl) and smepmp.adoc consistently use 'MMWP' (Machine-Mode Allowlist/Whitelist Policy). There is no 'MMAP' rename in the authoritative spec documents — the wavedrom diagram and all normative text use MMWP.",
+      "snippet": "typedef enum {\n    MSECCFG_MML   = 1 << 0,\n    MSECCFG_MMWP  = 1 << 1,\n    MSECCFG_RLB   = 1 << 2,\n    ...\n} mseccfg_field_t;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2387,
+          "line_end": 2389,
+          "excerpt": "The Smepmp extension adds the RLB, MMWP, and the MML fields in mseccfg."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "mseccfg_csr_write",
+        "line_start": 686,
+        "line_end": 695,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Sticky-bit semantics for MML and MMWP are correctly implemented. The pattern 'val |= (env->mseccfg & mask)' ORs in the current values of MML and MMWP, preventing a write of 0 to clear these bits once set. This matches the spec: MML and MMWP are sticky bits that cannot be unset until PMP reset (norm:mseccfg_mmwp_op_warl, norm:mseccfg_mml_sticky). When Smepmp is not implemented, MML, MMWP, and RLB are all forced to 0 via 'val &= ~(mask)'. TLB flush is correctly triggered when MMWP/MML actually change.",
+      "snippet": "if (riscv_cpu_cfg(env)->ext_smepmp) {\n    /* Sticky bits */\n    val |= (env->mseccfg & mask);\n    if ((val ^ env->mseccfg) & mask) {\n        tlb_flush(env_cpu(env));\n    }\n} else {\n    mask |= MSECCFG_RLB;\n    val &= ~(mask);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2413,
+          "line_end": 2418,
+          "excerpt": "The mseccfg.MMWP is a WARL field. This is a sticky bit, meaning that once set it cannot be unset until a PMP reset."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2422,
+          "line_end": 2423,
+          "excerpt": "This is a sticky bit, meaning that once set it cannot be unset until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "mseccfg_csr_write",
+        "line_start": 676,
+        "line_end": 684,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "RLB write-ignore logic is correct. When RLB is 0, it checks pmp_is_locked() which checks the pmpcfg.L bit. Under MML=1, M-mode-only rules and locked Shared-Region rules have pmpcfg.L=1, so pmp_is_locked() correctly returns true and blocks RLB from being enabled. The RLB bit in the write value is cleared when any entry is locked. Once RLB is already set (MSECCFG_RLB_ISSET is true), the check is skipped, allowing RLB to be cleared by writing 0 — correct behavior per spec.",
+      "snippet": "if (!MSECCFG_RLB_ISSET(env)) {\n    for (i = 0; i < pmp_regions; i++) {\n        if (pmp_is_locked(env, i)) {\n            val &= ~MSECCFG_RLB;\n            break;\n        }\n    }\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2391,
+          "line_end": 2397,
+          "excerpt": "When mseccfg.RLB is 0 and pmpcfg.L is 1 in any rule or entry, then mseccfg.RLB remains 0 and any further modifications to mseccfg.RLB are ignored until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "pmp_hart_has_privs_default",
+        "line_start": 311,
+        "line_end": 339,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Default PMP policy (when no rule matches) correctly implements Smepmp semantics. MMWP=1 → deny all including M-mode. MML=1 → M-mode gets read+write but no execute, other modes fully denied. Standard path → M-mode gets full access, others denied if rules exist. Matches the spec-defined default policies.",
+      "snippet": "if (MSECCFG_MMWP_ISSET(env)) {\n    *allowed_privs = 0;\n    return false;\n} else if (MSECCFG_MML_ISSET(env)) {\n    if (mode == PRV_M && !(privs & PMP_EXEC)) {\n        ret = true;\n        *allowed_privs = PMP_READ | PMP_WRITE;\n    } else {\n        ret = false;\n        *allowed_privs = 0;\n    }\n    return ret;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2413,
+          "line_end": 2418,
+          "excerpt": "The mseccfg.MMWP changes the default PMP policy for M-mode when accessing memory regions that don't have a matching PMP rule, to denied instead of ignored."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_riscv_cpu",
+        "line_start": 426,
+        "line_end": 504,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "mseccfg CSR state is NOT included in the VMStateDescription for migration. Neither the main vmstate_riscv_cpu fields nor any subsection (vmstate_pmp, vmstate_envcfg, etc.) saves env.mseccfg. On live migration, if Smepmp is enabled and mseccfg has been configured (e.g., MML=1, MMWP=1), the destination VM boots with mseccfg=0 (the reset value). This silently drops M-mode lockdown: PMP rules revert to non-Smepmp semantics, and guest memory protections are defeated. This is a confirmed migration completeness bug.",
+      "snippet": "const VMStateDescription vmstate_riscv_cpu = {\n    .subsections = (const VMStateDescription * const []) {\n        &vmstate_pmp, &vmstate_hyper, ... &vmstate_sstc, NULL\n    }\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2422,
+          "line_end": 2423,
+          "excerpt": "This is a sticky bit, meaning that once set it cannot be unset until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "mseccfg_csr_write",
+        "line_start": 698,
+        "line_end": 700,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The Zicfilp MLPE passthrough line 'val |= (val & MSECCFG_MLPE)' is a logical no-op (ORing val with a subset of itself). While functionally harmless (the MLPE bit from the guest write passes through unchanged, which is the intended behavior), the code is misleading — it appears to be dead code or a vestige of a different intended pattern. This creates confusion about whether MLPE requires sticky-bit treatment (it does not — per spec it resets to 0 but is freely writable).",
+      "snippet": "if (env_archcpu(env)->cfg.ext_zicfilp) {\n    val |= (val & MSECCFG_MLPE);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2794,
+          "line_end": 2794,
+          "excerpt": "If the Zicfilp extension is implemented, the mseccfg.MLPE field is reset to 0."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "pmp_is_invalid_smepmp_cfg",
+        "line_start": 77,
+        "line_end": 115,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Smepmp invalid config check correctly prevents adding executable M-mode-only or locked Shared-Region rules when MML=1 and RLB=0. Returns 0 (valid) for allowed encodings 0-8, 12, 14, 15 and returns 1 (invalid) for prohibited executable encodings (9, 10, 11, 13). Correctly bypasses check when MML is not set or RLB is set. This enforces norm:mseccfg_mml_X_restrict.",
+      "snippet": "if (!MSECCFG_MML_ISSET(env) || MSECCFG_RLB_ISSET(env)) {\n    return 0;\n}\nswitch (pmp_get_smepmp_operation(val)) {\ncase 0: ... case 8: case 12: case 14: case 15:\n    return 0;\ncase 9: case 10: case 11: case 13:\n    return 1;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2462,
+          "line_end": 2465,
+          "excerpt": "Adding a rule with executable privileges that either is M-mode-only or a locked Shared-Region is not possible and such pmpcfg writes are ignored. This restriction can be temporarily lifted by setting mseccfg.RLB."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

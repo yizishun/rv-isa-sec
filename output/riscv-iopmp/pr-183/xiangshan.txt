@@ -1,0 +1,182 @@
+PR #183  target=xiangshan  overall=bug_confirmed
+Spec: PR removes hardware reference behaviors for improper MDCFG Table settings, leaving entry-to-MD assignment purely implementation-dependent; XiangShan RTL without explicit monotonicity enforcement on MDCFG(m).t writes risks entry misattribution across memory domains, enabling unauthorized memory access through RRID-to-MD association bypass
+Violation:
+  In XiangShan RTL, when the MDCFG Table has an improper setting (non-
+  monotonic MDCFG(m).t values where MDCFG(k).t > MDCFG(m).t for k < m), the
+  IOPMP entry-to-MD assignment logic produces implementation-dependent
+  behavior. If the RTL implements a naive interval-based lookup (e.g., simple
+  combinational comparators without monotonicity enforcement or write-
+  rejection), a transaction with RRID associated to MD_m or MD_k may match
+  entries belonging to an unintended memory domain, or entries may become
+  orphaned and silently grant/deny access contrary to the programmer's intent.
+  This is especially critical when HWCFG0.enable is set after programming
+  improper MDCFG values—the spec now explicitly requires proper settings only
+  when enable is set, creating a window where improper configurations can be
+  latched into working state. The removed reference behaviors (auto-
+  correction, write rejection, entry nullification) are no longer suggested
+  guidance, so if XiangShan adopted or relied on any of those patterns, the
+  RTL must now ensure its custom implementation-dependent behavior still
+  satisfies the two remaining constraints: (a) an entry belongs to at most one
+  MD, and (b) lower-indexed MD entries have lower indices than higher-indexed
+  MD entries.
+Consequence: privilege_escape
+Pattern:
+  MDCFG_t_non_monotonic | MDCFG improper setting | MDCFG(m).t comparator
+  unsigned less-than | entry_index_range MDCFG lower_bound upper_bound |
+  HWCFG0_enable MDCFG_proper_setting gate | MDCFG write no monotonicity check
+------------------------------------------------------------
+[bug_confirmed] /home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala:327-330  MdcfgTable
+  MDCFG write path has no monotonicity check. Writes to MDCFG(m).t are
+  unconditionally accepted into SRAM (mdcfg.io.a_we := true.B when io.regcfg.v
+  && io.regcfg.rw). No comparison is made against MDCFG(m-1).t or MDCFG(m+1).t
+  to detect or reject non-monotonic settings. When an improper (non-monotonic)
+  MDCFG table is written, the Ctrl FSM will use these values directly in its
+  interval-scan logic, leading to implementation-dependent behavior that may
+  not satisfy spec requirements (a) entry belongs to at most one MD, (b)
+  lower-indexed MD entries have lower indices.
+  | when(io.regcfg.v){ mdcfg.io.a_en := true.B }.otherwise { mdcfg.io.a_en := false.B }
+  | when(io.regcfg.v && io.regcfg.rw){ mdcfg.io.a_we := true.B }.otherwise { mdcfg.io.a_we := false.B }
+  | when(io.regcfg.v && io.regcfg.rw){ mdcfg.io.a_wdata := io.regcfg.din(15, 0) }.otherwise { mdcfg.io.a_wdata := 0.U }
+  References:
+    - riscv-iopmp/chapter2.adoc:112-117
+      "Programmers should maintain proper settings in the MDCFG Table when
+      HWCFG0.enable is set, where MDCFG(m + 1).t should be greater than or
+      equal to MDCF"
+    - riscv-iopmp/chapter4.adoc:258-262
+      "Field t [15:0] WARL: Indicate the encoding the range of memory
+      domain m. An IOPMP entry with index j belongs to MD m: If
+      MDCFG(m-1).t ≤ j < MDCFG(m).t"
+
+[bug_confirmed] /home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala:1122-1131  Ctrl (sPriority FSM state)
+  sPriority exit condition uses simple equality (j_indx === md_t) with j_indx
+  initialized from md_t_pre and monotonically incrementing. When MDCFG is non-
+  monotonic (md_t_pre > md_t), j_indx starts above md_t and increments past it
+  without matching. The FSM then scans entries beyond the intended MD
+  boundary—j_indx wraps through all 65536 values before eventually equaling
+  md_t. During this scan, entries nominally belonging to other MDs (or beyond
+  entry_num=512) are checked against the current MD's RRID, potentially
+  matching entries from wrong memory domains. This violates the spec-
+  guaranteed constraint that entries belong to at most one MD.
+  | is(State.sPriority) {// polling check md(m-1).t <= j < md(m).t
+  |   when(pri_hit) {
+  |     state := State.sMatching // hit
+  |   }.elsewhen(pri_part_hit) {
+  |     etype := 0x4.U
+  |     state := State.sErr
+  |   }.elsewhen(j_indx === md_t){
+  |     state := State.sMdcfg // if j=md(m).t, go to mdcfg
+  |   }
+  | }
+  References:
+    - riscv-iopmp/chapter2.adoc:114-117
+      "When the MDCFG Table has an improper setting, the resulting
+      association of IOPMP entries to MDs is implementation-dependent, but
+      the following conditi"
+
+[potential_risk] /home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala:1218-1222  Ctrl (j_indx init and bounds)
+  j_indx is initialized to md_t_pre (line 1219) and incremented
+  unconditionally (line 1221) without any upper-bound check against
+  HWCFG1.entry_num (512). j_indx and md_t/md_t_pre are all 16-bit registers,
+  allowing software to program MDCFG(m).t values up to 65535. When md_t
+  exceeds entry_num, the FSM scans non-existent entries (j_indx >= entry_num),
+  which are spec-defined as OFF/not-available. Combined with non-monotonic
+  settings, this amplifies the boundary-violation behavior.
+  | when(state === State.sEntry && !mdcfg_m_en_d) {
+  |   j_indx := md_t_pre // j_indx = md.t_pre
+  | }.elsewhen(state === State.sPriority && io.entry.j_en === true.B) {
+  |   j_indx := j_indx + 1.U // j_indx ++
+  | }
+  References:
+    - riscv-iopmp/chapter2.adoc:109-110
+      "an entry with index j belongs to MD m if MDCFG(m - 1).t ≤ j <
+      MDCFG(m).t, where m > 0. an entry with index j belongs to MD 0 if j
+      < MDCFG(0).t."
+
+[potential_risk] /home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala:796-806  RegMap (HWCFG0.enable write)
+  HWCFG0.enable is set via W1SS (reg_hwcfg0.enable | w.enable) without any
+  validation of the MDCFG table state. There is no monotonicity gate or
+  warning mechanism that checks whether MDCFG entries are properly programmed
+  before enabling transaction checking. Since the write path (lines 328-330)
+  also lacks monotonicity enforcement, improper MDCFG settings can be silently
+  latched into the working configuration and activated by setting enable.
+  | when(io.regcfg.v && io.regcfg.rw && addrhit_hwcfg0) {
+  |   val w = io.regcfg.din.asTypeOf(new RegHwcfg0)
+  |   when(reg_hwcfg0.prient_prog === 1.U && w.prient_prog === 1.U) {
+  |     reg_hwcfg0.prient_prog := 0.U
+  |   }
+  |   reg_hwcfg0.enable := reg_hwcfg0.enable | w.enable  // W1SS
+  | }
+  References:
+    - riscv-iopmp/chapter2.adoc:112-112
+      "Programmers should maintain proper settings in the MDCFG Table when
+      HWCFG0.enable is set"
+
+[potential_risk] /home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala:1194-1214  Ctrl (md_t/md_t_pre TOCTOU)
+  md_t and md_t_pre are read from the MDCFG SRAM in two consecutive FSM cycles
+  (sMdcfg then sMdcfgPre). A concurrent MDCFG register write (via APB/RegCfg
+  on Port A of TrueDualPortSRAM) between these two reads can change the
+  relationship between md_t and md_t_pre. The stall signal (line 1356:
+  io.regcfg.v && io.regcfg.rw) only gates the sSrcmd→sMdcfg transition (line
+  1093), not sMdcfg→sMdcfgPre. If a write modifies MDCFG(m).t between the two
+  reads, the FSM may use a stale md_t_pre or md_t value, creating a window
+  where a momentarily non-monotonic pair is used.
+  | when(state === State.sMdcfg && md_hasTask) { // if have undone md task, read md.t
+  |     md_taskIdx_d := md_taskIdx
+  |     io.mdcfg.m_indx := md_taskIdx
+  |     io.mdcfg.m_en := true.B
+  | }.elsewhen(state === State.sMdcfgPre && md_taskIdx_d =/= 0.U) { // read pre md.t
+  |     io.mdcfg.m_indx := md_taskIdx_d - 1.U
+  |     io.mdcfg.m_en := true.B
+  | }
+
+[not_implemented] /home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala:565-616  RegMap (MDCFGLCK, MDLCK, ENTRYLCK)
+  All configuration protection registers (MDCFGLCK, MDLCK, MDLCKH, ENTRYLCK)
+  are entirely commented out. The spec (chapter3) defines these as the
+  hardware mechanism to lock MDCFG Table entries, SRCMD Table MD associations,
+  and Entry Array entries against runtime modification. Without these locks,
+  there is no hardware-enforced configuration integrity. A compromised
+  software component can rewrite MDCFG, SRCMD, or entry registers at any time
+  with no hardware-level defense.
+  | /* not implemented begin
+  | class RegHwcfguser extends Bundle { ... }
+  | class RegMdlck extends Bundle { ... }
+  | class RegMdlckh extends Bundle { ... }
+  | class RegMdcfglck extends Bundle { ... }
+  | class RegEntrylck extends Bundle { ... }
+  | not implemented end */
+  References:
+    - riscv-iopmp/chapter3.adoc:31-38
+      "Register MDCFGLCK is designed to partially or fully lock the MDCFG
+      Table... MDCFG(m) is locked if m < MDCFGLCK.f. MDCFGLCK.f is
+      incremental-only... If"
+    - riscv-iopmp/chapter3.adoc:40-42
+      "locked entries should be placed in the higher priorities.
+      Otherwise, when the secure monitor is compromised, one unlocked
+      entry in higher priority can"
+
+[compliant] /home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala:248-253  RegCfgMux
+  The RegCfgMux performs correct address-range-based demultiplexing of APB
+  register writes to the MDCFG, SRCMD, entry, and info register tables.
+  Address decode uses combinatorial comparators against base and max
+  addresses, which is correct. The Mux unconditionally forwards writes based
+  on address match—this is correct behavior for an address demux; write
+  qualification is the responsibility of the downstream module (RegMap for
+  info registers, MdcfgTable for MDCFG). The issue is that MdcfgTable itself
+  does not qualify writes (see finding 1).
+  | regcfgs.foreach { case (regcfg, hit) =>
+  |   regcfg.rw   := Mux(hit, io.regcfg.rw, false.B)
+  |   regcfg.addr := Mux(hit, io.regcfg.addr, 0.U)
+  |   regcfg.din  := Mux(hit, io.regcfg.din, 0.U)
+  |   regcfg.v    := Mux(hit, io.regcfg.v, false.B)
+  | }
+
+[compliant] /home/yzs/riscv/XiangShan/ChiselIOPMP/src/main/scala/IopmpChecker.scala:496-516  IopmpParams / RegHwcfg0
+  The HWCFG0 register bit layout is correct. The toUInt concatenation (line
+  516) matches the spec-defined field ordering: enable at bit 31, addrh_en at
+  bit 30, md_num at bits 29:24, md_entry_num at bits 23:17, followed by
+  feature-indication bits. All read-only fields are correctly initialized from
+  IopmpParams. The enable field is correctly initialized to 0 and uses W1SS
+  semantics (line 806). md_entry_num is correctly set to 0 for mdcfg_fmt=0 as
+  required by the spec.
+  | def toUInt: UInt = Cat(enable, addrh_en, md_num, md_entry_num, mfr_en, pees, peis, stall_en, no_w, no_x, chk_x, rrid_transl_prog, rrid_transl_en, prient_prog, user_cfg_en, sps_en, tor_en, srcmd_fmt, mdcfg_fmt)
+

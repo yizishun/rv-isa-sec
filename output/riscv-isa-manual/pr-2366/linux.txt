@@ -1,0 +1,163 @@
+PR #2366  target=linux  overall=bug_confirmed
+Spec: Kernel relying solely on Sstc extension probe without verifying menvcfg.STCE==1 may misread STIP behavior, causing lost or spurious timer interrupts and potential scheduler hang
+Violation:
+  Linux kernel checks for Sstc extension presence (via ISA string or DT) and
+  assumes stimecmp-driven STIP semantics, but firmware has set menvcfg.STCE=0
+  (or henvcfg.STCE=0 for VS-mode), causing the hardware to behave as if Sstc
+  is not implemented — STIP in sip becomes execution-environment-controlled
+  rather than stimecmp-reflected, yet kernel code still treats STIP as read-
+  only and timer-driven.
+Consequence: denial_of_service
+Pattern:
+  kernel code that tests Sstc extension availability
+  (riscv_isa_extension_available, __riscv_isa_ext, DT property) and branches
+  into stimecmp-based timer path without also reading menvcfg.STCE /
+  henvcfg.STCE to confirm the enable bit is set
+------------------------------------------------------------
+[bug_confirmed] drivers/clocksource/timer-riscv.c:193-196  riscv_timer_init_common
+  Sstc static branch is enabled based solely on
+  riscv_isa_extension_available(NULL, SSTC) without reading menvcfg.STCE to
+  confirm firmware has enabled stimecmp for S-mode. When menvcfg.STCE=0,
+  subsequent csr_write(CSR_STIMECMP, ...) in
+  riscv_clock_event_stop/riscv_clock_next_event will raise illegal-instruction
+  exceptions because the hardware behaves as if Sstc is not implemented.
+  | if (riscv_isa_extension_available(NULL, SSTC)) {
+  |     pr_info("Timer interrupt in S-mode is available via sstc extension\n");
+  |     static_branch_enable(&riscv_sstc_available);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2233-2239
+      "The STCE bit enables stimecmp for S-mode when set to one. When this
+      extension is implemented and STCE in menvcfg is zero, an attempt to
+      access stimecm"
+
+[bug_confirmed] drivers/clocksource/timer-riscv.c:51-57  riscv_clock_next_event
+  Direct csr_write(CSR_STIMECMP, next_tval) under the
+  static_branch_likely(&riscv_sstc_available) guard, which was enabled solely
+  on ISA string check. If menvcfg.STCE=0, this write to stimecmp from S-mode
+  triggers an illegal-instruction exception, crashing or hanging the calling
+  CPU.
+  | if (static_branch_likely(&riscv_sstc_available)) {
+  |     csr_write(CSR_STIMECMP, next_tval);
+  | } else
+  |     sbi_set_timer(next_tval);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2233-2239
+      "When this extension is implemented and STCE in menvcfg is zero, an
+      attempt to access stimecmp in a mode other than M-mode raises an
+      illegal-instructio"
+
+[bug_confirmed] arch/riscv/kernel/suspend.c:33-38  suspend_save_csrs
+  Reads CSR_STIMECMP based only on
+  riscv_has_extension_unlikely(RISCV_ISA_EXT_SSTC) without checking
+  menvcfg.STCE. On resume from suspend, if firmware cleared menvcfg.STCE
+  during the suspend cycle (e.g. for security policy or as part of a firmware
+  update), the kernel will trap on the csr_read.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SSTC)) {
+  |     context->stimecmp = csr_read(CSR_STIMECMP);
+  | #if __riscv_xlen < 64
+  |     context->stimecmph = csr_read(CSR_STIMECMPH);
+  | #endif
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2233-2235
+      "When this extension is implemented and STCE in menvcfg is zero, an
+      attempt to access stimecmp in a mode other than M-mode raises an
+      illegal-instructio"
+
+[bug_confirmed] arch/riscv/kernel/suspend.c:53-59  suspend_restore_csrs
+  Writes to CSR_STIMECMP during resume based solely on ISA extension check. If
+  firmware has menvcfg.STCE=0 (e.g. cleared during suspend), the csr_write
+  traps and the resume path fails, potentially leaving the CPU in an
+  inconsistent state.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SSTC)) {
+  |     csr_write(CSR_STIMECMP, ULONG_MAX);
+  |     csr_write(CSR_STIMECMPH, context->stimecmph);
+  |     csr_write(CSR_STIMECMP, context->stimecmp);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2233-2235
+      "When this extension is implemented and STCE in menvcfg is zero, an
+      attempt to access stimecmp in a mode other than M-mode raises an
+      illegal-instructio"
+
+[bug_confirmed] arch/riscv/kvm/vcpu_timer.c:256-260  kvm_riscv_vcpu_timer_init
+  Sets t->sstc_enabled = true based on riscv_isa_extension_available(NULL,
+  SSTC) without checking henvcfg.STCE (or menvcfg.STCE which gates it). When
+  menvcfg.STCE=0, henvcfg.STCE is read-only zero per spec, so vstimecmp CSR
+  accesses in kvm_riscv_vcpu_timer_restore/sync/save will trap in HS-mode,
+  crashing the VCPU run path.
+  | if (riscv_isa_extension_available(NULL, SSTC)) {
+  |     t->sstc_enabled = true;
+  |     hrtimer_setup(&t->hrt, kvm_riscv_vcpu_vstimer_expired, CLOCK_MONOTONIC,
+  |                   HRTIMER_MODE_REL);
+  |     t->timer_next_event = kvm_riscv_vcpu_update_vstimecmp;
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2234-2237
+      "When this extension is implemented and STCE in menvcfg is zero ...
+      STCE in henvcfg is read-only zero, and STIP in mip and sip reverts
+      to its defined b"
+    - riscv-isa-manual/src/priv/hypervisor.adoc:745-751
+      "The Sstc extension adds the STCE (STimecmp Enable) bit to henvcfg
+      CSR ... When STCE bit is henvcfg is zero, an attempt to access
+      stimecmp (really vsti"
+
+[bug_confirmed] arch/riscv/kvm/vcpu_timer.c:307-316  kvm_riscv_vcpu_timer_restore
+  Writes to CSR_VSTIMECMP guarded only by t->sstc_enabled. When menvcfg.STCE=0
+  forces henvcfg.STCE read-only zero, vstimecmp is inaccessible from HS-mode
+  just as stimecmp is from S-mode, causing an illegal-instruction trap on VCPU
+  load.
+  | if (!t->sstc_enabled)
+  |     return;
+  | ncsr_write(CSR_VSTIMECMP, t->next_cycles);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2233-2239
+      "When this extension is implemented and STCE in menvcfg is zero, an
+      attempt to access stimecmp in a mode other than M-mode raises an
+      illegal-instructio"
+
+[bug_confirmed] arch/riscv/kvm/vcpu_timer.c:340-366  kvm_riscv_vcpu_timer_save
+  csr_write(CSR_VSTIMECMP, -1UL) on VCPU put path, guarded only by
+  t->sstc_enabled. With menvcfg.STCE=0 making henvcfg.STCE read-only zero,
+  vstimecmp is inaccessible, and this write traps during VCPU context switch,
+  causing a host crash.
+  | if (!t->sstc_enabled)
+  |     return;
+  | csr_write(CSR_VSTIMECMP, -1UL);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2234-2237
+      "When this extension is implemented and STCE in menvcfg is zero ...
+      STCE in henvcfg is read-only zero"
+
+[bug_confirmed] arch/riscv/kernel/cpufeature.c:585-585  (extension table)
+  SSTC is registered with __RISCV_ISA_EXT_DATA (no validate callback), unlike
+  SVADU which has a validate callback via __RISCV_ISA_EXT_DATA_VALIDATE. No
+  menvcfg.STCE check exists anywhere in the extension probe path. By contrast,
+  extensions like smnpm/ssnpm declare riscv_xlinuxenvcfg_exts as subset, and
+  SVADU has riscv_ext_svadu_validate. SSTC has neither, meaning the kernel
+  trusts the ISA string unconditionally without verifying firmware enablement.
+  | __RISCV_ISA_EXT_DATA(sstc, RISCV_ISA_EXT_SSTC),
+  References:
+    - riscv-isa-manual/src/priv/sstc.adoc:22-24
+      "This extension adds the STCE bit to the menvcfg and henvcfg CSRs."
+    - riscv-isa-manual/src/priv/machine.adoc:2231-2232
+      "When the Sstc extension is not implemented, STCE is read-only
+      zero."
+
+[potential_risk] arch/riscv/kvm/vcpu.c:551-552  kvm_riscv_vcpu_setup_config
+  cfg->henvcfg |= ENVCFG_STCE is set based on the guest ISA string
+  (riscv_isa_extension_available(isa, SSTC)), not on host menvcfg.STCE. If
+  menvcfg.STCE=0, this write to henvcfg.STCE is a no-op (the bit is read-only
+  zero), so the guest VCPU will see STCE=0 in henvcfg while its ISA string
+  advertises Sstc. The guest kernel would then encounter the same
+  vulnerability pattern when it tries to use stimecmp. This is a
+  virtualization correctness bug: the guest ISA string and the actual henvcfg
+  state are inconsistent.
+  | if (riscv_isa_extension_available(isa, SSTC))
+  |     cfg->henvcfg |= ENVCFG_STCE;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2234-2236
+      "When this extension is implemented and STCE in menvcfg is zero ...
+      STCE in henvcfg is read-only zero"
+

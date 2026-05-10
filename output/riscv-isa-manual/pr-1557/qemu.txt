@@ -1,0 +1,130 @@
+PR #1557  target=qemu  overall=compliant
+Spec: QEMU TCG may fail to honor misaligned atomicity granule PMA for RVC compressed load/store encodings, causing non-atomic multi-operation access in SMP guests where the spec mandates single atomic operation
+Violation:
+  QEMU TCG applies misaligned atomicity granule PMA atomicity guarantees only
+  to 32-bit instruction encodings (base ISAs, F/D/Q loads/stores/AMOs) but
+  fails to apply the same single-memory-operation atomicity guarantee to their
+  compressed (RVC) counterparts (e.g., C.LW, C.SW, C.LD, C.SD, C.FLW, C.FSW,
+  C.FLD, C.FSD). A compressed load/store within a misaligned atomicity granule
+  region could be decomposed into multiple byte-level memory operations.
+Consequence: race_condition
+Pattern:
+  check for misaligned access decomposition or atomicity granule logic that
+  branches on instruction encoding width (e.g., checking only 32-bit opcodes)
+  without also covering compressed (16-bit) encodings; look for RVC decode
+  paths that bypass PMA atomicity checks; search for helper functions that
+  split misaligned accesses without first checking the misaligned atomicity
+  granule PMA
+------------------------------------------------------------
+[compliant] target/riscv/insn_trans/trans_rvi.c.inc:408-428  gen_load
+  gen_load() applies MO_ATOM_WITHIN16 based on ext_zama16b (line 413-414). All
+  32-bit integer load instructions (LB, LH, LW, LD, LBU, LHU, LWU, LDU) call
+  gen_load(), and the RVC compressed counterparts (C.LW, C.LD, C.LWSP, C.LDSP)
+  are decoded to the same 32-bit opcode names in insn16.decode, so they use
+  the identical code path. No RVC-specific bypass exists.
+  | static bool gen_load(DisasContext *ctx, arg_lb *a, MemOp memop)
+  | {
+  |     bool out;
+  |     memop |= mo_endian(ctx);
+  |     if (ctx->cfg_ptr->ext_zama16b) {
+  |         memop |= MO_ATOM_WITHIN16;
+  |     }
+
+[compliant] target/riscv/insn_trans/trans_rvi.c.inc:521-533  gen_store
+  gen_store() applies MO_ATOM_WITHIN16 based on ext_zama16b (line 524-525).
+  All 32-bit integer store instructions (SB, SH, SW, SD) call gen_store(), and
+  the RVC compressed counterparts (C.SW, C.SD, C.SWSP, C.SDSP) are decoded
+  identically in insn16.decode, using the same code path with no RVC-specific
+  bypass.
+  | static bool gen_store(DisasContext *ctx, arg_sb *a, MemOp memop)
+  | {
+  |     memop |= mo_endian(ctx);
+  |     if (ctx->cfg_ptr->ext_zama16b) {
+  |         memop |= MO_ATOM_WITHIN16;
+  |     }
+
+[compliant] target/riscv/insn_trans/trans_rvf.c.inc:42-64  trans_flw
+  trans_flw() applies MO_ATOM_WITHIN16 at line 52-53 for 32-bit FP loads.
+  trans_c_flw() (line 85-89) delegates directly to trans_flw(), so compressed
+  C.FLW gets the same atomicity treatment as the 32-bit FLW. No bypass.
+  | static bool trans_c_flw(DisasContext *ctx, arg_flw *a)
+  | {
+  |     REQUIRE_ZCF_OR_FC(ctx);
+  |     return trans_flw(ctx, a);
+  | }
+
+[compliant] target/riscv/insn_trans/trans_rvf.c.inc:66-83  trans_fsw
+  trans_fsw() applies MO_ATOM_WITHIN16 at line 75-76 for 32-bit FP stores.
+  trans_c_fsw() (line 91-95) delegates directly to trans_fsw(), so compressed
+  C.FSW gets the same atomicity treatment.
+  | static bool trans_c_fsw(DisasContext *ctx, arg_fsw *a)
+  | {
+  |     REQUIRE_ZCF_OR_FC(ctx);
+  |     return trans_fsw(ctx, a);
+  | }
+
+[compliant] target/riscv/insn_trans/trans_rvd.c.inc:42-71  trans_fld
+  trans_fld() applies MO_ATOM_WITHIN16 at line 58-59 (when XLEN>=64).
+  trans_c_fld() (line 96-100) delegates directly to trans_fld(), so compressed
+  C.FLD gets the same atomicity treatment as the 32-bit FLD. No separate RVC
+  path.
+  | static bool trans_c_fld(DisasContext *ctx, arg_fld *a)
+  | {
+  |     REQUIRE_ZCD_OR_DC(ctx);
+  |     return trans_fld(ctx, a);
+  | }
+
+[compliant] target/riscv/insn_trans/trans_rvd.c.inc:73-94  trans_fsd
+  trans_fsd() applies MO_ATOM_WITHIN16 at line 83-84 (when XLEN>=64).
+  trans_c_fsd() (line 102-106) delegates directly to trans_fsd(), so
+  compressed C.FSD gets the same atomicity treatment.
+  | static bool trans_c_fsd(DisasContext *ctx, arg_fsd *a)
+  | {
+  |     REQUIRE_ZCD_OR_DC(ctx);
+  |     return trans_fsd(ctx, a);
+  | }
+
+[compliant] target/riscv/insn_trans/trans_rvzce.c.inc:82-98  trans_c_lbu, trans_c_lhu, trans_c_lh
+  Zcb compressed load instructions (C.LBU, C.LHU, C.LH) all call gen_load()
+  directly, which applies MO_ATOM_WITHIN16 when ext_zama16b is set. Same code
+  path as 32-bit counterparts.
+  | static bool trans_c_lbu(DisasContext *ctx, arg_c_lbu *a)
+  | {
+  |     REQUIRE_ZCB(ctx);
+  |     return gen_load(ctx, a, MO_UB);
+  | }
+
+[compliant] target/riscv/insn_trans/trans_rvzce.c.inc:100-110  trans_c_sb, trans_c_sh
+  Zcb compressed store instructions (C.SB, C.SH) all call gen_store()
+  directly, which applies MO_ATOM_WITHIN16 when ext_zama16b is set. Same code
+  path as 32-bit counterparts.
+  | static bool trans_c_sb(DisasContext *ctx, arg_c_sb *a)
+  | {
+  |     REQUIRE_ZCB(ctx);
+  |     return gen_store(ctx, a, MO_UB);
+  | }
+
+[compliant] target/riscv/insn16.decode:118-141  (decode patterns)
+  The insn16.decode file maps RVC compressed load/store opcodes directly to
+  the same trans_* functions as their 32-bit counterparts: lw→trans_lw,
+  sw→trans_sw, ld→trans_ld, sd→trans_sd, c_fld→trans_fld, c_fsd→trans_fsd,
+  c_flw→trans_flw, c_fsw→trans_fsw. There is no separate RVC-specific decode
+  or translation path. Both encodings share identical atomicity treatment.
+  | lw                010  ... ... .. ... 00 @cl_w
+  | ...
+  | sw                110  ... ... .. ... 00 @cs_w
+  | ...
+  | ld              011 .  .....  ..... 10 @c_ldsp
+  | ...
+  | sd              111 .  .....  ..... 10 @c_sdsp
+
+[compliant] target/riscv/insn_trans/trans_zilsd.c.inc:22-91  gen_load_i64, gen_store_i64
+  Zilsd/Zclsd 64-bit load/store on RV32 uses MO_SQ without MO_ATOM_WITHIN16.
+  This is correct because zama16b only applies to operations of ≤MXLEN bits,
+  and on RV32 where MXLEN=32, a 64-bit operation is excluded. The spec comment
+  in trans_rvd.c.inc:50-55 confirms: 'zama16b applies to loads and stores of
+  no more than MXLEN bits.'
+  | tcg_gen_qemu_ld_i64(tmp, addr, ctx->mem_idx, MO_SQ | mo_endian(ctx));
+  | ...
+  | tcg_gen_qemu_st_i64(tmp, addr, ctx->mem_idx, MO_SQ | mo_endian(ctx));
+

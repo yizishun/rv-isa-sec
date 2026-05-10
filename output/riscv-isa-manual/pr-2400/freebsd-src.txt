@@ -1,0 +1,154 @@
+PR #2400  target=freebsd-src  overall=potential_risk
+Spec: FreeBSD bhyve writes henvcfg without ADUE-aware fence ordering; enabling Svadu/ADUE would cause stale TLB entries to misapply hardware A/D bit updates across guest boundaries
+Violation:
+  In FreeBSD's RISC-V bhyve VMM, when vmmops_run() writes henvcfg
+  (vmm_riscv.c:632) with an ADUE field change during guest world-switch
+  without a subsequent HFENCE.VVMA (rs1=x0, rs2=x0), stale VS-stage address-
+  translation cache entries cached under the current VMID may interpret PTE
+  A/D bits under the old ADUE setting. Per the spec's NOTE, ADUE should be
+  switched after zeroing vsatp but before writing the new vsatp value to avoid
+  needing an explicit HFENCE.VVMA. Currently FreeBSD does not set ADUE in
+  henvcfg (only STCE), but the henvcfg write site has no fence and no ADUE-
+  aware world-switch ordering, so any future Svadu enablement would
+  immediately violate this synchronization requirement.
+Consequence: data_corruption
+Pattern:
+  csr_write\(henvcfg,.*\)(?!.*hfence_vvma|.*csr_write\(vsatp)
+------------------------------------------------------------
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:631-632  vmmops_run
+  henvcfg write at line 632 has no subsequent HFENCE.VVMA and is not
+  interleaved with vsatp per the spec-recommended ordering (zero vsatp → write
+  henvcfg → write new vsatp). Currently only STCE (bit 63) is written, which
+  does not require VS-stage TLB synchronization. However, if a future patch
+  adds HENVCFG_ADUE (bit 61) to this write site — which is the natural place
+  to enable it — the code would immediately violate RISC-V spec
+  hypervisor.adoc §Lines 2114-2125: after changing henvcfg.ADUE, an
+  HFENCE.VVMA (rs1=x0, rs2=x0) suffices for synchronization; alternatively,
+  the ADUE change should happen after zeroing vsatp but before writing the new
+  vsatp to obviate the fence. Neither path exists. Stale VS-stage address-
+  translation cache entries cached under the current VMID would interpret PTE
+  A/D bits under the old ADUE setting.
+  | if (has_sstc)
+  |         csr_write(henvcfg, HENVCFG_STCE);
+  |     csr_write(hie, HIE_VSEIE | HIE_VSSIE | HIE_SGEIE);
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:2114-2125
+      "By contrast, if the PBMTE or ADUE bits in henvcfg are changed,
+      executing an HFENCE.VVMA with rs1=x0 and rs2=x0 suffices to
+      synchronize with respect to"
+    - riscv-isa-manual/src/priv/hypervisor.adoc:735-743
+      "If the Svadu extension is implemented, the ADUE bit controls
+      whether hardware updating of PTE A/D bits is enabled for VS-stage
+      address translation. Wh"
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:168-176  vmmops_vcpu_restore_csrs
+  vsatp is restored at line 176 after henvcfg was already written at line 632.
+  The spec-recommended ordering (zero vsatp → write henvcfg.ADUE → write new
+  vsatp) is not followed. Currently benign because ADUE=0, but the monolithic
+  vsatp write without prior zeroing means there is no window to safely change
+  henvcfg.ADUE between deactivating and reactivating VS-stage translation.
+  Without either this ordering or an explicit HFENCE.VVMA, enabling ADUE would
+  risk stale TLB entries using the old A/D interpretation under the new ADUE
+  setting.
+  | csr_write(vsstatus, csrs->vsstatus);
+  |     csr_write(vsie, csrs->vsie);
+  |     csr_write(vstvec, csrs->vstvec);
+  |     csr_write(vsscratch, csrs->vsscratch);
+  |     csr_write(vsepc, csrs->vsepc);
+  |     csr_write(vscause, csrs->vscause);
+  |     csr_write(vstval, csrs->vstval);
+  |     csr_write(hvip, csrs->hvip);
+  |     csr_write(vsatp, csrs->vsatp);
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:2119-2125
+      "NOTE: No mechanism is provided to atomically change vsatp and hgatp
+      together. Hence, to prevent speculative execution causing one
+      guest's VS-stage tra"
+
+[potential_risk] sys/riscv/include/cpufunc.h:122-127  hfence_gvma
+  Only hfence_gvma() exists as an inline asm wrapper for hypervisor fences.
+  There is no hfence_vvma() wrapper anywhere in the kernel. Any future code
+  path that needs to issue HFENCE.VVMA (e.g., after changing henvcfg.ADUE per
+  hypervisor.adoc line 2114) has no way to do so without adding this wrapper
+  first. The SBI constants SBI_RFNC_REMOTE_HFENCE_VVMA and
+  SBI_RFNC_REMOTE_HFENCE_VVMA_ASID are defined in sbi.h (lines 93-94) but
+  never referenced, confirming this capability gap extends to remote TLB
+  shootdowns.
+  | static __inline void
+  |     hfence_gvma(void)
+  |     {
+  |     __asm __volatile("hfence.gvma" ::: "memory");
+  |     }
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:2114-2117
+      "By contrast, if the PBMTE or ADUE bits in henvcfg are changed,
+      executing an HFENCE.VVMA with rs1=x0 and rs2=x0 suffices to
+      synchronize with respect to"
+
+[potential_risk] sys/riscv/include/riscvreg.h:176-182  
+  HENVCFG bit definitions are incomplete: STCE (63), PBMTE (62), CBZE (7),
+  CBCFE (6), CBIE (5:4), FIOM (0) are defined. HENVCFG_ADUE (bit 61 per the
+  ratified privileged spec hypervisor.adoc line 694) is not defined. Neither
+  MENVCFG_ADUE nor SENVCFG_ADUE exist. This prevents any kernel code from
+  referencing the ADUE field, making Svadu hardware-aware A/D update control
+  impossible at the source level. While this is consistent with not enabling
+  ADUE, it represents a spec-compliance gap for platforms implementing Svadu.
+  | #define HENVCFG_STCE   (1UL << 63)
+  |     #define HENVCFG_PBMTE  (1UL << 62)
+  |     #define HENVCFG_CBZE   (1UL << 7)
+  |     #define HENVCFG_CBCFE  (1UL << 6)
+  |     #define HENVCFG_CBIE_S  4
+  |     #define HENVCFG_CBIE_M  (0x3 << HENVCFG_CBIE_S)
+  |     #define HENVCFG_FIOM   (1UL << 0)
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:694-694
+      "{bits: 1, name: 'ADUE'}"
+    - riscv-isa-manual/src/priv/hypervisor.adoc:735-743
+      "If the Svadu extension is implemented, the ADUE bit controls
+      whether hardware updating of PTE A/D bits is enabled for VS-stage
+      address translation."
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:628-637  vmmops_run
+  G-stage (hypervisor guest physical) synchronization is correctly handled:
+  hfence_gvma() at line 628 precedes csr_write(hgatp, ...) at line 630,
+  satisfying the spec requirement in hypervisor.adoc §Lines 2109-2111 that
+  HFENCE.GVMA with rs1=x0, rs2=x0 suffices for G-stage synchronization after
+  PMTE/ADUE changes in menvcfg. The comment at lines 620-627 explicitly cites
+  the spec. This is the correct pattern, but it only covers G-stage — the
+  missing VS-stage analog (HFENCE.VVMA) is the asymmetry that creates the ADUE
+  risk.
+  | hfence_gvma();
+  | 
+  |     csr_write(hgatp, pmap->pm_satp);
+  |     if (has_sstc)
+  |         csr_write(henvcfg, HENVCFG_STCE);
+  |     csr_write(hie, HIE_VSEIE | HIE_VSSIE | HIE_SGEIE);
+  |     csr_write(hcounteren, HCOUNTEREN_CY | HCOUNTEREN_TM);
+  | 
+  |     vmmops_vcpu_restore_csrs(hypctx);
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:2109-2112
+      "Similarly, if the setting of the PBMTE or ADUE bits in menvcfg are
+      changed, an HFENCE.GVMA instruction with rs1=x0 and rs2=x0 suffices
+      to synchronize "
+
+[not_implemented] sys/riscv/vmm/vmm_switch.S:41-204  vmm_switch
+  The world-switch assembly saves/restores sstatus, hstatus, scounteren,
+  sscratch, stvec (lines 73-84, 158-169) but does not save/restore henvcfg or
+  senvcfg. If ADUE were per-VM state differing between guests, the world-
+  switch would need to save henvcfg on guest exit and restore it on guest
+  entry, with appropriate fencing (HFENCE.VVMA or the zero-vsatp interleave).
+  Currently henvcfg is written once in vmmops_run() (line 632) and never
+  changed per-VM. This is consistent with the current code not supporting per-
+  VM ADUE, but represents missing infrastructure for any future Svadu
+  enablement in bhyve.
+  | ENTRY(vmm_switch)
+  |     ...
+  |     csrrw   t0, sstatus, t0
+  |     csrrw   t1, hstatus, t1
+  |     csrrw   t2, scounteren, t2
+  |     csrrw   t3, sscratch, a0
+  |     csrrw   t4, stvec, t4
+  |     csrw    sepc, t5
+  |     /* no henvcfg/senvcfg access */
+

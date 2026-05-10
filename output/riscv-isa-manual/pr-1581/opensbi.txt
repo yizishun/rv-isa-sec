@@ -1,0 +1,98 @@
+PR #1581  target=opensbi  overall=compliant
+Spec: CSRRS/CSRRC read-modify-write on pmpaddr CSRs silently corrupts NAPOT 'reads as' bits (e.g., G-1) because the read phase returns the architectural read value (0) rather than the underlying hardware value (1), breaking PMP memory isolation enforced by OpenSBI
+Violation:
+  OpenSBI (M-mode) or S-mode code uses CSRRS/CSRRC (or CSRRSI/CSRRCI) read-
+  modify-write instructions on pmpaddr CSRs to modify a subset of bits while
+  the CSR is configured in NAPOT mode. During the read phase, the G-1 bit (and
+  possibly other 'reads as' bits) returns 0 instead of its underlying value of
+  1, and the write-back phase then overwrites those bits with 0, silently
+  corrupting the NAPOT address encoding.
+Consequence: data_corruption
+Pattern:
+  csr_read_set | csr_read_clear | CSRRS | CSRRC on CSR_PMPADDR with non-x0 rd
+  and non-x0 rs1 while pmpaddr holds NAPOT encoding — any read-modify-write to
+  a subfield of pmpaddr destroys the trailing-ones NAPOT pattern when 'reads
+  as' bits differ from underlying bits
+------------------------------------------------------------
+[compliant] lib/sbi/riscv_asm.c:333-381  pmp_set
+  pmp_set() uses csr_write_num() (plain csrw) to write pmpaddr CSRs. It
+  computes the NAPOT-encoded address entirely in software and writes it as a
+  full register value. No CSRRS/CSRRC read-modify-write is performed on
+  pmpaddr, so the 'reads as' bits are never read-and-written-back — the NAPOT
+  encoding is never exposed to silent corruption via RMW instructions.
+  | csr_write_num(pmpaddr_csr, pmpaddr);
+  | csr_write_num(pmpcfg_csr, pmpcfg);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3523-3535
+      "When G ≥ 2 and pmpcfg_i.A[1] is set, i.e. the mode is NAPOT, then
+      bits pmpaddr_i[G-2:0] read as all ones. ... Although changing
+      pmpcfg_i.A[1] affects "
+
+[compliant] lib/sbi/riscv_asm.c:290-315  pmp_disable
+  pmp_disable() only modifies pmpcfg (clearing the A field to OFF), not
+  pmpaddr. It reads pmpcfg with csr_read_num() (plain csrr) and writes back
+  with csr_write_num() (plain csrw). No CSRRS/CSRRC on pmpaddr at all.
+  | cfgmask = ~(0xffUL << pmpcfg_shift);
+  | pmpcfg  = (csr_read_num(pmpcfg_csr) & cfgmask);
+  | csr_write_num(pmpcfg_csr, pmpcfg);
+
+[compliant] lib/sbi/riscv_asm.c:383-434  pmp_get
+  pmp_get() is read-only: it reads both pmpcfg and pmpaddr with csr_read_num()
+  (plain csrr) and does not write back. The NAPOT decoding (ctz(~addr))
+  correctly handles the 'reads as ones' behavior because when the CSR is read,
+  the hardware returns the 'reads as ones' bits as 1s, which is the correct
+  NAPOT encoding for decoding.
+  | addr = csr_read_num(pmpaddr_csr);
+  | t1   = ctz(~addr);
+  | addr = (addr & ~((1UL << t1) - 1)) << PMP_SHIFT;
+
+[compliant] include/sbi/riscv_asm.h:121-129  csr_read_set
+  The csr_read_set() macro implements CSRRS (read-modify-write set) and
+  csr_read_clear() implements CSRRC. These macros exist in the codebase but
+  are never invoked on pmpaddr CSRs. Search of all .c/.h/.S files confirms
+  they are only used on MIE, MIP, MSECCFG, MENVCFG, and other non-pmpaddr
+  CSRs.
+  | #define csr_read_set(csr, val)
+  |   __asm__ __volatile__("csrrs %0, " __ASM_STR(csr) ", %1"
+  |     : "=r"(__v) : "rK"(__v) : "memory");
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3523-3535
+      "When G ≥ 2 and pmpcfg_i.A[1] is set, i.e. the mode is NAPOT, then
+      bits pmpaddr_i[G-2:0] read as all ones."
+
+[compliant] platform/generic/mips/boston.c:69-74  mips_boston_cold_boot
+  Platform cold boot code writes pmpaddr14 and pmpaddr15 with csr_write()
+  (plain csrw). It writes the NAPOT encoding directly (0x1fffffffffffffff for
+  'all addresses'). No CSRRS/CSRRC on pmpaddr.
+  | csr_write(CSR_PMPADDR14, DRAM_PMP_ADDR);
+  | csr_write(CSR_PMPADDR15, 0x1fffffffffffffff);
+  | csr_write(CSR_PMPCFG2, ((PMP_A_NAPOT|PMP_R|PMP_W|PMP_X)<<56)|...)
+
+[compliant] platform/generic/mips/eyeq7h.c:378-394  eyeq7h_cold_boot
+  Platform cold boot writes pmpaddr13/14/15 with csr_write() (plain csrw).
+  Notably, a FIXME comment at line 382-384 documents that a previous attempt
+  using csr_read(CSR_PMPADDR14) to copy the value failed (system hang), and
+  the code now writes pre-computed constants instead — the correct fix. No
+  CSRRS/CSRRC.
+  | csr_write(CSR_PMPADDR13, DRAM_PMP_ADDR);
+  | csr_write(CSR_PMPADDR14, DRAM_PMP_ADDR);
+  | csr_write(CSR_PMPADDR15, 0x1fffffffffffffff);
+
+[compliant] lib/sbi/sbi_hart.c:458-472  hart_pmp_get_allowed_addr
+  PMP detection writes pmpaddr0 with csr_write_allowed() (plain csrw) to probe
+  PMP address bits, then reads back with csr_read_allowed() (plain csrr).
+  These are single-register write and read operations, not read-modify-write.
+  No CSRRS/CSRRC on pmpaddr.
+  | csr_write_allowed(CSR_PMPADDR0, &trap, PMP_ADDR_MASK);
+  | val = csr_read_allowed(CSR_PMPADDR0, &trap);
+
+[compliant] lib/sbi/sbi_hart_pmp.c:121-218  sbi_hart_smepmp_configure
+  Smepmp domain configuration calls pmp_set() and pmp_disable() from
+  riscv_asm.c, both of which use plain csrw/csrr on pmpaddr and pmpcfg — never
+  CSRRS/CSRRC. Uses csr_set(CSR_MSECCFG, ...) which is on mseccfg, not
+  pmpaddr.
+  | csr_set(CSR_MSECCFG, MSECCFG_RLB);
+  | pmp_disable(SBI_SMEPMP_RESV_ENTRY);
+  | // ...
+  | pmp_set(pmp_idx, pmp_flags, reg->base, reg->order);
+

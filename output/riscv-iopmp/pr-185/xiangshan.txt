@@ -1,0 +1,248 @@
+PR #185  target=xiangshan  overall=bug_confirmed
+Spec: Field rename ERR_CFG.msi_en→msi_sel collides with new HWCFG2.msi_en capability bit; stale RTL signal names referencing 'msi_en' cause MSI interrupt path selection and address-register availability gating to read wrong CSR source, enabling MSI hardware interfaces when unsupported or routing interrupts to incorrect destination
+Violation:
+  RTL CSR module still references ERR_CFG field as 'msi_en' (bit 3) after spec
+  rename to 'msi_sel', while simultaneously implementing HWCFG2.msi_en (bit
+  26) as a new capability indicator. If the Chisel/Verilog CSR decoder uses
+  name-based field resolution (e.g., auto-generated from spec JSON), the old
+  wire name 'msi_en' now ambiguously maps to HWCFG2 bit 26 instead of ERR_CFG
+  bit 3, causing the MSI wired-or-MSISelect signal to read from the wrong
+  register — or causing ERR_MSIADDR/ERR_MSIADDRH availability gating to check
+  ERR_CFG.msi_sel (configuration) instead of HWCFG2.msi_en (capability),
+  exposing MSI address registers when hardware does not support MSI.
+Consequence: privilege_escape
+Pattern:
+  ERR_CFG.*msi_en|msi_sel.*io_msi_en|HWCFG2.*msi_en.*WARL|ERR_MSIADDR.*msi_en.
+  *avail|when.*msi_en.*MSI|addr_reg_avail.*msi_sel
+------------------------------------------------------------
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:544-549  RegHwcfg2 (bundle definition)
+  RegHwcfg2 bundle is the obsolete v0.8 layout containing only
+  prio_entry[15:0] and rrid_transl[31:16]. The spec (riscv-
+  iopmp/extensions/registers.adoc lines 91-108) defines HWCFG2 as a 32-bit
+  register with 10 fields: prio_entry[15:0], prio_ent_prog[16],
+  non_prio_en[17], rsv[25:18], msi_en[26], peis[27], pees[28], sps_en[29],
+  stall_en[30], mfr_en[31]. The RTL has NONE of the upper 16 bits. Bit 26
+  (msi_en) falls within the rrid_transl field, which is initialized to 0
+  (IopmpParams.rrid_transl=0 at line 52) with a disabled write path (lines
+  817-819 commented out). Software reading HWCFG2 at offset 0x0010 always sees
+  bit 26 = 0, incorrectly concluding MSI is unsupported. This is the root
+  function_loss in the security spec: MSI address registers appear absent to
+  software, so MSI interrupt configuration is skipped entirely.
+  | class RegHwcfg2 extends Bundle {
+  |   val rrid_transl       = UInt(16.W)
+  |   val prio_entry        = UInt(16.W)
+  |   def toUInt: UInt = Cat(rrid_transl, prio_entry)
+  | }
+  References:
+    - riscv-iopmp/extensions/registers.adoc:91-108
+      "HWCFG2 register fields: prio_entry[15:0], prio_ent_prog[16],
+      non_prio_en[17], rsv[25:18], msi_en[26] (R, Indicates whether the
+      IOPMP supports MSI exte"
+    - riscv-iopmp/extensions/msi.adoc:6-6
+      "The bit msi_en in register HWCFG2 indicates whether the IOPMP
+      supports MSI extension."
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:536-543  RegHwcfg2.apply (initialization)
+  RegHwcfg2.apply() initializes only prio_entry and rrid_transl. Neither
+  msi_en nor the other 7 extension capability bits (prio_ent_prog,
+  non_prio_en, peis, pees, sps_en, stall_en, mfr_en) are initialized. Note
+  that these capability indicators are already tracked separately in HWCFG0
+  (IopmpParams.peis=1 at line 42, IopmpParams.pees=0 at line 43,
+  IopmpParams.stall_en=0 at line 41, IopmpParams.mfr_en=0 at line 44) and in
+  the RegHwcfg0.toUInt encoding (line 516), but they need to be replicated in
+  HWCFG2 per the new spec layout. A new parameter (e.g., hwcfg2_msi_en = 1
+  since the ERR_CFG.msi_sel storage and msidata field exist in hardware) must
+  be added alongside the other capability parameters.
+  | object RegHwcfg2 {
+  |   def apply(): RegHwcfg2 = {
+  |     val init_val = Wire(new RegHwcfg2)
+  |     init_val.prio_entry  := IopmpParams.prio_entry.U
+  |     init_val.rrid_transl := IopmpParams.rrid_transl.U
+  |     RegInit(init_val)
+  |   }
+  | }
+  References:
+    - riscv-iopmp/extensions/registers.adoc:91-108
+      "HWCFG2 all fields with their Default column showing IMP
+      (implementation-defined) for capability bits"
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:633-643  RegErrcfg (bundle field naming)
+  ERR_CFG bit 3 field is named 'msi_en' instead of the spec-mandated
+  'msi_sel'. The spec (registers.adoc line 175) defines bit 3 as 'msi_sel'
+  with semantics: '0x0: wired interrupt, 0x1: MSI'. The PR title explicitly
+  states 'rename ERR_CFG.msi_en to ERR_CFG.msi_sel'. The old name 'msi_en' now
+  collides with HWCFG2.msi_en (bit 26, read-only capability indicator). The
+  comment on this field correctly describes MSI/wired selection behavior,
+  confirming this is a naming error, not a semantic mismatch. A name-based CSR
+  decoder or auto-generated header would resolve 'msi_en' to HWCFG2 bit 26
+  (capability) instead of ERR_CFG bit 3 (selection control).
+  | val msi_en            = UInt(1.W)  // [WARL] Indicates whether the IOPMP triggers interrupt by MSI or wired interrupt
+  | // ... toUInt encoding ...
+  | def toUInt: UInt = Cat(rsv2, msidata, rsv1, stall_violation_en, msi_en, rs, ie, l)
+  References:
+    - riscv-iopmp/extensions/registers.adoc:175-178
+      "msi_sel[3:3] WARL: Indicates whether the IOPMP triggers interrupt
+      by MSI or wired interrupt: 0x0: wired interrupt, 0x1: MSI"
+    - riscv-iopmp/extensions/msi.adoc:12-13
+      "The bit msi_sel in register ERR_CFG indicates whether the IOPMP
+      triggers interrupt by MSI or wired interrupt."
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:53-53  IopmpParams (msi_en parameter)
+  IopmpParams.msi_en (default=0) holds the ERR_CFG bit 3 default for MSI/wired
+  selection. This parameter name collides with the new HWCFG2.msi_en (read-
+  only capability indicator at bit 26). After the rename to ERR_CFG.msi_sel,
+  this parameter should be renamed to 'msi_sel' and a separate new parameter
+  'hwcfg2_msi_en' (default=1) should be added to indicate the MSI extension
+  capability is present in hardware (the RTL instantiates msidata storage at
+  line 628, writable at line 831, and has RegErrmsiaddr/RegErrmsiaddrh class
+  definitions at lines 724-729).
+  | val msi_en             = 0    // [WARL] Indicates whether the IOPMP triggers interrupt by MSI or wired interrupt
+  References:
+    - riscv-iopmp/extensions/registers.adoc:102-102
+      "msi_en[26:26] R, IMP default: Indicates whether the IOPMP supports
+      MSI extension."
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:822-833  RegMap (ERR_CFG write path)
+  ERR_CFG.msi_en (to be renamed msi_sel) write path at line 829 has no gating
+  on HWCFG2.msi_en. Per the reference model (iopmp_reg.c lines 708-710),
+  writes to ERR_CFG.msi_sel and ERR_CFG.msidata must be conditionally gated:
+  'if (iopmp->reg_file.hwcfg2.msi_en) { iopmp->reg_file.err_cfg.msi_sel =
+  err_cfg_temp.msi_sel; iopmp->reg_file.err_cfg.msidata =
+  err_cfg_temp.msidata; }'. When HWCFG2.msi_en=0 (MSI extension not present),
+  writes to msi_sel and msidata should be ignored/hardwired to 0. Currently
+  there is no such gating — software can write msi_sel=1 even when
+  HWCFG2.msi_en reads 0, creating a configuration inconsistency and a
+  potential privilege_escape: if downstream hardware or future versions DO
+  gate on HWCFG2.msi_en, the current unconditional write path silently permits
+  MSI configuration that should be impossible.
+  | when(io.regcfg.v && io.regcfg.rw && addrhit_errcfg) {
+  |     val w = io.regcfg.din.asTypeOf(new RegErrcfg)
+  |     reg_errcfg.l := reg_errcfg.l | w.l  // W1SS
+  |     when(reg_errcfg.l === 0.U) {
+  |       reg_errcfg.ie := w.ie
+  |       reg_errcfg.rs := w.rs
+  |       reg_errcfg.msi_en := w.msi_en  // WARL — NO gating on HWCFG2.msi_en
+  |       reg_errcfg.stall_violation_en := w.stall_violation_en
+  |       reg_errcfg.msidata := w.msidata  // WARL — NO gating on HWCFG2.msi_en
+  |     }
+  | }
+  References:
+    - riscv-iopmp/iopmp_ref_model/src/iopmp_reg.c:708-710
+      "if (iopmp->reg_file.hwcfg2.msi_en) {
+      iopmp->reg_file.err_cfg.msi_sel = err_cfg_temp.msi_sel;
+      iopmp->reg_file.err_cfg.msidata = err_cfg_temp.msidata; }"
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:1307-1318  Ctrl (interrupt generation FSM)
+  Ctrl interrupt generation always asserts io.int (wired interrupt pin) when
+  ERR_INFO.v=1 and ERR_CFG.ie=1, completely ignoring the msi_sel configuration
+  bit. There is no FSM state to issue an MSI write to ERR_MSIADDR with msidata
+  when msi_sel=1. Per the reference model (iopmp_interrupt.c lines 35-81), the
+  correct behavior is: (a) if HWCFG2.msi_en=0, always use wired interrupt; (b)
+  if HWCFG2.msi_en=1 and ERR_CFG.msi_sel=0, use wired interrupt; (c) if
+  HWCFG2.msi_en=1 and ERR_CFG.msi_sel=1, issue an MSI memory write to the
+  address formed from ERR_MSIADDR/ERR_MSIADDRH with data from ERR_CFG.msidata,
+  and set ERR_INFO.msi_werr on bus error. The current behavior is a
+  correctness gap: the wired interrupt pin is always used regardless of
+  configuration, making the msi_sel configuration bit effectively non-
+  functional.
+  | when(io.reg.o_reg_errinfo_v.asBool && io.reg.o_reg_errcfg_ie.asBool) {
+  |     when(io.reg.o_reg_errinfo_ttype === 1.U && !entry_attribute.sire) {
+  |       io.int := true.B
+  |     }.elsewhen(io.reg.o_reg_errinfo_ttype === 2.U && !entry_attribute.siwe) {
+  |       io.int := true.B
+  |     }.otherwise {
+  |       io.int := false.B
+  |     }
+  | }
+  References:
+    - riscv-iopmp/iopmp_ref_model/src/iopmp_interrupt.c:35-81
+      "generate_interrupt: when HWCFG2.msi_en=0, only wired interrupt;
+      when msi_en=1 and msi_sel=0, wired; when msi_en=1 and msi_sel=1,
+      generate MSI write to"
+    - riscv-iopmp/extensions/msi.adoc:8-10
+      "The address is MSI address and is specified by ERR_MSIADDR and
+      ERR_MSIADDRH, while the content to write is stored in the field
+      msidata in the register"
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:93-95  RegMap (ERR_MSIADDR/ERR_MSIADDRH not implemented)
+  ERR_MSIADDR (offset 0x0078) and ERR_MSIADDRH (offset 0x007C) are not
+  implemented. The register offset constants exist (lines 94-95), and Bundle
+  class definitions exist but are commented out as 'not implemented' (lines
+  724-730). No instances exist in RegMap (lines 766-776), no read entries in
+  the MuxLookup (lines 855-867), and no write logic. Per the spec (msi.adoc
+  lines 8-10), ERR_MSIADDR and ERR_MSIADDRH hold the MSI target address and
+  are the registers the IOPMP writes to when generating an MSI. The
+  availability of ERR_MSIADDRH is gated by HWCFG0.addrh_en=1 AND
+  HWCFG2.msi_en=1 (msi.adoc line 10). Even if HWCFG2.msi_en were correctly
+  implemented as 1, software would be unable to configure the MSI target
+  address, making MSI delivery impossible.
+  | val reg_errmsiaddr_addr_offset      = 0x0078.U(16.W) // errmsiaddr
+  | val reg_errmsiaddrh_addr_offset     = 0x007C.U(16.W) // errmsiaddrh
+  References:
+    - riscv-iopmp/extensions/registers.adoc:233-248
+      "ERR_MSIADDR[31:0] WARL: The address to trigger MSI. Available only
+      if HWCFG2.msi_en=1. ERR_MSIADDRH[31:0] WARL: The higher 32 bits.
+      Available only if "
+    - riscv-iopmp/extensions/msi.adoc:8-10
+      "The address is MSI address and is specified by ERR_MSIADDR and
+      ERR_MSIADDRH."
+
+[potential_risk] ChiselIOPMP/src/main/scala/IopmpChecker.scala:27-28  IopmpParams (specver)
+  specver is hardcoded to 8 (line 28). The PR adding HWCFG2.msi_en capability
+  bit and renaming ERR_CFG.msi_en to ERR_CFG.msi_sel is part of a spec
+  revision that changes the register layout (HWCFG2 goes from 2-field v0.8
+  layout to 10-field extension layout). specver must be bumped so software can
+  detect which register layout the hardware implements. Without this, software
+  cannot distinguish an old IOPMP (where HWCFG2 had only prio_entry and
+  rrid_transl) from the new one (where HWCFG2 has msi_en at bit 26).
+  | val vendor             = 0    // [R   ]
+  | val specver            = 8    // [R   ]
+
+[bug_confirmed] ChiselIOPMP/src/main/scala/IopmpChecker.scala:854-867  RegMap (read mux — HWCFG2)
+  The HWCFG2 read path at line 860 returns reg_hwcfg2.toUInt =
+  Cat(rrid_transl, prio_entry), which lacks msi_en at bit 26 and all other
+  extension capability bits. A CSR read from offset 0x0010 always returns bits
+  [31:16]=rrid_transl (all 0s, since init=0 and write path disabled) and
+  [15:0]=prio_entry. Bit 26 (msi_en) is therefore always 0. Software reading
+  HWCFG2 concludes MSI extension is absent and skips MSI interrupt
+  configuration. This is the concrete manifestation of function_loss.
+  Additionally, no read entries exist for ERR_MSIADDR (0x0078) or ERR_MSIADDRH
+  (0x007C) — these offsets fall through to the default (0), further confirming
+  the MSI address registers are inaccessible.
+  | regcfg_dout := MuxLookup(addr_offset, 0.U)(Seq(
+  |     ...
+  |     IopmpParams.reg_hwcfg2_addr_offset         -> reg_hwcfg2.toUInt,
+  |     ...
+  | ))
+  References:
+    - riscv-iopmp/extensions/registers.adoc:91-108
+      "HWCFG2 read must return msi_en at bit 26 per the register layout"
+
+[potential_risk] ChiselIOPMP/src/main/scala/IopmpChecker.scala:737-757  RegMapIO (output signals)
+  RegMapIO exposes o_reg_errcfg_msi_en (line 753) with the old name. After the
+  rename to msi_sel, this should be renamed to o_reg_errcfg_msi_sel.
+  Additionally, no output exists for o_reg_hwcfg2_msi_en (the capability bit)
+  which downstream consumers like the Ctrl module would need to gate MSI
+  behavior. The signal o_reg_errcfg_msi_en wires to reg_errcfg.msi_en (line
+  878) but is never consumed by Ctrl (Ctrl only references o_reg_errcfg_ie for
+  interrupt enable and o_reg_errinfo_v for error valid status).
+  | val o_reg_errcfg_ie = Output(UInt(1.W)) // interrupt enable
+  | val o_reg_errcfg_rs = Output(UInt(1.W)) // bus response suppression
+  | val o_reg_errcfg_msi_en = Output(UInt(1.W)) // MSI enable
+  | val o_reg_errcfg_msidata = Output(UInt(11.W)) // MSI data
+
+[potential_risk] ChiselIOPMP/src/main/scala/IopmpChecker.scala:497-497  RegHwcfg0.addrh_en (documentation comment)
+  HWCFG0.addrh_en comment documents the OLD gating rule: 'ERR_MSIADDRH (if
+  ERR_CFG.msi_en = 1) are available'. In the new spec (msi.adoc line 10),
+  ERR_MSIADDRH availability is gated by HWCFG2.msi_en (capability), NOT
+  ERR_CFG.msi_sel (runtime selection): 'ERR_MSIADDRH is available only when
+  HWCFG0.addrh_en = 1 and HWCFG2.msi_en = 1'. The actual hardware is benign
+  (addrh_en is hardwired to 1 at line 47, read-only), but the documented
+  dependency references the wrong register. This matters if addrh_en were ever
+  made conditional or if the comment is relied on by verification.
+  | val addrh_en = UInt(1.W) // [R] Indicate if ENTRY_ADDRH(i) and ERR_MSIADDRH (if ERR_CFG.msi_en = 1) are available
+  References:
+    - riscv-iopmp/extensions/msi.adoc:10-10
+      "ERR_MSIADDRH is available only when HWCFG0.addrh_en = 1 and
+      HWCFG2.msi_en = 1."
+

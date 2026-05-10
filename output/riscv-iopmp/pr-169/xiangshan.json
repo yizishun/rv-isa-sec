@@ -1,0 +1,167 @@
+{
+  "pr_number": 169,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 169,
+    "violation_condition": "IOPMP hardware checker RTL implemented against the pre-PR spec where instruction fetch permission checking is gated behind HWCFG2[26] (chk_x). Post-PR, chk_x is removed and bit 26 becomes reserved. If the RTL still evaluates chk_x as an internal enable signal for the x-permission check datapath — and software compliant with the new spec leaves HWCFG2[26]=0 (as reserved bits should be zero) — the entire instruction fetch permission checking pipeline is silently disabled. Every instruction fetch transaction passes regardless of ENTRY_CFG.x or no_x settings, because the hardware AND-gate at the check output is driven by chk_x=0.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "HWCFG2.*chk_x|chk_x.*HWCFG2|instruction.fetch.*enable.*gate|fetch_check_en.*HWCFG2\\[26\\]|HWCFG2\\[26\\].*inst_fetch|chk_x.*&&.*x_permission|x_perm.*chk_x",
+    "affected_entities": [
+      "HWCFG2",
+      "ENTRY_CFG",
+      "ERR_INFO.ttype",
+      "ERR_INFO.etype"
+    ],
+    "summary": "Removal of chk_x gating bit from baseline creates silent instruction-fetch bypass if RTL still uses HWCFG2[26] as fetch-check enable; software writes 0 to reserved bits but hardware interprets it as 'disable all instruction fetch checking'"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "IopmpParams (line 38-39)",
+        "line_start": 38,
+        "line_end": 39,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "chk_x hardwired to 0 ('unsupport instruction fetch check'). Post-PR per v0.8.2, instruction fetch permission (ENTRY_CFG.x, ttype=0x03, etype=0x03) is baseline. Hardwiring chk_x=0 means every instruction fetch silently bypasses all x-permission checking.",
+      "snippet": "val chk_x = 0    // [R   ] unsupport instruction fetch check\nval no_x  = 0    // [R   ] unsupport instruction fetch check",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "iopmp_ref_model/include/iopmp_registers.h",
+          "line_start": 584,
+          "line_end": 595,
+          "excerpt": "ENTRY_CFG: struct { uint32_t x : 1; /* The instruction fetch permission to the protected memory region. */ ...}"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegHwcfg0.toUInt (line 516)",
+        "line_start": 516,
+        "line_end": 516,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "chk_x and no_x are bit-packed into HWCFG0 (offset 0x0008, bits 10-11) instead of HWCFG3 (offset 0x0010, bits 27-28 per v0.8.2). The CSR offset is wrong and fields are in the wrong register. Software reading the spec-defined CSR address will see unrelated bits.",
+      "snippet": "def toUInt: UInt = Cat(..., no_w, no_x, chk_x, rrid_transl_prog, ...)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "iopmp_ref_model/include/iopmp_registers.h",
+          "line_start": 155,
+          "line_end": 191,
+          "excerpt": "HWCFG3: xinr at bit 27, no_x at bit 28, no_w at bit 29. chk_x is removed post-PR; instruction fetch is baseline."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl.sMatching (lines 1133-1143)",
+        "line_start": 1133,
+        "line_end": 1143,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The FSM permission check only evaluates entry_attribute.r (read) and entry_attribute.w (write). entry_attribute.x is read from SRAM (line 429) and latched (line 1272) but never evaluated. No etype=0x3 (illegal instruction fetch) is ever assigned. Every instruction fetch passes unchecked.",
+      "snippet": "is(State.sMatching) {\n  when(req.rw && !entry_attribute.w || ...) { etype := 0x2.U; state := State.sErr }\n  .elsewhen(!req.rw && !entry_attribute.r) { etype := 0x1.U; state := State.sErr }\n  .otherwise { state := State.sDone }\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "iopmp_ref_model/include/iopmp_registers.h",
+          "line_start": 334,
+          "line_end": 338,
+          "excerpt": "etype: 0x03 = illegal instruction fetch. RTL never sets etype to 0x3."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "ReqBundle (lines 988-993)",
+        "line_start": 988,
+        "line_end": 993,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ReqBundle has only 'rw' (Bool) to distinguish read vs write. No field encodes instruction-fetch transaction type. The bridge cannot communicate the transaction type needed for x-permission checking to the checker.",
+      "snippet": "class ReqBundle extends Bundle {\n  val rrid = UInt(...); val pa = UInt(...)\n  val rw = Bool(); val len = UInt(...)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "iopmp_ref_model/include/iopmp_req_rsp.h",
+          "line_start": 24,
+          "line_end": 28,
+          "excerpt": "Enumerates transaction types: read, write, instruction fetch (INSTR_FETCH = 3)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RspBundle (lines 997-1000)",
+        "line_start": 997,
+        "line_end": 1000,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "RspBundle has only cf_r and cf_w (check-fail flags). cf_x (check-fail for instruction fetch) is missing. Even if the checker detected a fetch violation, there is no response channel to carry it to the bridge.",
+      "snippet": "class RspBundle extends Bundle{\n  val cf_r = UInt(1.W); val cf_w = UInt(1.W)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "iopmp_ref_model/include/iopmp_registers.h",
+          "line_start": 334,
+          "line_end": 338,
+          "excerpt": "etype 0x03 = illegal instruction fetch. Requires cf_x in response bundle."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl ttype assignment (lines 1166-1172)",
+        "line_start": 1166,
+        "line_end": 1172,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ttype is derived from req.rw: write→0x2, else→0x1 (read). No path to set ttype=0x3 (instruction fetch). Instruction fetch violations would be mis-logged as read violations in ERR_INFO.ttype.",
+      "snippet": "when (io.req.bits.rw) { ttype := 0x2.U }\n.otherwise { ttype := 0x1.U }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "iopmp_ref_model/include/iopmp_registers.h",
+          "line_start": 326,
+          "line_end": 330,
+          "excerpt": "ttype: 0x03 = instruction fetch. RTL only encodes 0x01 and 0x02."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl interrupt logic (lines 1307-1318)",
+        "line_start": 1307,
+        "line_end": 1318,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Interrupt decision checks sire (suppress read irq) and siwe (suppress write irq) but never sixe (suppress instruction fetch irq). entry_attribute.sixe is read from SRAM (line 433) but dead — never evaluated.",
+      "snippet": "when(...ttype === 1.U && !entry_attribute.sire) { io.int := true.B }\n.elsewhen(...ttype === 2.U && !entry_attribute.siwe) { io.int := true.B }\n.otherwise { io.int := false.B }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-iopmp",
+          "file_path": "iopmp_ref_model/include/iopmp_registers.h",
+          "line_start": 603,
+          "line_end": 605,
+          "excerpt": "sixe: Suppress interrupt on an illegal instruction fetch caught by the entry. RTL never checks this bit."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

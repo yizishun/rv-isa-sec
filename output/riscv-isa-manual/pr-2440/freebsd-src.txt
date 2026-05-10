@@ -1,0 +1,97 @@
+PR #2440  target=freebsd-src  overall=potential_risk
+Spec: FreeBSD's page_fault_handler and trap delivery code read stval (tf_stval) without pointer-masking awareness — if Ssnpm is ever enabled, the hardware writes a pointer-masked address to stval for data-access faults, but the kernel treats it as an untransformed address, risking incorrect VIRT_IS_VALID rejection of valid masked addresses or leaking tag bits to userspace via siginfo
+Violation:
+  In the FreeBSD kernel, when pointer masking is enabled via senvcfg.PMM
+  (Ssnpm) for user mode, the page_fault_handler in trap.c reads tf_stval and
+  uses it directly for VIRT_IS_VALID checks, signal delivery via
+  call_trapsignal (SIGSEGV addr), and vm_fault_trap lookups — all without
+  distinguishing whether stval holds the raw tagged address or the hardware-
+  transformed (pointer-masked) address. The spec now clarifies that stval
+  receives the pointer-masked address only for accesses subject to PM (data
+  loads/stores), not for instruction fetches or implicit accesses. Code that
+  blindly treats stval as always-raw or always-masked will misclassify
+  faulting addresses under mixed PM/non-PM access scenarios.
+Consequence: info_leak
+Pattern:
+  tf_stval used without smpm_unmask() or equivalent PM-awareness wrapper;
+  VIRT_IS_VALID() applied to unmasked stval; call_trapsignal receiving
+  hardware-masked stval as siginfo si_addr; page_fault_handler comparing stval
+  >= VM_MIN_KERNEL_ADDRESS on masked address
+------------------------------------------------------------
+[potential_risk] sys/riscv/riscv/trap.c:228-228  page_fault_handler
+  tf_stval is read directly without any pointer-masking awareness. When Ssnpm
+  is enabled (senvcfg.PMM != 0), hardware applies the ignore-transformation to
+  stval for data load/store page faults but NOT for instruction fetch page
+  faults (norm:pm_not_apply_implicit). The handler makes no distinction based
+  on scause (data vs instruction fault), so it cannot determine whether the
+  address in stval is raw or masked. Since FreeBSD currently does not
+  implement Ssnpm, this is latent — but if PM were ever enabled (by future
+  kernel code, M-mode firmware Smnpm, or bhyve VU-mode PM), the handler would
+  silently treat masked and unmasked addresses identically.
+  | stval = frame->tf_stval;
+
+[potential_risk] sys/riscv/riscv/trap.c:231-235  page_fault_handler
+  VIRT_IS_VALID() is applied to stval without unmasking. For data page faults
+  with PM enabled, stval holds the pointer-masked (transformed) address, not
+  the raw tagged address. Since the ignore transformation sign-extends the
+  PMLEN+1st bit, the masked address will typically be canonical — but the
+  validity check is semantically operating on a transformed address while the
+  caller (e.g., call_trapsignal) passes this same masked value as si_addr to
+  userspace, creating confusion about which address type is being reported.
+  Currently latent because FreeBSD does not enable PM.
+  | if (!VIRT_IS_VALID(stval)) {
+  |   call_trapsignal(td, SIGSEGV, SEGV_MAPERR, (void *)stval,
+  |       frame->tf_scause & SCAUSE_CODE);
+  |   goto done;
+  | }
+
+[potential_risk] sys/riscv/riscv/trap.c:245-245  page_fault_handler
+  Kernel-mode fault path compares stval >= VM_MIN_KERNEL_ADDRESS
+  (0xffffffc000000000) without PM-awareness. If Smnpm (M-mode PM for S-mode)
+  were ever enabled, a masked supervisor-mode data fault would have its upper
+  bits zero-extended per the physical-address ignore transformation
+  (norm:pm_ignore_pa), potentially misclassifying a user-space access as a
+  kernel-space access or vice versa. Currently latent — FreeBSD does not
+  configure menvcfg.PMM.
+  | if (stval >= VM_MIN_KERNEL_ADDRESS) {
+
+[potential_risk] sys/riscv/riscv/trap.c:254-254  page_fault_handler
+  va = trunc_page(stval) is computed from the raw/unmasked stval for
+  vm_fault_trap. When PM is enabled for data faults, the hardware-transformed
+  address is the one that physically faulted, so using the masked stval is
+  technically correct for the re-fault attempt. However, if the handler
+  performed any address-range checks or comparisons between stval and the
+  original user-supplied pointer (which it currently does not),
+  inconsistencies would arise.
+  | va = trunc_page(stval);
+
+[potential_risk] sys/riscv/riscv/trap.c:272-276  page_fault_handler
+  vm_fault_trap failure path calls call_trapsignal with stval as si_addr
+  without PM-awareness. For a data page fault with PM enabled, si_addr
+  receives the masked address; for an instruction page fault it receives the
+  raw address. Userspace signal handlers (SIGSEGV handler receiving siginfo_t)
+  cannot distinguish which type was delivered and may incorrectly attempt to
+  unmask an already-unmasked instruction-fault address, or use a masked data-
+  fault address as-is for debugging/memory analysis.
+  | error = vm_fault_trap(map, va, ftype, VM_FAULT_NORMAL, &sig, &ucode);
+  | if (error != KERN_SUCCESS) {
+  |   if (usermode) {
+  |     call_trapsignal(td, sig, ucode, (void *)stval,
+  |         frame->tf_scause & SCAUSE_CODE);
+
+[not_implemented] sys/riscv/riscv/trap.c:204-304  page_fault_handler
+  The entire page_fault_handler has no pointer-masking awareness. There is no
+  smpm_unmask() wrapper, no PMLEN query, no scause-based discrimination
+  between masked (data) and unmasked (instruction) stval values. The function
+  uniformly assumes stval is always a raw, untransformed address. FreeBSD does
+  not implement Ssnpm (no PMM configuration in senvcfg, no PM enable/disable
+  paths, no boot-time PM setup), so this is currently a missing-feature gap
+  rather than an active bug.
+  | static void
+  | page_fault_handler(struct trapframe *frame, int usermode)
+  | {
+  |   struct vm_map *map;
+  |   uint64_t stval;
+  |   ...
+  |   stval = frame->tf_stval;
+

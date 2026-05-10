@@ -1,0 +1,216 @@
+PR #2400  target=xiangshan  overall=compliant
+Spec: menvcfg/henvcfg.ADUE changes require SFENCE.VMA/HFENCE.VVMA synchronization—XiangShan TLB/PTW must not cache A/D-update policy across ADUE writes, or stale cached translations will silently apply wrong A/D-bit behavior, breaking page eviction correctness and guest isolation
+Violation:
+  When menvcfg.ADUE or henvcfg.ADUE is written but the corresponding fence
+  (SFENCE.VMA/HFENCE.GVMA/HFENCE.VVMA with rs1=x0 and rs2=x0) is not executed
+  before the next address translation, the TLB or PTW-level translation caches
+  in XiangShan may contain stale entries that reflect the old A/D-bit-update
+  policy. Specifically: (1) if ADUE transitions 1→0, cached translations may
+  still trigger hardware A/D-bit updates by the PTW instead of raising page-
+  fault exceptions as required under Svade behavior; (2) if ADUE transitions
+  0→1, cached translations may incorrectly raise page-fault exceptions when
+  hardware should silently set A/D bits. In a hypervisor context, if
+  henvcfg.ADUE is changed without executing HFENCE.VVMA, VS-stage translations
+  cached under the active VMID continue using the old policy, enabling one
+  guest to observe A/D-bit side effects that differ from the hypervisor's
+  intended configuration. If the world-switch sequence does not place
+  henvcfg.ADUE write between zeroing vsatp and writing the new vsatp,
+  speculative execution can cache cross-VMID translations with inconsistent
+  ADUE interpretation.
+Consequence: privilege_escape
+Pattern:
+  menvcfg.ADUE OR henvcfg.ADUE sampled into TLB/PTW translation context
+  without fence-triggered invalidation; ADUE bit propagated into page-walker
+  FSM without SFENCE.VMA/HFENCE.VVMA flush path; translation cache valid bit
+  not cleared on menvcfg/henvcfg ADUE write; world-switch logic reordering
+  henvcfg.ADUE write relative to vsatp zero/store sequence
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:67-71  EnvCfg.ADUE
+  ADUE is correctly defined at bit 61 as RO with reset=0 in the EnvCfg base
+  class. Per spec norm:menvcfg_adue_rdonly0 (machine.adoc:2213), since Svadu
+  is not implemented, ADUE must be read-only zero. This matches the spec
+  requirement.
+  | abstract class EnvCfg extends CSRBundle {
+  |   val ADUE = RO(61).withReset(0.U).withDescription("Enable hardware A/D-bit update during page-table walks from the Svadu extension.")
+  References:
+    - riscv-isa-manual/src/priv/svadu.adoc:6-8
+      "If the Svadu extension is implemented, the menvcfg.ADUE field is
+      writable. If the hypervisor extension is additionally implemented,
+      the henvcfg.ADUE f"
+    - riscv-isa-manual/src/priv/machine.adoc:2213-2215
+      "If Svadu is not implemented, ADUE is read-only zero. Furthermore,
+      for implementations with the hypervisor extension, henvcfg.ADUE is
+      read-only zero if"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:712-722  MEnvCfg
+  MEnvCfg extends EnvCfg and promotes STCE, PBMTE, and DTE to RW but does NOT
+  promote ADUE to RW. ADUE remains RO=0 inherited from the base class. Since
+  Svadu is not implemented (ISA string declares 'svade' only), this is correct
+  behavior per norm:menvcfg_adue_rdonly0.
+  | class MEnvCfg extends EnvCfg {
+  |   if (CSRConfig.EXT_SSTC) { this.STCE.setRW().withReset(1.U) }
+  |   this.PBMTE.setRW().withReset(0.U)
+  |   if (CSRConfig.EXT_DBLTRP) { this.DTE.setRW().withReset(0.U) }
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2213-2213
+      "If Svadu is not implemented, ADUE is read-only zero."
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:364-374  HEnvCfg
+  HEnvCfg extends EnvCfg and promotes STCE, PBMTE, DTE to RW but does NOT
+  promote ADUE to RW. ADUE remains RO=0 inherited from the base class. Since
+  menvcfg.ADUE=0 forces henvcfg.ADUE to be read-only zero per
+  norm:menvcfg_adue_henvcfg_adue_rdonly0, this is correct.
+  | class HEnvCfg extends EnvCfg {
+  |   if (CSRConfig.EXT_SSTC) { this.STCE.setRW().withReset(1.U) }
+  |   this.PBMTE.setRW().withReset(0.U)
+  |   if (CSRConfig.EXT_DBLTRP) { this.DTE.setRW().withReset(0.U) }
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2214-2215
+      "for implementations with the hypervisor extension, henvcfg.ADUE is
+      read-only zero if menvcfg.ADUE is zero."
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:941-947  NewCSR (resetSatp)
+  resetSatp only triggers on writes to satp, vsatp, hgatp (and optionally
+  mbmc). Writes to menvcfg (0x30A) or henvcfg (0x60A) do NOT trigger resetSatp
+  and therefore do NOT cause flushPipe. If ADUE were ever promoted to RW for
+  Svadu support, writing ADUE would not flush the frontend pipeline, allowing
+  instructions already in flight to execute under the old A/D update policy.
+  The spec (norm:menvcfg_adue_fence at machine.adoc:2217) requires SFENCE.VMA
+  after ADUE change — there is no hardware enforcement.
+  | val resetSatp = WireInit(false.B)
+  | resetSatp := Cat(Seq(satp, vsatp, hgatp).map(_.addr.U === addr)).orR && wenLegalReg
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2217-2219
+      "After changing menvcfg.ADUE, executing an SFENCE.VMA instruction
+      with rs1=x0 and rs2=x0 suffices to synchronize address-translation
+      caches with respec"
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1480-1486  NewCSR (CSR-to-TLB forwarding)
+  The CSR-to-TLB interface forwards menvcfg.PBMTE and henvcfg.PBMTE to
+  io.tlb.mPBMTE/io.tlb.hPBMTE via RegNext, but there is no equivalent
+  forwarding for ADUE. If ADUE were made RW, there is no wire to propagate the
+  ADUE value from the CSR module to the TLB/PTW translation context. The
+  TlbCsrBundle (Bundle.scala:536-537) also lacks mADUE/hADUE fields. Compare:
+  PBMTE has full plumbing CSR->TlbCsrBundle->TLB flush gates->PTW isPf checks.
+  ADUE has none of this.
+  | io.tlb.mPBMTE := RegNext(menvcfg.regOut.PBMTE.asBool)
+  | io.tlb.hPBMTE := RegNext(henvcfg.regOut.PBMTE.asBool)
+  | io.tlb.pmm.menvcfg := RegNext(menvcfg.regOut.PMM.asUInt)
+  | io.tlb.pmm.henvcfg := RegNext(henvcfg.regOut.PMM.asUInt)
+
+[potential_risk] src/main/scala/xiangshan/cache/mmu/TLB.scala:69-70  TLB (flush_mmu)
+  TLB flush_mmu gate: sfence.valid || csr.satp.changed || csr.vsatp.changed ||
+  csr.hgatp.changed || csr.priv.virt_changed. No menvcfg/henvcfg change
+  detection. If ADUE were RW, L1 TLB entries cached under the old ADUE policy
+  would survive a menvcfg/henvcfg write. The spec (norm:menvcfg_adue_fence)
+  relies on software to issue SFENCE.VMA — the hardware does not auto-flush —
+  but the gap is that stale entries with cached A/D interpretation are not
+  invalidated by any mechanism other than explicit fence.
+  | val flush_mmu = sfence.valid || csr.satp.changed || csr.vsatp.changed || csr.hgatp.changed || csr.priv.virt_changed
+
+[potential_risk] src/main/scala/xiangshan/cache/mmu/L2TLB.scala:91-91  L2TLB (flush gate)
+  L2TLB flush gate uses identical exclusion pattern: sfence_dup(0).valid ||
+  satp.changed || vsatp.changed || hgatp.changed || priv.virt_changed. No
+  menvcfg/henvcfg change detection. Cached L2TLB PTE entries with stale ADUE
+  interpretation survive menvcfg/henvcfg writes.
+  | val flush = sfence_dup(0).valid || satp.changed || vsatp.changed || hgatp.changed || priv.virt_changed
+
+[potential_risk] src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala:120-120  PTW (flush gate)
+  PTW FSM flush gate: io.sfence.valid || io.csr.satp.changed ||
+  io.csr.vsatp.changed || io.csr.hgatp.changed || io.csr.priv.virt_changed. No
+  menvcfg/henvcfg change detection. An in-progress page walk that started
+  under the old ADUE policy would not be killed by a menvcfg/henvcfg ADUE
+  write, meaning it could complete a translation under inconsistent A/D
+  interpretation rules.
+  | val flush = io.sfence.valid || io.csr.satp.changed || io.csr.vsatp.changed || io.csr.hgatp.changed || io.csr.priv.virt_changed
+
+[potential_risk] src/main/scala/xiangshan/cache/mmu/PageTableCache.scala:221-222  PageTableCache (flush_dup)
+  PTW page-table cache (L0/L1/L2/L3/SP entries) flush gate: sfence_dup.valid
+  || satp.changed || vsatp.changed || hgatp.changed || virt_changed. No
+  menvcfg/henvcfg change detection. Cached PTEs that were validated under the
+  old ADUE policy (e.g., an entry cached as 'onlyPf' because A=0 under ADUE=0)
+  would be reused after ADUE transitions to 1, incorrectly faulting when
+  hardware should instead set A/D bits.
+  | val flush_dup = sfence_dup.valid || satp.changed || vsatp.changed || hgatp.changed || virt_changed
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:2109-2112
+      "Similarly, if the setting of the PBMTE or ADUE bits in menvcfg are
+      changed, an HFENCE.GVMA instruction with rs1=x0 and rs2=x0 suffices
+      to synchronize "
+
+[compliant] src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:765-783  PteBundle.isPf
+  PteBundle.isPf(level, pbmte) performs page-fault checking with PTE validity
+  rules but does NOT accept an 'adue' parameter. For Svade (ADUE=0), A/D bit
+  absence on non-leaf PTEs causes a fault (line 772: perm.a || perm.d for non-
+  leaf), and for leaf PTEs the A/D check is deferred to TLB.perm_check. Since
+  ADUE is hardwired RO=0 and the design implements Svade-only, this is correct
+  — no ADUE gating is needed. The function signature matches the current
+  Svade-only design intent.
+  | def isPf(level: UInt, pbmte: Bool) = {
+  |   val pf = WireInit(false.B)
+  |   when (isNext()) {
+  |     pf := (perm.u || perm.a || perm.d || n =/= 0.U || pbmt =/= 0.U)
+  |   } ...
+
+[compliant] src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:787-807  PteBundle.isGpf
+  PteBundle.isGpf(level, pbmte) correctly faults on !perm.a for G-stage leaf
+  entries (line 803-804) in Svade mode. Since ADUE is RO=0, this
+  unconditionally-Svade behavior is correct. The G-stage only checks A-bit
+  (D-bit deferred to L1TLB) per the comment at line 785-786.
+  | }.elsewhen (!perm.a) {
+  |   gpf := true.B
+  | }
+  | // Line 785-786: G-stage which for supporting VS-stage is LOAD type, only need to check A bit. The check of D bit is in L1TLB.
+
+[compliant] src/main/scala/xiangshan/cache/mmu/TLB.scala:424-426  TLB.perm_check
+  TLB perm_check correctly implements Svade behavior:
+  ldUpdate/stUpdate/instrUpdate treat missing A/D bits as page-fault
+  exceptions. Since ADUE is hardwired RO=0 and Svadu is not implemented,
+  unconditionally treating A/D absence as page faults is correct per
+  norm:Svadu_disabled_hw_update_falls_back_to_svade (svadu.adoc:12-13).
+  | val ldUpdate = !perm.a && isLd       // update A/D through exception
+  | val stUpdate = (!perm.a || !perm.d) && isSt  // update A/D through exception
+  | val instrUpdate = !perm.a && isInst  // update A/D through exception
+  References:
+    - riscv-isa-manual/src/priv/svadu.adoc:12-13
+      "When hardware updating of A/D bits is disabled, the Svade
+      extension, which mandates exceptions when A/D bits need be set,
+      instead takes effect."
+
+[compliant] src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala:115-180  PTW (hardware A/D update — not implemented)
+  The PTW has no hardware PTE A/D-bit modify-and-writeback logic. When a leaf
+  PTE has A=0 or D=0, pageFault=true via pte.isPf(level, s1Pbmte) at line 175.
+  No atomic RMW or PTE writeback for A/D bits exists anywhere in the PTW FSM.
+  Since ADUE is RO=0 and the design implements only Svade (software-managed
+  A/D), the absence of hardware A/D update logic is correct and matches the
+  declared ISA string ('svade' at Parameters.scala:300).
+  | val pageFault = pte.isPf(level, s1Pbmte)
+  | val find_pte = pte.isLeaf() || ppn_af || pageFault
+
+[compliant] src/main/scala/xiangshan/Parameters.scala:300-300  ISA string
+  ISA string declares 'svade' (software-managed A/D) and omits 'svadu'. This
+  is consistent with the RTL implementation which has ADUE as RO=0, implements
+  Svade behavior in all TLB/PTW components, and has no hardware PTE A/D update
+  logic. Correct per spec norm:menvcfg_adue_rdonly0.
+  | "sv48", "svade", "svbare", "svinval", ...
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2213-2213
+      "If Svadu is not implemented, ADUE is read-only zero."
+
+[compliant] src/main/scala/xiangshan/Bundle.scala:536-537  TlbCsrBundle
+  TlbCsrBundle carries mPBMTE and hPBMTE for PBMT forwarding to the MMU but
+  has no mADUE/hADUE fields. Since ADUE is hardwired RO=0 and Svadu is not
+  implemented, this is correct — no ADUE propagation is needed. The bundle
+  only carries fields that affect active translation behavior.
+  | val mPBMTE = Bool()
+  | val hPBMTE = Bool()
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1451-1453  NewCSR (TlbCsrBundle ADUE change detection)
+  ASID/VMID change detection signals (satpASIDChanged, vsatpASIDChanged,
+  hgatpVMIDChanged) exist and are wired to TLB for invalidation. No equivalent
+  menvcfgADUEChanged or henvcfgADUEChanged exists. Since ADUE is RO=0, this is
+  correct — there is no ADUE transition to detect.
+  | io.tlb.satpASIDChanged := GatedValidRegNext(satp.w.wen && satp.regOut.ASID =/= satp.w.wdataFields.ASID)
+

@@ -1,0 +1,87 @@
+PR #2361  target=xiangshan  overall=not_implemented
+Spec: Clarification that ctrtarget must hold sequential PC (PC+ilen) for not-taken branches; hardware CTR recorder must compute next-PC from retired instruction size, not reuse branch predictor's predicted target, especially on mispredicted-conditional branches where predictor state differs from architectural execution path
+Violation:
+  In XiangShan RTL, when the CTR recording logic (likely in the commit/retire
+  stage) records a not-taken conditional branch (ctrctl.NTBREN=1), if
+  ctrtarget is assigned from the branch predictor's computed target address
+  (e.g., ftq_pc or predicted target from FTQ/TAGE) instead of the actual next
+  sequential PC (current PC + ilen where ilen is 2 or 4 based on RVC), the
+  implementation violates the clarified spec. This is most likely to occur
+  when a conditional branch is mispredicted as taken: the frontend predicted a
+  target, but the branch resolved as not-taken, and the CTR recording logic
+  incorrectly latches the predicted target rather than computing PC+ilen from
+  the actual retired instruction.
+Consequence: info_leak
+Pattern:
+  ctrtarget\s*:?=.*(?:predictedTarget|ftq_pc|pred_tgt|branchTarget|btbTarget)|
+  when\(.*notTaken.*\).*ctrtarget|WireInit.*ctrtarget.*io.*pred
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/backend/trace/Interface.scala:64-144  Itype
+  The Itype enumeration defines transfer type encodings (NonTaken=4, Taken=5)
+  matching the RISC-V E-trace/CTR itype spec. However, this is solely for the
+  trace encoder interface — no CTR recording logic (ctrtarget, ctrsource,
+  ctrdata registers) exists. The Itype enum is infrastructure that CTR would
+  use if implemented, but the CTR hardware itself is absent.
+  | object Itype extends NamedUInt(4) {
+  |   def NonTaken = 4.U    //commit
+  |   def Taken    = 5.U    //commit
+  |   ...
+  |   def isBranch(itype: UInt) = Seq(NonTaken, Taken).map(_ === itype).reduce(_ || _)
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:316-318
+      "#[#norm:ctrtarget_pc_next_br]#For a not-taken branch, `ctrtarget`
+      holds the PC of the next sequential instruction following the
+      branch."
+
+[not_implemented] src/main/scala/xiangshan/backend/rob/Rob.scala:1086-1090  Rob
+  The ROB updates itype from NonTaken to Taken when a branch resolves as taken
+  (correcting the conservative decode-time NonTaken assumption). This is trace
+  infrastructure, not CTR recording. There is no ctrtarget assignment for not-
+  taken branches, no NTBREN gate logic, and no CTR entry buffer management.
+  | val taken = branchWBs.map(writeback => writeback.valid && writeback.bits.robIdx.value === i.U && writeback.bits.redirect.get.bits.taken).reduce(_ || _)
+  | when(robEntries(i).valid && Itype.isNonTaken(robEntries(i).traceBlockInPipe.itype) && taken){
+  |   robEntries(i).traceBlockInPipe.itype := Itype.Taken
+  | }
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:85-85
+      "NTBREN | #[#norm:mctrctl_ntbren_op]#Enable recording of not-taken
+      branches."
+
+[not_implemented] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:66-162  CSRs
+  CSR address constants for sctrctl (0x14e), vsctrctl (0x24e), mctrctl
+  (0x34e), sctrstatus (0x14f), and sctrdepth (0x15f) are defined and added to
+  the supervisor/machine CSR address lists. However, no CSRModule
+  implementations exist for any of these registers in the NewCSR/ directory.
+  The addresses are enumerated for access permission checking only.
+  | sctrctl = 0x14e
+  | sctrstatus = 0x14f
+  | sctrdepth = 0x15f
+  | vsctrctl = 0x24e
+  | mctrctl = 0x34e
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:25-110
+      "The `mctrctl` register is a 64-bit read/write register that enables
+      and configures the CTR capability."
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:78-78  MenvcfgBundle
+  The menvcfg.LPE bit (Zicfilp landing-pad enable) is defined as read-only 0,
+  confirming the Zicfilp extension is not implemented. This is tangentially
+  related to CTR (control flow integrity) but is a separate extension.
+  | val LPE = RO(2).withReset(0.U).withDescription("Enable the Zicfilp landing-pad extension.")
+
+[not_implemented] src/main/scala/xiangshan/backend/trace/Trace.scala:19-65  Trace
+  The Trace module receives commit info from the ROB (traceBundle with ftqIdx,
+  ftqOffset, itype, iretire, ilastsize) and pipelines it through a trace
+  buffer to the encoder. This is purely trace infrastructure — there is no CTR
+  buffer, no ctrtarget register, no NTBREN-gated recording, and no CTR CSR
+  indirect-access logic.
+  | val fromRob = Flipped(new TraceBundle(hasIaddr = false, CommitWidth, IretireWidthCommited))
+  | ...
+  | toPcMem := s3_in_groups
+  | io.out.toEncoder := s3_out_groups
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:286-287
+      "The CTR buffer entries are logically accessed via the indirect
+      register access mechanism defined by the Sscsrind extension. The
+      `siselect` index range"
+

@@ -1,0 +1,198 @@
+PR #2482  target=linux  overall=potential_risk
+Spec: CBO instructions are now unambiguously permission-checked: cbo.clean/flush/inval consume read permission, cbo.zero consumes write permission at both PTE and PMP levels, closing hardware-level privilege-escape vectors where implementations could silently allow cache-block operations across permission boundaries
+Violation:
+  In the Linux kernel, S/U-mode code (or M-mode with MPRV) executes a cache-
+  block management instruction (cbo.clean, cbo.flush, cbo.inval) targeting a
+  virtual address whose PTE has R=0 or whose PMP region has R=0, or executes
+  cbo.zero targeting a virtual address whose PTE has W=0 or whose PMP region
+  has W=0. The hardware now explicitly raises a load/store page-fault or
+  access-fault where previously non-enforcement was implementation-defined,
+  exposing kernel assumptions that CBO operations succeed without explicit
+  permission checks.
+Consequence: privilege_escape
+Pattern:
+  (CBO_ZERO|CBO_INVAL|CBO_CLEAN|CBO_FLUSH)\s*\(.*\) without prior PTE
+  permission validation (pte_write|pte_read) on the target address; or
+  userspace-accessible code path issuing CBO without PTE R/W checks
+------------------------------------------------------------
+[compliant] arch/riscv/mm/dma-noncoherent.c:18-29  arch_dma_cache_wback
+  Uses phys_to_virt() to convert DMA physical address to direct-map virtual
+  address, then ALT_CMO_OP(CLEAN). The direct map always has R=1,W=1 PTE
+  permissions for RAM pages, so cbo.clean (which requires PTE R=1 per
+  supervisor.adoc norm:load_page_fault_no_r) is satisfied. Physical addresses
+  come from the DMA API, not userspace — this is trusted kernel
+  infrastructure.
+  | static inline void arch_dma_cache_wback(phys_addr_t paddr, size_t size)
+  | {
+  | 	void *vaddr = phys_to_virt(paddr);
+  | 	ALT_CMO_OP(CLEAN, vaddr, size, riscv_cbom_block_size);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1566-1568
+      "Attempting to execute a load, load-reserved, or cache-block
+      management instruction whose effective address lies within a page
+      without read permissions"
+
+[compliant] arch/riscv/mm/dma-noncoherent.c:31-43  arch_dma_cache_inv
+  Same pattern as arch_dma_cache_wback — phys_to_virt() into direct map, then
+  ALT_CMO_OP(INVAL). The direct map provides R=1,W=1 for all RAM pages.
+  cbo.inval requires PTE R=1, which the direct map satisfies. No software-side
+  PTE validation performed, but none needed for kernel direct-map addresses.
+  | static inline void arch_dma_cache_inv(phys_addr_t paddr, size_t size)
+  | {
+  | 	void *vaddr = phys_to_virt(paddr);
+  | 	ALT_CMO_OP(INVAL, vaddr, size, riscv_cbom_block_size);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1566-1568
+      "Attempting to execute a load, load-reserved, or cache-block
+      management instruction whose effective address lies within a page
+      without read permissions"
+
+[compliant] arch/riscv/mm/dma-noncoherent.c:45-57  arch_dma_cache_wback_inv
+  Uses phys_to_virt() into direct map then ALT_CMO_OP(FLUSH). cbo.flush
+  requires PTE R=1. The kernel direct map always provides R=1 for RAM pages,
+  so this is safe. No software PTE walk performed, but the direct-map
+  invariant makes it unnecessary.
+  | static inline void arch_dma_cache_wback_inv(phys_addr_t paddr, size_t size)
+  | {
+  | 	void *vaddr = phys_to_virt(paddr);
+  | 	ALT_CMO_OP(FLUSH, vaddr, size, riscv_cbom_block_size);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1566-1568
+      "Attempting to execute a load, load-reserved, or cache-block
+      management instruction whose effective address lies within a page
+      without read permissions"
+
+[compliant] arch/riscv/mm/dma-noncoherent.c:117-129  arch_dma_prep_coherent
+  Uses page_address() to get the kernel virtual address of a coherent DMA
+  page, then ALT_CMO_OP(FLUSH). Pages from the DMA coherent allocator are
+  kernel-owned and have full R+W in the direct map. cbo.flush requirement of
+  PTE R=1 is satisfied.
+  | void arch_dma_prep_coherent(struct page *page, size_t size)
+  | {
+  | 	void *flush_addr = page_address(page);
+  | 	ALT_CMO_OP(FLUSH, flush_addr, size, riscv_cbom_block_size);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1566-1568
+      "Attempting to execute a load, load-reserved, or cache-block
+      management instruction whose effective address lies within a page
+      without read permissions"
+
+[compliant] arch/riscv/mm/pmem.c:12-21  arch_wb_cache_pmem
+  Issues cbo.clean via ALT_CMO_OP(CLEAN) on PMEM virtual addresses from the
+  NVDIMM subsystem. These are kernel virtual addresses with valid PTE
+  mappings. cbo.clean requires PTE R=1, which kernel-mapped PMEM pages
+  provide. The non-standard cache ops fallback uses virt_to_phys() to convert
+  to physical addresses, bypassing MMU — this also relies on PMP being
+  correctly configured.
+  | void arch_wb_cache_pmem(void *addr, size_t size)
+  | {
+  | 	ALT_CMO_OP(CLEAN, addr, size, riscv_cbom_block_size);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1566-1568
+      "Attempting to execute a load, load-reserved, or cache-block
+      management instruction whose effective address lies within a page
+      without read permissions"
+
+[compliant] arch/riscv/mm/pmem.c:24-33  arch_invalidate_pmem
+  Issues cbo.inval via ALT_CMO_OP(INVAL) on PMEM virtual addresses. cbo.inval
+  requires PTE R=1 per spec. Kernel-mapped PMEM pages satisfy this. No
+  software PTE validation, but addresses are kernel-internal.
+  | void arch_invalidate_pmem(void *addr, size_t size)
+  | {
+  | 	ALT_CMO_OP(INVAL, addr, size, riscv_cbom_block_size);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1566-1568
+      "Attempting to execute a load, load-reserved, or cache-block
+      management instruction whose effective address lies within a page
+      without read permissions"
+
+[compliant] arch/riscv/lib/clear_page.S:20-73  clear_page
+  Uses CBO_ZERO in an unrolled loop to zero pages from the buddy allocator.
+  cbo.zero requires PTE W=1 per supervisor.adoc norm:store_page_fault_no_w.
+  Pages from the buddy allocator are kernel-owned and always have W=1 in the
+  direct map. The function performs no software W-bit validation because it
+  trusts the caller (kernel page allocator). Block-size check at patches
+  ensures the unrolled loop is only used when riscv_cboz_block_size <= 4K.
+  | SYM_FUNC_START(clear_page)
+  | 	li	a2, PAGE_SIZE
+  | 	CBOZ_ALT(12, "j .Lno_zicboz", "nop")
+  | 	lw	a1, riscv_cboz_block_size
+  | 	add	a2, a0, a2
+  | .Lzero_loop:
+  | 	CBO_ZERO(a0)
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1569-1571
+      "Attempting to execute a store, store-conditional, AMO, or cache-
+      block zero instruction whose effective address lies within a page
+      without write permis"
+
+[compliant] arch/riscv/errata/thead/errata.c:88-91  thead_errata_cache_inv
+  T-Head C9xx erratum: uses non-standard CMO instructions (THEAD_INVAL_A0)
+  operating on physical addresses directly, bypassing MMU translation
+  entirely. Registered as noncoherent_cache_ops.inv and called instead of
+  ALT_CMO_OP when CONFIG_ERRATA_THEAD_CMO is set. Physical-address CMO relies
+  on PMP for access control; the kernel configures its own PMP entries at
+  boot. No PTE checks possible since MMU is bypassed.
+  | static void thead_errata_cache_inv(phys_addr_t paddr, size_t size)
+  | {
+  | 	THEAD_CMO_OP(INVAL, paddr, size, riscv_cbom_block_size);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3421-3426
+      "Attempting to execute a load, load-reserved, or cache-block
+      management instruction which accesses a physical address within a
+      PMP region without read "
+
+[potential_risk] arch/riscv/kernel/cpufeature.c:1171-1186  riscv_user_isa_enable
+  Unconditionally sets ENVCFG_CBZE and ENVCFG_CBCFE for init task
+  (current->thread.envcfg), which propagates to all userspace processes via
+  fork() and context switch (__switch_to_envcfg in switch_to.h:84-88). This
+  enables cbo.zero (requires PTE W=1), cbo.clean, and cbo.flush (require PTE
+  R=1) for ALL userspace processes without any per-process opt-in. The spec
+  (cmo.adoc norm:cbm_unperm_fault, norm:cbz_unperm_fault) mandates hardware
+  raises page-faults when PTE permissions are insufficient, and the spec notes
+  this enforcement was previously implementation-defined. On hardware with
+  incomplete CBO permission enforcement, userspace could exploit cbo.zero on
+  read-only mappings or cbo.clean/flush on inaccessible pages. cbo.inval
+  (ENVCFG_CBIE) is correctly NOT enabled for userspace.
+  | void __init riscv_user_isa_enable(void)
+  | {
+  | 	if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOZ))
+  | 		current->thread.envcfg |= ENVCFG_CBZE;
+  | 	if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOM))
+  | 		current->thread.envcfg |= ENVCFG_CBCFE;
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:352-362
+      "A cache-block management instruction is permitted to access the
+      specified cache block whenever a load instruction or store
+      instruction is permitted to"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:373-381
+      "A cache-block zero instruction is permitted to access the specified
+      cache block whenever a store instruction is permitted to access the
+      corresponding "
+
+[compliant] arch/riscv/include/asm/errata_list.h:101-115  ALT_CMO_OP
+  The ALT_CMO_OP macro emits CBO instructions via the RISC-V ALTERNATIVE
+  framework, iterating over cache-block-aligned virtual addresses. It performs
+  address alignment ((_start) & ~((_cachesize) - 1UL)) and loops by
+  incrementing by _cachesize until reaching (_start + _size). No PTE
+  permission validation is performed within the macro — the caller is
+  responsible. This is correct architectural design: PTE enforcement is the
+  hardware's responsibility; the macro is infrastructure, each call site is
+  responsible for address validity.
+  | #define ALT_CMO_OP(_op, _start, _size, _cachesize)
+  | asm volatile(ALTERNATIVE(
+  | 	__nops(5),
+  | 	"mv a0, %1\n\t"
+  | 	"j 2f\n\t"
+  | 	"3:\n\t"
+  | 	CBO_##_op(a0)
+  | 	"add a0, a0, %0\n\t"
+

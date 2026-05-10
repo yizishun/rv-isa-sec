@@ -1,0 +1,46 @@
+PR #714  target=qemu  overall=bug_confirmed
+Spec: QEMU IOMMU never writes back A/D bits to PTEs; GADE/SADE=1 skips checks instead of performing hardware A/D updates, causing stale D=0 for implicit ATS writes to writable pages
+Violation:
+  QEMU's riscv_iommu_spa_fetch() at line 456 checks D-bit as a pass/fail gate
+  but never implements the hardware A/D bit update path (PTE write-back). When
+  GADE/SADE=1 (ade=true), the A/D checks are simply skipped rather than
+  performing the mandated update. Specifically, for ATS no-write=0 requests to
+  a writable page (W=1) with D=0, the spec requires the IOMMU to set D=1 as an
+  implicit side-effect; QEMU's riscv_iommu_process_dbg() sets perm=IOMMU_RW
+  for such requests, subjecting them to the D-bit failure check at line 456
+  (if ade=0) or silently passing without updating the PTE (if ade=1). Neither
+  path correctly updates the D-bit in the page table.
+Consequence: info_leak
+Pattern:
+  ade.*PTE_D|GADE.*SADE.*skip.*update|spa_fetch.*!.*pte.*PTE_D|iotlb-
+  >perm.*IOMMU_WO.*ade.*PTE_D
+------------------------------------------------------------
+[bug_confirmed] hw/riscv/riscv-iommu.c:454-494  riscv_iommu_spa_fetch
+  IOMMU A/D bit hardware update path is incomplete: when GADE/SADE=1
+  (ade=true), the A/D check is skipped at lines 454/456, but no PTE write-back
+  is performed to actually set the A/D bits. Compare with
+  target/riscv/cpu_helper.c:1594-1639 which performs atomic cmpxchg write-back
+  when ADUE=1. This means GADE/SADE=1 provides no actual A/D update — the PTE
+  in memory stays unchanged. If the guest OS later switches to GADE/SADE=0 or
+  if the guest OS expects the A/D bits to have been set, this causes incorrect
+  behavior. For ATS no-write=0 requests (perm=IOMMU_RW), a writable page (W=1)
+  with D=0 will either fail (ade=0) or silently pass without updating D
+  (ade=1). Neither path correctly updates the D bit in the page table.
+  | 454:        } else if ((iotlb->perm & IOMMU_RO) && !ade && !(pte & PTE_A)) {
+  | 455:            break;                /* Access bit not set */
+  | 456:        } else if ((iotlb->perm & IOMMU_WO) && !ade && !(pte & PTE_D)) {
+  | 457:            break;                /* Dirty bit not set */
+  | 458:        } else {
+  | 459:            /* Leaf PTE, translation completed. */
+  | ...
+  | 493:            return 0;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2202-2210
+      "If the Svadu extension is implemented, the ADUE bit controls
+      whether hardware updating of PTE A/D bits is enabled for S-mode and
+      G-stage address trans"
+    - riscv-isa-manual/src/priv/svadu.adoc:6-14
+      "If the Svadu extension is implemented, the menvcfg.ADUE field is
+      writable. translation defines the semantics of hardware updating of
+      A/D bits. When ha"
+

@@ -1,0 +1,35 @@
+PR #2442  target=xiangshan  overall=compliant
+Spec: Hardware writes to *tval must apply pointer masking only when PM is enabled for the effective privilege mode AND the faulting access is an explicit memory access subject to PM; unconditional or mis-gated application of the ignore transform on the *tval write data path writes incorrectly masked trap addresses, leaking tag bits or corrupting the fault address delivered to the trap handler.
+Violation:
+  In XiangShan RTL, when the trap/exception handling logic in the CSR module
+  unconditionally applies the pointer-masking 'ignore' transformation (sign-
+  extension or zero-extension of upper PMLEN bits) to the faulting effective
+  address before writing it to stval/mtval/htval, regardless of (a) whether
+  pointer masking is actually enabled for the privilege mode that was active
+  when the fault occurred (i.e., senvcfg.PMM, menvcfg.PMM, or mseccfg.PMM ==
+  0), or (b) whether the faulting access is an explicit memory access subject
+  to pointer masking (e.g., instruction fetch page faults, page-table walk
+  faults, and HLVX.* faults are NOT subject to PM). The spec now explicitly
+  conditions the transformation on 'when applicable,' meaning the hardware
+  must gate the ignore-transform datapath on the conjunction of (PM enabled
+  for the effective privilege mode) AND (access type is in the set of explicit
+  memory accesses listed in the spec). Applying the transformation
+  unconditionally—or applying it when PM is disabled—writes an incorrectly
+  masked address into *tval.
+Consequence: info_leak
+Pattern:
+  search in Chisel/Verilog for: (1) the combinational logic that computes the
+  value written to stval/mtval on exception entry—look for sign-extension or
+  zero-extension of upper address bits (the 'ignore' transformation pattern
+  `{{PMLEN{addr[XLEN-PMLEN-1]}}, addr[XLEN-PMLEN-1:0]}` or `{{PMLEN{1'b0}},
+  addr[XLEN-PMLEN-1:0]}`) that is NOT gated by a PM-enable condition such as
+  `senvcfg.PMM =/= 0.U` or `mseccfg.PMM =/= 0.U`; (2) the MPRV/SPVP effective
+  privilege mode computation for the faulting access—verify that the PM-enable
+  check uses the effective privilege mode, not the trap-target privilege mode;
+  (3) the exception entry FSM or microcode that selects which address gets
+  written to *tval—verify that page-fault addresses from PTW walks and
+  instruction-fetch-fault addresses bypass the PM transformation
+  unconditionally; (4) grep for `stval`, `mtval`, `PointerMask`,
+  `ignore_transform`, `pmlen`, `PMM` in the CSR write path and trap-entry
+  logic to find the specific mux/assign that produces the *tval write data.
+------------------------------------------------------------

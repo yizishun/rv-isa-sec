@@ -1,0 +1,129 @@
+{
+  "pr_number": 1581,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1581,
+    "violation_condition": "When CSRRS/CSRRC (or CSRRSI/CSRRCI) executes on pmpaddr CSR while the corresponding PMP entry is in TOR or NAPOT mode and not locked. The riscv_csrrw_do64() function at csr.c:5669 uses the 'reads as' value from pmpaddr_csr_read() as the basis for RMW computation, then writes it back via pmpaddr_csr_write() which stores it directly into addr_reg without restoring the raw underlying bits. For bits NOT in the rs1 write mask, the read-as value overwrites the true underlying register state.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "csr_ops[csrno].read.*old_value.*write_mask.*csr_ops[csrno].write|pmpaddr_csr_read.*addr_reg.*PMP_AMATCH_TOR|pmpaddr_csr_write.*addr_reg = val",
+    "affected_entities": [
+      "CSRRS",
+      "CSRRC",
+      "CSRRSI",
+      "CSRRCI",
+      "pmpaddr0-pmpaddr63"
+    ],
+    "summary": "CSRRS/CSRRC RMW path uses pmpaddr_csr_read() 'reads-as' value as write-back base, silently corrupting raw addr_reg bits (e.g. TOR G-1) not targeted by rs1 mask"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "pmpaddr_csr_read",
+        "line_start": 624,
+        "line_end": 657,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "pmpaddr_csr_read correctly implements 'reads as' behavior per spec: for TOR/OFF (G>=1), bits [G-1:0] forced to 0 at line 638; for NAPOT (G>=2), bits [G-2:0] forced to all-ones at line 644. The transformation is applied only to the returned value; underlying addr_reg is not modified, preserving raw bits across mode changes per norm:pmp_addr_retention_on_mode_change.",
+      "snippet": "case PMP_AMATCH_TOR:\n    if (g >= 1 && g < TARGET_LONG_BITS) {\n        val &= ~((1ULL << g) - 1ULL);\n    }\n    break;\ncase PMP_AMATCH_NAPOT:\n    if (g >= 2 && g < TARGET_LONG_BITS) {\n        val |= ((1ULL << (g - 1)) - 1ULL);\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3524,
+          "line_end": 3529,
+          "excerpt": "#norm:pmp_napot_addr_read_mask# When G >= 2 and pmpcfg_i.A[1] is set, i.e. the mode is NAPOT, then bits pmpaddr_i[G-2:0] read as all ones. #norm:pmp_tor_off_addr_read_mask# When G >= 1 and pmpcfg_i.A[1] is clear, i.e. the mode is OFF or TOR, then bits pmpaddr_i[G-1:0] read as all zeros."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3530,
+          "line_end": 3535,
+          "excerpt": "#norm:pmp_addr_retention_on_mode_change# Although changing pmpcfg_i.A[1] affects the value read from pmpaddr_i, it does not affect the underlying value stored in that register—in particular, pmpaddr_i[G-1] retains its original value when pmpcfg_i.A is changed from NAPOT to TOR/OFF then back to NAPOT."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "pmpaddr_csr_write",
+        "line_start": 574,
+        "line_end": 617,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Stores val directly into addr_reg at line 603 without stripping low don't-care bits. This is spec-compliant: the RISC-V spec does not require writes to mask these bits, and plain CSR writes (CSRW/CSRWI) should store the raw value. The early-return comparison at line 582 correctly compares against the raw addr_reg to avoid unnecessary TLB flushes.",
+      "snippet": "if (!pmp_is_readonly(env, addr_index)) {\n    env->pmp_state.pmp[addr_index].addr_reg = val;\n    pmp_update_rule_addr(env, addr_index);\n    if (is_next_cfg_tor) {\n        pmp_update_rule_addr(env, addr_index + 1);\n    }\n    tlb_flush(env_cpu(env));\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "riscv_csrrw_do64",
+        "line_start": 5637,
+        "line_end": 5684,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "RMW for CSRRS/CSRRC: reads old_value via .read() at line 5661 (returns transformed 'reads as' value for pmpaddr), computes (old_value & ~write_mask) | (new_value & write_mask) at line 5669, writes back via .write() at line 5671. This is ISA-mandated behavior: the spec NOTE at zicsr.adoc:55-61 explicitly documents that CSRRS/CSRRC will overwrite underlying bits when 'reads as' bits differ from raw bits, using pmpaddr[G-1] as the canonical example. The normative exception rs1=x0 (no write) is handled at line 5668: write_mask==0 skips the write.",
+      "snippet": "ret = csr_ops[csrno].read(env, csrno, &old_value);\nif (write_mask) {\n    new_value = (old_value & ~write_mask) | (new_value & write_mask);\n    if (csr_ops[csrno].write) {\n        ret = csr_ops[csrno].write(env, csrno, new_value, ra);\n    }\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zicsr.adoc",
+          "line_start": 55,
+          "line_end": 61,
+          "excerpt": "Since CSRRS and CSRRC perform a read-modify-write operation, any bits that read as a different value to their underlying value may be modified by these instructions even if the corresponding bit is not set in rs1. For example, pmpaddr_n[G-1] may have an underlying value of 1 but read as 0. Executing CSRRC or CSRRS to modify a different bit will cause 0 to be read from pmpaddr_n[G-1] and then written back, updating the underlying value to 0."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zicsr.adoc",
+          "line_start": 63,
+          "line_end": 65,
+          "excerpt": "norm:csrrs_csrrc_rs1_x0 — For both CSRRS and CSRRC, if rs1=x0, then the instruction will not write to the CSR at all, and so shall not cause any of the side effects that might otherwise occur on a CSR write."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_pmpaddr",
+        "line_start": 5362,
+        "line_end": 5367,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Thin wrapper around pmpaddr_csr_read(), correctly maps csrno to pmpaddr index via csrno - CSR_PMPADDR0 and returns the transformed 'reads as' value. No issues.",
+      "snippet": "static RISCVException read_pmpaddr(CPURISCVState *env, int csrno,\n                                   target_ulong *val)\n{\n    *val = pmpaddr_csr_read(env, csrno - CSR_PMPADDR0);\n    return RISCV_EXCP_NONE;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_pmpaddr",
+        "line_start": 5369,
+        "line_end": 5374,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Thin wrapper around pmpaddr_csr_write(), correctly maps csrno to pmpaddr index. The write path stores value directly without bit stripping, which is correct for a plain CSR write. No issues.",
+      "snippet": "static RISCVException write_pmpaddr(CPURISCVState *env, int csrno,\n                                    target_ulong val, uintptr_t ra)\n{\n    pmpaddr_csr_write(env, csrno - CSR_PMPADDR0, val);\n    return RISCV_EXCP_NONE;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "(csr_ops registration for pmpaddr)",
+        "line_start": 6260,
+        "line_end": 6275,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All 64 pmpaddr CSR entries registered with predicate=pmp, read=read_pmpaddr, write=write_pmpaddr, op=NULL. The NULL op field means CSRRS/CSRRC fall through to separate read-then-write in riscv_csrrw_do64(), which is correct: the spec explicitly says RMW operates on the read-as value, not the raw bits. An .op callback working on raw bits would deviate from ISA-mandated behavior.",
+      "snippet": "[CSR_PMPADDR0]   = { \"pmpaddr0\",  pmp, read_pmpaddr, write_pmpaddr },\n[CSR_PMPADDR1]   = { \"pmpaddr1\",  pmp, read_pmpaddr, write_pmpaddr },",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

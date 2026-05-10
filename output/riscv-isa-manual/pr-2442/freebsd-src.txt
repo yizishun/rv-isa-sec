@@ -1,0 +1,115 @@
+PR #2442  target=freebsd-src  overall=potential_risk
+Spec: FreeBSD's trap handler uses stval directly for signal delivery without accounting for pointer masking — if Ssnpm is enabled, the original tagged address is lost and the user receives only the transformed address in si_addr, breaking HWASAN-style tag diagnostics.
+Violation:
+  FreeBSD page_fault_handler reads stval and passes it to call_trapsignal() as
+  si_addr, assuming it holds the original faulting address. When Ssnpm pointer
+  masking is enabled for U-mode, the hardware writes the transformed (masked)
+  address into stval instead of the original tagged address, and the kernel
+  delivers a stripped address to the user-space signal handler.
+Consequence: info_leak
+Pattern:
+  page_fault_handler|call_trapsignal.*stval|tf_stval.*signal|set_mcontext.*stv
+  al
+------------------------------------------------------------
+[potential_risk] sys/riscv/riscv/exception.S:110-111  save_registers
+  The save_registers macro unconditionally reads stval via csrr and stores it
+  to the trapframe without any awareness of pointer masking. When Ssnpm is
+  enabled for U-mode (senvcfg.PMM != 0), the hardware writes the transformed
+  (masked) address into stval per norm:pm_csr_hw_apply, but the kernel treats
+  it as the original faulting address. The kernel has no code to check
+  senvcfg.PMM or recover the original tagged address.
+  | csrr	t0, stval
+  | sd	t0, (TF_STVAL)(sp)
+  References:
+    - riscv-isa-manual/src/priv/zpm.adoc:161-163
+      "pointer masking, when applicable, is applied for hardware writes to
+      a CSR (e.g., when the hardware writes the transformed address to
+      stval when taking"
+    - riscv-isa-manual/src/priv/supervisor.adoc:927-944
+      "If the Ssnpm extension is implemented, the PMM field enables or
+      disables pointer masking for the next-lower privilege mode (U/VU)
+      […] 10: PMLEN=7, 11:"
+
+[potential_risk] sys/riscv/riscv/trap.c:228-235  page_fault_handler
+  page_fault_handler reads tf_stval and directly passes it as si_addr to
+  call_trapsignal() when the address is invalid for user mode. When Ssnpm is
+  enabled for U-mode, stval contains the hardware-transformed (masked)
+  address, so the signal handler receives a stripped address with tag bits
+  zeroed/sign-extended instead of the original tagged faulting address. The
+  VIRT_IS_VALID check also operates on the masked address, potentially
+  misclassifying a tagged-but-valid address as invalid.
+  | stval = frame->tf_stval;
+  | if (usermode) {
+  |   if (!VIRT_IS_VALID(stval)) {
+  |     call_trapsignal(td, SIGSEGV, SEGV_MAPERR, (void *)stval,
+  |       frame->tf_scause & SCAUSE_CODE);
+  References:
+    - riscv-isa-manual/src/priv/zpm.adoc:161-163
+      "pointer masking, when applicable, is applied for hardware writes to
+      a CSR (e.g., when the hardware writes the transformed address to
+      stval when taking"
+
+[potential_risk] sys/riscv/riscv/trap.c:272-277  page_fault_handler
+  On vm_fault_trap failure for user mode, page_fault_handler passes stval
+  (which is the masked/transformed address under Ssnpm) as si_addr to
+  call_trapsignal(). The signal handler receives a stripped address rather
+  than the original tagged faulting address, constituting a silent info_leak
+  where user-space tag bits are lost in the signal delivery path.
+  | error = vm_fault_trap(map, va, ftype, VM_FAULT_NORMAL, &sig, &ucode);
+  | if (error != KERN_SUCCESS) {
+  |   if (usermode) {
+  |     call_trapsignal(td, sig, ucode, (void *)stval,
+  |       frame->tf_scause & SCAUSE_CODE);
+  References:
+    - riscv-isa-manual/src/priv/zpm.adoc:161-163
+      "pointer masking, when applicable, is applied for hardware writes to
+      a CSR (e.g., when the hardware writes the transformed address to
+      stval when taking"
+
+[potential_risk] sys/riscv/riscv/trap.c:83-94  call_trapsignal
+  call_trapsignal is a thin wrapper that passes through the addr argument
+  directly to ksi.ksi_addr without any pointer-masking-aware transformation.
+  The addr value originates from stval in the page_fault_handler caller,
+  meaning a masked address flows through unmodified into ksiginfo_t and
+  ultimately to the user-space siginfo_t via sendsig().
+  | ksiginfo_init_trap(&ksi);
+  | ksi.ksi_signo = sig;
+  | ksi.ksi_code = code;
+  | ksi.ksi_addr = addr;
+  | ksi.ksi_trapno = trapno;
+  | trapsignal(td, &ksi);
+
+[potential_risk] sys/riscv/riscv/exec_machdep.c:377-379  sendsig
+  sendsig copies the entire ksi->ksi_info (which contains si_addr derived from
+  the masked stval) directly into the sigframe delivered to user space. There
+  is no point in the signal delivery path where the original tagged address
+  could be recovered; the masked address flows from exception.S -> trapframe
+  -> page_fault_handler -> call_trapsignal -> ksiginfo_t -> siginfo_t with no
+  transformation.
+  | get_mcontext(td, &frame.sf_uc.uc_mcontext, 0);
+  | frame.sf_si = ksi->ksi_info;
+  | frame.sf_uc.uc_sigmask = *mask;
+
+[potential_risk] sys/riscv/riscv/trap.c:254-254  page_fault_handler
+  va = trunc_page(stval) uses the potentially-masked stval as the basis for
+  the virtual address used in pmap_fault and vm_fault_trap. When Ssnpm is
+  enabled, the masked address may point to a different page than the original
+  tagged address, causing incorrect page fault handling and potentially
+  misleading fault resolution.
+  | va = trunc_page(stval);
+  References:
+    - riscv-isa-manual/src/priv/zpm.adoc:161-163
+      "when delivering an exception, the hardware applies pointer masking
+      to any address written into stval if pointer masking is applicable
+      to that address."
+
+[not_implemented] sys/riscv/riscv/machdep.c:556-558  initriscv
+  FreeBSD's RISC-V kernel has zero Ssnpm/Supm pointer masking support: no CSR
+  definitions for the PMM field in senvcfg/menvcfg, no configuration in
+  initriscv() or elsewhere, no senvcfg CSR access at all in the kernel, and no
+  code to detect or recover original tagged addresses from masked stval.
+  Pointer masking is an entirely unhandled hardware feature.
+  | void
+  | initriscv(struct riscv_bootparams *rvbp)
+  | {
+

@@ -1,0 +1,132 @@
+{
+  "pr_number": 181,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 181,
+    "violation_condition": "",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "",
+    "affected_entities": [],
+    "summary": "JSON decode error"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala",
+        "function_name": "TageTable (usefulCtrSram construction)",
+        "line_start": 67,
+        "line_end": 81,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "FoldedSRAMTemplate for useful counters uses shouldReset=true, ensuring SRAM is properly initialized at reset. The fold width NumUsefulCtrSramFolds=8 divides evenly into NumSets (512 for 4-bank, 2-way, 4096-entry tables): 512 % 8 == 0, satisfying FoldedSRAMTemplate's require(set % width == 0). No correctness issue.",
+      "snippet": "  private val usefulCtrSram =\n    Seq.tabulate(NumBanks, NumWays) { (bankIdx, wayIdx) =>\n      Module(new FoldedSRAMTemplate(\n        UsefulCounter(),\n        set = NumSets,\n        width = NumUsefulCtrSramFolds,",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala",
+        "function_name": "TageTable (useful reset protocol)",
+        "line_start": 176,
+        "line_end": 199,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The useful-counter reset progression at line 179 uses bank.head.io.w.req.fire to advance the reset setIdx. Each bank contains NumWays separate FoldedSRAMTemplate instances. The reset writes apply to ALL ways simultaneously (line 188-196 with usefulResetValid=True for all ways), but only the first way's (.head) write-fire signal gates the setIdx increment. If different ways have different SRAM ready timings, some ways could miss a reset write for a particular set before the index advances. This would leave stale useful counter state un-zeroed. While this doesn't affect ISA compliance (branch predictors are microarchitectural), it deviates from the intended 'reset all useful counters' behavior. Consider accumulating all ways' fire signals: bank.map(_.io.w.req.fire).reduce(_ && _).",
+      "snippet": "    }.elsewhen(usefulResetInFlightMask(bankIdx) && bank.head.io.w.req.fire) {\n      when(usefulResetSetIdx(bankIdx) === (NumSets - 1).U) {\n        usefulResetInFlightMask(bankIdx) := false.B\n        usefulResetSetIdx(bankIdx)       := 0.U\n      }.otherwise {\n        usefulResetSetIdx(bankIdx) := usefulResetSetIdx(bankIdx) + 1.U",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala",
+        "function_name": "TageTable (read response during reset)",
+        "line_start": 201,
+        "line_end": 217,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "During useful-reset-in-flight, reads from usefulCtrSram are suppressed (line 130: && !usefulResetInFlightMask(bankIdx)), and the read response returns Zero for usefulCtrs via the Mux on readDuringUsefulResetNext (line 209-215). This correctly prevents stale/partial data from being observed during a reset sweep. The reset read bypass returning zero is architecturally safe because the TAGE predictor treats zero useful counters as having no confident prediction, and the prediction pipeline can proceed with stale-but-safe counter values.",
+      "snippet": "    resp.usefulCtrs := Mux(\n      readDuringUsefulResetNext,\n      VecInit.fill(NumWays)(UsefulCounter.Zero),\n      Mux1H(\n        readBankMaskNext,\n        usefulCtrSram.map(bank => VecInit(bank.map(way => way.io.r.resp.data.head)))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala",
+        "function_name": "TageTable (read conflict arbitration)",
+        "line_start": 118,
+        "line_end": 133,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The single-port entry SRAM multiplexes two read ports (predict read at index 0, train read at index 1) with priority given to the predictor read via Mux(readValid(0), ...). A hard assert at line 133 catches simultaneous read requests to the same bank. Since the parent Tage.scala gates train reads when a predict read would conflict (Tage.scala line 209-210: io.trainReady := !t0_readBankConflict), this assert should never fire during normal operation. The OOO priority (using Mux(readValid(0), ...) without arbitration) is acceptable because the parent module guarantees mutual exclusion.",
+      "snippet": "    val readValid = VecInit(\n      io.readReq(0).valid && io.readReq(0).bits.bankMask(bankIdx),\n      io.readReq(1).valid && io.readReq(1).bits.bankMask(bankIdx)\n    )\n    val readSetIdx = Mux(readValid(0), io.readReq(0).bits.setIdx, io.readReq(1).bits.setIdx)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala",
+        "function_name": "Tage (usefulResetCtr logic)",
+        "line_start": 571,
+        "line_end": 581,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The usefulResetCtr increment condition at line 579 adds a !usefulResetInFlight guard: usefulResetCtr.selfIncrease() is now gated by !usefulResetInFlight (prevents incrementing while a reset is already in flight). Combined with the handshake (line 571-574: usefulResetInFlight is set when t2_usefulResetStart, cleared when all tables report !usefulResetInFlight), this correctly prevents the degenerate case where the reset counter could overflow/loop rapidly, causing back-to-back reset sweeps that never complete.",
+      "snippet": "  when(t2_usefulResetStart) {\n    usefulResetInFlight := true.B\n  }.elsewhen(usefulResetInFlight && !tables.map(_.io.usefulResetInFlight).reduce(_ || _)) {\n    usefulResetInFlight := false.B\n  }\n\n  when(t2_usefulResetStart) {\n    usefulResetCtr.resetZero()\n  }.elsewhen(t2_fire && t2_needAllocate && !t2_canAllocate && !usefulResetInFlight) {\n    usefulResetCtr.selfIncrease()\n  }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/frontend/bpu/tage/Bundles.scala",
+        "function_name": "EntrySramWriteReq",
+        "line_start": 91,
+        "line_end": 96,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "EntrySramWriteReq was refactored from a combined entry+useful bundle to an entry-only bundle (usefulCtr fields moved to separate UsefulCtrSramWriteReq at line 98-101). The WriteBuffer for entry SRAM now writes only entry fields, and useful counter writes use a separate Queue-based write buffer. This separation is correct: it eliminates unnecessary dependencies between entry updates and useful counter updates that were previously coupled in the same write buffer entry. No spec violation.",
+      "snippet": "class EntrySramWriteReq(implicit p: Parameters, info: TageTableInfo) extends WriteReqBundle with HasTageParameters {\n  val setIdx:       UInt                    = UInt(SetIdxWidth.W)\n  val entry:        TageEntry               = new TageEntry\n  override def tag: Option[UInt]            = Some(entry.tag)\n  override def cnt: Option[SaturateCounter] = Some(entry.takenCtr)\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/frontend/bpu/tage/TageTable.scala",
+        "function_name": "TageTable (entry SRAM write path)",
+        "line_start": 140,
+        "line_end": 173,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The entry SRAM write path correctly gates writes when reads are in flight (!way.io.r.req.valid) to prevent read-write conflicts on the single-port SRAM. The write buffer outputs (bufferOut) provide backpressure (bufferOut.ready := way.io.w.req.ready && !way.io.r.req.valid), stalling buffer drains during reads. This is correct single-port SRAM arbitration.",
+      "snippet": "      way.io.w.apply(\n        bufferOut.valid && !way.io.r.req.valid,\n        bufferOut.bits.entry,\n        bufferOut.bits.setIdx,\n        1.U(1.W) // way mask\n      )\n      bufferOut.ready := way.io.w.req.ready && !way.io.r.req.valid",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/frontend/bpu/tage/Parameters.scala",
+        "function_name": "TageParameters",
+        "line_start": 23,
+        "line_end": 47,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "New parameter NumUsefulCtrSramFolds=8 was added with a reasonable default. The comment at line 26 clarifies the Size=NumSets*NumWays*NumBanks relationship. The fold count of 8 is appropriate: each useful counter is 2 bits (UsefulCtrWidth), so a fold of 8 maps to a physical SRAM data width of 8*2=16 bits, which is efficient for standard SRAM compilers. No correctness or security concern.",
+      "snippet": "    NumUsefulCtrSramFolds: Int = 8,\n    WriteBufferSize:       Int = 4,\n    UsefulResetCtrWidth:   Int = 8,",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/frontend/bpu/tage/Tage.scala",
+        "function_name": "Tage (useProvider logic)",
+        "line_start": 146,
+        "line_end": 146,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The useProvider condition changed from (!useAltOnNa || !provider.takenCtr.isWeak) to !(useAltOnNa && provider.takenCtr.isWeak). By De Morgan's law these are logically equivalent: !A || !B == !(A && B). This is a pure refactoring, no behavioral change.",
+      "snippet": "    val useProvider = hasProvider && !(useAltOnNa && provider.takenCtr.isWeak)",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

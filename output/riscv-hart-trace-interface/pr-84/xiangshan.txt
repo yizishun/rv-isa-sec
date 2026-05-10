@@ -1,0 +1,128 @@
+PR #84  target=xiangshan  overall=not_implemented
+Spec: Spec tightens final MMA data-access retirement deadline from permissive 'may' to normative 'must report no later than instruction retirement,' requiring XiangShan trace-interface RTL to guarantee dretire timing for the last access of Zcmp/vector multi-access instructions does not lag behind iretire.
+Violation:
+  In XiangShan RTL, if the final load/store access of a multi-memory-access
+  instruction (Zcmp push/pop, vector load/store) has its dretire signal
+  asserted AFTER the instruction's iretire is asserted (i.e., the data trace
+  retirement pulse occurs in a cycle subsequent to instruction trace
+  retirement), the hardware violates the tightened normative requirement that
+  the final data access 'must be reported no later than when the instruction
+  is reported as retired.' This can occur when the load/store unit's
+  completion pipeline is decoupled from the commit/retirement stage in an out-
+  of-order design, such that a straggling final MMA access completes post-
+  retirement.
+Consequence: data_corruption
+Pattern:
+  when (dretire && dtype_is_mma && is_final_access_of_instruction &&
+  iretire_past) in trace interface output logic; or $past(iretire) && dretire
+  && is_final_mma_access without corresponding iretire in same cycle
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/backend/trace/Interface.scala:20-24  TracePipe class definition
+  TracePipe defines only itype, iretire, ilastsize — no dretire field exists.
+  The trace architecture is instruction-retirement-only with no data trace
+  (dretire) support. Since the violation condition requires a dretire signal
+  that does not exist, the described vulnerability cannot manifest in this
+  RTL.
+  | class TracePipe(iretireWidth: Int)(implicit val p: Parameters) extends Bundle with HasXSParameter {
+  |   val itype     = Itype()
+  |   val iretire   = UInt(iretireWidth.W)
+  |   val ilastsize = Ilastsize()
+  | }
+
+[not_implemented] src/main/scala/xiangshan/backend/trace/Interface.scala:47-61  TraceCoreInterface.toEncoder output Bundle
+  The TraceCoreInterface output to the external encoder carries per-group
+  {itype, iretire, ilastsize, iaddr} only. No dretire or dtype field exists at
+  the core-to-encoder boundary. Data trace retirement is not implemented.
+  | val toEncoder = Output(new Bundle {
+  |   val groups = Vec(TraceGroupNum, ValidIO(new Bundle{
+  |     val iaddr     = UInt(IaddrWidth.W)
+  |     val ftqOffset = ...
+  |     val itype     = UInt(ItypeWidth.W)
+  |     val iretire   = UInt(IretireWidthCompressed.W)
+  |     val ilastsize = UInt(IlastsizeWidth.W)
+  |   }))
+  | })
+
+[compliant] src/main/scala/xiangshan/backend/rob/Rob.scala:1278-1296  RobImp trace output assignment
+  Trace context signals are driven simultaneously with traceValids gated on
+  io.commits.isCommit && io.commits.commitValid(i). Since dretire is not
+  implemented, the iretire-only trace output is internally consistent. There
+  is no scenario where dretire could lag behind iretire because dretire does
+  not exist.
+  | for (i <- 0 until CommitWidth) {
+  |   traceBlockInPipe(i).itype := rawInfo(i).traceBlockInPipe.itype
+  |   traceBlockInPipe(i).iretire := iretireCommit(i)
+  |   traceBlockInPipe(i).ilastsize := rawInfo(i).traceBlockInPipe.ilastsize
+  |   traceValids(i) := io.commits.isCommit && io.commits.commitValid(i)
+
+[compliant] src/main/scala/xiangshan/backend/rob/Rob.scala:799-804  RobImp commit state machine
+  The ROB state machine has only s_idle and s_walk states. There is no
+  s_dretire state because data-only retirement is not implemented. Within the
+  current one-dimensional iretire architecture, this is correct.
+  | io.commits.isWalk := state === s_walk
+  | io.commits.isCommit := state === s_idle && !blockCommit
+
+[compliant] src/main/scala/xiangshan/backend/trace/TraceBuffer.scala:31-84  TraceBuffer compression logic
+  TraceBuffer compresses adjacent trace blocks by accumulating iretire counts.
+  No dretire handling exists, but this is consistent with the one-dimensional
+  iretire-only architecture. The buffer correctly handles the signals it was
+  designed for.
+  | blocksUpdate(i).bits.tracePipe.iretire := blocksUpdate(i - 1).bits.tracePipe.iretire + io.in.fromRob.blocks(i).bits.tracePipe.iretire
+  | // No dretire accumulation — dretire not implemented
+
+[not_implemented] src/main/scala/xiangshan/backend/rename/Rename.scala:640-658  Rename stage trace field generation
+  Rename generates itype for trace. For vector load/store instructions,
+  Itype.jumpTypeGen returns 0.U (None) since they are not branch/jump/xret. No
+  Zcmp-specific itype generation exists because Zcmp instructions
+  (cm.push/cm.pop) are not implemented in XiangShan. No MMA classification for
+  trace purposes.
+  | uops(i).traceBlockInPipe.itype := Mux(
+  |   isXret, Itype.ExpIntReturn,
+  |   Itype.jumpTypeGen(inVec(i).fuType, inVec(i).fuOpType, ...)
+  | )
+
+[compliant] src/main/scala/xiangshan/backend/CtrlBlock.scala:313-320  CtrlBlockImp trace wiring
+  CtrlBlock passes trace output as a pure identity mapping for
+  iretire/itype/ilastsize. No dretire path exists, which is consistent with
+  the not-implemented state of data trace retirement.
+  | io.traceCoreInterface.toEncoder.groups(i).bits.itype := trace.io.out.toEncoder.blocks(i).bits.tracePipe.itype
+  | io.traceCoreInterface.toEncoder.groups(i).bits.iretire := trace.io.out.toEncoder.blocks(i).bits.tracePipe.iretire
+  | io.traceCoreInterface.toEncoder.groups(i).bits.ilastsize := trace.io.out.toEncoder.blocks(i).bits.tracePipe.ilastsize
+
+[compliant] src/main/scala/xiangshan/backend/rob/Rob.scala:1086-1090  RobImp branch-taken trace feedback
+  The only dynamic trace update in the ROB is branch-taken feedback
+  (NonTaken->Taken). No post-commit data-side trace update mechanism exists,
+  confirming that once an instruction retires, its trace data is final. With
+  no dretire feature, this is correct.
+  | when(robEntries(i).valid && Itype.isNonTaken(robEntries(i).traceBlockInPipe.itype) && taken){
+  |   robEntries(i).traceBlockInPipe.itype := Itype.Taken
+  | }
+
+[compliant] src/main/scala/xiangshan/mem/MemBlock.scala:1498-1525  MemBlock trace bypass
+  MemBlock trace bypass passes iretire/itype/ilastsize/iaddr through register
+  stages to L2Top. No dretire or dtype fields exist in this path. Consistent
+  with the not-implemented data trace feature.
+  | traceToL2Top.toEncoder.groups(i).bits.iretire := RegNext(traceFromBackend.toEncoder.groups(i).bits.iretire)
+  | traceToL2Top.toEncoder.groups(i).bits.itype := RegNext(traceFromBackend.toEncoder.groups(i).bits.itype)
+
+[not_implemented] src/main/scala/xiangshan/backend/trace/Interface.scala:26-31  TraceBlock class definition
+  TraceBlock contains iaddr/ftqIdx, ftqOffset, and tracePipe (itype, iretire,
+  ilastsize). No dretire or dtype field. This is the fundamental storage unit
+  in all trace pipeline stages. Without a dretire field, the described
+  vulnerability (dretire after iretire for final MMA access) cannot occur.
+  | class TraceBlock(hasIaddr: Boolean, iretireWidth: Int)(implicit val p: Parameters) extends Bundle with HasXSParameter {
+  |   val iaddr     = if (hasIaddr) Some(UInt(IaddrWidth.W)) else None
+  |   val ftqIdx    = if (!hasIaddr) Some(new FtqPtr) else None
+  |   val ftqOffset = if (!hasIaddr) Some(UInt(FetchBlockInstOffsetWidth.W)) else None
+  |   val tracePipe = new TracePipe(iretireWidth)
+  | }
+
+[not_implemented] src/main/scala/xiangshan/backend/dispatch/Dispatch.scala:186-188  Dispatch push/pop logic
+  Dispatch's isPush/isPop extraction uses Itype.isPush/isPop which only maps
+  to standard jal/jalr RAS patterns for front-end prediction, not Zcmp multi-
+  register stack operations. Zcmp (cm.push/cm.pop/cm.popret/cm.popretz)
+  instructions are not decoded, dispatched, or executed anywhere in the
+  current RTL.
+  | isPush(i) := Itype.isPush(uop.traceBlockInPipe.itype)
+  | isPop(i) := Itype.isPop(uop.traceBlockInPipe.itype)
+

@@ -1,0 +1,30 @@
+PR #2397  target=xiangshan  overall=compliant
+Spec: XiangShan pmp_match_res uses is_match to check full-access containment instead of first detecting any-byte overlap; cross-boundary M-mode accesses to unlocked PMP regions may silently pass via the passThrough default instead of faulting as required by the 'any byte matches → must match all bytes' rule now clarified to supersede M-mode exemption
+Violation:
+  In XiangShan's pmp_match_res (PMP.scala:414-457), the is_match per-entry
+  test (via torMatch/napotMatch at lines 200-260) checks whether the entire
+  access fits within the PMP entry range, not whether any byte of the access
+  overlaps the entry. For TOR mode, torMatch uses boundMatch (line 210-218)
+  and lowerBoundMatch (line 221-223) with size-aware bounds; when lgMaxSize <=
+  PlatformGrain, boundMatch only compares the base address against the
+  boundary (paddr < compare_addr), ignoring lgSize entirely (line 212). This
+  means an access that straddles a PMP region boundary may have no entry with
+  is_match=true. The fallback default (cfg_vec(num)=pmpDefault,
+  match_vec(num)=true.B) applies, and for M-mode (mode > 1.U), passThrough is
+  true (line 424), granting full r/w/x permissions. The spec requires: 'the
+  lowest-numbered PMP entry that matches any byte of an access determines
+  whether that access succeeds or fails; the matching entry must match ALL
+  bytes or the access fails, irrespective of the L,R,W,X bits.' The new NOTE
+  clarifies this supersedes the optional M-mode exemption—M-mode must also
+  fail on partial matches to unlocked regions. XiangShan's is_match skips 'any
+  byte' detection and jumps directly to 'all bytes' matching, allowing M-mode
+  accesses that partially overlap an unlocked PMP entry to silently succeed
+  via the default passThrough path instead of faulting.
+Consequence: privilege_escape
+Pattern:
+  is_match(addr, size, lgMaxSize, last_pmp) where torMatch/napotMatch check
+  full-access containment but NOT any-byte overlap; grep for 'is_match',
+  'pmp_match_res', 'passThrough' near mode comparison at PMP.scala:424-455;
+  also check that aligned=false with ignore=true produces correctly denied
+  permissions at line 439-441
+------------------------------------------------------------

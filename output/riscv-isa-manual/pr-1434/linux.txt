@@ -1,0 +1,161 @@
+PR #1434  target=linux  overall=bug_confirmed
+Spec: PMP faults from misaligned/wide stores or decomposed CMOs may leave partially-visible writes in protected regions; kernel must not assume PMP faults are atomic with zero side effects
+Violation:
+  Kernel code writes to memory via misaligned stores or stores wider than XLEN
+  (e.g., FSD on RV32D) that straddle a PMP boundary, or issues CBO
+  instructions crossing PMP region boundaries, and assumes that a PMP access-
+  fault exception means no bytes were modified in the protected region.
+Consequence: data_corruption
+Pattern:
+  misaligned.*store.*pmp|pmp.*partial.*write|FSD.*RV32.*pmp|cbo\.zero.*pmp.*bo
+  undary|store.*wider.*XLEN.*pmp|assume.*pmp.*fault.*atomic
+------------------------------------------------------------
+[bug_confirmed] arch/riscv/kernel/traps_misaligned.c:333-425  handle_scalar_misaligned_store
+  On RV32, when emulating an FSD (8-byte FP store) instruction that triggered
+  a misaligned trap, the handler calls copy_to_user() at line 416 to write all
+  8 bytes in a single call. Since XLEN=32, copy_to_user() decomposes this into
+  two 32-bit word writes. If the misaligned address straddles a page or PMP
+  boundary such that the second 32-bit write faults, the first 32-bit write
+  has already been committed to memory. The handler returns -1 on any
+  copy_to_user() failure, and the caller (do_trap_misaligned at
+  traps.c:230-232) signals SIGBUS — without any mechanism to detect or undo
+  the partial write. This means bytes are written into the protected/faulting
+  region despite the exception. This is the exact vulnerability pattern
+  described by the RISC-V spec at machine.adoc:3571-3574.
+  | } else if ((insn & INSN_MASK_FSD) == INSN_MATCH_FSD) {
+  | 	fp = 1;
+  | 	len = 8;
+  | 	val.data_u64 = GET_F64_RS2(insn, regs);
+  | ...
+  | if (copy_to_user((u8 __user *)addr, &val, len))
+  | 	return -1;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3567-3574
+      "On some implementations, misaligned loads, stores, and instruction
+      fetches may be decomposed into multiple memory operations, some of
+      which may succee"
+    - riscv-isa-manual/src/priv/machine.adoc:3602-3608
+      "Failed memory operations generate an instruction, load, or store
+      access-fault exception. Note that a single instruction may generate
+      multiple memory o"
+    - riscv-isa-manual/src/priv/supervisor.adoc:1724-1730
+      "On some implementations, misaligned loads, stores, and instruction
+      fetches may also be decomposed into multiple accesses, some of which
+      may succeed be"
+
+[bug_confirmed] arch/riscv/kernel/traps_misaligned.c:386-393  handle_scalar_misaligned_store
+  Same partial-write vulnerability as FSD for the compressed variants C.FSD
+  and C.FSDSP on RV32. These also write 8 bytes (len=8) in a single
+  copy_to_user() call, which decomposes into two 32-bit writes on RV32. If the
+  address straddles a page/PMP boundary, the first half-write may succeed
+  while the second faults.
+  | } else if ((insn & INSN_MASK_C_FSD) == INSN_MATCH_C_FSD) {
+  | 	fp = 1;
+  | 	len = 8;
+  | 	val.data_u64 = GET_F64_RS2S(insn, regs);
+  | } else if ((insn & INSN_MASK_C_FSDSP) == INSN_MATCH_C_FSDSP) {
+  | 	fp = 1;
+  | 	len = 8;
+  | 	val.data_u64 = GET_F64_RS2C(insn, regs);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3567-3574
+      "In particular, a portion of a misaligned store that passes the PMP
+      check may become visible, even if another portion fails the PMP
+      check. The same beh"
+
+[potential_risk] arch/riscv/kernel/traps_misaligned.c:310-319  handle_scalar_misaligned_load
+  On RV32 with FLD (8-byte FP load, len=8), copy_from_user() reads 8 bytes
+  decomposed into two 32-bit reads. If the second read faults, copy_from_user
+  returns an error, and the handler returns -1. While a load doesn't corrupt
+  protected memory (it only reads), the partial read may have observable side-
+  effects: the first 4 bytes are consumed but the instruction is retried or
+  the process is killed. More critically, if the watched memory has MMIO side-
+  effects on read (e.g., a FIFO), the partial read consumes data that is lost
+  when the instruction fails. This is lower severity because it does not write
+  into a protected region, but it is the same pattern.
+  | val.data_u64 = 0;
+  | if (user_mode(regs)) {
+  | 	if (copy_from_user(&val, (u8 __user *)addr, len))
+  | 		return -1;
+  | } else {
+  | 	memcpy(&val, (u8 *)addr, len);
+  | }
+
+[potential_risk] arch/riscv/lib/clear_page.S:20-73  clear_page
+  clear_page() uses CBO.ZERO instructions operating on cache-block-sized
+  regions (typically 64 bytes). Per the RISC-V CMO spec (cmo.adoc:327-328), if
+  a CBO instruction's cache block spans two PMP regions with different
+  permissions, the behavior is UNSPECIFIED. The kernel does not check whether
+  the target page straddles a PMP boundary before issuing CBO.ZERO. In the
+  kernel's own PMP configuration (head.S:237-240), PMP0 grants universal R/W/X
+  access, so this is not triggerable by the kernel's PMP setup alone. However,
+  with firmware-managed PMP where M-mode restricts kernel S-mode access to
+  certain physical regions, a page allocation that spans a PMP boundary could
+  cause UNSPECIFIED behavior — potentially zeroing memory in a protected
+  region.
+  | .Lzero_loop:
+  | 	CBO_ZERO(a0)
+  | 	add	a0, a0, a1
+  | 	CBOZ_ALT(11, "bltu a0, a2, .Lzero_loop; ret", "nop; nop")
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:319-328
+      "The PMP access control bits shall be the same for all physical
+      addresses in the cache block, and if write permission is granted by
+      the PMP access cont"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:336-345
+      "The access size for CMO instructions is equal to the size of the
+      cache block, however in some cases that access can be decomposed
+      into multiple memory"
+
+[potential_risk] arch/riscv/mm/dma-noncoherent.c:18-29  arch_dma_cache_wback
+  DMA cache management uses ALT_CMO_OP(CLEAN, ...) which emits CBO.CLEAN
+  instructions. Similarly arch_dma_cache_inv() uses CBO.INVAL and
+  arch_dma_cache_wback_inv() uses CBO.FLUSH. These CBO instructions access
+  cache-block-sized regions. Same UNSPECIFIED-behavior risk as clear_page if a
+  DMA buffer spans a firmware-enforced PMP boundary. A CBO.FLUSH that writes
+  back dirty cache lines across a PMP boundary could corrupt protected memory.
+  In practice, the kernel's own PMP grants universal access, so this requires
+  external M-mode PMP enforcement to trigger.
+  | static inline void arch_dma_cache_wback(phys_addr_t paddr, size_t size)
+  | {
+  | 	void *vaddr = phys_to_virt(paddr);
+  | ...
+  | 	ALT_CMO_OP(CLEAN, vaddr, size, riscv_cbom_block_size);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:319-328
+      "The PMP access control bits shall be the same for all physical
+      addresses in the cache block... If the above constraints are not
+      met, the behavior of a"
+
+[compliant] arch/riscv/kernel/head.S:229-242  _start_kernel
+  The kernel boot sequence in M-mode configures PMP0 as NAPOT covering the
+  full address space with R/W/X permissions, then never reconfigures PMP at
+  runtime. This L=0 entry grants M-mode universal access and S/U-mode
+  universal access. This is the correct behavior for a kernel that delegates
+  PMP management to M-mode firmware (e.g., OpenSBI). The kernel does not
+  attempt runtime PMP manipulation, which avoids introducing PMP-related bugs
+  in kernel context-switch or hotplug paths.
+  | la a0, .Lpmp_done
+  | csrw CSR_TVEC, a0
+  | li a0, -1
+  | csrw CSR_PMPADDR0, a0
+  | li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+  | csrw CSR_PMPCFG0, a0
+
+[potential_risk] arch/riscv/kernel/traps_misaligned.c:415-420  handle_scalar_misaligned_store
+  When the misaligned store is from kernel mode (user_mode(regs) is false),
+  the handler uses memcpy() at line 419 instead of copy_to_user(). On RV32
+  with FSD (len=8), this memcpy writes 8 bytes decomposed into two 32-bit
+  stores to kernel memory. If the kernel's own memory access triggers a page
+  fault or PMP fault on the second 32-bit write, the first write has already
+  been committed. While kernel memory is generally uniformly mapped, this
+  could matter in edge cases like persistent memory (PMEM) DAX mappings or if
+  kernel code operates on user-owned pages via kmap.
+  | if (user_mode(regs)) {
+  | 	if (copy_to_user((u8 __user *)addr, &val, len))
+  | 		return -1;
+  | } else {
+  | 	memcpy((u8 *)addr, &val, len);
+  | }
+

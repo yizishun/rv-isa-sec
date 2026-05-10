@@ -1,0 +1,134 @@
+{
+  "pr_number": 1557,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 1557,
+    "violation_condition": "XiangShan currently does not implement the misaligned atomicity granule PMA (MAG) at all — the PMA checker tracks only R/W/X/A/ATOMIC/C/L bits with no MAG field. If MAG PMA support is added in the future, the load/store unit misalignment check at NewLoadUnit.scala:926 (`val am = !in.align.get && accessType.isScalar() && isNC && !pmpUnaccessable`) and NewStoreUnit.scala:641 (`val am = !align && isScalar && isNC && !pmpInaccessible`) must apply to both 32-bit and compressed encodings identically. If the MAG check were gated on instruction decode format (e.g., checking `!isRVC` or matching only 32-bit opcode patterns), compressed load/store instructions (C.LW/C.SW/C.LD/C.SD/C.FLW/C.FSW/C.FLD/C.FSD) would bypass the MAG PMA atomicity guarantee, causing either spurious misaligned exceptions or non-atomic execution within the granule.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "isRVC.*PMA|PMA.*isRVC|mag.*check.*(?!compressed)|misaligned.*atomicity.*granule.*(?!rvc|compressed)|MAG\\d+.*opcode.*filter",
+    "affected_entities": [
+      "NewLoadUnit",
+      "NewStoreUnit",
+      "AtomicsUnit",
+      "PMA",
+      "PMAEntry",
+      "C.LW",
+      "C.SW",
+      "C.LD",
+      "C.SD",
+      "C.FLW",
+      "C.FSW",
+      "C.FLD",
+      "C.FSD"
+    ],
+    "summary": "If MAG PMA is implemented, compressed load/store encodings (RVC) must be treated identically to 32-bit encodings for misaligned atomicity granule coverage; failure to do so causes incorrect misalignment exceptions or non-atomic memory access within the granule, leading to data corruption"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/PMA.scala",
+        "function_name": "PMAConfigEntry",
+        "line_start": 42,
+        "line_end": 52,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "XiangShan does not implement the Misaligned Atomicity Granule (MAG) PMA. PMAConfigEntry tracks only l/c/atomic/a/x/w/r fields — no MAG field exists. The PMPRespBundle (PMP.scala:385-391) similarly lacks any MAG output. The MMPMA CSR interface (PMA.scala:163-168) maps config bits 7:0 as {l, c, atomic, a[1:0], x, w, r} with no bits reserved for MAG. This means MAG PMA is entirely absent from the hardware design.",
+      "snippet": "case class PMAConfigEntry(\n  base_addr: BigInt,\n  range: BigInt = 0L,\n  l: Boolean = false,\n  c: Boolean = false,\n  atomic: Boolean = false,\n  a: Int = 0,\n  x: Boolean = false,\n  w: Boolean = false,\n  r: Boolean = false\n)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3084,
+          "line_end": 3116,
+          "excerpt": "The misaligned atomicity granule PMA provides constrained support for misaligned AMOs. This PMA, if present, specifies the size of a misaligned atomicity granule, a naturally aligned power-of-two number of bytes."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "PMPRespBundle",
+        "line_start": 385,
+        "line_end": 391,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "PMPRespBundle has no MAG field — confirms MAG PMA is not plumbed through the PMA/PMP checker pipeline. The bundle only exports ld/st/instr/mmio/atomic permissions, so downstream consumers (NewLoadUnit, NewStoreUnit) have no way to query MAG granularity even if it were configured.",
+      "snippet": "class PMPRespBundle(implicit p: Parameters) extends PMPBundle {\n  val ld = Output(Bool())\n  val st = Output(Bool())\n  val instr = Output(Bool())\n  val mmio = Output(Bool())\n  val atomic = Output(Bool())",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3084,
+          "line_end": 3092,
+          "excerpt": "This PMA, if present, specifies the size of a misaligned atomicity granule, a naturally aligned power-of-two number of bytes. Specific supported values for this PMA are represented by MAGNN, e.g., MAG16 indicates the misaligned atomicity granule is at least 16 bytes."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/pipeline/NewLoadUnit.scala",
+        "function_name": "MisalignCheck (load)",
+        "line_start": 926,
+        "line_end": 926,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The load misalignment exception check uses accessType.isScalar(), which classifies instructions by InstrType (scalar/vector/prefetch) rather than by encoding format (32-bit vs compressed). Both C.LW/C.LD/C.FLW/C.FLD (compressed) and LW/LD/FLW/FLD (32-bit) are InstrType.scalar, so compressed encodings are treated identically. If MAG PMA were implemented in the future, gating the MAG check on isScalar() would correctly cover both 32-bit and compressed encodings per spec requirement (machine.adoc:3094-3096: 'applies only to AMOs, loads and stores defined in the base ISAs... and compressed encodings thereof').",
+      "snippet": "val am = !in.align.get && accessType.isScalar() && isNC && !pmpUnaccessable",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3094,
+          "line_end": 3096,
+          "excerpt": "The misaligned atomicity granule PMA applies only to AMOs, loads and stores defined in the base ISAs, and loads and stores of no more than XLEN bits defined in the F, D, and Q extensions, and compressed encodings thereof."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/pipeline/NewStoreUnit.scala",
+        "function_name": "MisalignCheck (store)",
+        "line_start": 641,
+        "line_end": 641,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The store misalignment exception check uses accessType.isScalar(), which classifies instructions by InstrType (scalar/vector/prefetch) rather than by encoding format (32-bit vs compressed). Both C.SW/C.SD/C.FSW/C.FSD (compressed) and SW/SD/FSW/FSD (32-bit) are InstrType.scalar, so compressed encodings are treated identically. Same as the load-side check at NewLoadUnit.scala:926 — no encoding-format discrimination exists.",
+      "snippet": "val am = !align && isScalar && isNC && !pmpInaccessible",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3094,
+          "line_end": 3096,
+          "excerpt": "The misaligned atomicity granule PMA applies only to AMOs, loads and stores defined in the base ISAs, and loads and stores of no more than XLEN bits defined in the F, D, and Q extensions, and compressed encodings thereof."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/pipeline/package.scala",
+        "function_name": "InstrType / isScalar",
+        "line_start": 108,
+        "line_end": 115,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "InstrType classifies instructions into three categories: scalar, vector, prefetch. The isScalar() method checks InstrType === scalar, which is encoding-format-agnostic — it does not distinguish between 32-bit and compressed encodings. Both compressed (C.LW/C.SW/C.LD/C.SD/C.FLW/C.FSW/C.FLD/C.FSD) and 32-bit (LW/SW/LD/SD/FLW/FSW/FLD/FSD) scalar memory instructions are classified as 'scalar'. This means any future MAG PMA check gated on isScalar() would apply uniformly to both encoding formats.",
+      "snippet": "object InstrType extends ChiselOHEnum {\n  val scalar = addType(\"scalar\")\n  val vector = addType(\"vector\")\n  val prefetch = addType(\"prefetch\")\n  def apply() = UInt(this.values.size.W)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3094,
+          "line_end": 3096,
+          "excerpt": "The misaligned atomicity granule PMA applies only to AMOs, loads and stores defined in the base ISAs, and loads and stores of no more than XLEN bits defined in the F, D, and Q extensions, and compressed encodings thereof."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "not_implemented"
+}
