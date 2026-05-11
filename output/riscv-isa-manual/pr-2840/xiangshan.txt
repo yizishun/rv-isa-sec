@@ -1,0 +1,116 @@
+PR #2840  target=xiangshan  overall=compliant
+Spec: Smcdeleg/Ssccfg counter delegation through siselect range 0x40-0x5F depends on Sscsrind for stateen-based indirect CSR access control; XiangShan comments explicitly note Sscsrind is unimplemented, creating a hardware gap where counter delegation state may be accessible without proper mstateen0[60] CSRIND gating
+Violation:
+  In XiangShan RTL, the Sscsrind indirect-CSR access infrastructure
+  (siselect/sireg*) is implemented for AIA interrupt-file purposes, but source
+  comments in StateEnBundle.scala:20,31 explicitly state 'Smcsrind/Sscsrind is
+  not implemented.' If the hardware exposes Smcdeleg/Ssccfg counter-delegation
+  functionality (siselect range 0x40-0x5F mapping to hpmcounter/hpmevent
+  aliases) through this same siselect/sireg* register file without properly
+  implementing the Sscsrind dependency, the mstateen0[60].CSRIND state-enable
+  access-control gate—which Sscsrind requires to block or allow indirect CSR
+  access from lower privilege modes—is either missing or incorrectly wired.
+  This means S/HS-mode software can access delegated counter state (cycle,
+  instret, hpmcounters, hpmevents) through sireg* without the stateen-based
+  access-control check that the Sscsrind-dependent spec mandates, and
+  conversely, setting mstateen0[60]=0 may not actually block indirect counter
+  access as expected.
+Consequence: privilege_escape
+Pattern:
+  siselect.*0x40.*0x5F.*CSRIND|mstateen0.*60.*sireg.*counter|Sscsrind.*not.*im
+  plement.*Smcdeleg|indirect.*CSR.*stateen.*bypass|counter.*delegation.*sisele
+  ct.*CDE
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/StateEnBundle.scala:19-21  Hstateen0Bundle
+  The CSRIND bit is defined as RW(60) and IS wired through to the
+  CSRPermitModule access-control gates. The source comment 'Smcsrind/Sscsrind
+  is not implemented' is stale/misleading (the field and its gating logic are
+  fully functional), but the hardware behavior is correct: mstateen0[60]=0
+  blocks indirect CSR access from less-privileged modes as required.
+  | // zeros for that hart. Smcsrind/Sscsrind is not implemented.
+  | val CSRIND  = RW(60).withDescription("Enable indirect CSR access state...")
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/StateEnBundle.scala:30-32  Mstateen0Bundle
+  Same stale comment as line 20. The M-mode CSRIND is correctly defined as
+  RW(60) with reset 0. The access-control gate is functional via
+  MLevelPermitModule.
+  | // zeros for that hart. Smcsrind/Sscsrind is not implemented.
+  | override val CSRIND  = RW(60).withReset(0.U).withDescription("Enable indirect CSR access state...")
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:252-257  MLevelPermitModule
+  The accessIND_EX_II gate correctly checks !mstateen0.CSRIND.asBool for non-
+  M-mode access to siselect/sireg* and vsiselect/vsireg* (CSR addresses
+  0x150-0x157, 0x250-0x257). When mstateen0[60]=0, lower-privilege indirect
+  CSR access raises illegal-instruction exception, as required by
+  smcsrind.adoc §norm:sscsrind_csrs_access_control.
+  | // CSRIND bit 60 indirect reg (Sscsrind extensions), this is not implemented
+  | // csr addr S: [0x150, 0x157]     VS: [0x250, 0x257]
+  | private val csrIsSi = Ireg.isInSCsrInd(addr)
+  | private val csrIsVSi = Ireg.isInVSCsrInd(addr)
+  | private val csrIsIND = csrIsSi || csrIsVSi
+  | private val accessIND_EX_II = csrIsIND && !privState.isModeM && !mstateen0.CSRIND.asBool
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:465-468  VirtualLevelPermitModule
+  The accessIND_EX_VI gate correctly checks !hstateen0.CSRIND.asBool for
+  virtual-mode access to siselect/sireg* (0x150-0x157). When hstateen0[60]=0
+  and mstateen0[60]=1, VS/VU-mode access raises virtual-instruction exception,
+  as required by smcsrind.adoc §norm:hypervisor_impl_csrs_access_control.
+  | // CSRIND bit 60 indirect reg (Sscsrind extensions), this is not implemented
+  | // csr addr S: [0x150, 0x157]
+  | private val csrIsSi = Ireg.isInSCsrInd(addr)
+  | private val accessIND_EX_VI = csrIsSi && privState.isVirtual && !hstateen0.CSRIND.asBool
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala:44-53  CSRAIA.siselect
+  The siselect WARL constraint correctly marks siselect values 0x40-0x6F
+  (including the Smcdeleg/Ssccfg counter-delegation range 0x40-0x5F) as
+  illegal. Since Smcdeleg/Ssccfg is not implemented in XiangShan, blocking the
+  counter-delegation siselect range prevents software from attempting to
+  access nonexistent delegated counter state through sireg*. This is correct
+  behavior per smcdeleg.adoc line 32 which states Smcdeleg/Ssccfg depends on
+  Sscsrind — XiangShan does not implement Smcdeleg/Ssccfg, so the range is
+  correctly excluded.
+  | val siselect = Module(new CSRModule("Siselect", new SISelectBundle) with HasISelectBundle {
+  |   private val value = reg.ALL.asUInt
+  |   inIMSICRange := value >= 0x70.U && value < 0x100.U
+  |   isIllegal :=
+  |     value < 0x30.U ||
+  |     value >= 0x30.U && value < 0x40.U && value(0) === 1.U ||
+  |     value >= 0x40.U && value < 0x70.U ||
+  |     value >= 0x100.U
+  | })
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRIND.scala:42-65  CSRIND.sireg2 through sireg6
+  sireg2 through sireg6 are all read-only-zero stubs (ZeroFieldBundle with
+  regOut := 0.U). This is correct since Smcdeleg/Ssccfg counter delegation is
+  not implemented — there is no counter state to expose through these indirect
+  alias registers. The IndirectCSRPermitModule correctly flags all sireg2-6
+  and mireg2-6 accesses as illegal-instruction exceptions.
+  | val sireg2 = Module(new CSRModule("Sireg2", new ZeroFieldBundle(...)) {
+  |   regOut := 0.U
+  | }).setAddr(CSRs.sireg2)
+  | // ... sireg3 through sireg6 follow identical pattern
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:536-536  IndirectCSRPermitModule
+  All mireg2-6 accesses are unconditionally flagged as illegal-instruction
+  exception (rwMireg2_6_EX_II). This is consistent with the M-mode WARL
+  constraint on miselect (which only allows 0x30-0x3F even values and
+  0x70-0xFF) and the fact that mireg2-6 are zero stubs. There is no
+  Smcdeleg/Ssccfg counter-delegation bypass possible because miselect itself
+  cannot hold values in 0x40-0x5F.
+  | private val rwMireg2_6_EX_II = Ireg.isInMireg2_6(addr)
+
+[potential_risk] src/main/scala/xiangshan/Parameters.scala:297-298  XiangShanParameters.ISAExtensions
+  The ISA string declares 'smcsrind' and 'sscsrind' as implemented extensions.
+  While the Sscsrind indirect-CSR infrastructure IS partially implemented
+  (siselect/sireg* for AIA interrupt-file access, with proper mstateen0[60]
+  gating), the full Sscsrind framework (including support for counter-
+  delegation siselect range 0x40-0x5F and indirect register expansion through
+  sireg2-6) is not. Software that probes the ISA string may incorrectly assume
+  full Sscsrind capability. However, this is not a security vulnerability
+  because: (a) the counter-delegation range is blocked by siselect WARL, (b)
+  sireg2-6 are zero stubs, and (c) the access-control stateen gates are
+  functional. The risk is limited to software compatibility, not privilege
+  escape.
+  | "smcsrind",
+  | "sscsrind",
+

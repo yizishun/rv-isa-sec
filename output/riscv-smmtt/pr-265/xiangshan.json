@@ -1,0 +1,318 @@
+{
+  "pr_number": 265,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 265,
+    "violation_condition": "When msdcfg.SIDN holds a value that does not correspond to an implemented supervisor interrupt domain, the XiangShan RTL accesses internal per-domain register arrays (hgeip/hgeie array, IMSIC interrupt file register file) using SIDN as an unchecked index. The PR removes the previously mandatory trap-on-invalid-SIDN behavior (illegal instruction on siselect/sireg/stopei access, read-only zero on hgeip/hgeie/hstatus.vgein, SEIP=0), making the invalid-SIDN behavior UNSPECIFIED. If the hardware does not implement bounds-checking comparators on SIDN before using it to index internal state arrays, out-of-bounds reads return uninitialized or stale register state, and out-of-bounds writes corrupt memory adjacent to the array.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "msdcfg.SIDN used as array index without bounds check; SIDN >= NUM_SUPERVISOR_DOMAINS not gated before hgeip/hgeie internal array access; siselect/sireg CSR access path missing SIDN validity check; stopei CSR read path missing SIDN validity gate; IMSIC interrupt file address computation using SIDN without saturation/clamping",
+    "affected_entities": [
+      "msdcfg",
+      "SIDN",
+      "hgeip",
+      "hgeie",
+      "siselect",
+      "sireg",
+      "stopei",
+      "mip.SEIP",
+      "hstatus.vgein",
+      "msideip",
+      "mgeien"
+    ],
+    "summary": "PR removes mandatory trap-and-zero behavior for invalid msdcfg.SIDN, making hardware-level SIDN bounds-checking critical: missing comparators allow out-of-bounds array indexing into per-domain hgeip/hgeie/IMSIC register state, leaking stale internal state or corrupting adjacent memory"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "Mip CSRModule",
+        "line_start": 285,
+        "line_end": 285,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "VSEIP computation uses VGEIN as direct bit-index into hgeip.asUInt without any bounds gate: hgeip.asUInt(hstatusVGEIN.asUInt). The HstatusVgeinField WLRL has no legalRange or legalValues defined, so isLegal returns true.B for all 6-bit values (0-63). Writes of VGEIN > 7 are silently accepted, and the bit-extract at the illegal VGEIN index reads from zero-padded bits above the implemented hgeip[7:1] field, producing VSEIP=0 when a valid guest interrupt might be pending.",
+      "snippet": "regOut.VSEIP := hvip.VSEIP || platformIRP.VSEIP || hgeip.asUInt(hstatusVGEIN.asUInt)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 253,
+          "line_end": 260,
+          "excerpt": "The VGEIN (Virtual Guest External Interrupt Number) field selects a guest external interrupt source for VS-level external interrupts. VGEIN is a WLRL field that must be able to hold values between zero and the maximum guest external interrupt number (known as GEILEN), inclusive."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 634,
+          "line_end": 640,
+          "excerpt": "The number of bits implemented in hgeip and hgeie for guest external interrupts is UNSPECIFIED and may be zero. This number is known as GEILEN. ... bits GEILEN:1 shall be writable in hgeie, and all other bit positions shall be read-only zeros in both hgeip and hgeie."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "HstatusVgeinField (object)",
+        "line_start": 247,
+        "line_end": 247,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "HstatusVgeinField extends CSREnum with WLRLApply but defines NO legalValues or legalRange. The default CSREnum.isLegal returns true.B (all values legal), making the WLRL write gate wen && wfield.isLegal a no-op. Any 6-bit value (0-63) is accepted as a write to VGEIN, despite the spec mandating legal values are only [0, GEILEN]. With geilen=7, values 8-63 are illegally writable.",
+      "snippet": "object HstatusVgeinField extends CSREnum with WLRLApply",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 1159,
+          "line_end": 1184,
+          "excerpt": "Software should not write anything other than legal values to such a field ... Implementations are permitted but not required to raise an illegal-instruction exception if an instruction attempts to write a non-supported value to a WLRL field."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/system/SoC.scala",
+        "function_name": "XSTileWrapConfig (IMSICParams)",
+        "line_start": 106,
+        "line_end": 112,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Configuration mismatch: vgeinWidth=6 (encoding 64 values, 0-63) but geilen=7 (only 7 guest domains, legal VGEIN 0-7). The 6-bit field can hold values far exceeding the legal range, and the WLRL isLegal check is width-agnostic (always returns true), so software-controlled VGEIN values 8-63 pass all gates.",
+      "snippet": "IMSICParams: aia.IMSICParams = aia.IMSICParams(\n  ...\n  geilen = 7,\n  vgeinWidth = 6,",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 253,
+          "line_end": 258,
+          "excerpt": "VGEIN is a WLRL field that must be able to hold values between zero and the maximum guest external interrupt number (known as GEILEN), inclusive."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (diff-test edge-detect)",
+        "line_start": 1677,
+        "line_end": 1677,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Diff-test edge-detection: hgeipVgeinReg performs unbounded VGEIN-indexed hgeip bit extraction. Functional impact limited (diff-test only), but confirms systemic absence of VGEIN bounds gating.",
+      "snippet": "val hgeipVgeinReg = RegNext(hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt), false.B)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (diff-test change-detection)",
+        "line_start": 1690,
+        "line_end": 1691,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "platformIRPVseipChange XORs current/previous hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt). Same unbounded VGEIN bit-index. Zero functional risk (diff-test only).",
+      "snippet": "!hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt) &&  hgeipVgeinReg ||\n hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt) && !hgeipVgeinReg",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (diff-test signaling)",
+        "line_start": 1709,
+        "line_end": 1709,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "platformIRPVseip aggregates hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt) into diff-test event. Diff-test only, zero operational impact.",
+      "snippet": "diffNonRegInterruptPendingEvent.platformIRPVseip := platformIRP.VSEIP || hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "HstatusBundle VGEIN field",
+        "line_start": 238,
+        "line_end": 238,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "VGEIN = HstatusVgeinField(17, 12, wNoFilter, rNoFilter) — WLRL at 6-bit with no-op write/read filters. Combined with missing isLegal range, constitutes fully unbounded 6-bit store.",
+      "snippet": "val VGEIN = HstatusVgeinField(17, 12, wNoFilter, rNoFilter).withReset(0.U)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "HgeipBundle, HgeieBundle",
+        "line_start": 280,
+        "line_end": 288,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HgeipBundle (ip=RO(geilen,1)) and HgeieBundle (ie=RW(geilen,1)) correctly sized. Bit 0 hardwired to 0. Bundle definitions correct per spec; vulnerability is in consuming code.",
+      "snippet": "class HgeieBundle ... { val ie = RW(soc.IMSICParams.geilen, 1).withReset(0.U) }\nclass HgeipBundle ... { val ip = RO(soc.IMSICParams.geilen, 1) }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala",
+        "function_name": "CSRPermitModule (stopei checks)",
+        "line_start": 436,
+        "line_end": 437,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Bounds check (vgein===0 || vgein>geilen) properly gates stopei/vstopei illegal-instruction. Correct but critically incomplete: does not prevent unbounded hgeip bit extraction at MachineLevel:285.",
+      "snippet": "private val rwVStopei_EX_II = ... && (vgein === 0.U || vgein > soc.IMSICParams.geilen.U)\nprivate val rwStopei_EX_VI = ... && (vgein === 0.U || vgein > soc.IMSICParams.geilen.U)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala",
+        "function_name": "statusIO bundle",
+        "line_start": 585,
+        "line_end": 599,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "statusIO.vgein = UInt(6.W) — 6-bit bus width allows values 0-63 to propagate. With geilen=7, width exceeds needed 3 bits. Enables illegal VGEIN values on internal buses.",
+      "snippet": "class statusIO extends Bundle {\n  ...\n  val vgein = UInt(6.W)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "Mip CSRModule SGEIP",
+        "line_start": 292,
+        "line_end": 292,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SGEIP := Cat(hgeip.asUInt & hgeie.asUInt).orR — full-vector OR-reduction, not VGEIN-indexed. Correct and unaffected by VGEIN bounds issues.",
+      "snippet": "regOut.SGEIP := Cat(hgeip.asUInt & hgeie.asUInt).orR",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala",
+        "function_name": "InterruptFilter (Candidate1/2/3)",
+        "line_start": 284,
+        "line_end": 286,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Candidate1 uses VGEIN =/= 0 for VS interrupt routing. Illegal VGEIN (e.g. 63) passes =/= 0 check, routing through Candidate1. Functionally benign since vsip.SEIP=0 for VGEIN>7, but logic correctness depends on undefined VGEIN value.",
+      "snippet": "val Candidate1 = vsip.SEIP && vsie.SEIE && (hstatus.VGEIN.asUInt =/= 0.U) && (vstopei.asUInt =/= 0.U)\nval Candidate2 = vsip.SEIP && vsie.SEIE && (hstatus.VGEIN.asUInt === 0.U) && ...\nval Candidate3 = vsip.SEIP && vsie.SEIE && !Candidate1 && !Candidate2",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (toAIA vgein)",
+        "line_start": 1445,
+        "line_end": 1445,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "toAIA.vgein := hstatus.regOut.VGEIN.asUInt — forwards unbounded VGEIN to IMSIC without clamping. IMSIC has its own bounds check, so protected downstream.",
+      "snippet": "toAIA.vgein := hstatus.regOut.VGEIN.asUInt",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (permitMod vgein)",
+        "line_start": 489,
+        "line_end": 489,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "permitMod.io.in.status.vgein := hstatus.regOut.VGEIN.asUInt — correct forwarding to CSRPermitModule for privilege checks.",
+      "snippet": "permitMod.io.in.status.vgein := hstatus.regOut.VGEIN.asUInt",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/wrapper/CSR.scala",
+        "function_name": "CSR wrapper (IMSIC wiring)",
+        "line_start": 205,
+        "line_end": 226,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "IMSIC_WRAP wiring correct: vgein passthrough to IMSIC which has internal bounds check. pendings bit-slice uses compile-time constant intFilesNum-1, not runtime VGEIN.",
+      "snippet": "imsic.fromCSR.vgein := csrMod.toAIA.vgein\ncsrMod.fromAIA.vseip := imsic.toCSR.pendings(soc.IMSICParams.intFilesNum - 1, 2)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "HipBundle VSEIP comment",
+        "line_start": 267,
+        "line_end": 268,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Comment-only documentation of VGEIN chain. No executable logic.",
+      "snippet": "this.VSEIP.setRO() // aliasRO of mip.VSEIP = hvip.VSEIP | hgeip(hstatus.VGEIN) | PLIC.VSEIP",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "Hip CSRModule",
+        "line_start": 95,
+        "line_end": 99,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Comment documentation chain, executable logic is simple alias (regOut.VSEIP := mip.VSEIP). Actual VGEIN indexing delegated to MachineLevel:285.",
+      "snippet": "// hip.VSEIP is read-only alias of mip.VSEIP\nregOut.VSEIP := mip.VSEIP",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (interrupt bundle passthrough)",
+        "line_start": 748,
+        "line_end": 750,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Wiring passthrough: hgeip.regOut, hgeie.regOut, hstatus.regOut.VGEIN to InterruptFilter. Data-path connection, no processing logic.",
+      "snippet": "m.hgeip := hgeip.regOut\nm.hgeie := hgeie.regOut\nm.hstatusVGEIN := hstatus.regOut.VGEIN",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptBundle.scala",
+        "function_name": "InterruptIO ports",
+        "line_start": 425,
+        "line_end": 427,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "IO port type declarations for hgeip/hgeie/hstatusVGEIN. Pure structural types, no executable logic.",
+      "snippet": "val hgeip = IO(Input(new HgeipBundle))\nval hgeie = IO(Input(new HgeieBundle))\nval hstatusVGEIN = IO(Input(HstatusVgeinField()))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/InterruptBundle.scala",
+        "function_name": "MipBundle SEIP/VSEIP fields",
+        "line_start": 113,
+        "line_end": 114,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Field definitions: SEIP=RO(9), VSEIP=RO(10). Bit-position declarations matching spec; no executable logic.",
+      "snippet": "val SEIP  = RO(9)\nval VSEIP = RO(10)",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

@@ -1,0 +1,226 @@
+{
+  "pr_number": 118,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 118,
+    "violation_condition": "XiangShan RTL implements Smstateen CSRs (mstateen0-3) but does NOT implement Ssstateen registers (sstateen0-3, hstateen0-3). This occurs when the Chisel CSR module instantiates mstateen read/write logic with state-enable bit fields but omits the corresponding sstateen and hstateen CSR definitions and address decode entries, violating the implication that Smstateen requires Ssstateen registers to be visible at supervisor and hypervisor levels.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "mstateen.*StateEnable|customStateEn|Mapping.*sstateen.*MissingCSR|sstateen0.*NOT.*defined|hstateen0.*unimplemented|stateEnableField.*mstatus",
+    "affected_entities": [
+      "mstateen0",
+      "mstateen1",
+      "mstateen2",
+      "mstateen3",
+      "sstateen0",
+      "sstateen1",
+      "sstateen2",
+      "sstateen3",
+      "hstateen0",
+      "hstateen1",
+      "hstateen2",
+      "hstateen3",
+      "Smstateen",
+      "Ssstateen"
+    ],
+    "summary": "Implementing Smstateen without Ssstateen hides state-enable access control from S/HS-mode software, creating a privilege control gap where M-mode can silently disable extensions without supervisor visibility"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "machineLevelCSRMods (mstateen0-3 instantiation)",
+        "line_start": 402,
+        "line_end": 408,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mstateen0-3 CSRs are correctly instantiated at addresses 0x30C-0x30F with proper WARL semantics. mstateen0 uses Mstateen0Bundle with all writable fields reset to 0 via .withReset(0.U). mstateen1-3 use MstateenNonZeroBundle with SE bit 63 reset to 0. Cascade wiring through HasStateenBundle correctly propagates mstateen regOut to hstateen/sstateen modules.",
+      "snippet": "val mstateen0 = Module(new CSRModule(\"Mstateen0\", new Mstateen0Bundle)).setAddr(CSRs.mstateen0)\nval mstateen1 = Module(new CSRModule(\"Mstateen1\", new MstateenNonZeroBundle)).setAddr(CSRs.mstateen1)\nval mstateen2 = Module(new CSRModule(\"Mstateen2\", new MstateenNonZeroBundle)).setAddr(CSRs.mstateen2)\nval mstateen3 = Module(new CSRModule(\"Mstateen3\", new MstateenNonZeroBundle)).setAddr(CSRs.mstateen3)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 46,
+          "line_end": 50,
+          "excerpt": "The Smstateen and Ssstateen extensions collectively specify machine-mode and supervisor-mode features. The Smstateen extension specification comprises the mstateen*, sstateen*, and hstateen* CSRs and their functionality."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 153,
+          "line_end": 156,
+          "excerpt": "On reset, all writable mstateen bits are initialized by the hardware to zeros. If machine-level software changes these values, it is responsible for initializing the corresponding writable bits of the hstateen and sstateen CSRs to zeros too."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala",
+        "function_name": "supervisorLevelCSRMods (sstateen0-3 instantiation)",
+        "line_start": 164,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sstateen0-3 CSRs are correctly instantiated at addresses 0x10C-0x10F. sstateen0 uses HasStateenBundle with dual-source masking: Mux(privState.isVirtual, fromHstateen0, fromMstateen0) & reg, correctly implementing the spec's rule that mstateen zeros propagate to sstateen (HS-mode) and hstateen zeros propagate to sstateen (VS-mode). sstateen1-3 are read-only zero as expected for unimplemented extensions.",
+      "snippet": "val sstateen0 = Module(new CSRModule(\"Sstateen0\", new Sstateen0Bundle) with HasStateenBundle {\n    regOut := Mux(privState.isVirtual, fromHstateen0.asUInt, fromMstateen0.asUInt) & reg.asUInt\n  }).setAddr(CSRs.sstateen0)\nval sstateen1 = Module(new CSRModule(\"Sstateen1\", new SstateenNonZeroBundle)).setAddr(CSRs.sstateen1)\nval sstateen2 = Module(new CSRModule(\"Sstateen2\", new SstateenNonZeroBundle)).setAddr(CSRs.sstateen2)\nval sstateen3 = Module(new CSRModule(\"Sstateen3\", new SstateenNonZeroBundle)).setAddr(CSRs.sstateen3)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 141,
+          "line_end": 146,
+          "excerpt": "For every bit in an mstateen CSR that is zero (whether read-only zero or set to zero), the same bit appears as read-only zero in the matching hstateen and sstateen CSRs. For every bit in an hstateen CSR that is zero (whether read-only zero or set to zero), the same bit appears as read-only zero in sstateen when accessed in VS-mode."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 110,
+          "line_end": 127,
+          "excerpt": "Each bit of a supervisor-level sstateen CSR controls user-level access (from U-mode or VU-mode) to an extension's state. ... the bit positions of 'encroaching' bits will remain forever read-only zeros in the matching sstateen CSRs."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "hypervisorCSRMods (hstateen0-3 instantiation)",
+        "line_start": 170,
+        "line_end": 186,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hstateen0-3 CSRs are correctly instantiated at addresses 0x60C-0x60F with HasStateenBundle. Each applies WARL masking: regOut := reg.asUInt & fromMstateen<N>.asUInt, correctly implementing mstateen-to-hstateen zero propagation. hstateen0 uses Hstateen0Bundle with SE0, ENVCFG, CSRIND, AIA, IMSIC, CONTEXT RW fields. Bit 63 (SE0) correctly controls access to sstateen CSRs from VS/VU-mode.",
+      "snippet": "val hstateen0 = Module(new CSRModule(\"Hstateen0\", new Hstateen0Bundle) with HasStateenBundle {\n    regOut := reg.asUInt & fromMstateen0.asUInt\n  }).setAddr(CSRs.hstateen0)\nval hstateen1 = Module(new CSRModule(\"Hstateen1\", new HstateenNonZeroBundle) with HasStateenBundle {\n    regOut := reg.asUInt & fromMstateen1.asUInt\n  }).setAddr(CSRs.hstateen1)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 129,
+          "line_end": 132,
+          "excerpt": "With the hypervisor extension, the hstateen CSRs have identical encodings to the mstateen CSRs, except controlling accesses for a virtual machine (from VS and VU modes)."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 165,
+          "line_end": 166,
+          "excerpt": "bit 63 of each hstateen correspondingly controls access to the matching sstateen CSR."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/StateEnBundle.scala",
+        "function_name": "Hstateen0Bundle (field definitions)",
+        "line_start": 15,
+        "line_end": 25,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Hstateen0Bundle writable fields (SE0 at bit 63, ENVCFG at bit 62, CSRIND at bit 60, AIA at bit 59, IMSIC at bit 58, CONTEXT at bit 57) are declared RW without .withReset(). In CSRModule.scala:24, the reg is created as Reg(bundle) rather than RegInit(bundle, bundle.init) when needReset is false. This means hstateen0-3 register values at reset are undefined (uninitialized flops). While the spec (smstateen.adoc:154-155) places the burden of hstateen/sstateen initialization on M-mode software, undefined reset values could transiently enable privileged state access (e.g. SE0=1 allowing VS-mode to access sstateen CSRs) if software reads hstateen before writing it. The masking by mstateen (which resets to 0) limits but does not fully mitigate this — the raw reg value could be observed via CSR read before a write happens.",
+      "snippet": "class Hstateen0Bundle extends Sstateen0Bundle {\n  override val len: Int = 64\n  val SE0     = RW(63).withDescription(\"...\")\n  val ENVCFG  = RW(62).withDescription(\"...\")\n  val CSRIND  = RW(60).withDescription(\"...\")\n  val AIA     = RW(59).withDescription(\"...\")\n  val IMSIC   = RW(58).withDescription(\"...\")\n  val CONTEXT = RW(57).withDescription(\"...\")\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 153,
+          "line_end": 156,
+          "excerpt": "On reset, all writable mstateen bits are initialized by the hardware to zeros. If machine-level software changes these values, it is responsible for initializing the corresponding writable bits of the hstateen and sstateen CSRs to zeros too."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 141,
+          "line_end": 143,
+          "excerpt": "For every bit in an mstateen CSR that is zero (whether read-only zero or set to zero), the same bit appears as read-only zero in the matching hstateen and sstateen CSRs."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/StateEnBundle.scala",
+        "function_name": "Sstateen0Bundle (sstateen0.C field)",
+        "line_start": 8,
+        "line_end": 13,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Sstateen0Bundle has FCSR(bit 1) and JVT(bit 2) as RO with reset=0, and C(bit 0) as RW without explicit reset. Because FCSR and JVT have .withReset(0.U), needReset=true, so the full 32-bit register is initialized via RegInit with C defaulting to 0 (CSRBundle.init defaults null-init fields to 0). This is correct — sstateen0.C resets to 0, blocking custom state access from U/VU-mode until S-mode software enables it.",
+      "snippet": "class Sstateen0Bundle extends CSRBundle {\n  override val len: Int = 32\n  val JVT  = RO(2).withReset(0.U)\n  val FCSR = RO(1).withReset(0.U)\n  val C    = RW(0)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 239,
+          "line_end": 242,
+          "excerpt": "The C bit controls access to any and all custom state. The C bit of these registers is not custom state itself; it is a standard field of a standard CSR, either mstateen0, hstateen0, or sstateen0."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala",
+        "function_name": "MLevelPermitModule (accessStateen_EX_II)",
+        "line_start": 237,
+        "line_end": 244,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "M-level permit module correctly gates access to hstateen/sstateen CSRs using mstateen<N>.SE0/SE bit 63. When mstateen0.SE0=0 and the hart is not in M-mode, any access to hstateen0 or sstateen0 raises EX_II. Same logic applies for indices 1-3. This correctly implements the spec rule that mstateen bit 63 controls access to matching sstateen and hstateen CSRs.",
+      "snippet": "private val accessStateen_EX_II = (\n    mstateen0.SE0.asBool +: Seq(mstateen1, mstateen2, mstateen3).map(_.SE.asBool)\n    ).zipWithIndex.map{ case(se, i) => {\n    val csrIsHstateen = addr === (CSRs.hstateen0 + i).U\n    val csrIsSstateen = addr === (CSRs.sstateen0 + i).U\n    val csrIsStateen = csrIsHstateen || csrIsSstateen\n    csrIsStateen && !privState.isModeM && !se\n  }}.reduce(_ || _)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 162,
+          "line_end": 164,
+          "excerpt": "For each mstateen CSR, bit 63 is defined to control access to the matching sstateen and hstateen CSRs. That is, bit 63 of mstateen0 controls access to sstateen0 and hstateen0; bit 63 of mstateen1 controls access to sstateen1 and hstateen1; etc."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala",
+        "function_name": "VirtualLevelPermitModule (accessStateen_EX_VI)",
+        "line_start": 454,
+        "line_end": 459,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Virtual-level permit module correctly gates access to sstateen CSRs from VS/VU-mode using hstateen<N>.SE/SE0 bit 63. When hstateen0.SE0=0 and the hart is in virtual mode (VS/VU), access to sstateen0 raises EX_VI. This correctly implements hstateen bit 63 controlling access to matching sstateen CSR from VS/VU-mode.",
+      "snippet": "private val accessStateen_EX_VI = (\n    hstateen0.SE0.asBool +: Seq(hstateen1, hstateen2, hstateen3).map(_.SE.asBool)\n    ).zipWithIndex.map{case(se, i) => {\n    val csrIsSstateen = addr === (CSRs.sstateen0 + i).U\n    csrIsSstateen && privState.isVirtual && !se\n  }}.reduce(_ || _)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 165,
+          "line_end": 166,
+          "excerpt": "Likewise, bit 63 of each hstateen correspondingly controls access to the matching sstateen CSR."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "HasStateenBundle cascade wiring",
+        "line_start": 766,
+        "line_end": 774,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The cascade wiring correctly connects mstateen<N>.regOut and hstateen0.regOut to every module mixing in HasStateenBundle. Uses regOut (raw register output, not rdata which includes masking) ensuring the cascade applies clean masking at each level: hstateen masks against mstateen regOut, sstateen0 masks against both hstateen0 and mstateen0 via Mux. The three-tier WARL cascade correctly implements the spec's zero-propagation hierarchy.",
+      "snippet": "mod match {\n      case m: HasStateenBundle =>\n        m.fromMstateen0 := mstateen0.regOut\n        m.fromMstateen1 := mstateen1.regOut\n        m.fromMstateen2 := mstateen2.regOut\n        m.fromMstateen3 := mstateen3.regOut\n        m.fromHstateen0 := hstateen0.regOut\n        m.privState     := privState\n      case _ =>",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 141,
+          "line_end": 146,
+          "excerpt": "For every bit in an mstateen CSR that is zero ... the same bit appears as read-only zero in the matching hstateen and sstateen CSRs. For every bit in an hstateen CSR that is zero ... the same bit appears as read-only zero in sstateen when accessed in VS-mode."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,178 @@
+PR #265  target=xiangshan  overall=bug_confirmed
+Spec: PR removes mandatory trap-and-zero behavior for invalid msdcfg.SIDN, making hardware-level SIDN bounds-checking critical: missing comparators allow out-of-bounds array indexing into per-domain hgeip/hgeie/IMSIC register state, leaking stale internal state or corrupting adjacent memory
+Violation:
+  When msdcfg.SIDN holds a value that does not correspond to an implemented
+  supervisor interrupt domain, the XiangShan RTL accesses internal per-domain
+  register arrays (hgeip/hgeie array, IMSIC interrupt file register file)
+  using SIDN as an unchecked index. The PR removes the previously mandatory
+  trap-on-invalid-SIDN behavior (illegal instruction on siselect/sireg/stopei
+  access, read-only zero on hgeip/hgeie/hstatus.vgein, SEIP=0), making the
+  invalid-SIDN behavior UNSPECIFIED. If the hardware does not implement
+  bounds-checking comparators on SIDN before using it to index internal state
+  arrays, out-of-bounds reads return uninitialized or stale register state,
+  and out-of-bounds writes corrupt memory adjacent to the array.
+Consequence: info_leak
+Pattern:
+  msdcfg.SIDN used as array index without bounds check; SIDN >=
+  NUM_SUPERVISOR_DOMAINS not gated before hgeip/hgeie internal array access;
+  siselect/sireg CSR access path missing SIDN validity check; stopei CSR read
+  path missing SIDN validity gate; IMSIC interrupt file address computation
+  using SIDN without saturation/clamping
+------------------------------------------------------------
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:285-285  Mip CSRModule
+  VSEIP computation uses VGEIN as direct bit-index into hgeip.asUInt without
+  any bounds gate: hgeip.asUInt(hstatusVGEIN.asUInt). The HstatusVgeinField
+  WLRL has no legalRange or legalValues defined, so isLegal returns true.B for
+  all 6-bit values (0-63). Writes of VGEIN > 7 are silently accepted, and the
+  bit-extract at the illegal VGEIN index reads from zero-padded bits above the
+  implemented hgeip[7:1] field, producing VSEIP=0 when a valid guest interrupt
+  might be pending.
+  | regOut.VSEIP := hvip.VSEIP || platformIRP.VSEIP || hgeip.asUInt(hstatusVGEIN.asUInt)
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:253-260
+      "The VGEIN (Virtual Guest External Interrupt Number) field selects a
+      guest external interrupt source for VS-level external interrupts.
+      VGEIN is a WLRL "
+    - riscv-isa-manual/src/priv/hypervisor.adoc:634-640
+      "The number of bits implemented in hgeip and hgeie for guest
+      external interrupts is UNSPECIFIED and may be zero. This number is
+      known as GEILEN. ... bi"
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:247-247  HstatusVgeinField (object)
+  HstatusVgeinField extends CSREnum with WLRLApply but defines NO legalValues
+  or legalRange. The default CSREnum.isLegal returns true.B (all values
+  legal), making the WLRL write gate wen && wfield.isLegal a no-op. Any 6-bit
+  value (0-63) is accepted as a write to VGEIN, despite the spec mandating
+  legal values are only [0, GEILEN]. With geilen=7, values 8-63 are illegally
+  writable.
+  | object HstatusVgeinField extends CSREnum with WLRLApply
+  References:
+    - riscv-isa-manual/src/priv/csrs.adoc:1159-1184
+      "Software should not write anything other than legal values to such
+      a field ... Implementations are permitted but not required to raise
+      an illegal-inst"
+
+[potential_risk] src/main/scala/system/SoC.scala:106-112  XSTileWrapConfig (IMSICParams)
+  Configuration mismatch: vgeinWidth=6 (encoding 64 values, 0-63) but geilen=7
+  (only 7 guest domains, legal VGEIN 0-7). The 6-bit field can hold values far
+  exceeding the legal range, and the WLRL isLegal check is width-agnostic
+  (always returns true), so software-controlled VGEIN values 8-63 pass all
+  gates.
+  | IMSICParams: aia.IMSICParams = aia.IMSICParams(
+  |   ...
+  |   geilen = 7,
+  |   vgeinWidth = 6,
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:253-258
+      "VGEIN is a WLRL field that must be able to hold values between zero
+      and the maximum guest external interrupt number (known as GEILEN),
+      inclusive."
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1677-1677  NewCSR (diff-test edge-detect)
+  Diff-test edge-detection: hgeipVgeinReg performs unbounded VGEIN-indexed
+  hgeip bit extraction. Functional impact limited (diff-test only), but
+  confirms systemic absence of VGEIN bounds gating.
+  | val hgeipVgeinReg = RegNext(hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt), false.B)
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1690-1691  NewCSR (diff-test change-detection)
+  platformIRPVseipChange XORs current/previous
+  hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt). Same unbounded VGEIN bit-
+  index. Zero functional risk (diff-test only).
+  | !hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt) &&  hgeipVgeinReg ||
+  |  hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt) && !hgeipVgeinReg
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1709-1709  NewCSR (diff-test signaling)
+  platformIRPVseip aggregates hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt)
+  into diff-test event. Diff-test only, zero operational impact.
+  | diffNonRegInterruptPendingEvent.platformIRPVseip := platformIRP.VSEIP || hgeip.rdata.asUInt(hstatus.regOut.VGEIN.asUInt)
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:238-238  HstatusBundle VGEIN field
+  VGEIN = HstatusVgeinField(17, 12, wNoFilter, rNoFilter) — WLRL at 6-bit with
+  no-op write/read filters. Combined with missing isLegal range, constitutes
+  fully unbounded 6-bit store.
+  | val VGEIN = HstatusVgeinField(17, 12, wNoFilter, rNoFilter).withReset(0.U)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:280-288  HgeipBundle, HgeieBundle
+  HgeipBundle (ip=RO(geilen,1)) and HgeieBundle (ie=RW(geilen,1)) correctly
+  sized. Bit 0 hardwired to 0. Bundle definitions correct per spec;
+  vulnerability is in consuming code.
+  | class HgeieBundle ... { val ie = RW(soc.IMSICParams.geilen, 1).withReset(0.U) }
+  | class HgeipBundle ... { val ip = RO(soc.IMSICParams.geilen, 1) }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:436-437  CSRPermitModule (stopei checks)
+  Bounds check (vgein===0 || vgein>geilen) properly gates stopei/vstopei
+  illegal-instruction. Correct but critically incomplete: does not prevent
+  unbounded hgeip bit extraction at MachineLevel:285.
+  | private val rwVStopei_EX_II = ... && (vgein === 0.U || vgein > soc.IMSICParams.geilen.U)
+  | private val rwStopei_EX_VI = ... && (vgein === 0.U || vgein > soc.IMSICParams.geilen.U)
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:585-599  statusIO bundle
+  statusIO.vgein = UInt(6.W) — 6-bit bus width allows values 0-63 to
+  propagate. With geilen=7, width exceeds needed 3 bits. Enables illegal VGEIN
+  values on internal buses.
+  | class statusIO extends Bundle {
+  |   ...
+  |   val vgein = UInt(6.W)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:292-292  Mip CSRModule SGEIP
+  SGEIP := Cat(hgeip.asUInt & hgeie.asUInt).orR — full-vector OR-reduction,
+  not VGEIN-indexed. Correct and unaffected by VGEIN bounds issues.
+  | regOut.SGEIP := Cat(hgeip.asUInt & hgeie.asUInt).orR
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala:284-286  InterruptFilter (Candidate1/2/3)
+  Candidate1 uses VGEIN =/= 0 for VS interrupt routing. Illegal VGEIN (e.g.
+  63) passes =/= 0 check, routing through Candidate1. Functionally benign
+  since vsip.SEIP=0 for VGEIN>7, but logic correctness depends on undefined
+  VGEIN value.
+  | val Candidate1 = vsip.SEIP && vsie.SEIE && (hstatus.VGEIN.asUInt =/= 0.U) && (vstopei.asUInt =/= 0.U)
+  | val Candidate2 = vsip.SEIP && vsie.SEIE && (hstatus.VGEIN.asUInt === 0.U) && ...
+  | val Candidate3 = vsip.SEIP && vsie.SEIE && !Candidate1 && !Candidate2
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1445-1445  NewCSR (toAIA vgein)
+  toAIA.vgein := hstatus.regOut.VGEIN.asUInt — forwards unbounded VGEIN to
+  IMSIC without clamping. IMSIC has its own bounds check, so protected
+  downstream.
+  | toAIA.vgein := hstatus.regOut.VGEIN.asUInt
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:489-489  NewCSR (permitMod vgein)
+  permitMod.io.in.status.vgein := hstatus.regOut.VGEIN.asUInt — correct
+  forwarding to CSRPermitModule for privilege checks.
+  | permitMod.io.in.status.vgein := hstatus.regOut.VGEIN.asUInt
+
+[compliant] src/main/scala/xiangshan/backend/fu/wrapper/CSR.scala:205-226  CSR wrapper (IMSIC wiring)
+  IMSIC_WRAP wiring correct: vgein passthrough to IMSIC which has internal
+  bounds check. pendings bit-slice uses compile-time constant intFilesNum-1,
+  not runtime VGEIN.
+  | imsic.fromCSR.vgein := csrMod.toAIA.vgein
+  | csrMod.fromAIA.vseip := imsic.toCSR.pendings(soc.IMSICParams.intFilesNum - 1, 2)
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:267-268  HipBundle VSEIP comment
+  Comment-only documentation of VGEIN chain. No executable logic.
+  | this.VSEIP.setRO() // aliasRO of mip.VSEIP = hvip.VSEIP | hgeip(hstatus.VGEIN) | PLIC.VSEIP
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:95-99  Hip CSRModule
+  Comment documentation chain, executable logic is simple alias (regOut.VSEIP
+  := mip.VSEIP). Actual VGEIN indexing delegated to MachineLevel:285.
+  | // hip.VSEIP is read-only alias of mip.VSEIP
+  | regOut.VSEIP := mip.VSEIP
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:748-750  NewCSR (interrupt bundle passthrough)
+  Wiring passthrough: hgeip.regOut, hgeie.regOut, hstatus.regOut.VGEIN to
+  InterruptFilter. Data-path connection, no processing logic.
+  | m.hgeip := hgeip.regOut
+  | m.hgeie := hgeie.regOut
+  | m.hstatusVGEIN := hstatus.regOut.VGEIN
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/InterruptBundle.scala:425-427  InterruptIO ports
+  IO port type declarations for hgeip/hgeie/hstatusVGEIN. Pure structural
+  types, no executable logic.
+  | val hgeip = IO(Input(new HgeipBundle))
+  | val hgeie = IO(Input(new HgeieBundle))
+  | val hstatusVGEIN = IO(Input(HstatusVgeinField()))
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/InterruptBundle.scala:113-114  MipBundle SEIP/VSEIP fields
+  Field definitions: SEIP=RO(9), VSEIP=RO(10). Bit-position declarations
+  matching spec; no executable logic.
+  | val SEIP  = RO(9)
+  | val VSEIP = RO(10)
+

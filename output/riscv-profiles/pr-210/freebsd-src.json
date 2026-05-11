@@ -1,0 +1,168 @@
+{
+  "pr_number": 210,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 210,
+    "violation_condition": "In the FreeBSD kernel on RVYA25 hardware implementing Zyhybrid, when the context-switch path (cpu_switch) saves or restores capability registers without clearing tag bits when transitioning from a CHERI process to a pure RV64I process, the non-CHERI process inherits valid capability tags and can exercise authority it should not possess",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "cpu_switch|cpu_throw|set_user_capregs|capability.*tag.*clear|cheri_capability_build_user|capregs_save|capregs_restore|CTSTATUS|DDC|PCC",
+    "affected_entities": [
+      "Zyhybrid",
+      "Zys",
+      "Zydefaultcap",
+      "capability registers (c1-c31)",
+      "DDC",
+      "PCC",
+      "uycfg CSR",
+      "capability tag bits"
+    ],
+    "summary": "Zyhybrid context switch must scrub capability tags when switching to non-CHERI processes, else pure-RV64I processes inherit dangling capability authority across process boundaries"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "cpu_switch saves/restores only integer registers (ra, sp, s0-s11) and optional FPE state. No CHERI capability registers (DDC, PCC, capability GPRs with their tag bits) are saved or restored. The PCB structure (sys/riscv/include/pcb.h) has no capability register fields. On Zyhybrid/RVYA25 hardware, a context switch from a CHERI process to a pure RV64I process would leak valid capability tags because this kernel has zero awareness of capability state. The CHERI spec (riscv-cheri/src/cheri/riscv-priv-integration.adoc:437-482) defines the CHERI disable mechanism via [CRE] bits in misa/menvcfg/senvcfg, and specifies that CHERI-disabled privilege levels must not be able to observe or exercise capability state — but this kernel has no code to clear tags on mode transition.",
+      "snippet": "ENTRY(cpu_switch)\n  sd a1, PC_CURTHREAD(tp)\n  ld x13, TD_PCB(a1)\n  sd x13, PC_CURPCB(tp)\n  ld x13, TD_PCB(a0)\n  sd ra, (PCB_RA)(x13)\n  sd sp, (PCB_SP)(x13)\n  /* s[0-11] saved — no capability regs */\n  ...\n  /* s[0-11] restored — no capability regs */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-priv-integration.adoc",
+          "line_start": 437,
+          "line_end": 482,
+          "excerpt": "When using a system with {cheri_default_ext_name}, it may be desirable to disable CHERI register and instruction access to some (or all) privilege levels such that they operate as a RV32I/RV64I system without any observable presence of CHERI features. ... Disabling CHERI has no effect on implicit accesses or security checks. The last capability written to <<pcc>> and <<ddc>> before disabling CHERI will be used to authorize instruction execution and data memory accesses."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-hybrid-integration.adoc",
+          "line_start": 1,
+          "line_end": 64,
+          "excerpt": "{cheri_default_ext_name} is an optional extension to {cheri_base_ext_name} which adds the ability to dynamically change the base architecture of the hart between CHERI ({cheri_base_ext_name}) and standard RISC-V (RVI/RVE). ... {cheri_int_mode_name}: Executing with the RVI (or RVE) base ISA. ... The authorizing capability for memory access is <<ddc>> (as opposed to rs1)."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-unpriv-integration.adoc",
+          "line_start": 96,
+          "line_end": 145,
+          "excerpt": "The {ctag} is an additional bit added to addressable memory and all YLEN-bit registers. ... Writing non-capability data into a register or memory location causes the {ctag} to be cleared. ... Every YLEN-bit register has a one-bit {ctag}, indicating whether the capability in the register is valid to be dereferenced. This {ctag} is cleared whenever an invalid capability operation is performed."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 206,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "cpu_throw activates a new thread's pmap and restores only integer registers (ra, sp, s0-s11) and optional FPE state. It has no capability register restoration logic. On Zyhybrid hardware, the new thread would inherit whatever capability state (DDC, PCC tag, GPR tags) was left in the hardware registers from the previous thread — a direct privilege_escape path if the previous thread was CHERI-aware and the new thread is a pure RV64I process.",
+      "snippet": "ENTRY(cpu_throw)\n  mv s0, a1\n  mv a0, a1\n  call _C_LABEL(pmap_activate_sw)\n  mv a0, s0\n  sd a0, PC_CURTHREAD(tp)\n  ld x13, TD_PCB(a0)\n  sd x13, PC_CURPCB(tp)\n  ld ra, (PCB_RA)(x13)\n  ld sp, (PCB_SP)(x13)\n  /* s[0-11] restored — no capability regs */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-priv-integration.adoc",
+          "line_start": 437,
+          "line_end": 471,
+          "excerpt": "The following occurs when executing code in a privilege mode that has CHERI disabled: ... Disabling CHERI has no effect on implicit accesses or security checks. The last capability written to <<pcc>> and <<ddc>> before disabling CHERI will be used to authorize instruction execution and data memory accesses."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The PCB structure stores only standard 64-bit integer registers (ra, sp, gp, tp, s[12]) and FP state. There are no fields for capability register state: no DDC save slot, no PCC metadata/tag save slot, no capability GPR metadata/tag save slots. On Zyhybrid hardware implementing full YLEN (129-bit) capability registers with tag bits, this PCB is structurally incapable of saving/restoring the hardware register state across context switches.",
+      "snippet": "struct pcb {\n  uint64_t pcb_ra;\n  uint64_t pcb_sp;\n  uint64_t pcb_gp;\n  uint64_t pcb_tp;\n  uint64_t pcb_s[12];\n  uint64_t pcb_x[32][2];\n  uint64_t pcb_fcsr;\n  uint64_t pcb_fpflags;\n  vm_offset_t pcb_onfault;\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-unpriv-integration.adoc",
+          "line_start": 56,
+          "line_end": 65,
+          "excerpt": "{cheri_base_ext_name} extends all registers that have to be able to hold addresses to 2*XLEN bits (hereafter referred to as YLEN), adding metadata to protect its integrity, limit how it is manipulated, and control its use. In addition to widening to YLEN, each register also gains a one-bit {ctag}."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-unpriv-integration.adoc",
+          "line_start": 619,
+          "line_end": 643,
+          "excerpt": "As stated above, all state which can hold addresses are extended from XLEN to YLEN bits. ... The <<gprs,XLEN-wide integer registers>> (e.g., sp, a0) are all extended to YLEN bits and associated {ctag}s."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fork_trampoline",
+        "line_start": 365,
+        "line_end": 432,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "fork_trampoline returns to userspace via sret after restoring only standard RISC-V trapframe registers (sstatus, sepc, t0-t6, s0-s11, a0-a7, ra, sp, gp, tp). No capability register state is restored. On Zyhybrid hardware, a newly forked process would receive undefined capability register state (DDC, PCC metadata, GPR tags) from kernel context — potentially inheriting valid capability tags from the parent process or kernel execution context.",
+      "snippet": "ENTRY(fork_trampoline)\n  mv a0, s0\n  mv a1, s1\n  mv a2, sp\n  call _C_LABEL(fork_exit)\n  ld t0, (TF_SSTATUS)(sp)\n  li t1, ~SSTATUS_SIE\n  and t0, t0, t1\n  csrw sstatus, t0\n  ld t0, (TF_SEPC)(sp)\n  csrw sepc, t0\n  /* t0-t6, s0-s11, a0-a7 restored — no capability regs */\n  sret",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "savectx saves only standard integer registers (ra, sp, tp, gp, s0-s11) and FPE state. No capability registers or metadata are preserved. This function is called during context dumps (e.g., panic, debugger entry). On Zyhybrid hardware, any forensic analysis after a crash would lose all CHERI capability state, making it impossible to determine whether a capability violation caused the crash.",
+      "snippet": "ENTRY(savectx)\n  sd ra, (PCB_RA)(a0)\n  sd sp, (PCB_SP)(a0)\n  sd tp, (PCB_TP)(a0)\n  sd gp, (PCB_GP)(a0)\n  /* s[0-11] saved — no capability regs */\n  __fpe_state_save a0\n  ret",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/sys/_types.h",
+        "function_name": "__intptr_t / __uintptr_t typedefs",
+        "line_start": 70,
+        "line_end": 76,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "This file contains CHERI-compatible type scaffolding (__intcap_t/__uintcap_t) guarded by #ifdef __CHERI__, but the kernel is not built with __CHERI__ defined. On RVYA25/Zyhybrid hardware, pointer-sized types would be XLEN (64-bit) instead of YLEN (128-bit), making all pointer arithmetic in the kernel structurally incompatible with capability-aware hardware. This is not a bug per se — it means the entire CHERI feature is absent from this build configuration.",
+      "snippet": "#ifdef __CHERI__\ntypedef __intcap_t   __intptr_t;\ntypedef __intcap_t   __intfptr_t;\ntypedef __uintcap_t  __uintptr_t;\ntypedef __uintcap_t  __uintfptr_t;\n#else\n/* fallback to integer pointers */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/conf/GENERIC",
+        "function_name": "machine config",
+        "line_start": 22,
+        "line_end": 22,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The RISC-V GENERIC kernel config specifies 'machine riscv riscv64' with no CHERI ISA extension options (no 'cpu CHERI', no Zyhybrid capability format option, no RVYA25 profile). The kernel binary is compiled as pure RV64I and lacks all CHERI instruction encodings, CSR definitions, and capability-aware runtime support required to operate on Zyhybrid hardware implementing the RVYA25 profile.",
+      "snippet": "machine   riscv riscv64",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/riscv-priv-integration.adoc",
+          "line_start": 122,
+          "line_end": 135,
+          "excerpt": "The <<mycfg>> register is used to identify which CHERI capability encoding is used by the platform. The capability encoding both determines the in-memory representation of a CHERI capability and entails a set of extensions present atop {cheri_base_ext_name}."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

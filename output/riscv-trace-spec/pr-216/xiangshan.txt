@@ -1,0 +1,65 @@
+PR #216  target=xiangshan  overall=potential_risk
+Spec: XiangShan TraceCoreInterface.FromEncoder lacks the spec-mandated 'inhibit[1:0]' sideband vector; hart-halted and security-violation trace-inhibition events are invisible to the external encoder, causing trace-decode reconstruction gaps and loss of security-audit trail
+Violation:
+  XiangShan RTL defines TraceCoreInterface
+  (src/main/scala/xiangshan/backend/trace/Interface.scala) with only 'enable'
+  and 'stall' in FromEncoder bundle — no 'halted' or 'inhibit' sideband signal
+  exists. When the hart enters debug-halted state (dcsr.halt=1), the trace
+  encoder receives zero notification. The new inhibit=10 (security violation)
+  encoding has no corresponding hardware signal to propagate security-monitor-
+  triggered trace inhibition events to an external encoder.
+Consequence: info_leak
+Pattern:
+  class FromEncoder|class
+  TraceCoreInterface|traceCoreInterface.*fromEncoder|io\.in\.fromEncoder
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/trace/Interface.scala:37-40  FromEncoder
+  FromEncoder bundle contains only 'enable' and 'stall' — no 'halted' or
+  'inhibit' sideband signal. Per RISC-V Smctr spec section
+  norm:debug_recording_inhibited, 'Recording in Debug Mode is always
+  inhibited. Transfers into and out of Debug Mode are never recorded.' Without
+  a debug-mode-aware inhibit signal in the trace encoder interface, the
+  external encoder cannot distinguish 'hart is idle' from 'hart is in debug
+  mode, recording must be suppressed.' If the hart generates trace records
+  during debug mode entry/exit or the security monitor wants to inject
+  inhibit=10 signals, there is no hardware path to propagate this.
+  | class FromEncoder extends Bundle {
+  |   val enable = Bool()
+  |   val stall  = Bool()
+  | }
+
+[potential_risk] src/main/scala/xiangshan/backend/trace/Interface.scala:42-47  TraceCoreInterface
+  TraceCoreInterface.fromEncoder input only exposes enable/stall from the
+  external encoder; no mechanism to receive debug-halted notification
+  (dcsr.halt=1) or security-monitor-triggered trace inhibition events. The
+  Smctr spec norm:debug_recording_inhibited requires debug-mode recording
+  suppression, but this interface has no way for the encoder or security
+  monitor to signal such inhibition to the hart-side trace logic. The
+  inhibit=10 (security violation) encoding has no corresponding hardware
+  signal.
+  | val fromEncoder = Input(new Bundle {
+  |   val enable = Bool()
+  |   val stall  = Bool()
+  | })
+
+[potential_risk] src/main/scala/xiangshan/backend/CtrlBlock.scala:292-293  CtrlBlock (trace wiring)
+  CtrlBlock wires only fromEncoder.stall and fromEncoder.enable to the Trace
+  module — no debug-mode or inhibit signal is propagated. The CSR block
+  maintains a debugMode register (CSR.scala:223), but this state is never
+  routed into the trace infrastructure. Consequently, when the hart enters
+  debug-halted state, the Trace/TraceBuffer modules have zero awareness and
+  continue operating under the last encoder state, potentially generating
+  trace packets during debug mode contrary to norm:debug_recording_inhibited.
+  | trace.io.in.fromEncoder.stall  := io.traceCoreInterface.fromEncoder.stall
+  | trace.io.in.fromEncoder.enable := io.traceCoreInterface.fromEncoder.enable
+
+[compliant] src/main/scala/xiangshan/backend/trace/TraceBuffer.scala:62-62  TraceBuffer (blockCommit logic)
+  TraceBuffer.blockCommit is gated by fromEncoder.enable and fromEncoder.stall
+  only. This is correct as far as it goes — the stall mechanism does work to
+  backpressure trace recording. However, this logic has no awareness of debug
+  mode or security-triggered inhibit conditions, which means it relies
+  entirely on the external encoder to orchestrate stall/enable during debug
+  mode transitions. If the encoder is not aware of debug mode entry (no
+  sideband signal), it cannot issue the necessary stall.
+  | blockCommit := io.in.fromEncoder.enable && (canNotTraceAll || io.in.fromEncoder.stall)
+

@@ -1,0 +1,192 @@
+{
+  "pr_number": 91,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 91,
+    "violation_condition": "In XiangShan RTL, the LSU/LDU tag-check enable logic evaluates: tag_check_applies = (data_page.MTAG_bit_set && xIE_bit_clear) && (code_page.MTAG_bit_set && xIE_bit_set). This means load/store instructions fetched from a tagcheck-exempt code page (MTAG=1, X=1) trigger tag checks, while instructions fetched from normal code pages (MTAG=0) bypass tag checks — the exact inverse of the intended semantics where tagcheck-exempt code pages should always generate unchecked accesses per Rule 3 of the TAGGED_PAGE section.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "tag_check_enable &lt;= is_tagged_data_page &amp; is_tagcheck_exempt_code_page",
+    "affected_entities": [
+      "LSU_tag_check_logic",
+      "PTE.MTAG",
+      "menvcfg.MT_MODE",
+      "senvcfg.MT_MODE",
+      "henvcfg.MT_MODE",
+      "load",
+      "store"
+    ],
+    "summary": "Logic inversion in tag-check gating: RTL implementing the pre-fix spec would AND the tagged-data-page condition with 'instruction IS from tagcheck-exempt code page' instead of 'is NOT', systematically inverting which code regions trigger memory tag checks and effectively disabling tag protection for the majority of code."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "PteBundle.perm",
+        "line_start": 738,
+        "line_end": 747,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "PteBundle.perm sub-bundle lacks an mtag bit-field — only d,a,g,u,x,w,r,v are defined. Without this field, the PTW cannot extract the MTAG bit from page-table entries, making all downstream tag-check logic structurally impossible.",
+      "snippet": "val perm = new Bundle {\n  val d    = Bool()\n  val a    = Bool()\n  val g    = Bool()\n  val u    = Bool()\n  val x    = Bool()\n  val w    = Bool()\n  val r    = Bool()\n  val v    = Bool()\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "PteBundle.isAf",
+        "line_start": 811,
+        "line_end": 813,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "isAf() only checks ppn_high overflow and v-bit. It does not detect the MTAG=1 && X=1 illegal combination which the spec requires to raise access-fault. A tagged executable page would silently pass isAf() and be treated as a valid leaf PTE.",
+      "snippet": "def isAf(): Bool = {\n    !(ppn_high === 0.U) && perm.v\n  }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "PteBundle.isPf",
+        "line_start": 765,
+        "line_end": 783,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "isPf() checks reserved =/= 0.U as the first page-fault condition. If MTAG reuses a currently-reserved PTE bit, every PTE with MTAG=1 would falsely trigger a page-fault, making the feature unusable. Conversely, if MTAG does NOT overlap reserved bits, isPf() would not flag MTAG-related violations at all.",
+      "snippet": "when (reserved =/= 0.U){\n      pf := true.B\n    }.elsewhen(pbmt === 3.U || (!pbmte && pbmt =/= 0.U)){",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "PteBundle.isGpf",
+        "line_start": 787,
+        "line_end": 807,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "isGpf() has the same reserved-bit conflict as isPf(). For two-stage translation, a G-stage PTE with MTAG=1+X=1 would not be detected, and MTAG bits overlapping reserved bits would cause false guest-page-faults.",
+      "snippet": "when (reserved =/= 0.U){\n      gpf := true.B\n    }.elsewhen(pbmt === 3.U || (!pbmte && pbmt =/= 0.U)){",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "PteBundle.getPerm",
+        "line_start": 825,
+        "line_end": 835,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "getPerm() propagates d,a,g,u,x,w,r from raw PTE to PtePermBundle but does not propagate mtag. The MTAG bit is silently dropped at the PTE→permission extraction boundary, so TLB fills carry zero MTAG information downstream.",
+      "snippet": "pm.d := perm.d; pm.a := perm.a; pm.g := perm.g\npm.u := perm.u; pm.x := perm.x; pm.w := perm.w; pm.r := perm.r\npm",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "PtePermBundle",
+        "line_start": 38,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "PtePermBundle — the cached permission representation in PtwEntry — has no mtag field. Every TLB hit on a tagged page returns zero MTAG information, making tag_check_enable always false regardless of PTE content.",
+      "snippet": "class PtePermBundle(implicit p: Parameters) extends TlbBundle {\n  val d = Bool(); val a = Bool(); val g = Bool()\n  val u = Bool(); val x = Bool(); val w = Bool(); val r = Bool()\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "TlbPermBundle.apply(PtwSectorResp)",
+        "line_start": 82,
+        "line_end": 96,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "TlbPermBundle.apply() propagates d,a,g,u,x,w,r from PtePermBundle but drops mtag. The TLB.perm_check() function — the central tag-check-enable decision point — receives a TlbPermBundle with no MTAG information to compute tag_check_enable = mtag && !x && mt_mode_enabled.",
+      "snippet": "this.d := ptePerm.d; this.a := ptePerm.a; this.g := ptePerm.g\nthis.u := ptePerm.u; this.x := ptePerm.x; this.w := ptePerm.w; this.r := ptePerm.r",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/MMUBundle.scala",
+        "function_name": "TlbResp",
+        "line_start": 606,
+        "line_end": 625,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "TlbResp — the TLB→LSU response bundle — has paddr, gpaddr, pbmt, miss, excp but no tagCheckEnable or mtag signal. The LSU load/store S2 stage has no way to know whether the current page requires tag checking. All pages look identical (normal/untagged), so tag checks are structurally impossible.",
+      "snippet": "class TlbResp(nDups: Int = 1)(implicit p: Parameters) extends TlbBundle {\n  val paddr = Vec(nDups, Output(UInt(PAddrBits.W)))\n  val pbmt = Vec(nDups, Output(UInt(ptePbmtLen.W)))\n  val miss = Output(Bool())\n  val excp = Output(Vec(nDups, new TlbRespExcp))\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/cache/mmu/TLB.scala",
+        "function_name": "TLB.perm_check",
+        "line_start": 407,
+        "line_end": 499,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "TLB.perm_check() — the central tag-check-enable decision point — handles R/W/X permissions, SUM, MXR, HLVX, pf/af/gpf enforcement, and A/D updates, but has zero MTAG logic. The computation tag_check_enable = perm.mtag && !perm.x && mt_mode_enabled is not implemented. There is no per-page signal telling LSU whether to compare pointer tags against memory tags.",
+      "snippet": "val ldPermFail = !(modeCheck && Mux(hlvx, perm.x, perm.r || mxr(idx) && perm.x))\nval stPermFail = !(modeCheck && perm.w)\nval instrPermFail = !(modeCheck && perm.x)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala",
+        "function_name": "EnvCfg",
+        "line_start": 67,
+        "line_end": 80,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "EnvCfg CSR bundle — base class for menvcfg/senvcfg/henvcfg — has no MT_MODE field. Bits 34-60 are entirely absent. Without MT_MODE, tag checking can never be enabled via CSR configuration, so the tag_check_enable computation at TLB perm_check would always evaluate to false regardless of PTE.mtag.",
+      "snippet": "abstract class EnvCfg extends CSRBundle {\n    val STCE  = RO(63); val PBMTE = RO(62); val ADUE = RO(61); val DTE = RO(59)\n    val PMM   = EnvPMM(33, 32, wNoEffect).withReset(EnvPMM.Disable)\n    ...\n  }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/pipeline/NewLoadUnit.scala",
+        "function_name": "LoadUnit S2 exception generation",
+        "line_start": 917,
+        "line_end": 924,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "LoadUnit S2 access-fault sources are: afUnaccessable, afVectorUncache, afUnalignMMIO, afTagError (DCache tag ECC, not MTE), afForwardDenied, afBypassDenied. No afMTagIllegal (MTAG=1+X=1) or afMTagMismatch (tag comparison failure) sources exist. Loads from tagged pages execute with no tag checking at all.",
+      "snippet": "val afUnaccessable = uop.exceptionVec(loadAccessFault) || pmpUnaccessable\nval afTagError = io.dcacheResp.bits.tag_error && tlbHit && io.csrCtrl.cache_error_enable\nval af = afUnaccessable || afVectorUncache || afUnalignMMIO || afTagError || afForwardDenied || afBypassDenied",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/pipeline/NewStoreUnit.scala",
+        "function_name": "StoreUnit S2 exception generation",
+        "line_start": 635,
+        "line_end": 640,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "StoreUnit S2 access-fault sources are: afInaccessible, afVectorUncache, afCboUncache, afUnalignMMIO. No afMTagIllegal or afMTagMismatch sources exist. Stores to tagged pages execute without any tag validation.",
+      "snippet": "val afInaccessible = uop.exceptionVec(storeAccessFault) || pmpInaccessible\nval af = afInaccessible || afVectorUncache || afCboUncache || afUnalignMMIO",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "CSR-to-TLB signal routing",
+        "line_start": 1480,
+        "line_end": 1486,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "CSR-to-TLB signal routing propagates mPBMTE, hPBMTE, and PMM fields, but no MT_MODE or MTE-related enable signals. The TLB's perm_check() needs mt_mode_enabled as input to compute tag_check_enable; without this routing, the TLB cannot know whether the current privilege level has MTE enabled.",
+      "snippet": "io.tlb.mPBMTE := RegNext(menvcfg.regOut.PBMTE.asBool)\nio.tlb.hPBMTE := RegNext(henvcfg.regOut.PBMTE.asBool)\nio.tlb.pmm.mseccfg := RegNext(mseccfg.regOut.PMM.asUInt)",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

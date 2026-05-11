@@ -1,0 +1,160 @@
+{
+  "pr_number": 3,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 3,
+    "violation_condition": "In the FreeBSD RISC-V kernel, copyin/copyout (sys/riscv/riscv/copyinout.S) performs a bounds check (bgeu against VM_MAXUSER_ADDRESS) followed by user memory access under SSTATUS_SUM without any speculation barrier (TEB). When the bounds-check branch is mispredicted, the CPU can speculatively execute the subsequent load/store with an out-of-bounds user address or a kernel address, leaking kernel memory through microarchitectural side channels (cache timing). Additionally, sendsig() in exec_machdep.c writes user-controlled signal handler addresses to tf_sepc and tf_sp without MDB/DPB barriers, and sys_sigreturn() restores user-provided register state including sstatus bits without barriers, allowing speculative execution with attacker-influenced architectural state.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "bgeu.*VM_MAXUSER_ADDRESS|bgeu.*copyio_fault|bounds[_-]?check.*\\.S|sendsig.*tf_sepc|copyin.*fault.*nopcb|sigreturn|ENTER_USER_ACCESS without preceding speculation barrier",
+    "affected_entities": [
+      "copyin",
+      "copyout",
+      "copyinstr",
+      "sendsig",
+      "sys_sigreturn",
+      "cpu_switch",
+      "fork_trampoline",
+      "TEB",
+      "MDB",
+      "DPB",
+      "SSTATUS_SUM",
+      "vmm_switch"
+    ],
+    "summary": "FreeBSD RISC-V kernel lacks Zisb speculation barriers (TEB/MDB/DPB) after all bounds checks in copyinout.S and during signal frame/trapframe manipulation in exec_machdep.c and swtch.S, enabling Spectre-v1 bounds-check-bypass and Spectre-v2 BTB-style info leaks via mispredicted branches on user-controlled inputs"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/copyinout.S",
+        "function_name": "copyout",
+        "line_start": 115,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Bounds check at line 119 (bgeu a3, a4, copyio_fault_nopcb) compares kaddr+len against VM_MAXUSER_ADDRESS, then falls through to copycommon which sets SSTATUS_SUM (ENTER_USER_ACCESS) and performs user memory accesses. No speculation barrier (fence or equivalent) exists between the bounds-check branch and the memory access under SUM. On a branch misprediction, the CPU can speculatively execute ld/sd with an out-of-bounds user address or kernel address while SUM=1, potentially leaking kernel memory through cache timing side channels (Spectre-v1 pattern).",
+      "snippet": "ENTRY(copyout)\n\tbeqz\ta2, copyout_end\n\tadd\ta3, a1, a2\n\tli\ta4, VM_MAXUSER_ADDRESS\n\tbgeu\ta3, a4, copyio_fault_nopcb\n\n\tcopycommon",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 185,
+          "line_end": 203,
+          "excerpt": "The SUM (permit Supervisor User Memory access) bit modifies the privilege with which S-mode loads and stores access virtual memory. When SUM=0, S-mode memory accesses to pages that are accessible by U-mode (U=1) will fault. When SUM=1, these accesses are permitted."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32.adoc",
+          "line_start": 645,
+          "line_end": 655,
+          "excerpt": "various microarchitectural techniques exist to dynamically convert unpredictable short forward branches into internally predicated code to avoid the cost of flushing pipelines on a branch mispredict ... allowing the branch and following instructions to be executed speculatively and out-of-order with respect to other code."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/copyinout.S",
+        "function_name": "copyin",
+        "line_start": 133,
+        "line_end": 144,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same Spectre-v1 pattern as copyout. Bounds check at line 137 (bgeu a3, a4, copyio_fault_nopcb) compares uaddr+len against VM_MAXUSER_ADDRESS, then falls through to copycommon which sets SSTATUS_SUM and performs user memory loads. No speculation barrier between the bounds check and the subsequent memory access under SUM.",
+      "snippet": "ENTRY(copyin)\n\tbeqz\ta2, copyin_end\n\tadd\ta3, a0, a2\n\tli\ta4, VM_MAXUSER_ADDRESS\n\tbgeu\ta3, a4, copyio_fault_nopcb\n\n\tcopycommon",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 185,
+          "line_end": 203,
+          "excerpt": "SUM (permit Supervisor User Memory access) bit modifies the privilege with which S-mode loads and stores access virtual memory."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/copyinout.S",
+        "function_name": "copyinstr",
+        "line_start": 151,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "copyinstr sets SSTATUS_SUM via ENTER_USER_ACCESS at line 157, then performs per-byte bounds check (bgeu a0, a7, copyio_fault at line 160) followed immediately by load (lb a4, 0(a0) at line 161). The per-byte check is inside the SUM-enabled region. On a mispredicted bgeu, the lb can speculatively access an out-of-bounds or kernel address, leaking data through cache timing. No speculation barrier between the check and the load.",
+      "snippet": "ENTER_USER_ACCESS(a7)\nli\ta7, VM_MAXUSER_ADDRESS\n1:\tbgeu\ta0, a7, copyio_fault\n\tlb\ta4, 0(a0)\t/* Load from uaddr */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 185,
+          "line_end": 203,
+          "excerpt": "SUM (permit Supervisor User Memory access) bit modifies the privilege with which S-mode loads and stores access virtual memory."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sendsig",
+        "line_start": 394,
+        "line_end": 399,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sendsig writes user-controlled signal handler address (catcher) to tf_sepc and user-controlled stack pointer (fp) to tf_sp at lines 398-399, then returns. When the kernel subsequently executes sret (exception.S line 234), the CPU may speculatively fetch and execute instructions at the attacker-influenced sepc with attacker-influenced sp before the architectural page table permissions are validated. No MDB/DPB or speculation barrier before these writes to the trapframe.",
+      "snippet": "tf->tf_a[0] = sig;\ntf->tf_a[1] = (register_t)&fp->sf_si;\ntf->tf_a[2] = (register_t)&fp->sf_uc;\n\ntf->tf_sepc = (register_t)catcher;\ntf->tf_sp = (register_t)fp;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 1373,
+          "line_end": 1374,
+          "excerpt": "Changes to the sstatus fields SUM and MXR take effect immediately, without the need to execute an SFENCE.VMA instruction."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32.adoc",
+          "line_start": 645,
+          "line_end": 655,
+          "excerpt": "branch and following instructions to be executed speculatively and out-of-order with respect to other code."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "sys_sigreturn",
+        "line_start": 317,
+        "line_end": 334,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sys_sigreturn copies user-controlled ucontext_t via copyin (line 323), then set_mcontext (line 326) writes user-provided register state directly to the trapframe, including tf_sstatus (line 258) and tf_sepc (line 257). The sstatus validation at lines 245-248 only masks out specific bits but does not insert a speculation barrier. When the kernel returns to userspace via sret (exception.S line 234), the CPU may speculatively execute with the attacker-influenced sstatus and sepc before architectural checks complete, potentially enabling Spectre-type gadgets with attacker-controlled architectural state.",
+      "snippet": "if (copyin(uap->sigcntxp, &uc, sizeof(uc)))\n\treturn (EFAULT);\nerror = set_mcontext(td, &uc.uc_mcontext);\nif (error != 0)\n\treturn (error);\nkern_sigprocmask(td, SIG_SETMASK, &uc.uc_sigmask, NULL, 0);\nreturn (EJUSTRETURN);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 250,
+          "line_end": 260,
+          "excerpt": "Previous Expected Landing Pad (ELP) State in sstatus Register ... preserved across traps"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "cpu_exception_handler_user",
+        "line_start": 227,
+        "line_end": 235,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The sret-based return path restores sstatus (including SUM=0) at line 131 within load_registers before sret at line 234. The sstatus write via csrw at line 131 ensures SUM is cleared before the sret instruction commits, so any return to userspace will not retain supervisor SUM privileges. No speculation barrier is required at this point because SUM is architecturally cleared before sret; speculative execution after sret runs in user mode. This is architecturally correct.",
+      "snippet": "csrw\tsstatus, t0\nld\tt0, (TF_SEPC)(sp)\ncsrw\tsepc, t0\n...\nsret",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

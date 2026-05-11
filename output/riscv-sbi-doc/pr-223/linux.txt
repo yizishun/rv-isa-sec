@@ -1,0 +1,54 @@
+PR #223  target=linux  overall=not_implemented
+Spec: Kernel must handle local unknown NMI SSE event (0xffff0001) to completion; failure to register, save full interrupted context, or call sbi_sse_complete strands the event in RUNNING state, permanently blocking all lower-priority SSE events on the affected hart
+Violation:
+  In the Linux kernel, when the SBI SSE handler dispatches event_id 0xffff0001
+  (local unknown NMI) and the kernel either (a) lacks a registered handler,
+  leaving the event unacknowledged and permanently blocking lower-priority SSE
+  events on that hart, or (b) the handler fails to save/restore the full
+  interrupted context (sepc, sstatus.SPP/SPIE/SDT, A6) before invoking generic
+  NMI handling, or (c) the handler fails to call sbi_sse_complete, stranding
+  the event in RUNNING state and breaking the SSE state machine for all local
+  events on that hart.
+Consequence: denial_of_service
+Pattern:
+  sbi_sse_event_handler.*0xffff0001|case
+  0xffff0001|SSE.*unknown.*nmi|local_unknown_nmi|event_id == 0xffff0001
+------------------------------------------------------------
+[not_implemented] arch/riscv/include/asm/sbi.h:39-40  N/A (header definitions)
+  The SBI SSE (Supervisor Software Events) extension ID (0x535345) is not
+  defined in sbi.h. No sbi_sse_complete, sbi_sse_event_handler, or any SSE-
+  related SBI function IDs exist. The kernel has zero infrastructure for
+  registering, dispatching, or completing SSE events. The only SSE-related
+  definition is SBI_MPXY_ATTR_SSE_EVENT_ID (line 467), which is an MPXY
+  channel attribute for associating a channel with an SSE event — not an SSE
+  handler itself.
+  | SBI_EXT_MPXY = 0x4D505859,
+  | // SBI_EXT_SSE = 0x535345 -- NOT DEFINED
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:309-315
+      "Supervisor Software Events (SSE), an extension to the SBI, provide
+      a mechanism for supervisor software to register and service system
+      events emanating"
+
+[not_implemented] arch/riscv/kernel/traps.c:0-0  N/A (no SSE handler)
+  No handler for SSE event 0xffff0001 (local unknown NMI) exists anywhere in
+  the kernel. The traps.c NMI handling paths (DO_ERROR_INFO for illegal
+  instructions, breakpoints, etc.) are CSRs-triggered NMIs from machine-mode
+  hardware traps, not SBI SSE software-injected events. There is no code path
+  that would save/restore the full interrupted context (sepc,
+  sstatus.SPP/SPIE/SDT, A6) followed by sbi_sse_complete(), because the SSE
+  extension is entirely unimplemented.
+  | // No relevant snippet — SSE event dispatch/handler code does not exist
+
+[potential_risk] drivers/mailbox/riscv-sbi-mpxy-mbox.c:795-802  mpxy_mbox_populate_channels
+  The MPXY mailbox driver reads sse_event_id as a channel attribute but never
+  registers an SSE event handler for it. If firmware delivers SSE events
+  (including event 0xffff0001) via MPXY channels with SSE capability
+  (SBI_MPXY_CHAN_CAP_SSE), the kernel has no handler to acknowledge or
+  complete these events. This could strand the SSE event in RUNNING state on
+  the firing hart, blocking lower-priority events.
+  | rc = mpxy_read_attrs(mchan->channel_id, SBI_MPXY_ATTR_MSG_PROT_ID,
+  |                      sizeof(mchan->attrs) / sizeof(u32),
+  |                      (u32 *)&mchan->attrs);
+  | // sse_event_id is read but never used for handler registration
+

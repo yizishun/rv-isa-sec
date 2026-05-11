@@ -1,0 +1,278 @@
+{
+  "pr_number": 223,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 223,
+    "violation_condition": "",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "",
+    "affected_entities": [],
+    "summary": "Agent error: exit code 1"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/include/sbi.h",
+        "function_name": "SBI extension ID definitions",
+        "line_start": 79,
+        "line_end": 113,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "SBI extension IDs for TIME (0x54494D45), IPI (0x735049), RFNC (0x52464E43), HSM (0x48534D), and SRST (0x53525354) are defined, but the SBI SSE extension ID and the UNKNOWN_NMI event ID (0xffff8001) are entirely absent. No SBI_EXT_SSE constant exists anywhere in the FreeBSD source tree, meaning the kernel has zero awareness of the SSE extension.",
+      "snippet": "#define SBI_EXT_ID_TIME         0x54494D45\n#define SBI_EXT_ID_IPI          0x735049\n#define SBI_EXT_ID_RFNC         0x52464E43\n#define SBI_EXT_ID_HSM          0x48534D\n#define SBI_EXT_ID_SRST         0x53525354",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/sbi.c",
+        "function_name": "sbi_init",
+        "line_start": 314,
+        "line_end": 322,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sbi_init() probes TIME, IPI, RFNC, and SRST extensions at boot via sbi_probe_extension(). No probe for the SSE extension. This is currently correct behavior since the kernel does not implement SSE support — probing a service you don't use would be unnecessary. However, if SSE support is added, an SSE probe must be added here.",
+      "snippet": "if (sbi_probe_extension(SBI_EXT_ID_TIME) != 0)\n    has_time_extension = true;\nif (sbi_probe_extension(SBI_EXT_ID_IPI) != 0)\n    has_ipi_extension = true;\nif (sbi_probe_extension(SBI_EXT_ID_RFNC) != 0)\n    has_rfnc_extension = true;\nif (sbi_probe_extension(SBI_EXT_ID_SRST) != 0)\n    has_srst_extension = true;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_intr",
+        "line_start": 276,
+        "line_end": 279,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When active_irq (scause & SCAUSE_CODE) >= INTC_NIRQS (16), the function returns FILTER_HANDLED without any logging. Any S-mode interrupt delivered via a non-standard scause code (>=16) is silently discarded. If firmware delivers an SSE event/NMI via a non-standard interrupt code, the kernel has zero visibility. However, this is also legitimate behavior under the current architecture since RISC-V S-mode only defines 12 standard interrupt codes (0–11 for software/timer/external x user/supervisor/hypervisor/machine). The use of codes 12–15 and >=16 for SSE events is undefined in the base privileged spec.",
+      "snippet": "active_irq = frame->tf_scause & SCAUSE_CODE;\n\nif (active_irq >= INTC_NIRQS)\n    return (FILTER_HANDLED);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 1,
+          "line_end": 1,
+          "excerpt": "RISC-V S-mode defines standard interrupt codes: 1 (supervisor software), 5 (supervisor timer), 9 (supervisor external). Codes >= 16 are not allocated for standard S-mode interrupts."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 372,
+        "line_end": 375,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The default case in the kernel exception handler calls panic('Unknown kernel exception %#lx trap value %#lx'). If an SSE event is delivered as an exception with an unrecognized scause code (e.g., a non-standard exception code used by the SSE mechanism), the host kernel panics — creating a Denial-of-Service vector: a firmware-initiated NMI event could crash the kernel.",
+      "snippet": "default:\n    dump_regs(frame);\n    panic(\"Unknown kernel exception %#lx trap value %#lx\",\n        exception, frame->tf_stval);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 455,
+        "line_end": 458,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same panic-on-unknown pattern for user-mode exceptions: panic('Unknown userland exception %#lx, trap value %#lx'). An unknown exception code delivered to a user process context would trigger a full kernel panic rather than delivering a signal to the process.",
+      "snippet": "default:\n    dump_regs(frame);\n    panic(\"Unknown userland exception %#lx, trap value %#lx\",\n        exception, frame->tf_stval);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 319,
+        "line_end": 322,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All interrupts are uniformly dispatched through intr_irq_handler(frame, INTR_ROOT_IRQ). No NMI-specific dispatch path exists. This is architecturally correct for the current codebase: the base RISC-V privileged architecture does not define an NMI delivery mechanism in S-mode (RNMI is M-mode only via the Smrnmi extension). SSE-based NMI delivery to S-mode is defined by the separate SBI SSE specification, which FreeBSD does not implement.",
+      "snippet": "if ((frame->tf_scause & SCAUSE_INTR) != 0) {\n    /* Interrupt */\n    intr_irq_handler(frame, INTR_ROOT_IRQ);\n    return;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smrnmi.adoc",
+          "line_start": 4,
+          "line_end": 14,
+          "excerpt": "The base machine-level architecture supports only unresumable non-maskable interrupts (UNMIs), where the NMI jumps to a handler in machine mode. The Smrnmi extension adds support for resumable non-maskable interrupts (RNMIs) to RISC-V, adding four new CSRs (mnepc, mncause, mnstatus, and mnscratch) and the MNRET instruction — all M-mode only."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 400,
+        "line_end": 403,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Same uniform interrupt dispatch in the user-trap path: intr_irq_handler(frame, INTR_ROOT_IRQ). This is architecturally consistent with the current baseline. No ability to distinguish NMI from regular interrupts exists because the base RISC-V privileged architecture does not define a user-mode NMI path.",
+      "snippet": "if ((frame->tf_scause & SCAUSE_INTR) != 0) {\n    /* Interrupt */\n    intr_irq_handler(frame, INTR_ROOT_IRQ);\n    return;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_sbi.c",
+        "function_name": "vmm_sbi_ecall",
+        "line_start": 201,
+        "line_end": 214,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmm_sbi_ecall() handles only three SBI extensions in-kernel (RFNC, TIME, IPI). SBI_EXT_ID_BASE — which includes SBI_BASE_PROBE_EXTENSION used by guests to discover firmware capabilities — falls through to the default case and returns false, forwarding to userspace as VM_EXITCODE_ECALL. This means a guest probing for SSE support via SBI_BASE_PROBE_EXTENSION would receive whatever answer bhyve userspace provides, not what the actual firmware supports. This creates a trust-boundary issue where userspace could incorrectly report SSE as supported.",
+      "snippet": "switch (sbi_extension_id) {\ncase SBI_EXT_ID_RFNC:\n    error = vmm_sbi_handle_rfnc(vcpu, hypctx);\n    break;\ncase SBI_EXT_ID_TIME:\n    ...\ndefault:\n    /* Return to handle in userspace. */\n    return (false);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_sbi.c",
+        "function_name": "vmm_sbi_ecall",
+        "line_start": 211,
+        "line_end": 213,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Unknown SBI extension IDs return false with the comment 'Return to handle in userspace.' If bhyve userspace does not implement SSE handling, a guest's SSE registration or event-handling SBI calls would receive an undefined response. This is the kernel side of a delegation chain where the kernel abdicates responsibility but has no way to audit what userspace does.",
+      "snippet": "default:\n    /* Return to handle in userspace. */\n    return (false);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmexit_trap",
+        "line_start": 499,
+        "line_end": 506,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "When vmm_sbi_ecall() returns false for unhandled SBI calls, the ECALL arguments are forwarded to userspace via vme->u.ecall.args[] and the VM exits with VM_EXITCODE_ECALL. This is the architectural design for extending SBI handling into userspace. The mechanism is correct; the risk is at the userspace layer.",
+      "snippet": "case SCAUSE_VIRTUAL_SUPERVISOR_ECALL:\n    handled = vmm_sbi_ecall(hypctx->vcpu);\n    if (handled == true)\n        break;\n    for (i = 0; i < nitems(vme->u.ecall.args); i++)\n        vme->u.ecall.args[i] = hypctx->guest_regs.hyp_a[i];\n    vme->exitcode = VM_EXITCODE_ECALL;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_exception",
+        "line_start": 905,
+        "line_end": 921,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "vmmops_exception() returns ENOSYS with the comment 'TODO: implement me.' Exception injection into guests is completely unimplemented. Even if the host kernel could receive an SSE NMI event, there is no mechanism to inject it into a guest vCPU. This is the fundamental blocker for any NMI/SSE virtualization.",
+      "snippet": "int\nvmmops_exception(void *vcpui, uint64_t scause)\n{\n    ...\n    /* TODO: implement me. */\n\n    return (ENOSYS);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_run",
+        "line_start": 642,
+        "line_end": 647,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The has_exception flag is checked and cleared on every VCPU loop iteration, but the TODO block for exception injection is empty — the flag is silently consumed with no action taken. Any pending exception or NMI event would be silently dropped, with no logging and no delivery to the guest.",
+      "snippet": "if (hypctx->has_exception) {\n    hypctx->has_exception = false;\n    /*\n     * TODO: implement exception injection.\n     */\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/vmm.h",
+        "function_name": "VM_INTINFO definitions",
+        "line_start": 100,
+        "line_end": 104,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "VM_INTINFO_NMI is defined as (2 << 8) alongside VM_INTINFO_HWINTR and VM_INTINFO_HWEXCEPTION, following the Intel VT-x/AMD-V intinfo format. However, this constant is unreferenced anywhere in the kernel source tree — it exists as dead code with no consumers. It was likely forward-ported from x86 but never wired into the RISC-V VMM interrupt injection path.",
+      "snippet": "#define VM_INTINFO_TYPE     0x700\n#define VM_INTINFO_HWINTR   (0 << 8)\n#define VM_INTINFO_NMI      (2 << 8)\n#define VM_INTINFO_HWEXCEPTION (3 << 8)\n#define VM_INTINFO_SWINTR   (4 << 8)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmexit_trap",
+        "line_start": 515,
+        "line_end": 520,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Unknown guest exit reasons (scause values) print the scause via printf and exit with VM_EXITCODE_BOGUS. If an SSE event propagated through the hypervisor trap path as an unrecognized guest trap, the guest VM would see a BOGUS exit rather than a structured NMI delivery. The current printf-based error handling provides no structured error recovery path.",
+      "snippet": "default:\n    printf(\"unknown scause %lx\\n\", vme->scause);\n    vmm_stat_incr(hypctx->vcpu, VMEXIT_UNHANDLED, 1);\n    vme->exitcode = VM_EXITCODE_BOGUS;\n    handled = false;\n    break;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/intr.h",
+        "function_name": "IRQ type enum",
+        "line_start": 43,
+        "line_end": 56,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The IRQ type enum defines exactly 12 interrupt types: SOFTWARE/TIMER/EXTERNAL x USER/SUPERVISOR/HYPERVISOR/MACHINE (indices 0–11). This is correct per the RISC-V privileged specification, which defines exactly these 12 standard interrupt cause codes. No room for an SSE/NMI-specific interrupt type exists because the base privileged architecture doesn't define one.",
+      "snippet": "enum {\n    IRQ_SOFTWARE_USER,\n    IRQ_SOFTWARE_SUPERVISOR,\n    IRQ_SOFTWARE_HYPERVISOR,\n    IRQ_SOFTWARE_MACHINE,\n    IRQ_TIMER_USER,\n    ...\n    IRQ_EXTERNAL_MACHINE,\n};",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/intr.h",
+        "function_name": "INTR_ROOT definitions",
+        "line_start": 59,
+        "line_end": 60,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Only INTR_ROOT_COUNT=1 root interrupt controller exists (INTR_ROOT_IRQ=0). All interrupts funnel through a single root. This matches the current RISC-V architecture where S-mode has a single interrupt dispatch path. A separate NMI root was never designed because RNMI is M-mode only and SSE events use a different delivery mechanism.",
+      "snippet": "#define INTR_ROOT_IRQ   0\n#define INTR_ROOT_COUNT 1",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_intr",
+        "line_start": 281,
+        "line_end": 286,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "If intr_isrc_dispatch() fails for a recognized IRQ code (0–15), the code prints 'Stray irq %lu disabled' and permanently disables the interrupt via intc_disable_intr(). An intermittent or transient SSE event arriving on a known IRQ code could trigger permanent disabling of that interrupt line, with no mechanism for automatic re-enablement. This is the standard FreeBSD 'stray IRQ' handling pattern, but it interacts poorly with events that may be delivered transiently.",
+      "snippet": "src = &sc->isrcs[active_irq];\nif (intr_isrc_dispatch(&src->isrc, frame) != 0) {\n    intc_disable_intr(sc->dev, &src->isrc);\n    device_printf(sc->dev, \"Stray irq %lu disabled\\n\",\n        active_irq);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/aplic.c",
+        "function_name": "aplic_intr",
+        "line_start": 234,
+        "line_end": 243,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "aplic_intr() claims and dispatches all pending interrupts in a loop via aplic_irq_dispatch(). There is no priority-based categorization or NMI/distinguished-event awareness. For the current architecture this is correct behavior: APLIC delivers standard external interrupts and the kernel dispatches them uniformly.",
+      "snippet": "while ((claimi = aplic_read(sc, APLIC_IDC_CLAIMI(sc, cpu))) != 0) {\n    prio = APLIC_IDC_CLAIMI_PRIO(claimi);\n    irq = APLIC_IDC_CLAIMI_IRQ(claimi);\n    KASSERT((irq != 0), (\"Invalid IRQ 0\"));\n    tf = curthread->td_intr_frame;\n    aplic_irq_dispatch(sc, irq, prio, tf);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/plic.c",
+        "function_name": "plic_intr",
+        "line_start": 181,
+        "line_end": 187,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Same flat dispatch pattern as APLIC. plic_intr() claims and dispatches all pending interrupts without priority or category awareness. This is architecturally correct for the current codebase.",
+      "snippet": "while ((pending = RD4(sc, PLIC_CLAIM(sc, cpu))) != 0) {\n    tf = curthread->td_intr_frame;\n    plic_irq_dispatch(sc, pending, tf);\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

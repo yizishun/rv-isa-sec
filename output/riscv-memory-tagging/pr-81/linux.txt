@@ -1,0 +1,94 @@
+PR #81  target=linux  overall=compliant
+Spec: Removing Zitagelide eliminates a CSR bit-24 conflict: SPTTCD collided with SPELP in mstatus/sstatus; kernel context-switch and trap-entry code managing SPELP would have silently clobbered or misinterpreted tag-check-elide state.
+Violation:
+  If hardware had implemented Zitagelide with SPTTCD at mstatus/sstatus bit
+  24, the kernel's existing SPELP management (sr->status & SR_SPELP
+  save/restore at context-switch and csrrc clearing of SR_ELP on trap entry in
+  entry.S:178-183) would silently alias TTCD state, causing: (a) kernel
+  clobbering tag-check-elide state across context switches when
+  saving/restoring SPELP, and (b) hardware interpreting SPELP writes as TTCD
+  transitions, potentially eliding tag checks on kernel-originated memory
+  accesses when landing-pad state changes.
+Consequence: privilege_escape
+Pattern:
+  csrrc.*CSR_STATUS.*SR_SPELP|csrw.*CSR_STATUS.*SR_SPELP|csrs.*CSR_STATUS.*SR_
+  SPELP|SR_SPELP_AC\(0x00800000
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/entry.S:176-190  handle_exception (trap entry)
+  Kernel correctly implements SPELP management per Zicfilp spec: csrrc reads-
+  and-clears SR_ELP on trap entry (line 183), saves pre-clear sstatus (with
+  SPELP preserved) to pt_regs->status (line 190), and restores via csrw
+  CSR_STATUS on sret return (line 301). Bit 24 is formally assigned to SPELP
+  by the ratified Zicfilp extension. No aliasing conflict exists because
+  Zitagelide is not a defined RISC-V extension and is not implemented in this
+  kernel.
+  | li t0, SR_SUM | SR_FS_VS
+  | #ifdef CONFIG_64BIT
+  | li t1, SR_ELP
+  | or t0, t0, t1
+  | #endif
+  | REG_L s0, TASK_TI_USER_SP(tp)
+  | csrrc s1, CSR_STATUS, t0
+  | save_userssp s2, s1
+  | csrr s2, CSR_EPC
+  | csrr s3, CSR_TVAL
+  | csrr s4, CSR_CAUSE
+  | csrr s5, CSR_SCRATCH
+  | REG_S s0, PT_SP(sp)
+  | REG_S s1, PT_STATUS(sp)
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:67-68
+      "sstatus register field at bit position corresponding to bit 24 of
+      mstatus: {bits: 1, name: 'SPELP'} — added by Zicfilp extension."
+    - riscv-isa-manual/src/priv/cfi.adoc:78-91
+      "norm:Zicfilp_forward_traps: A trap must preserve previous ELP.
+      norm:cfi_sstatus_spelp_op: The spelp bit in mstatus can be accessed
+      through the sstatus"
+
+[compliant] arch/riscv/kernel/entry.S:279-302  ret_from_exception (trap return)
+  Trap return correctly restores full pt_regs->status (including SPELP at bit
+  24) via csrw CSR_STATUS, a0. The saved value was captured from the csrrc
+  read at trap entry (line 183), which preserved the pre-trap SPELP state.
+  This matches Zicfilp spec requirement that previous ELP be restored on xRET
+  (norm:Zicfilp_pelp_trap_return).
+  | REG_L a0, PT_STATUS(sp)
+  | restore_userssp s3, a0
+  | REG_L  a2, PT_EPC(sp)
+  | REG_SC x0, a2, PT_EPC(sp)
+  | csrw CSR_STATUS, a0
+  | csrw CSR_EPC, a2
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:92-97
+      "norm:Zicfilp_pelp_trap_return: When executing an xRET instruction,
+      if the new privilege mode is y, then ELP is set to the value of
+      xpelp if yLPE is 1;"
+
+[compliant] arch/riscv/include/asm/csr.h:21-28  SR_SPELP definition
+  SR_SPELP is correctly defined as bit 24 (0x00800000) matching the
+  mstatus/sstatus SPELP field defined by the Zicfilp extension. The kernel
+  does not define any SPTTCD or Zitagelide-related constants, which is correct
+  since Zitagelide is not a ratified RISC-V extension.
+  | /* zicfilp landing pad status bit */
+  | #define SR_SPELP    _AC(0x00800000, UL)
+  | #define SR_MPELP    _AC(0x020000000000, UL)
+  | #ifdef CONFIG_RISCV_M_MODE
+  | #define SR_ELP      SR_MPELP
+  | #else
+  | #define SR_ELP      SR_SPELP
+  | #endif
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:252-255
+      "norm:sstatus_spelp: Access to the SPELP field, added by Zicfilp,
+      accesses the homonymous fields of mstatus when V=0, and the
+      homonymous fields of vsst"
+
+[not_implemented] arch/riscv/kernel/entry.S:1-1  Zitagelide / SPTTCD
+  Zitagelide is not a defined RISC-V extension in any specification document
+  under spec_ref/. No Zitagelide or SPTTCD code exists in the Linux kernel
+  (confirmed by exhaustive grep). The hypothetical aliasing conflict described
+  in the security spec—where SPELP and SPTTCD both use bit 24—is a spec-level
+  bit-allocation concern that would need to be resolved at the ISA design
+  level before any kernel implementation could exist. The kernel correctly
+  uses bit 24 exclusively for SPELP per the ratified Zicfilp extension.
+  | (no Zitagelide/SPTTCD code exists in kernel)
+

@@ -1,0 +1,218 @@
+PR #1049  target=xiangshan  overall=not_implemented
+Spec: Zvfofp8min introduces FP8 OFP8 (E4M3/E5M2) convert ops at SEW=8; XiangShan VFPU must correctly decode new funct6 encodings, nan-box 8-bit results in VF registers, implement saturating narrowing clamp (not truncation) for FP32→OFP8, and validate VLEN≥32 when VSEW=8 against Zve32f constraint
+Violation:
+  XiangShan VFPU decode incorrectly matches Zvfofp8min OFP8 convert
+  instruction encodings against existing vector ALU opcodes, or implements
+  narrowing FP32→OFP8 saturation with wraparound instead of saturation, or
+  fails to nan-box OFP8 results in vector destination registers, or computes
+  VL/SEW for OFP8 (SEW=8) without validating VSETVL constraints against Zve32f
+  minimum VLEN, or executes OFP8 convert ops when mstatus.VS=Off without
+  raising illegal-instruction
+Consequence: data_corruption
+Pattern:
+  VFPU decoder match for OFP8 convert funct6/funct3 opcode fields; narrowing
+  conversion saturation mux using truncation instead of clamp; VF register
+  writeback without upper-bit nan-boxing when SEW=8; VSETVL SEW=8 path
+  skipping VLEN≥32 check; FP8 E4M3/E5M2 format conversion LUT with incorrect
+  NaN/denormal encoding
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/decode/VecExceptionGen.scala:190-192  VecExceptionGen
+  fpEewIllegal gate declares SEW=8 (SEW===0.U) unconditionally illegal for all
+  FP vector instructions except double-width integer-fp converts. Zvfofp8min
+  OFP8 convert instructions require SEW=8 with funct3=001 (same as OPFVV).
+  This gate would raise EX_II for any OFP8 instruction even if decoder entries
+  and execution logic were added. The gate must exempt OFP8 convert
+  instructions from the SEW=8 FP-illegal check.
+  | private val isFp = (inst.FUNCT3 === BitPat("b?01")) && (inst.OPCODE7Bit === OPCODE7Bit.VECTOR_ARITH)
+  | private val fpEewIllegal = isFp && ((SEW === 0.U) && !doubleFpInst)
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:193-204
+      "vsew[2:0] encoding: 000=8, 001=16, 010=32, 011=64. SEW=8 is a legal
+      element width for vector operations."
+
+[not_implemented] src/main/scala/xiangshan/backend/decode/VecDecoder.scala:654-680  VecDecoder (opfvv table)
+  The OPFVV decode table contains standard VFCVT/VFWCVT/VFNCVT instructions
+  but has no entries for Zvfofp8min OFP8 convert instructions
+  (vfofp8.convert.f32.to.ofp8, vfofp8.convert.ofp8.to.bf16,
+  vfofp8.convert.bf16.to.ofp8). Any OFP8 instruction encoding falls through to
+  decodeDefault (illegal instruction trap). No incorrect matching — the
+  instructions simply don't exist in the decoder.
+  | VFNCVT_F_F_W       -> OPFVV(..., VfcvtType.vfncvt_ffw, ...)
+  | VFNCVT_ROD_F_F_W   -> OPFVV(..., VfcvtType.vfncvt_rod_ffw, ...)
+  | // No OFP8 convert entries follow
+
+[not_implemented] rocket-chip/src/main/scala/rocket/Instructions.scala:460-539  (Zvfofp8min BitPat definitions)
+  No BitPat instruction encoding definitions exist for any Zvfofp8min OFP8
+  convert instructions. All standard V extension instructions (VFCVT_*,
+  VFNCVT_*, VFWCVT_*) have BitPat definitions, but vfofp8.convert.f32.to.ofp8,
+  vfofp8.convert.ofp8.to.bf16, and vfofp8.convert.bf16.to.ofp8 are absent. Any
+  attempt to reference OFP8 instruction names in decoder tables would fail
+  compilation.
+  | def VFWCVT_XU_F_V      = BitPat("b010010??????01000001?????1010111")
+  | // No OFP8 convert BitPat definitions exist
+
+[not_implemented] yunsuan/src/main/scala/yunsuan/vector/VectorConvert/CVTparameter.scala:15-59  FloatFormat / fpParam
+  No E4M3 (sign=1, exp=4, frac=3, bias=7) or E5M2 (sign=1, exp=5, frac=2,
+  bias=15) FloatFormat objects exist. Only f16, f32, and f64 are defined. The
+  fpParam.fpMap is Seq(f16, f32, f64) and biasDeltaMap has only three entries
+  (f32-f16, f64-f32, f64-f16). Without these format definitions, no conversion
+  module can compute FP8 biases, pack/unpack FP8 bit patterns, or perform FP8
+  format conversions.
+  | object fpParam {
+  |   val fpMap = Seq(f16, f32, f64)
+  |   val biasDeltaMap = Seq(f32.bias - f16.bias, f64.bias - f32.bias, f64.bias - f16.bias)
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zf.adoc:42-49
+      "E4M3 and E5M2 formats: 8-bit floating-point formats specified by
+      the Open Compute Project (OCP) as the OCP FP8 (OFP8) formats."
+
+[potential_risk] yunsuan/src/main/scala/yunsuan/vector/VectorConvert/CVT32.scala:517-523  CVT32 (isFpNarrow branch)
+  Narrowing FP-to-FP overflow in fpNarrowResultGen produces IEEE Infinity
+  (case 2: exponent=all-ones, fraction=0) or greatest normal finite (case 1:
+  exponent=maxExp, fraction=all-ones). For OFP8 narrowing (FP32→OFP8 E4M3),
+  the spec requires saturation to max representable positive/negative finite,
+  not infinity. In E4M3 format, all exponent-ones encodings (0_1111_XXX)
+  represent NaN, not infinity — so the existing overflow-to-infinity path
+  would produce invalid E4M3 NaN encodings. The existing pattern is correct
+  for FP16 but incompatible with OFP8 saturation semantics.
+  | signNonNan ## f16.maxExp.U(f16.expWidth.W) ## ~0.U(f16.fracWidth.W),  // of => GNF
+  | signNonNan ## (f16.maxExp + 1).U(f16.expWidth.W) ## 0.U(f16.fracWidth.W), // of => INF
+  | // No FP8 saturation case: E4M3 max norm = 0_1110_111
+  References:
+    - riscv-isa-manual/src/unpriv/zf.adoc:42-49
+      "E4M3 and E5M2 are specified by the OCP as OFP8 formats. E4M3:
+      sign=1, exp=4, frac=3, bias=7. All exponent-ones encodings represent
+      NaN (no infinity en"
+
+[potential_risk] yunsuan/src/main/scala/yunsuan/vector/VectorConvert/CVT64.scala:551-559  CVT64 (isFpNarrow/isFpCrossLow branch)
+  Same overflow-to-Infinity pattern as CVT32 in fpNarrowResultMapGen for
+  FP64→FP32 and FP64→FP16 narrowing. The function generates results for
+  fp={f16,f32}: case 0=QNaN, case 1=GNF, case 2=INF, case 3=normal, case
+  4=subnormal. For OFP8 destination, overflow must saturate to max finite
+  (E4M3 max = 448.0 = 0_1110_111, E5M2 max = 57344.0 = 0_11110_11), not
+  produce Infinity encoding. Existing pattern is correct for IEEE 754 formats
+  but would produce invalid FP8 bit patterns if applied to OFP8.
+  | def fpNarrowResultMapGen(fp: FloatFormat): Seq[UInt] = Seq(
+  |   ... // case 1 => GNF, case 2 => INF for f16/f32 only
+  | ) // No FP8 saturation case
+  References:
+    - riscv-isa-manual/src/unpriv/zf.adoc:42-49
+      "E4M3 and E5M2 OFP8 formats use saturation to max representable
+      finite on overflow (no infinity encoding in E4M3)."
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/wrapper/VFALU.scala:250-259  VFALU (canonical NaN checks)
+  Canonical NaN checks for vector FP operands only cover SEW=16 and SEW=32. No
+  SEW=8 canonical NaN check exists (would need
+  !vs2Split.io.outVec64b(i).head(56).andR). When Zvfofp8min OFP8 results
+  (SEW=8) are written to VF registers, subsequent wider-SEW reads need upper-
+  bit NaN-boxing (all 56 upper bits=1) to produce valid NaN-boxed values.
+  Without SEW=8 checks, improperly NaN-boxed OFP8 results could be consumed as
+  valid operands by other FP instructions.
+  | fp_aIsFpCanonicalNAN(i) := vecCtrl.fpu.isFpToVecInst & (
+  |   ((vsew === VSew.e32) & (!vs2Split.io.outVec64b(i).head(32).andR)) |
+  |   ((vsew === VSew.e16) & (!vs2Split.io.outVec64b(i).head(48).andR))
+  | ) // No SEW=8 case
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:2318-2324
+      "If FLEN > SEW, the value in the f registers is checked for a valid
+      NaN-boxed value, in which case the least-significant SEW bits of the
+      f register are"
+    - riscv-isa-manual/src/unpriv/d-st-ext.adoc:23-30
+      "NaN-boxing: Narrower n-bit values (n < FLEN) are represented in the
+      low n bits of FLEN-bit NaN values. The upper bits of a valid NaN-
+      boxed value must "
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/wrapper/VFALU.scala:409-410  VFALU (source mask comment)
+  Explicit comment '// use srcMask(XLEN-1, 0) because float format hasn't fp8'
+  confirms FP8 is intentionally absent from the VFALU datapath. Source mask
+  computation truncates to XLEN bits because FP8 element masking is absent.
+  When FP8 operations are added, the mask width computation would need to
+  account for the 4x increase in element count at SEW=8 vs SEW=32 (16 elements
+  vs 4 per 128-bit register).
+  | // use srcMask(XLEN-1, 0) because float format hasn't fp8
+  | val allVmZero = RegEnable(LZD(Reverse(srcMask(XLEN-1, 0))) >= outVl_s0, io.in.fire)
+
+[potential_risk] src/main/scala/xiangshan/backend/datapath/VldMergeUnit.scala:19-50  VldMergeUnit
+  VldMergeUnit writes back vector data via MGU with no per-element NaN-boxing
+  logic for narrow SEW. When vsew=SEW8, 8-bit OFP8 elements would be written
+  as-is without upper-bit 1-fill (NaN-boxing). The MGU masking only handles
+  tail/body masking (ta/ma), not per-element NaN-boxing. Per the RISC-V V
+  spec, narrower values in VF registers must be NaN-boxed so that wider-SEW
+  reads return valid NaN-boxed values. Without NaN-boxing, reading an OFP8
+  result at SEW=32 would return non-NaN-boxed garbage in the upper 24 bits of
+  each 32-bit element.
+  | mgu.io.in.vd := wbReg.bits.toVecRf.map(_.bits).getOrElse(0.U(params.destDataBitsMax.W))
+  | mgu.io.in.info.vsew := wbReg.bits.toRob.bits.vls.get.vpu.vsew
+  | // No per-element upper-bit NaN-boxing for SEW=8 elements
+  References:
+    - riscv-isa-manual/src/unpriv/d-st-ext.adoc:23-30
+      "Narrower n-bit values (n < FLEN) are represented in the low n bits
+      of FLEN-bit NaN values. The upper bits of a valid NaN-boxed value
+      must all be 1s."
+
+[compliant] src/main/scala/xiangshan/backend/fu/Vsetu.scala:95-98  VsetModule
+  SEW=8 VLMAX computation uses ELEN=64 as reference: log2VsewMax =
+  Mux(log2Vlmul(2), log2Elen.U + log2Vlmul, log2Elen.U). For SEW=8
+  (log2Vsew=3, log2Elen=6), SEW=8 is always legal. With VLEN=128, VLMAX at
+  SEW=8/LMUL=1 is 16 elements, satisfying Zve32f minimum VLEN≥32 requirement.
+  No explicit Zve32f VLEN constraint check exists, but VLEN=128 makes it moot
+  — SEW=8 is safe at any LMUL setting on this implementation.
+  | private val log2Elen = log2Up(ELEN)
+  | private val log2VsewMax = Mux(log2Vlmul(2), log2Elen.U + log2Vlmul, log2Elen.U)
+  | private val sewIllegal = VSew.isReserved(vsew) || (log2Vsew > log2VsewMax)
+
+[compliant] src/main/scala/xiangshan/backend/decode/DecodeUnit.scala:891-891  DecodeUnit (VS=Off gate)
+  mstatus.VS=Off illegal-instruction gate correctly checks vecAll: when VS is
+  Off, any vector instruction routed to vecAll functional units triggers
+  EX_II. OFP8 convert instructions, if properly decoded into the vector
+  pipeline, would be classified under vecArith (subset of vecAll) and thus
+  covered. However, since OFP8 decode entries don't exist, the instructions
+  currently fall through to decodeDefault (INVALID_INSTR) before ever reaching
+  this VS=Off check. The infrastructure is correct; OFP8 instructions need
+  decode entries to use it.
+  | io.fromCSR.illegalInst.vsIsOff && (FuType.FuTypeOrR(decodedInst.fuType, FuType.vecAll) || isCsrrVl || isCsrrVlenb)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:510-566  MstatusBundle / MstatusModule
+  mstatus.VS CSR field correctly defined at bits [10:9] with reset value Off.
+  VS dirty tracking at lines 563-566 transitions to Dirty when
+  robCommit.vsDirty, writeVCSR, or robCommit.vstart.valid is asserted. Assert
+  on line 564 confirms 'VS should not be Off when set dirty'. OFP8 instruction
+  execution would trigger robCommit.vsDirty, properly setting VS to Dirty. CSR
+  infrastructure is sound.
+  | val VS = ContextStatus(10, 9).withReset(ContextStatus.Off)
+  | // ...
+  | when (robCommit.vsDirty || writeVCSR || robCommit.vstart.valid) {
+  |   assert(reg.VS =/= ContextStatus.Off, "VS should not be Off when set dirty")
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/fpu/IntFPToVec.scala:87-91  IntFPToVec
+  SEW=8 NaN-boxing pattern correctly implemented: Cat(Fill(56, 1.U),
+  scalaData(7, 0)) produces 64-bit value with upper 56 bits set to 1 (NaN-
+  box). This demonstrates the correct pattern for OFP8 element NaN-boxing:
+  each 8-bit FP8 element padded with 56 upper ones. This pattern should be
+  replicated in VFALU/VFMA/VFDivSqrt wrappers and VldMergeUnit for OFP8 result
+  writeback.
+  | (vsew === VSew.e8)  -> Cat(Fill(56, 1.U), scalaData( 7, 0)),
+  | (vsew === VSew.e16) -> Cat(Fill(48, 1.U), scalaData(15, 0)),
+  | (vsew === VSew.e32) -> Cat(Fill(32, 1.U), scalaData(31, 0)),
+  References:
+    - riscv-isa-manual/src/unpriv/d-st-ext.adoc:23-30
+      "Narrower n-bit values represented in low n bits of FLEN-bit NaN
+      values. Upper bits of valid NaN-boxed value must all be 1s."
+
+[not_implemented] yunsuan/src/main/scala/yunsuan/package.scala:520-571  VfcvtType / VectorElementFormat
+  VfcvtType defines opcodes for all standard V convert instructions (vfcvt_*,
+  vfwcvt_*, vfncvt_*, fcvt_h_s, etc.) but no OFP8 convert opcodes exist.
+  VectorElementFormat enum has only b(BF16), h(FP16), w(FP32), d(FP64) — no
+  FP8 format slot. New OFP8 opcodes would need unique 9-bit codes distinct
+  from existing VfcvtType encodings, and a new fp8 element format slot in
+  VectorElementFormat.
+  | object VfcvtType {
+  |   // vfcvt_*, vfwcvt_*, vfncvt_* opcodes defined
+  |   // No vfofp8.convert.* opcodes
+  | }
+  | object VectorElementFormat {
+  |   val b :: h :: w :: d :: Nil = Enum(4) // No fp8 slot
+  | }
+

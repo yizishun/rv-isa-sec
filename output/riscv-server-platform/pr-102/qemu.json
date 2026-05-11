@@ -1,0 +1,100 @@
+{
+  "pr_number": 102,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 102,
+    "violation_condition": "QEMU's RISC-V virt machine instantiates an IOMMU (riscv-iommu) but does not generate a corresponding RIMT ACPI table in the guest firmware/hardware description, or generates a malformed RIMT table that fails to describe the IOMMU device topology, base addresses, and capabilities correctly",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "iommu.*rimt|RIMT|riscv_iommu.*acpi|build_rimt|acpi.*iommu|iort.*riscv",
+    "affected_entities": [
+      "riscv-iommu",
+      "RIMT ACPI table",
+      "virt machine ACPI generator"
+    ],
+    "summary": "FIRM_140 unconditionally requires IOMMU to be described via RIMT ACPI table; QEMU virt machine must generate a correct RIMT table for the riscv-iommu device, or guest OS will fail to discover IOMMU — breaking DMA isolation and device assignment"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/hw/riscv/virt-acpi-build.c",
+        "function_name": "build_rimt_id_mapping",
+        "line_start": 644,
+        "line_end": 657,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The 'Destination Device ID Base' field (line 652) is incorrectly written with `source_id_base` instead of a proper destination device ID (typically 0 for the single-IOMMU case). The function's third parameter `dest_id_base` is misnamed — it actually carries the IOMMU table offset (used as 'Destination IOMMU Offset' on line 654), not the destination device ID. There is no parameter for the true Destination Device ID Base, so the field is erroneously set equal to source_id_base. This produces a malformed ID mapping structure where the destination output ID incorrectly mirrors the source Requester ID rather than starting at 0.",
+      "snippet": "    /* Destination Device ID Base */\n    build_append_int_noprefix(table_data, source_id_base, 4);\n    /* Destination IOMMU Offset */\n    build_append_int_noprefix(table_data, dest_id_base, 4);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-acpi-rimt",
+          "file_path": "rimt-spec.pdf (v0.99)",
+          "line_start": 0,
+          "line_end": 0,
+          "excerpt": "Referenced at line 699: https://github.com/riscv-non-isa/riscv-acpi-rimt/releases/download/v0.99/rimt-spec.pdf — ID Mapping Structure: Destination Device ID Base is the starting output ID at the IOMMU node's device ID space, not the source ID."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/hw/riscv/virt-acpi-build.c",
+        "function_name": "build_rimt",
+        "line_start": 800,
+        "line_end": 811,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Off-by-one error in `num_ids` for the system IOMMU path. Line 808 sets `range->num_ids = 0xffff - s->pci_iommu_bdf`, which evaluates to `0xffff` (65535) when `s->pci_iommu_bdf` is 0 (its default for the system IOMMU case). PCI Requester IDs span 0 through 0xffff inclusive — 65536 IDs total. The RIMT table declares only 65535 IDs, omitting the last Requester ID (0xffff). This is a malformed RIMT table: an OS parsing it will believe the IOMMU covers IDs 0–65534 but not 65535. The correct value should be `0x10000` (65536), i.e., `0xffff - s->pci_iommu_bdf + 1`.",
+      "snippet": "        range->num_ids = 0xffff - s->pci_iommu_bdf;\n        build_rimt_id_mapping(table_data, range->source_id_base,\n                              range->num_ids, iommu_offset);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-acpi-rimt",
+          "file_path": "rimt-spec.pdf (v0.99)",
+          "line_start": 0,
+          "line_end": 0,
+          "excerpt": "Referenced at line 699: https://github.com/riscv-non-isa/riscv-acpi-rimt/releases/download/v0.99/rimt-spec.pdf — The 'Number of IDs' field in the ID Mapping Structure is a count (not a mask), so covering all 65536 PCI RIDs requires the value 65536 (0x10000)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/hw/riscv/virt.c",
+        "function_name": "create_fdt_pcie",
+        "line_start": 900,
+        "line_end": 904,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The FDT `iommu-map` property for the system IOMMU path (line 903) writes `0xffff` as the length/mask value covering all RIDs. If the FDT iommu-map parser treats this as a count (Linux kernel convention), this covers 65535 IDs instead of 65536, paralleling the RIMT off-by-one bug. The FDT behavior depends on the guest OS's interpretation of the length field (count vs. mask). This diverges from the PCI IOMMU path at line 1117 which correctly computes `0xffff - bdf` as the count.",
+      "snippet": "    if (virt_is_iommu_sys_enabled(s)) {\n        qemu_fdt_setprop_cells(ms->fdt, name, \"iommu-map\",\n                               0, iommu_sys_phandle, 0, 0, 0,\n                               iommu_sys_phandle, 0, 0xffff);\n    }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/hw/riscv/virt-acpi-build.c",
+        "function_name": "virt_acpi_build",
+        "line_start": 891,
+        "line_end": 894,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "RIMT table generation is correctly gated on either `virt_is_iommu_sys_enabled(s)` or `s->pci_iommu_bdf` being set. When the IOMMU is instantiated, the RIMT ACPI table IS generated — the IOMMU is never silently present without a corresponding RIMT table. This guard is correct.",
+      "snippet": "    if (virt_is_iommu_sys_enabled(s) || s->pci_iommu_bdf) {\n        acpi_add_table(table_offsets, tables_blob);\n        build_rimt(tables_blob, tables->linker, s);\n    }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/hw/riscv/virt-acpi-build.c",
+        "function_name": "acpi_dsdt_add_iommu_sys",
+        "line_start": 208,
+        "line_end": 227,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The DSDT IOMMU device entry (IMU0) correctly uses the BRS-specified HID 'RSCV0004', exposes the MMIO resource at the correct base address, and declares 4 interrupts (CQ, FQ, PM, PQ) with correct edge-triggered active-low configuration. The AML device structure is well-formed.",
+      "snippet": "    Aml *dev = aml_device(\"IMU0\");\n    aml_append(dev, aml_name_decl(\"_HID\", aml_string(\"RSCV0004\")));\n    aml_append(dev, aml_name_decl(\"_UID\", aml_int(0)));\n    Aml *crs = aml_resource_template();\n    aml_append(crs, aml_memory32_fixed(iommu_memmap->base, iommu_memmap->size, AML_READ_WRITE));",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

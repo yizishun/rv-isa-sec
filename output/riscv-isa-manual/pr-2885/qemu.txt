@@ -1,0 +1,24 @@
+PR #2885  target=qemu  overall=compliant
+Spec: QEMU TCG emulates amocas.q on any memory type without Ziccamoc's coherent+cacheable PMA constraint, and applies Zama16b's MAG16 atomicity guarantee unconditionally without validating the target region's misaligned atomicity granule PMA — a guest kernel assuming RVA23 profile guarantees can trigger non-atomic 128-bit load/store sequences on MMIO/device memory, corrupting device register state
+Violation:
+  QEMU TCG translates amocas.q (AMOCASQ) gated solely on REQUIRE_ZACAS(ctx)
+  with no ext_ziccamoc CPU flag and no runtime PMA check on the target
+  physical address for coherence and cacheability. The instruction executes on
+  any memory type — RAM, MMIO, or device memory — via
+  tcg_gen_atomic_cmpxchg_i128, which in non-parallel (CF_PARALLEL=0) mode
+  falls through to a fully non-atomic 128-bit load-compare-store sequence
+  (qemu_ld_i128 + XOR-compare + qemu_st_i128) with no PMA gating whatsoever.
+  Similarly, ext_zama16b is checked at translate time to set MO_ATOM_WITHIN16
+  on load/store memop flags, but QEMU never validates that the target physical
+  address region actually carries the MAG16 PMA — the flag is applied
+  unconditionally to all memory, including regions where MAG16 is not
+  supported.
+Consequence: data_corruption
+Pattern:
+  REQUIRE_ZACAS without ext_ziccamoc flag or PMA coherence/cacheability check;
+  tcg_gen_atomic_cmpxchg_i128 without PMA gate; ext_zama16b applied to
+  MO_ATOM_WITHIN16 unconditionally without MAG16 PMA validation on target
+  address; missing MULTI_EXT_CFG_BOOL("ziccamoc") in cpu.c; NO PMA
+  coherence/cacheability inspection in atomic_mmu_lookup before any 128-bit
+  atomic path
+------------------------------------------------------------

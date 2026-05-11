@@ -1,0 +1,292 @@
+{
+  "pr_number": 2974,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 2974,
+    "violation_condition": "OpenSBI unconditionally writes to mie bits (e.g., csr_set(CSR_MIE, MIP_MSIP) in sbi_ipi_init() and csr_set(CSR_MIE, MIP_MSIP | MIP_MEIP) in sbi_hsm_hart_wait()) without probing WARL writability first. Per spec, mie bits for interrupts that can never become pending are read-only zero, so these writes silently fail on platforms where MSIP or MEIP is unsupported, leaving OpenSBI's wait loop or IPI path relying on interrupt enables that were never actually set.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csr_set(CSR_MIE, ...) or csr_write(CSR_MIE, ...) without prior WARL probe (try-write-then-readback) to verify the targeted mie bit positions are actually writable on this hart",
+    "affected_entities": [
+      "mie",
+      "mip",
+      "MIP_MSIP",
+      "MIP_MEIP",
+      "MIP_MSIP | MIP_MEIP"
+    ],
+    "summary": "Unconditional mie writes silently fail on implementations where target interrupt sources can never become pending (read-only-zero mie bits); OpenSBI's IPI init and HSM wait paths assume MSIE/MEIE are always settable"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_ipi.c",
+        "function_name": "sbi_ipi_init",
+        "line_start": 384,
+        "line_end": 385,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Unconditionally sets MSIE bit via csr_set(CSR_MIE, MIP_MSIP) without probing whether MSIE is writable on this hart. Per RISC-V spec (norm:mip_msip_mie_msie_maybe_rdonly0), MSIE may be read-only zero on single-hart systems or platforms that deliver machine-level IPIs through MEI instead. If MSIE is read-only zero, the write silently fails, and the entire IPI mechanism is broken—S-mode IPIs via SBI are never received, resulting in denial of service for multi-core synchronization.",
+      "snippet": "/* Enable software interrupts */\ncsr_set(CSR_MIE, MIP_MSIP);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1382,
+          "line_end": 1384,
+          "excerpt": "A bit in mie must be writable if the corresponding interrupt can ever become pending. Bits of mie that are not writable must be read-only zero."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1430,
+          "line_end": 1433,
+          "excerpt": "If a system has only one hart, or if a platform standard supports the delivery of machine-level interprocessor interrupts through external interrupts (MEI) instead, then mip.MSIP and mie.MSIE may both be read-only zeros."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "sbi_hsm_hart_wait",
+        "line_start": 165,
+        "line_end": 192,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "HSM hart wait loop saves MIE (line 166), then unconditionally sets MSIE and MEIE via csr_set(CSR_MIE, MIP_MSIP | MIP_MEIP) at line 169 to configure wakeup sources before entering WFI. On platforms where either MSIE or MEIE is read-only zero (spec-allowed for single-hart or MEI-based IPI), the enable bits are never actually set. The WFI wait loop at line 172 then spins forever because no wakeup interrupt can be received. The saved_mie is restored at line 186 via csr_write, which also does not verify WARL legality of the restored value. Consequence: hart is permanently stuck in the wait loop, unable to resume from suspend.",
+      "snippet": "saved_mie = csr_read(CSR_MIE);\n/* Set MSIE and MEIE bits to receive IPI */\ncsr_set(CSR_MIE, MIP_MSIP | MIP_MEIP);\n/* Wait for state transition requested by sbi_hsm_hart_start() */\nwhile (atomic_read(&hdata->state) != SBI_HSM_STATE_START_PENDING) {\n\t...\n\twfi();\n}\n/* Restore MIE CSR */\ncsr_write(CSR_MIE, saved_mie);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1382,
+          "line_end": 1384,
+          "excerpt": "A bit in mie must be writable if the corresponding interrupt can ever become pending. Bits of mie that are not writable must be read-only zero."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1430,
+          "line_end": 1433,
+          "excerpt": "If a system has only one hart, or if a platform standard supports the delivery of machine-level interprocessor interrupts through external interrupts (MEI) instead, then mip.MSIP and mie.MSIE may both be read-only zeros."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_restore",
+        "line_start": 435,
+        "line_end": 446,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Non-retentive suspend restore writes hdata->saved_mie back to CSR_MIE at line 444 via csr_write() without reading back to verify WARL legalization. The saved_mie was read at line 427 before suspend, but after power-gating (non-retentive), the hart may reinitialize MIE to a WARL-legalized default that differs from the pre-suspend value. The csr_write may silently drop bits that existed pre-suspend but are not writable post-resume. No subsequent csr_read(CSR_MIE) comparison against hdata->saved_mie detects this loss. Reordered writes also place csr_set(MIP, ...) after MIE restore without a barrier, potentially exposing a window where stale MIP state interacts with the newly-restored MIE.",
+      "snippet": "csr_write(CSR_MIDELEG, hdata->saved_mideleg);\ncsr_write(CSR_MEDELEG, hdata->saved_medeleg);\ncsr_write(CSR_MIE, hdata->saved_mie);\ncsr_set(CSR_MIP, (hdata->saved_mip & (MIP_SSIP | MIP_STIP)));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1382,
+          "line_end": 1384,
+          "excerpt": "A bit in mie must be writable if the corresponding interrupt can ever become pending. Bits of mie that are not writable must be read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_irqchip.c",
+        "function_name": "sbi_irqchip_init",
+        "line_start": 301,
+        "line_end": 303,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Enables MEIE unconditionally via csr_set(CSR_MIE, MIP_MEIP) at line 303 when an irqchip with process_hwirqs is present, without verifying MEIE is actually writable on this hart. On platforms without an external interrupt controller or where MEI is not implemented, MEIE is read-only zero per spec. The write silently fails, and M-mode external interrupts are never delivered despite the irqchip being configured and initialized. The condition on line 302 (hd && hd->chip && hd->chip->process_hwirqs) guards which harts get this write, but does not validate that the MIE bit was actually set afterward.",
+      "snippet": "hd = sbi_scratch_thishart_offset_ptr(irqchip_hart_data_off);\nif (hd && hd->chip && hd->chip->process_hwirqs)\n\tcsr_set(CSR_MIE, MIP_MEIP);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1382,
+          "line_end": 1384,
+          "excerpt": "A bit in mie must be writable if the corresponding interrupt can ever become pending. Bits of mie that are not writable must be read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/utils/hsm/fdt_hsm_sifive_tmc0.c",
+        "function_name": "sifive_tmc0_stop",
+        "line_start": 267,
+        "line_end": 281,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SiFive TMC0 hart_stop saves MIE at line 269, then unconditionally sets MSIE|MEIE as wakeup sources via csr_set(CSR_MIE, MIP_MEIP | MIP_MSIP) at line 272 before issuing tile power-gate. On error at line 275, it restores MIE via csr_write(CSR_MIE, mie) at line 276. Neither the csr_set at line 272 nor the csr_write restore at line 276 verifies the write took effect (no readback comparison). If MSIE/MEIE are read-only zero on this platform, the wakeup mask is never applied, and the tile power-gates without any configured wakeup source—resulting in an unrecoverable hart.",
+      "snippet": "unsigned long mie = csr_read(CSR_MIE);\ncsr_set(CSR_MIE, MIP_MEIP | MIP_MSIP);\nrc = sifive_tmc0_tile_pg();\nif (rc) {\n\tcsr_write(CSR_MIE, mie);\n\treturn rc;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1382,
+          "line_end": 1384,
+          "excerpt": "A bit in mie must be writable if the corresponding interrupt can ever become pending. Bits of mie that are not writable must be read-only zero."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1430,
+          "line_end": 1433,
+          "excerpt": "If a system has only one hart, or if a platform standard supports the delivery of machine-level interprocessor interrupts through external interrupts (MEI) instead, then mip.MSIP and mie.MSIE may both be read-only zeros."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/utils/hsm/fdt_hsm_andes_atcsmu.c",
+        "function_name": "ae350_hart_stop",
+        "line_start": 149,
+        "line_end": 156,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Andes AE350 hart_stop first clears all MIE bits via csr_write(CSR_MIE, 0) at line 153 (safe—writing zero is always legal), then for LIGHT_SLEEP mode writes csr_write(CSR_MIE, MIP_MSIP) at line 156 to reconfigure MSIE as the sole wakeup source. No readback after the MSIP-only write verifies MSIE is actually writable on this hart. On a platform where MSIE is read-only zero, the MIE register stays at zero (from line 153), the hart enters WFI with no wakeup source enabled, and never resumes.",
+      "snippet": "csr_write(CSR_MIE, 0);\nif (sleep_type == SBI_SUSP_AE350_LIGHT_SLEEP) {\n\tcsr_write(CSR_MIE, MIP_MSIP);\n\tatcsmu_set_wakeup_events(PCS_WAKEUP_MSIP_MASK, hartid);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1382,
+          "line_end": 1384,
+          "excerpt": "A bit in mie must be writable if the corresponding interrupt can ever become pending. Bits of mie that are not writable must be read-only zero."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1430,
+          "line_end": 1433,
+          "excerpt": "If a system has only one hart, or if a platform standard supports the delivery of machine-level interprocessor interrupts through external interrupts (MEI) instead, then mip.MSIP and mie.MSIE may both be read-only zeros."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_timer.c",
+        "function_name": "sbi_timer_event_start",
+        "line_start": 145,
+        "line_end": 147,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Sets MTIE via csr_set(CSR_MIE, MIP_MTIP) to enable machine timer interrupts. MTIE is defined as writable on any platform that implements the machine-level timer interrupt, which is mandatory in M-mode. The write is correctly paired with csr_clear(CSR_MIE, MIP_MTIP) in sbi_timer_process() at line 152. No WARL probe is needed since MTIE is architecturally guaranteed writable when the machine timer interrupt exists.",
+      "snippet": "csr_set(CSR_MIE, MIP_MTIP);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "mstatus_init",
+        "line_start": 183,
+        "line_end": 184,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Writes csr_write(CSR_MIE, 0) to disable all interrupts during hart initialization. Writing zero to MIE is always legal regardless of WARL properties—all bits in MIE are either writable or read-only zero, and writing 0 to a read-only-zero bit is a no-op that does not violate any spec constraint. No WARL probe is needed.",
+      "snippet": "/* Disable all interrupts */\ncsr_write(CSR_MIE, 0);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/utils/suspend/fdt_suspend_andes_atcsmu.c",
+        "function_name": "ae350_system_suspend",
+        "line_start": 47,
+        "line_end": 48,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Writes csr_write(CSR_MIE, 0) at line 48 to prevent the core leaving WFI unexpectedly during system suspend. Writing zero is always safe—no WARL probe needed. After suspend, the warm-boot path reinitializes MIE from scratch, so no stale-value-restore concern.",
+      "snippet": "/* Prevent the core leaving the WFI mode unexpectedly */\ncsr_write(CSR_MIE, 0);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_ipi.c",
+        "function_name": "sbi_ipi_exit",
+        "line_start": 392,
+        "line_end": 393,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Clears MSIE via csr_clear(CSR_MIE, MIP_MSIP) during IPI exit. csr_clear performs a read-modify-write: the read returns the WARL-legalized value, clearing a bit that was already zero (if MSIE is read-only zero) is a safe no-op. The write-back value is already legalized by the prior read.",
+      "snippet": "/* Disable software interrupts */\ncsr_clear(CSR_MIE, MIP_MSIP);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_pmu.c",
+        "function_name": "pmu_sse_enable",
+        "line_start": 1156,
+        "line_end": 1161,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Enables PMU-related MIE bits via csr_set(CSR_MIE, irq_mask) where irq_mask is sbi_pmu_irq_mask(). The PMU overflow interrupt is only relevant on platforms with Sscofpmf implemented. If the extension is absent, the corresponding MIE bits are hardwired to zero and the csr_set is a no-op on those bits. The function is only called when PMU SSE events are active, implying the hardware support exists. No WARL probe is necessary because the irq_mask is derived from hardware capability checks elsewhere.",
+      "snippet": "unsigned long irq_mask = sbi_pmu_irq_mask();\ncsr_set(CSR_MIE, irq_mask);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_pmu.c",
+        "function_name": "pmu_sse_complete",
+        "line_start": 1171,
+        "line_end": 1174,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Re-enables PMU interrupt bits via csr_set(CSR_MIE, sbi_pmu_irq_mask()) after completing a PMU SSE event. Same analysis as pmu_sse_enable: only called when PMU extension is active, and the mask reflects hardware capability.",
+      "snippet": "csr_set(CSR_MIE, sbi_pmu_irq_mask());",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "sbi_hsm_hart_wait",
+        "line_start": 185,
+        "line_end": 186,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Restores saved MIE via csr_write(CSR_MIE, saved_mie) at line 186 after the WFI wait loop completes. The saved_mie value was obtained from csr_read(CSR_MIE) at line 166, which returns the WARL-legalized value. Writing back a previously-read value is safe because the value has already been filtered by the hardware's WARL logic. No bits beyond what the hardware exposed via read are written.",
+      "snippet": "/* Restore MIE CSR */\ncsr_write(CSR_MIE, saved_mie);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/utils/hsm/fdt_hsm_sifive_tmc0.c",
+        "function_name": "sifive_tmc0_stop",
+        "line_start": 275,
+        "line_end": 277,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "On tile power-gate failure, restores MIE from a locally-saved value (obtained via csr_read at line 269) via csr_write(CSR_MIE, mie) at line 276. The mie value was read from CSR, so it reflects WARL-legalized state. Writing it back is safe. This is the error-recovery path only.",
+      "snippet": "if (rc) {\n\tcsr_write(CSR_MIE, mie);\n\treturn rc;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_timer.c",
+        "function_name": "sbi_timer_process",
+        "line_start": 150,
+        "line_end": 152,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Clears MTIE via csr_clear(CSR_MIE, MIP_MTIP) during timer interrupt processing. csr_clear is a read-modify-write sequence; the read returns the legalized value and clearing a bit is always safe regardless of WARL.",
+      "snippet": "csr_clear(CSR_MIE, MIP_MTIP);",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

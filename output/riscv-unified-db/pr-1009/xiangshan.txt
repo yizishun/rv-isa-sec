@@ -1,0 +1,113 @@
+PR #1009  target=xiangshan  overall=not_implemented
+Spec: Zicfiss shadow stack instruction SSE gating requires mode-specific two-stage checking (illegal check per-mode then any-SSE OR for execution); implementing as a single combined OR-gate of all three SSE bits enables privilege escape where guest/hypervisor-disabled shadow stack operations execute incorrectly
+Violation:
+  In XiangShan RTL, when shadow stack instructions (sspush, sspopchk, ssrdp,
+  ssamoswap, c.sspush, c.sspopchk) are decoded and the implementation checks
+  only the OR of menvcfg.SSE, henvcfg.SSE, and senvcfg.SSE as a single
+  combined enable signal (e.g., any_sse_en = menvcfg.SSE | henvcfg.SSE |
+  senvcfg.SSE) instead of performing the two-stage check: (1) gate on the
+  mode-specific SSE bit to raise IllegalInstruction/VirtualInstruction for the
+  current privilege level, then (2) check any SSE bit for the operation body.
+  Specifically, in VS/VU mode when menvcfg.SSE=1 but henvcfg.SSE=0, or in VU
+  mode when senvcfg.SSE=0, or in U-mode when menvcfg.SSE=1 but senvcfg.SSE=0,
+  a single-combined-check implementation would execute shadow stack operations
+  that the spec requires to trap with VirtualInstruction or
+  IllegalInstruction.
+Consequence: privilege_escape
+Pattern:
+  menvcfg.SSE | henvcfg.SSE | senvcfg.SSE
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:67-80  EnvCfg
+  SSE field is defined as RO(3) hardwired to 0 in the abstract base class
+  EnvCfg, which is inherited by MEnvCfg, HEnvCfg, and SEnvCfg. None of the
+  derived classes override SSE to make it RW. The SSE field is never read
+  anywhere in the RTL. Zicfiss is not implemented.
+  | val SSE = RO(3).withReset(0.U).withDescription("Enable the Zicfiss shadow-stack extension below M-mode.")
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:130-143
+      "Attempts to access the ssp CSR may result in either an illegal-
+      instruction exception or a virtual-instruction exception, contingent
+      upon the state of "
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:712-722  MEnvCfg
+  MEnvCfg extends EnvCfg but only overrides STCE, PBMTE, and DTE to be RW. SSE
+  remains RO(3)=0 from the base class. No SSE gate logic exists in menvcfg CSR
+  module instantiation. Zicfiss is not implemented.
+  | class MEnvCfg extends EnvCfg {
+  |   if (CSRConfig.EXT_SSTC) { this.STCE.setRW().withReset(1.U) }
+  |   this.PBMTE.setRW().withReset(0.U)
+  |   if (CSRConfig.EXT_DBLTRP) { this.DTE.setRW().withReset(0.U) }
+  | }
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:150-161
+      "The term xSSE is used to determine if backward-edge CFI using
+      shadow stacks ... is enabled at a privilege mode. When S-mode is
+      implemented: S or HS =>"
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:73-83  HEnvCfg
+  HEnvCfg extends EnvCfg but only overrides STCE, PBMTE, and DTE to be RW. SSE
+  remains RO(3)=0. The henvcfg CSR module has gates for STCE/PBMTE/DTE against
+  menvcfg but no SSE gate. Zicfiss is not implemented.
+  | class HEnvCfg extends EnvCfg {
+  |   if (CSRConfig.EXT_SSTC) { this.STCE.setRW().withReset(1.U) }
+  |   this.PBMTE.setRW().withReset(0.U)
+  |   if (CSRConfig.EXT_DBLTRP) { this.DTE.setRW().withReset(0.U) }
+  | }
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:139-143
+      "Otherwise, if in VS-mode and henvcfg[sse] is 0, a virtual-
+      instruction exception is raised. Otherwise, if in VU-mode and either
+      henvcfg[sse] or senvcfg"
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala:70-71  SEnvCfg
+  SEnvCfg extends EnvCfg with an empty body. SSE remains RO(3)=0. The senvcfg
+  CSR has no SSE-related logic. Zicfiss is not implemented.
+  | class SEnvCfg extends EnvCfg
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:137-138
+      "Otherwise, if in U-mode and senvcfg[sse] is 0, an illegal-
+      instruction exception is raised."
+
+[not_implemented] src/main/scala/xiangshan/backend/decode/DecodeUnit.scala:798-810  DecodeUnit
+  The decode table assembles XDecode, FpDecode, BitmanipDecode,
+  ScalarCryptoDecode, CBODecode, SvinvalDecode, HypervisorDecode, VecDecoder,
+  ZicondDecode, ZimopDecode, and ZfaDecode. There is no ZicfissDecode table.
+  All Zicfiss instructions (sspush, sspopchk, ssrdp, c.sspush, c.sspopchk)
+  fall through to Zimop no-op behavior or illegal-instruction decodeDefault.
+  Zicfiss is not implemented.
+  | val decode_table: Array[(BitPat, List[BitPat])] = XDecode.table ++
+  |   FpDecode.table ++
+  |   BitmanipDecode.table ++
+  |   ScalarCryptoDecode.table ++
+  |   XSDebugDecode.table ++
+  |   CBODecode.table ++
+  |   SvinvalDecode.table ++
+  |   HypervisorDecode.table ++
+  |   VecDecoder.table ++
+  |   ZicondDecode.table ++
+  |   ZimopDecode.table ++
+  |   ZfaDecode.table
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:350-358
+      "The Zicfiss instructions, except ssamoswap.w and ssamoswap.d, are
+      encoded using a subset of May-Be-Operation instructions defined by
+      the Zimop and Zcm"
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:28-73  CSRConfig
+  CSRConfig defines EXT_SSTC and EXT_DBLTRP flags but has no EXT_ZICFISS,
+  EXT_SSE, or EXT_CFI configuration flag. Zicfiss is not implemented.
+  | final val EXT_SSTC = true
+  | final val EXT_DBLTRP = true
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/wrapper/CSR.scala:417-568  CSRToDecode
+  CSRToDecode defines illegalInst and virtualInst bundles for various
+  extensions (sfenceVMA, hfenceGVMA, hfenceVVMA, hlsv, fsIsOff, vsIsOff, wfi,
+  wrs_nto, frm, cboZ, cboCF, cboI) but has no SSE-related illegal-instruction
+  or virtual-instruction signal. Zicfiss is not implemented.
+  | class CSRToDecode extends Bundle { ... illegalInst ... virtualInst ... }
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:130-143
+      "Attempts to access the ssp CSR may result in either an illegal-
+      instruction exception or a virtual-instruction exception, contingent
+      upon the state of "
+

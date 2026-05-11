@@ -1,0 +1,217 @@
+{
+  "pr_number": 210,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 210,
+    "violation_condition": "The kernel frees a physical page (via put_page, kfree, munmap) and reallocates it without first issuing a capability revocation sweep (Svucrg) that invalidates all outstanding user-mode capabilities authorizing access to that page, allowing a use-after-free via a stale capability.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "free_page|put_page|__free_pages|kfree|vfree|kvfree|mmap.*MAP_FIXED|do_munmap|unmap_region|free_pgd_range|pte_free|pmd_free|pud_free|__pmd_free_tlb|__pte_free_tlb",
+    "affected_entities": [
+      "Svucrg",
+      "Svucrglct",
+      "Svy",
+      "satp",
+      "menvcfg",
+      "senvcfg"
+    ],
+    "summary": "Svucrg page-based revocation guarantees that freed pages cannot be accessed via stale CHERI capabilities, but the kernel must trigger revocation as part of the page-freeing path, or the hardware-backed use-after-free defense is silently defeated"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "mm/page_alloc.c",
+        "function_name": "__free_pages_prepare",
+        "line_start": 1342,
+        "line_end": 1472,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "This is the universal convergence point for all page-freeing paths. arch_free_page() at line 1469 is a no-op on RISC-V (default weak definition in include/linux/gfp.h:223). No Svucrg capability revocation sweep is performed before pages are returned to the buddy allocator or PCP lists. Without SvyRG enablement, any user-mode capabilities authorizing access to the freed physical page remain valid after reallocation, enabling use-after-free via stale capabilities.",
+      "snippet": "trace_mm_page_free(page, order);\nkmsan_free_page(page, order);\n// ... no CHERI capability revocation sweep ...\narch_free_page(page, order);  // no-op on RISC-V\ndebug_pagealloc_unmap_pages(page, 1 << order);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 11,
+          "line_end": 13,
+          "excerpt": "Applied to userspace pages, this has been shown to allow the operating system to implement capability revocation schemes, which allow userspace memory allocators to deterministically guard against use-after-reallocation. Applied to kernel pages, they can similarly be used against use-after-reallocation within the kernel itself."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 36,
+          "line_end": 57,
+          "excerpt": "SvyRG defines capability load faults (cause 35). When pte.YR is set, pte.YRG != sstatus.xYRG traps on capability loads, implementing the load-barrier primitive from Cornucopia Reloaded."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/attributes.adoc",
+          "line_start": 101,
+          "line_end": 102,
+          "excerpt": ":cheri_priv_crg_ext: SvyRG — the MMU-based capability data flow control and measurement extension name."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "mm/page_alloc.c",
+        "function_name": "__free_pages",
+        "line_start": 5367,
+        "line_end": 5370,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Primary API for freeing pages from alloc_pages(). Calls ___free_pages() which eventually reaches __free_frozen_pages() / __free_pages_prepare(). No Svucrg capability revocation sweep is performed at any point in this call chain before the page is returned to the free pool.",
+      "snippet": "void __free_pages(struct page *page, unsigned int order)\n{\n\t___free_pages(page, order, FPI_NONE);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 11,
+          "line_end": 13,
+          "excerpt": "Applied to userspace pages, this has been shown to allow the operating system to implement capability revocation schemes, which allow userspace memory allocators to deterministically guard against use-after-reallocation."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "mm/page_alloc.c",
+        "function_name": "__free_one_page",
+        "line_start": 978,
+        "line_end": 1037,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Final insertion point into the buddy allocator free lists. Pages merged into the buddy system here are immediately available for reallocation. No Svucrg capability revocation sweep precedes buddy merging. A stale user-mode capability targeting a PFN in this free block would remain valid after reallocation.",
+      "snippet": "static inline void __free_one_page(struct page *page,\n\t\tunsigned long pfn,\n\t\tstruct zone *zone, unsigned int order,\n\t\tint migratetype, fpi_t fpi_flags)\n{",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 11,
+          "line_end": 13,
+          "excerpt": "Applied to userspace pages, this has been shown to allow the operating system to implement capability revocation schemes, which allow userspace memory allocators to deterministically guard against use-after-reallocation."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "mm/swap.c",
+        "function_name": "__folio_put",
+        "line_start": 97,
+        "line_end": 113,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Called when a folio's reference count drops to zero (from put_page/folio_put). Delegates to free_frozen_pages() which calls __free_frozen_pages(). This is the refcount-driven free path (e.g., file-backed pages, anonymous pages on last unmap). No Svucrg capability revocation sweep is performed.",
+      "snippet": "void __folio_put(struct folio *folio)\n{\n\t// ... zone_device and hugetlb special cases ...\n\tpage_cache_release(folio);\n\tfolio_unqueue_deferred_split(folio);\n\tmem_cgroup_uncharge(folio);\n\tfree_frozen_pages(&folio->page, folio_order(folio));\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 11,
+          "line_end": 13,
+          "excerpt": "Applied to userspace pages, this has been shown to allow the operating system to implement capability revocation schemes, which allow userspace memory allocators to deterministically guard against use-after-reallocation."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "mm/mmap.c",
+        "function_name": "do_munmap",
+        "line_start": 1061,
+        "line_end": 1067,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Entry point for munmap(). Calls do_vmi_munmap() which gathers VMAs and invokes unmap_region() to clear PTEs, free page tables, and release physical pages via tlb_finish_mmu(). No Svucrg capability revocation sweep is performed on the affected pages before they are returned to the allocator.",
+      "snippet": "int do_munmap(struct mm_struct *mm, unsigned long start, size_t len,\n\t      struct list_head *uf)\n{\n\tVMA_ITERATOR(vmi, mm, start);\n\treturn do_vmi_munmap(&vmi, mm, start, len, uf, false);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 49,
+          "line_end": 57,
+          "excerpt": "When pte.YR is set, pte.YRG can be used to trap on capability loads when it does not match sstatus.UYRG for userspace pages or sstatus.SYRG for kernel pages. This is the load-barrier primitive from Cornucopia Reloaded."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "mm/vma.c",
+        "function_name": "unmap_region",
+        "line_start": 478,
+        "line_end": 489,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Core unmapping function that clears PTEs via unmap_vmas() (zapping present PTEs and queueing pages for TLB shootdown), frees page tables via free_pgtables(), and releases queued pages via tlb_finish_mmu(). None of these operations perform a Svucrg capability revocation sweep. Stale capabilities held by user mode remain valid through the entire unmapping sequence.",
+      "snippet": "void unmap_region(struct unmap_desc *unmap)\n{\n\tstruct mmu_gather tlb;\n\ttlb_gather_mmu(&tlb, mm);\n\tupdate_hiwater_rss(mm);\n\tunmap_vmas(&tlb, unmap);\n\tmas_set(unmap->mas, unmap->tree_reset);\n\tfree_pgtables(&tlb, unmap);\n\ttlb_finish_mmu(&tlb);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 49,
+          "line_end": 57,
+          "excerpt": "pte.YRG can be used to trap on capability loads when it does not match sstatus.xYRG — this is the load-barrier primitive from Cornucopia Reloaded for capability revocation."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/pgalloc.h",
+        "function_name": "__pte_free_tlb",
+        "line_start": 133,
+        "line_end": 134,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "RISC-V PTE page freeing via TLB gather mechanism. Calls tlb_remove_ptdesc() which eventually calls __free_pages(). No Svucrg capability revocation sweep is performed on page-table pages. If page-table pages were accessible via capabilities (e.g., in a CHERI-aware kernel), stale capabilities to freed page-table pages would remain valid.",
+      "snippet": "static inline void __pte_free_tlb(struct mmu_gather *tlb, pgtable_t pte, unsigned long addr)\n{ tlb_remove_ptdesc(tlb, page_ptdesc(pte)); }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 12,
+          "line_end": 13,
+          "excerpt": "Applied to kernel pages, they can similarly be used against use-after-reallocation within the kernel itself."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "mm/page_alloc.c",
+        "function_name": "free_pages",
+        "line_start": 5391,
+        "line_end": 5397,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Variant of __free_pages() accepting a virtual address instead of a struct page. Same call chain (___free_pages → __free_frozen_pages → __free_pages_prepare). No Svucrg capability revocation sweep.",
+      "snippet": "void free_pages(unsigned long addr, unsigned int order)\n{\n\tif (addr != 0) {\n\t\tVM_BUG_ON(!virt_addr_valid((void *)addr));\n\t\t__free_pages(virt_to_page((void *)addr), order);\n\t}\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "include/linux/gfp.h",
+        "function_name": "arch_free_page",
+        "line_start": 223,
+        "line_end": 223,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Architecture-specific hook in __free_pages_prepare() intended for platform-specific page-free work. Default is a no-op. RISC-V does NOT override this. This is the natural injection point for adding a Svucrg capability revocation sweep (scanning for and invalidating capabilities to the freed PFN range), but it is unused.",
+      "snippet": "static inline void arch_free_page(struct page *page, int order) { }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/cheri/cheri-pte-ext.adoc",
+          "line_start": 11,
+          "line_end": 13,
+          "excerpt": "Applied to userspace pages, this has been shown to allow the operating system to implement capability revocation schemes, which allow userspace memory allocators to deterministically guard against use-after-reallocation."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

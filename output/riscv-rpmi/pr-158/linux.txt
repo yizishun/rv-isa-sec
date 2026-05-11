@@ -1,0 +1,209 @@
+PR #158  target=linux  overall=not_implemented
+Spec: Agent error: exit code 1
+Violation:
+
+Consequence: function_loss
+Pattern:
+
+------------------------------------------------------------
+[potential_risk] drivers/mailbox/riscv-sbi-mpxy-mbox.c:339-369  mpxy_setup_shmem
+  MPXY shared memory allocated with alloc_pages(GFP_KERNEL|__GFP_ZERO) places
+  all RPMI transport buffers in regular kernel heap with no memory isolation.
+  If a TEE service group were added and carried sensitive data (e.g. session
+  tokens, attestation results, key material), that data would reside in pages
+  accessible to any kernel code path. Lines 866-869 intentionally skip CPUHP
+  teardown cleanup because the RPMI sysmsi irqchip needs the shared memory
+  during IRQ migration — meaning stale data could persist across CPU hotplug
+  events. No ZONE_DMA, restricted-memory, or confidential-computing memory
+  allocation is used.
+  | shmem_page = alloc_pages(GFP_KERNEL | __GFP_ZERO, get_order(mpxy_shmem_size));
+  | if (!shmem_page)
+  | 	return -ENOMEM;
+  | sret = sbi_ecall(SBI_EXT_MPXY, SBI_EXT_MPXY_SET_SHMEM,
+  | 		 page_to_phys(shmem_page), 0, 0, 0, 0, 0);
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:33-41
+      "Without the Smepmp extension, it is not possible for a PMP rule to
+      be enforced only on non-Machine modes and denied on Machine mode...
+      For any physica"
+
+[compliant] drivers/mailbox/riscv-sbi-mpxy-mbox.c:400-471  mpxy_mbox_send_rpmi_data
+  The RPMI dispatch switch (lines 404-471) treats all service groups uniformly
+  via GET_ATTRIBUTE, SET_ATTRIBUTE, SEND_WITH_RESPONSE, SEND_WITHOUT_RESPONSE
+  message types. This is correct behavior for a transport layer — the mailbox
+  driver is a message conduit, not a policy enforcer. Service-group-specific
+  validation belongs at the client layer (e.g., clk-rpmi, irq-rpmi-sysmsi).
+  The servicegroup_id is available via RPMI_MBOX_ATTR_SERVICEGROUP_ID query
+  (line 414) for clients that need it.
+  | case RPMI_MBOX_MSG_TYPE_SEND_WITH_RESPONSE:
+  | 	if ((!msg->data.request && msg->data.request_len) ||
+  | 	    (msg->data.request && msg->data.request_len > mchan->max_xfer_len) ||
+  | 	    (!msg->data.response && msg->data.max_response_len)) {
+  | 		msg->error = -EINVAL;
+
+[compliant] drivers/mailbox/riscv-sbi-mpxy-mbox.c:474-495  mpxy_mbox_peek_rpmi_data
+  The notification event dispatch loop iterates over event_data bytes and
+  delivers events via mbox_chan_received_data() without per-servicegroup
+  filtering. This is correct transport-layer behavior: the mailbox channel is
+  opened for a specific service group (channel attributes include
+  servicegroup_id per mpxy_mbox_read_rpmi_attrs at line 497), so only events
+  for the bound service group arrive on that channel. Filtering at the
+  transport layer would duplicate what the channel binding already enforces.
+  | while (pos < events_data_len && (events_data_len - pos) <= sizeof(*event)) {
+  | 	event = (struct rpmi_notification_event *)(notif->events_data + pos);
+  | 	msg.type = RPMI_MBOX_MSG_TYPE_NOTIFICATION_EVENT;
+  | 	...
+  | 	mbox_chan_received_data(chan, &msg);
+
+[compliant] arch/riscv/kvm/vcpu_sbi_forward.c:29-34  vcpu_sbi_ext_mpxy
+  KVM registers SBI_EXT_MPXY as a forwarded extension with
+  default_disabled=true. This means the VMM must explicitly enable it before
+  the guest can use RPMI over MPXY. The forwarding design delegates all policy
+  decisions to the host VMM, which is the correct architecture: the VMM owns
+  the platform security model and decides which service groups to expose. The
+  kernel KVM layer is a conduit, not a policy engine.
+  | const struct kvm_vcpu_sbi_extension vcpu_sbi_ext_mpxy = {
+  | 	.extid_start = SBI_EXT_MPXY,
+  | 	.extid_end = SBI_EXT_MPXY,
+  | 	.default_disabled = true,
+  | 	.handler = kvm_riscv_vcpu_sbi_forward_handler,
+  | };
+
+[compliant] arch/riscv/kvm/vcpu_sbi.c:127-148  kvm_riscv_vcpu_sbi_forward_handler
+  The SBI forward handler copies all guest register arguments (a0-a5) into
+  run->riscv_sbi.args[] and exits to the VMM with KVM_EXIT_RISCV_SBI. ret[0]
+  is initialized to SBI_ERR_NOT_SUPPORTED so that a VMM that doesn't handle
+  the call gets a safe default. Service-group-level filtering is the VMM's
+  responsibility per the KVM split-design architecture. The kernel KVM layer
+  is not the right place to enforce TEE service group policy — that belongs in
+  the VMM (e.g., kvmtool, QEMU, rust-vmm) which understands the full platform
+  security configuration.
+  | run->riscv_sbi.args[0] = cp->a0;
+  | run->riscv_sbi.args[1] = cp->a1;
+  | run->riscv_sbi.args[2] = cp->a2;
+  | run->riscv_sbi.args[3] = cp->a3;
+  | run->riscv_sbi.args[4] = cp->a4;
+  | run->riscv_sbi.args[5] = cp->a5;
+  | run->riscv_sbi.ret[0] = SBI_ERR_NOT_SUPPORTED;
+
+[not_implemented] include/linux/mailbox/riscv-rpmi-message.h:94-95  RPMI_SRVGRP_SYSTEM_MSI
+  Only two RPMI service group IDs are defined: SYSTEM_MSI (0x00002) and CLOCK
+  (0x00008). No TEE service group constant (e.g., RPMI_SRVGRP_TEE) exists. The
+  TEE service group is not implemented in the kernel. The rpmi_message_header
+  includes servicegroup_id as a __le16 field (line 19), so the protocol wire
+  format supports arbitrary service groups, but the kernel has no compile-time
+  or runtime awareness of a TEE service group identity.
+  | /* RPMI service group IDs */
+  | #define RPMI_SRVGRP_SYSTEM_MSI		0x00002
+  | #define RPMI_SRVGRP_CLOCK		0x00008
+
+[potential_risk] arch/riscv/kernel/head.S:229-242  _start_kernel
+  In CONFIG_RISCV_M_MODE builds, PMP0 is configured as a single NAPOT region
+  covering all physical memory (pmpaddr0 = -1) with R|W|X permissions and L=0
+  (no lock). The kernel sets up a trap handler (lines 234-235) before touching
+  PMP CSRs, so if PMP registers are locked or inaccessible, the trap handler
+  safely skips to .Lpmp_done. However, the kernel never reads CSR_MSECCFG to
+  check whether Smepmp MML or MMWP bits are set by firmware/BootROM. Under
+  Smepmp spec (mseccfg.MML=1), the PMP encoding L=0,R=1,W=1,X=1 would be
+  interpreted as 'Access Exception' for M-mode per the Smepmp truth table,
+  rendering the kernel unable to access any memory. The trap handler would
+  catch this and skip PMP setup, leaving the kernel with whatever PMP
+  configuration firmware set — which could be either too restrictive or too
+  permissive depending on the platform.
+  | li a0, -1
+  | csrw CSR_PMPADDR0, a0
+  | li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+  | csrw CSR_PMPCFG0, a0
+  | .align 2
+  | .Lpmp_done:
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:44-57
+      "The physical memory protection rules when mseccfg.MML is set to 1
+      are summarized in the truth table below... L=0,R=1,W=1,X=1: Access
+      Exception for M M"
+    - riscv-isa-manual/src/priv/machine.adoc:2420-2424
+      "The mseccfg.MML (Machine Mode Lockdown) is a WARL field. This is a
+      sticky bit, meaning that once set it cannot be unset without a PMP
+      reset."
+
+[potential_risk] arch/riscv/include/asm/csr.h:245-249  CSR_MSECCFG
+  CSR_MSECCFG (0x747) and CSR_MSECCFGH (0x757) are defined at lines 429-430,
+  but only MSECCFG_PMM aliases (pointer masking) exist at lines 246-249. No
+  MML, MMWP, RLB, USEED, SSEED, or MLPE bit definitions are present. The
+  kernel never reads CSR_MSECCFG at boot or runtime (verified by searching the
+  entire codebase — 'mseccfg' appears only in csr.h definitions), so it cannot
+  detect whether Smepmp is active, whether Zkr seed access is restricted, or
+  whether Zicfilp landing-pad enforcement is enabled. This is not a current
+  bug since the kernel doesn't manage TEE state, but it means the kernel has
+  zero visibility into the platform security configuration that M-mode
+  firmware may have established.
+  | /* mseccfg bits */
+  | #define MSECCFG_PMM			ENVCFG_PMM
+  | #define MSECCFG_PMM_PMLEN_0		ENVCFG_PMM_PMLEN_0
+  | #define MSECCFG_PMM_PMLEN_7		ENVCFG_PMM_PMLEN_7
+  | #define MSECCFG_PMM_PMLEN_16		ENVCFG_PMM_PMLEN_16
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2387-2397
+      "The Smepmp extension adds the RLB, MMWP, and the MML fields in
+      mseccfg. When mseccfg.RLB is 1, locked PMP rules can be temporarily
+      modified... When ms"
+
+[compliant] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The context-switch macro saves and restores FPU state (via __switch_to_fpu),
+  Vector state (via __switch_to_vector), and ENVCFG (via __switch_to_envcfg
+  with ALTERNATIVE-patched csrw). No TEE session state is saved because no TEE
+  state exists in the kernel — there is no RISC-V TEE backend, no per-task TEE
+  session tokens, and no TEE-shared-memory mappings. The context-switch path
+  correctly handles all state that the kernel currently manages. If a future
+  TEE backend introduced per-task state, it would need to add hooks here, but
+  that is a future implementation concern, not a current bug.
+  | if (has_fpu())
+  | 	__switch_to_fpu(__prev, __next);
+  | if (has_vector() || has_xtheadvector())
+  | 	__switch_to_vector(__prev, __next);
+  | ...
+  | __switch_to_envcfg(__next);
+  | ((last) = __switch_to(__prev, __next));
+
+[compliant] arch/riscv/kernel/suspend.c:15-42  suspend_save_csrs
+  Suspend correctly saves and restores CSR_ENVCFG, CSR_TVEC, CSR_IE,
+  CSR_STIMECMP (if SSTC), and CSR_SATP (if MMU). It does not save MSECCFG or
+  PMP CSRs, which is correct: MSECCFG is a machine-mode CSR managed by M-mode
+  firmware, not by the S-mode kernel. PMP CSRs are also M-mode resources. The
+  S-mode kernel cannot read or write MSECCFG directly (it's an M-mode CSR at
+  0x747); the S-mode view of machine security configuration is via
+  menvcfg/senvcfg. The suspend path correctly handles all S-mode-accessible
+  CSRs needed for resume.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_XLINUXENVCFG))
+  | 	context->envcfg = csr_read(CSR_ENVCFG);
+  | context->tvec = csr_read(CSR_TVEC);
+  | context->ie = csr_read(CSR_IE);
+
+[not_implemented] drivers/tee/tee_core.c:1-1  tee_init
+  The generic TEE subsystem (CONFIG_TEE in drivers/tee/Kconfig line 5) depends
+  on HAVE_ARM_SMCCC || COMPILE_TEST || CPU_SUP_AMD. RISC-V is only supported
+  via COMPILE_TEST (compile-only, no runtime). There is no RISC-V native TEE
+  backend driver (e.g., drivers/tee/riscv/) that could pair with an RPMI TEE
+  service group as its secure-world transport. On ARM, OP-TEE uses SMC as the
+  transport; on AMD, PSP uses a hardware mailbox. A RISC-V TEE backend would
+  need to use RPMI-over-MPXY as its transport, analogous to how
+  drivers/tee/optee/ uses SMC. Without this backend, a TEE service group ID in
+  RPMI has no kernel consumer.
+  | depends on HAVE_ARM_SMCCC || COMPILE_TEST || CPU_SUP_AMD
+
+[compliant] arch/riscv/kvm/vcpu.c:578-641  kvm_arch_vcpu_load
+  KVM VCPU load correctly manages VS CSRs (vsstatus, vsie, vstvec, vsscratch,
+  vsepc, vscause, vstval), HEDELEG, HVIP, VSATP, HENVCFG, and HSTATEEN0 (if
+  SMSTATEEN present). It also handles NACL shmem sync for nested
+  virtualization. MSECCFG is a machine-mode CSR managed by the hypervisor (HS-
+  mode), not by the guest VS-mode. The guest cannot access MSECCFG directly.
+  If a future TEE service group required MSECCFG virtualization (e.g., to give
+  the guest a view of a synthetic MSECCFG), that would be added here. But for
+  current KVM, not managing MSECCFG is correct: it's an M-mode resource, and
+  the hypervisor in HS-mode accesses it via menvcfg/senvcfg indirection.
+  | csr_write(CSR_VSSTATUS, csr->vsstatus);
+  | csr_write(CSR_VSIE, csr->vsie);
+  | csr_write(CSR_HENVCFG, cfg->henvcfg);
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SMSTATEEN)) {
+  | 	csr_write(CSR_HSTATEEN0, cfg->hstateen0);
+

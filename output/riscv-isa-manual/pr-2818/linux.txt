@@ -1,0 +1,149 @@
+PR #2818  target=linux  overall=not_implemented
+Spec: Agent error: exit code 1
+Violation:
+
+Consequence: function_loss
+Pattern:
+
+------------------------------------------------------------
+[potential_risk] arch/riscv/Kconfig:623-627  RISCV_ISA_V (Kconfig)
+  RISCV_ISA_V depends on FPU (line 626), which selects FPU register-file
+  support (f-state save/restore). On a Zfinx+Zve64d system there are no f
+  registers at all — mstatus.FS is hardwired to 0 per
+  norm:Zfinx_mstatus_FS_zero, and misa.F/misa.D are hardwired to 0 per
+  norm:Zfinx_misa_F_D_Q_zero. The spec explicitly states V is compatible with
+  Zfinx (vector-common.adoc:956-960; norm:V_Zinx_fp_scalar at vector-
+  common.adoc:2329-2333). This forced dependency makes V unsupportable on any
+  Zfinx hardware, which violates the spec’s stated compatibility guarantee.
+  | config RISCV_ISA_V
+  | 	bool "Vector extension support"
+  | 	depends on TOOLCHAIN_HAS_V
+  | 	depends on FPU
+  | 	select DYNAMIC_SIGFRAME
+  | 	default y
+  References:
+    - riscv-isa-manual/src/unpriv/zfinx.adoc:155-163
+      "norm:Zfinx_mstatus_FS_zero: mstatus.FS is hardwired to 0 if Zfinx
+      is implemented. norm:Zfinx_misa_F_D_Q_zero: misa.F, misa.D, and
+      misa.Q are hardwired"
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:956-960
+      "Zfinx ("F in X") is a new ISA extension where floating-point
+      instructions take their arguments from the integer register file.
+      The vector extension is"
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:2329-2333
+      "norm:V_Zinx_fp_scalar: When adding a vector extension to the
+      Zfinx/Zdinx/Zhinx extensions, floating-point scalar arguments are
+      taken from the x regist"
+    - riscv-isa-manual/src/unpriv/v-st-ext.adoc:53-59
+      "norm:V_dependent_F_D: The V extension depends upon the F and D
+      extensions, and implements all vector floating-point instructions
+      for EEW=32 or EEW=64."
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:3333-3337
+      "norm:mstatus_FS_off_V_fp_ill: If mstatus.FS is Off then any attempt
+      to execute a vector floating-point instruction will raise an
+      illegal-instruction e"
+
+[potential_risk] arch/riscv/kernel/cpufeature.c:175-196  riscv_ext_vector_float_validate
+  This validator requires IS_ENABLED(CONFIG_FPU) (line 181) and
+  __riscv_isa_extension_available(RISCV_ISA_EXT_d) (line 192). On a
+  Zfinx+Zve64d system, misa.D is hardwired to 0 and CONFIG_FPU would be
+  disabled — so vector support would be rejected by this function even though
+  the hardware implements Zve64d (which gives EEW=64 FP in vector registers)
+  and the spec says V+Zfinx is a valid combination. The kernel has no code
+  path that recognizes Zdinx as satisfying the scalar-FP dependency for V.
+  | static int riscv_ext_vector_float_validate(const struct riscv_isa_ext_data *data,
+  | 					   const unsigned long *isa_bitmap)
+  | {
+  | 	if (!IS_ENABLED(CONFIG_RISCV_ISA_V))
+  | 		return -EINVAL;
+  | 	if (!IS_ENABLED(CONFIG_FPU))
+  | 		return -EINVAL;
+  | 	if (!__riscv_isa_extension_available(isa_bitmap, RISCV_ISA_EXT_d))
+  | 		return -EINVAL;
+  | 	return 0;
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zfinx.adoc:155-163
+      "norm:Zfinx_mstatus_FS_zero + norm:Zfinx_misa_F_D_Q_zero: mstatus.FS
+      hardwired to 0, misa.F/D/Q hardwired to 0 when Zfinx implemented."
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:2329-2333
+      "norm:V_Zinx_fp_scalar: When adding a vector extension to
+      Zfinx/Zdinx/Zhinx, floating-point scalar arguments are taken from
+      the x registers."
+
+[potential_risk] arch/riscv/include/asm/switch_to.h:61-65  has_fpu
+  has_fpu() returns false on Zfinx systems because misa.F and misa.D are both
+  hardwired to 0 per norm:Zfinx_misa_F_D_Q_zero. This gate controls
+  __switch_to_fpu() in the context-switch path (line 118-119 of switch_to.h),
+  which would skip f-register save/restore. On a non-Zfinx system this is
+  correct — but on a Zfinx+V system it's also correct behavior since there are
+  no f registers. However, the broader implications (CONFIG_FPU disabled → V
+  support impossible via Kconfig dep) make this a contributing risk factor,
+  not a standalone bug.
+  | static __always_inline bool has_fpu(void)
+  | {
+  | 	return riscv_has_extension_likely(RISCV_ISA_EXT_f) ||
+  | 		riscv_has_extension_likely(RISCV_ISA_EXT_d);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zfinx.adoc:155-163
+      "norm:Zfinx_mstatus_FS_zero + norm:Zfinx_misa_F_D_Q_zero: mstatus.FS
+      hardwired to 0, misa.F/D/Q hardwired to 0 when Zfinx implemented."
+
+[not_implemented] arch/riscv/kernel/cpufeature.c:140-155  riscv_ext_f_validate
+  The kernel's F-extension validator checks misa.F bit directly (via
+  __riscv_isa_extension_available). On Zfinx systems misa.F is hardwired to 0
+  per the spec, so the kernel would reject the F-extension probe entirely.
+  There is no Zfinx ISA extension ID defined in hwcap.h, no DT binding parsed
+  for Zfinx, and no Zfinx-specific validation path. The kernel simply does not
+  implement Zfinx detection or support at all.
+  | static int riscv_ext_f_validate(...)
+  | {
+  | 	...
+  | 	if (!__riscv_isa_extension_available(isa_bitmap, RISCV_ISA_EXT_d)) {
+  | 		pr_warn_once("This kernel does not support systems with F but not D\n");
+  | 		return -EINVAL;
+  | 	}
+  | 	...
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zfinx.adoc:27-169
+      "Full Zfinx specification: Zfinx provides F-equivalent instructions
+      using x registers instead of f registers. Depends on Zicsr.
+      mstatus.FS hardwired to"
+
+[not_implemented] arch/riscv/kernel/entry.S:173-180  handle_exception (entry.S)
+  Exception-entry code clears SR_FS and SR_VS bits via 'li t0, SR_SUM |
+  SR_FS_VS' followed by a csrc to sstatus (line 176-177). On Zfinx systems
+  mstatus.FS is hardwired to 0 per norm:Zfinx_mstatus_FS_zero, so the SR_FS
+  bit manipulation is a no-op (safe). However, the kernel has no awareness
+  that FS is hardwired — it still tries to manipulate FS bits in context-
+  switch paths as if f registers exist. This is harmless on real Zfinx
+  hardware but represents an architectural gap in the kernel's understanding
+  of the Zfinx privilege model.
+  | li t0, SR_SUM | SR_FS_VS
+  | csrc sstatus, t0
+  References:
+    - riscv-isa-manual/src/unpriv/zfinx.adoc:155-159
+      "norm:Zfinx_mstatus_FS_zero: mstatus.FS is hardwired to 0 if the
+      Zfinx extension is implemented, and FS no longer affects the
+      trapping behavior of floa"
+
+[not_implemented] arch/riscv/kernel/cpufeature.c:488-510  riscv_isa_ext[] (extension table)
+  The riscv_isa_ext[] table has no entries for Zfinx, Zdinx, Zhinx, or
+  Zhinxmin. The kernel's ISA string parser at boot time cannot recognize these
+  extensions from the device tree. The hwcap infrastructure
+  (arch/riscv/include/asm/hwcap.h) has no RISCV_ISA_EXT_ZFINX constant. Zfinx
+  is entirely absent from the kernel's extension inventory, making it
+  impossible for the kernel to correctly configure itself on a Zfinx system.
+  | __RISCV_ISA_EXT_DATA_VALIDATE(f, RISCV_ISA_EXT_f, riscv_ext_f_validate),
+  | __RISCV_ISA_EXT_DATA_VALIDATE(d, RISCV_ISA_EXT_d, riscv_ext_d_validate),
+  | __RISCV_ISA_EXT_DATA(q, RISCV_ISA_EXT_q),
+  | __RISCV_ISA_EXT_SUPERSET(c, RISCV_ISA_EXT_c, riscv_c_exts),
+  | __RISCV_ISA_EXT_SUPERSET_VALIDATE(v, RISCV_ISA_EXT_v, riscv_v_exts, ...)
+  References:
+    - riscv-isa-manual/src/unpriv/zfinx.adoc:1-169
+      "ext:zfinx[], ext:zdinx[], ext:zhinx[], ext:zhinxmin[] Extensions
+      for Floating-Point in Integer Registers — full normative
+      specification."
+

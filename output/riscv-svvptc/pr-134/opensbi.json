@@ -1,0 +1,187 @@
+{
+  "pr_number": 0,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 0,
+    "violation_condition": "",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "",
+    "affected_entities": [],
+    "summary": "Failed to parse agent output as JSON"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain_context.c",
+        "function_name": "switch_to_next_domain_context",
+        "line_start": 127,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "PMP unconfigure() writes PMP CSRs (pmp_disable) without issuing SFENCE.VMA. Then configure() is called but its return value is discarded. If configure() fails, all non-firmware PMP entries remain disabled from unconfigure() with no fence, and execution proceeds to swap supervisor CSRs and eventually mret to S-mode — S-mode would run without PMP enforcement.",
+      "snippet": "sbi_hart_protection_unconfigure(scratch);\nsbi_hart_protection_configure(scratch);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3629,
+          "line_end": 3633,
+          "excerpt": "when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches. This is accomplished by executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0, after the PMP CSRs are written."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_pmp_unconfigure",
+        "line_start": 300,
+        "line_end": 312,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "sbi_hart_pmp_unconfigure() iterates all non-firmware PMP entries calling pmp_disable() (which writes pmpcfg CSR) but never issues sbi_hart_pmp_fence() after the loop. In contrast, both sbi_hart_smepmp_configure() (line 216) and sbi_hart_oldpmp_configure() (line 296) correctly end with sbi_hart_pmp_fence(). The RISC-V privileged spec requires SFENCE.VMA after PMP CSR modifications to synchronize PMP caches.",
+      "snippet": "for (i = 0; i < pmp_count; i++) {\n    if (sbi_hart_smepmp_is_fw_region(i))\n        continue;\n    sbi_platform_pmp_disable(sbi_platform_ptr(scratch), i);\n    pmp_disable(i);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3622,
+          "line_end": 3633,
+          "excerpt": "Implementations with virtual memory are permitted to perform address translations speculatively and earlier than required by an explicit memory access, and are permitted to cache them in address translation cache structures... Hence, when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches. This is accomplished by executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0, after the PMP CSRs are written."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 184,
+        "line_end": 209,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "MML (Machine Mode Lockdown) is set at line 185 via csr_set(CSR_MSECCFG, MSECCFG_MML) before shared/SU-only PMP entries are programmed at lines 188-206. The M-only entries programmed in lines 145-180 were written under legacy (MML=0) encoding where PMP_L has different semantics. Between MML=1 (line 185) and the completion of shared/SU region programming (line 206), speculative accesses to shared regions would encounter either uninitialized or legacy-encoded PMP entries misinterpreted under the Smepmp truth table — a transient window with undefined protection behavior.",
+      "snippet": "/* Set the MML to enforce new encoding */\ncsr_set(CSR_MSECCFG, MSECCFG_MML);\n\n/* Program shared and SU-only regions */\npmp_idx = 0;\nsbi_domain_for_each_memregion(dom, reg) {",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3629,
+          "line_end": 3633,
+          "excerpt": "when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "mstatus_init",
+        "line_start": 32,
+        "line_end": 48,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "mstatus_init() constructs mstatus_val from zero (line 35) and writes it directly to CSR_MSTATUS (line 48), clearing all bits including TW (Timeout Wait, bit 21), TVM (Trap Virtual Memory, bit 20), and TSR (Trap SRET, bit 22). During HSM non-retentive suspend/resume, the HSM save/restore path (sbi_hsm_data) does not save or restore mstatus. The warm resume path calls sbi_hart_reinit() which invokes mstatus_init() destructively, then __sbi_hsm_suspend_non_ret_restore() only restores MENVCFG/MIDELEG/MEDELEG/MIE/MIP — mstatus virtualization trap bits set by S-mode before suspend are permanently lost. For example, if S-mode had TW=1 to intercept WFI for power management, post-resume WFI in S-mode would halt indefinitely instead of trapping.",
+      "snippet": "unsigned long mstatus_val = 0;\n// ... only FS and VS bits set ...\ncsr_write(CSR_MSTATUS, mstatus_val);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 754,
+          "line_end": 761,
+          "excerpt": "The TW (Timeout Wait) bit is a WARL field that supports intercepting the WFI instruction. When TW=0, the WFI instruction may execute in modes less privileged than M when not prevented for some other reason. When TW=1, then if WFI is executed in any less-privileged mode, and it does not complete within an implementation-specific, bounded time limit, the WFI instruction causes an illegal-instruction exception."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 734,
+          "line_end": 741,
+          "excerpt": "The TVM (Trap Virtual Memory) bit is a WARL field that supports intercepting supervisor virtual-memory management operations. When TVM=1, attempts to read or write the satp CSR or execute an SFENCE.VMA or SINVAL.VMA instruction while executing in S-mode will raise an illegal-instruction exception."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain_context.c",
+        "function_name": "switch_to_next_domain_context",
+        "line_start": 139,
+        "line_end": 140,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "After csr_swap(CSR_SATP, ...) at line 139, __sbi_sfence_vma_all() is correctly called at line 140. This was added by the most recent commit (4aad9d76876e) and properly synchronizes address-translation caches after the SATP change, as required by the RISC-V privileged spec.",
+      "snippet": "ctx->satp = csr_swap(CSR_SATP, dom_ctx->satp);\n__sbi_sfence_vma_all();",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 1142,
+          "line_end": 1149,
+          "excerpt": "writing satp does not imply any ordering constraints between page-table updates and subsequent address translations, nor does it imply any invalidation of address-translation caches. If the new address space's page tables have been modified, or if an ASID is reused, it may be necessary to execute an SFENCE.VMA instruction after, or in some cases before, writing satp."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_save",
+        "line_start": 408,
+        "line_end": 433,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HSM non-retentive suspend correctly saves MIE, MIP (S-mode bits only: SSIP|STIP), MEDELEG, MIDELEG, and MENVCFG. These are restored by __sbi_hsm_suspend_non_ret_restore() at lines 435-446 before mret to S-mode. The rationale for saving only S-mode MIP bits is well-documented: M-mode MIP bits are read-only, VS-mode bits alias HVIP.",
+      "snippet": "hdata->saved_mie = csr_read(CSR_MIE);\nhdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);\nhdata->saved_medeleg = csr_read(CSR_MEDELEG);\nhdata->saved_mideleg = csr_read(CSR_MIDELEG);\nif (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)\n    hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "sbi_hart_switch_mode",
+        "line_start": 794,
+        "line_end": 820,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sbi_hart_switch_mode() correctly configures mstatus.MPP to the target mode, clears MPIE (preventing traps from re-entering M-mode with interrupts enabled), clears SIE/STVEC/SSCRATCH/SATP before mret to S-mode, and properly handles H-extension MPV/VS CSRs when next_virt is set. The trap delegation (medeleg/mideleg) is configured separately during cold boot init before entering S-mode.",
+      "snippet": "val = csr_read(CSR_MSTATUS);\nval = INSERT_FIELD(val, MSTATUS_MPP, next_mode);\nval = INSERT_FIELD(val, MSTATUS_MPIE, 0);\ncsr_write(CSR_MSTATUS, val);\ncsr_write(CSR_MEPC, next_addr);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 211,
+        "line_end": 217,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The RLB (Rule Lock Bypass) bit is intentionally kept set after PMP programming is complete (line 211-214 comment). This permanently bypasses the hardware-enforced lock guarantee on PMP entries to support dynamic map_range/unmap_range operations via reserved entry 0. While operationally justified, RLB=1 means any vulnerability that corrupts M-mode execution flow could reprogram what should be immutable locked PMP entries.",
+      "snippet": "/*\n * All entries are programmed.\n * Keep the RLB bit so that dynamic mappings can be done.\n */\n\nsbi_hart_pmp_fence();",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_map_range",
+        "line_start": 220,
+        "line_end": 250,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "sbi_hart_smepmp_map_range() writes pmpaddr then pmpcfg via pmp_set() to grant temporary M-mode shared access using reserved entry 0, but does not issue sbi_hart_pmp_fence() afterward. Similarly, sbi_hart_smepmp_unmap_range() at lines 252-257 calls pmp_disable() without a fence. Callers (sbi_ecall_dbcn.c, sbi_pmu.c, sbi_sse.c, sbi_dbtr.c, sbi_mpxy.c) immediately access the mapped region after map_range() returns, so a speculatively cached stale PMP translation could cause spurious access faults.",
+      "snippet": "// map_range: pmp_set() writes pmpaddr then pmpcfg — no fence follows\n// unmap_range: pmp_disable() writes pmpcfg — no fence follows",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3629,
+          "line_end": 3633,
+          "excerpt": "when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches. This is accomplished by executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0, after the PMP CSRs are written."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

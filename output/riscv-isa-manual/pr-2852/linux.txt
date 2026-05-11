@@ -1,0 +1,80 @@
+PR #2852  target=linux  overall=compliant
+Spec: Agent error: exit code 1
+Violation:
+
+Consequence: function_loss
+Pattern:
+
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/module.c:835-839  apply_relocate_add
+  Error path for unknown symbol now calls cleanup_accumulated_relocations()
+  before returning -ENOENT, preventing memory leak of relocation_hashtable
+  (kvmalloc) and accumulated relocation entries (kmalloc) that were allocated
+  during prior loop iterations.
+  | pr_warn("%s: Unknown symbol %s\n",
+  | 	me->name, strtab + sym->st_name);
+  | cleanup_accumulated_relocations(&relocation_hashtable,
+  | 				&used_buckets_list);
+  | return -ENOENT;
+
+[compliant] arch/riscv/kernel/module.c:849-854  apply_relocate_add
+  Error path for unknown relocation type now calls
+  cleanup_accumulated_relocations() before returning -EINVAL, preventing
+  memory leak.
+  | pr_err("%s: Unknown relocation type %u\n",
+  |        me->name, type);
+  | cleanup_accumulated_relocations(&relocation_hashtable,
+  | 				&used_buckets_list);
+  | return -EINVAL;
+
+[compliant] arch/riscv/kernel/module.c:903-910  apply_relocate_add
+  Error path for missing HI20 relocation now calls
+  cleanup_accumulated_relocations() before returning -EINVAL, preventing
+  memory leak.
+  | pr_err(
+  |   "%s: Can not find HI20 relocation information\n",
+  |   me->name);
+  | cleanup_accumulated_relocations(&relocation_hashtable,
+  | 				&used_buckets_list);
+  | return -EINVAL;
+
+[compliant] arch/riscv/kernel/module.c:924-928  apply_relocate_add
+  Error path for failed relocation handler or add_relocation_to_accumulate now
+  calls cleanup_accumulated_relocations() before returning the error,
+  preventing memory leak.
+  | if (res) {
+  | 	cleanup_accumulated_relocations(&relocation_hashtable,
+  | 					&used_buckets_list);
+  | 	return res;
+  | }
+
+[compliant] arch/riscv/kernel/module.c:597-627  cleanup_accumulated_relocations
+  New cleanup function correctly traverses used_buckets_list -> bucket hlist
+  -> relocation_entry list, freeing all accumulated entries, relocation_heads,
+  buckets, and the hashtable itself. Properly uses _safe iteration variants to
+  handle deletion during traversal.
+  | static void
+  | cleanup_accumulated_relocations(struct hlist_head **relocation_hashtable,
+  | 				struct list_head *used_buckets_list)
+  | {
+  | 	struct used_bucket *bucket_iter;
+  | 	...
+  | 	kvfree(*relocation_hashtable);
+  | }
+
+[potential_risk] arch/riscv/kernel/module.c:731-757  add_relocation_to_accumulate
+  When bucket allocation fails (line 746), rel_head has been initialized with
+  INIT_HLIST_NODE (line 741) but hlist_add_head (line 756) is never reached
+  because the failure return is at line 749. This is correct — rel_head is
+  freed and no dangling pointer exists. However, if future refactoring
+  reorders the bucket allocation or adds code between INIT_HLIST_NODE and the
+  error return, a dangling hlist_node could result. The pattern is currently
+  safe but fragile.
+  | if (!bucket) {
+  | 	kfree(entry);
+  | 	kfree(rel_head);
+  | 	return -ENOMEM;
+  | }
+  | ...
+  | hlist_add_head(&rel_head->node, current_head);
+

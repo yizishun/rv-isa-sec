@@ -1,0 +1,48 @@
+PR #258  target=opensbi  overall=compliant
+Spec: Off-by-one boundary check in SBI debug trigger range validation: using >= instead of > against trig_max rejects legitimate requests operating on all available triggers (0..trig_max-1), causing denial of debug functionality for S-mode software.
+Violation:
+  OpenSBI's sbi_dbtr_read_trig, sbi_dbtr_install_triggers, or
+  sbi_dbtr_update_trig uses >= (greater-or-equal) instead of > (strictly
+  greater) in the range check against trig_max (total_trigs), causing valid
+  requests operating on the full trigger set (e.g., trig_count == trig_max or
+  trig_idx_base + trig_count == trig_max, which references triggers 0 through
+  trig_max-1 inclusive) to be incorrectly rejected with SBI_ERR_BAD_RANGE.
+Consequence: denial_of_service
+Pattern:
+  trig_count >= (hs->total_trigs|trig_max) OR trig_idx_base + trig_count >=
+  (hs->total_trigs|trig_max) in
+  sbi_dbtr_read_trig|sbi_dbtr_install_trig|sbi_dbtr_update_trig
+------------------------------------------------------------
+[compliant] lib/sbi/sbi_dbtr.c:553-555  sbi_dbtr_read_trig
+  Post-fix, the range check correctly uses > (strictly greater) for
+  trig_idx_base + trig_count > hs->total_trigs and returns SBI_ERR_BAD_RANGE.
+  The trig_idx_base >= total_trigs check is correct because trigger indices
+  are 0-based (idx == total_trigs is out of range). Reading trig_count ==
+  total_trigs - trig_idx_base (all remaining triggers) is now correctly
+  allowed.
+  | if (trig_idx_base >= hs->total_trigs ||
+  |     trig_idx_base + trig_count > hs->total_trigs)
+  |     return SBI_ERR_BAD_RANGE;
+
+[potential_risk] lib/sbi/sbi_dbtr.c:624-629  sbi_dbtr_install_trig
+  sbi_dbtr_install_trig lacks a trig_count > hs->total_trigs check returning
+  SBI_ERR_BAD_RANGE as required by spec Table 100. Instead, it only checks
+  hs->available_trigs < trig_count with return SBI_ERR_FAILED, which is a
+  different error code and a different predicate (availability vs. validity).
+  While functionally available_trigs <= total_trigs means trig_count >
+  total_trigs would also fail the availability check, the spec-mandated error
+  code SBI_ERR_BAD_RANGE is never returned, and the error is semantically
+  wrong (resource exhaustion vs. invalid parameter).
+  | if (hs->available_trigs < trig_count) {
+  |     *out = hs->available_trigs;
+  |     ...
+  |     return SBI_ERR_FAILED;
+  | }
+
+[compliant] lib/sbi/sbi_dbtr.c:718-719  sbi_dbtr_update_trig
+  Post-fix, the range check correctly uses > (strictly greater) for trig_count
+  > hs->total_trigs and returns SBI_ERR_BAD_RANGE. Updating trig_count ==
+  total_trigs (all triggers) is now correctly allowed.
+  | if (trig_count > hs->total_trigs)
+  |     return SBI_ERR_BAD_RANGE;
+

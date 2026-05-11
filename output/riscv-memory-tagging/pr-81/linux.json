@@ -1,0 +1,102 @@
+{
+  "pr_number": 81,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 81,
+    "violation_condition": "If hardware had implemented Zitagelide with SPTTCD at mstatus/sstatus bit 24, the kernel's existing SPELP management (sr->status & SR_SPELP save/restore at context-switch and csrrc clearing of SR_ELP on trap entry in entry.S:178-183) would silently alias TTCD state, causing: (a) kernel clobbering tag-check-elide state across context switches when saving/restoring SPELP, and (b) hardware interpreting SPELP writes as TTCD transitions, potentially eliding tag checks on kernel-originated memory accesses when landing-pad state changes.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "csrrc.*CSR_STATUS.*SR_SPELP|csrw.*CSR_STATUS.*SR_SPELP|csrs.*CSR_STATUS.*SR_SPELP|SR_SPELP_AC\\(0x00800000",
+    "affected_entities": [
+      "mstatus",
+      "sstatus",
+      "vsstatus"
+    ],
+    "summary": "Removing Zitagelide eliminates a CSR bit-24 conflict: SPTTCD collided with SPELP in mstatus/sstatus; kernel context-switch and trap-entry code managing SPELP would have silently clobbered or misinterpreted tag-check-elide state."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception (trap entry)",
+        "line_start": 176,
+        "line_end": 190,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Kernel correctly implements SPELP management per Zicfilp spec: csrrc reads-and-clears SR_ELP on trap entry (line 183), saves pre-clear sstatus (with SPELP preserved) to pt_regs->status (line 190), and restores via csrw CSR_STATUS on sret return (line 301). Bit 24 is formally assigned to SPELP by the ratified Zicfilp extension. No aliasing conflict exists because Zitagelide is not a defined RISC-V extension and is not implemented in this kernel.",
+      "snippet": "li t0, SR_SUM | SR_FS_VS\n#ifdef CONFIG_64BIT\nli t1, SR_ELP\nor t0, t0, t1\n#endif\nREG_L s0, TASK_TI_USER_SP(tp)\ncsrrc s1, CSR_STATUS, t0\nsave_userssp s2, s1\ncsrr s2, CSR_EPC\ncsrr s3, CSR_TVAL\ncsrr s4, CSR_CAUSE\ncsrr s5, CSR_SCRATCH\nREG_S s0, PT_SP(sp)\nREG_S s1, PT_STATUS(sp)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 67,
+          "line_end": 68,
+          "excerpt": "sstatus register field at bit position corresponding to bit 24 of mstatus: {bits: 1, name: 'SPELP'} — added by Zicfilp extension."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 78,
+          "line_end": 91,
+          "excerpt": "norm:Zicfilp_forward_traps: A trap must preserve previous ELP. norm:cfi_sstatus_spelp_op: The spelp bit in mstatus can be accessed through the sstatus CSR. norm:Zicfilp_pelp_trap: When a trap is taken into privilege mode x, the xpelp is set to ELP and ELP is set to NO_LP_EXPECTED."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "ret_from_exception (trap return)",
+        "line_start": 279,
+        "line_end": 302,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Trap return correctly restores full pt_regs->status (including SPELP at bit 24) via csrw CSR_STATUS, a0. The saved value was captured from the csrrc read at trap entry (line 183), which preserved the pre-trap SPELP state. This matches Zicfilp spec requirement that previous ELP be restored on xRET (norm:Zicfilp_pelp_trap_return).",
+      "snippet": "REG_L a0, PT_STATUS(sp)\nrestore_userssp s3, a0\nREG_L  a2, PT_EPC(sp)\nREG_SC x0, a2, PT_EPC(sp)\ncsrw CSR_STATUS, a0\ncsrw CSR_EPC, a2",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 92,
+          "line_end": 97,
+          "excerpt": "norm:Zicfilp_pelp_trap_return: When executing an xRET instruction, if the new privilege mode is y, then ELP is set to the value of xpelp if yLPE is 1; otherwise, it is set to NO_LP_EXPECTED; xpelp is set to NO_LP_EXPECTED."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "SR_SPELP definition",
+        "line_start": 21,
+        "line_end": 28,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SR_SPELP is correctly defined as bit 24 (0x00800000) matching the mstatus/sstatus SPELP field defined by the Zicfilp extension. The kernel does not define any SPTTCD or Zitagelide-related constants, which is correct since Zitagelide is not a ratified RISC-V extension.",
+      "snippet": "/* zicfilp landing pad status bit */\n#define SR_SPELP    _AC(0x00800000, UL)\n#define SR_MPELP    _AC(0x020000000000, UL)\n#ifdef CONFIG_RISCV_M_MODE\n#define SR_ELP      SR_MPELP\n#else\n#define SR_ELP      SR_SPELP\n#endif",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 252,
+          "line_end": 255,
+          "excerpt": "norm:sstatus_spelp: Access to the SPELP field, added by Zicfilp, accesses the homonymous fields of mstatus when V=0, and the homonymous fields of vsstatus when V=1."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "Zitagelide / SPTTCD",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Zitagelide is not a defined RISC-V extension in any specification document under spec_ref/. No Zitagelide or SPTTCD code exists in the Linux kernel (confirmed by exhaustive grep). The hypothetical aliasing conflict described in the security spec—where SPELP and SPTTCD both use bit 24—is a spec-level bit-allocation concern that would need to be resolved at the ISA design level before any kernel implementation could exist. The kernel correctly uses bit 24 exclusively for SPELP per the ratified Zicfilp extension.",
+      "snippet": "(no Zitagelide/SPTTCD code exists in kernel)",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,140 @@
+PR #1009  target=linux  overall=compliant
+Spec: Zicfiss shadow stack CSR ssp (0x011) is per-hardware-thread state that stores the top-of-shadow-stack pointer; kernel must context-switch it atomically with the user register file to prevent cross-process shadow-stack corruption and spurious SoftwareCheck exceptions, and must clear/hide ssp via SSE bits on execve() to avoid inherited-shadow-stack attacks.
+Violation:
+  Linux kernel fails to save/restore CSR ssp (address 0x011) on context switch
+  while SSE is enabled in {m,s,henvcfg}.SSE, or fails to clear SSE bits on
+  execve()/task teardown, causing a new process to inherit a stale shadow
+  stack pointer from the previous thread.
+Consequence: data_corruption
+Pattern:
+  arch/riscv/kernel/switch_to|__switch_to|switch_to.*riscv|ssp.*save|ssp.*rest
+  ore|CSR_SSP|0x011.*csr|SSE.*menvcfg|SSE.*senvcfg|SSE.*henvcfg|shadow.stack.*
+  switch|Zicfiss.*context
+------------------------------------------------------------
+[compliant] arch/riscv/kernel/entry.S:99-110  save_userssp
+  On trap entry from U-mode, save_userssp reads CSR_SSP via csrrw (read-and-
+  clear) and stores it in the per-task
+  thread_info.user_cfi_state.user_shdw_stk. The ALTERNATIVE gates this on
+  RISCV_ISA_EXT_ZICFISS + CONFIG_RISCV_USER_CFI. Since this runs in S-mode
+  where menvcfg.SSE=1 (enabled at boot), the CSR read always succeeds.
+  Clearing CSR_SSP to x0 on entry prevents the kernel from accidentally
+  leaking the user's shadow stack pointer.
+  | csrrw \tmp, CSR_SSP, x0;
+  | REG_S \tmp, TASK_TI_USER_SSP(tp);
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:412-416
+      "The csr:ssp[] CSR is an unprivileged read-write (URW) CSR that
+      reads and writes XLEN low order bits of the shadow stack pointer.
+      The CSR address is 0x"
+    - riscv-isa-manual/src/priv/cfi.adoc:135-138
+      "If the privilege mode is less than M and csr:menvcfg[sse] is 0, an
+      illegal-instruction exception is raised. Otherwise, if in U-mode and
+      csr:senvcfg[ss"
+
+[compliant] arch/riscv/kernel/entry.S:112-123  restore_userssp
+  On trap return to U-mode, restore_userssp loads the per-task saved SSP from
+  thread_info.user_cfi_state.user_shdw_stk and writes it back to CSR_SSP. This
+  occurs before SRET, while in S-mode, so the write succeeds regardless of the
+  target task's senvcfg.SSE. The restore correctly pairs with save_userssp to
+  carry SSP across context switches.
+  | REG_L \tmp, TASK_TI_USER_SSP(tp);
+  | csrw CSR_SSP, \tmp;
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:412-416
+      "The csr:ssp[] CSR is an unprivileged read-write (URW) CSR that
+      reads and writes XLEN low order bits of the shadow stack pointer."
+
+[compliant] arch/riscv/include/asm/switch_to.h:84-89  __switch_to_envcfg
+  During context switch, __switch_to_envcfg writes the next task's
+  thread.envcfg (which contains the ENVCFG_SSE bit) directly to
+  CSR_ENVCFG/CSR_SENVCFG. This ensures that when the next task resumes
+  execution in U-mode, senvcfg.SSE correctly reflects whether shadow stacks
+  are enabled for that task. The ENVCFG_SSE bit is at position 3 (value 0x8).
+  | asm volatile (ALTERNATIVE("nop", "csrw " __stringify(CSR_ENVCFG) ", %0",
+  |                  0, RISCV_ISA_EXT_XLINUXENVCFG, 1)
+  |         :: "r" (next->thread.envcfg) : "memory");
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:145-161
+      "xSSE determination: U or VU mode: csr:senvcfg[sse]"
+
+[compliant] arch/riscv/kernel/process.c:159-170  start_thread
+  On execve(), start_thread fully clears shadow stack state:
+  set_shstk_status(false) clears the ENVCFG_SSE bit in thread.envcfg (and
+  writes CSR_ENVCFG), set_shstk_base(0,0) clears the shadow stack base/size,
+  and set_active_shstk(0) zeros the saved SSP in thread_info. This prevents
+  the new process from inheriting stale shadow stack state from the previous
+  thread.
+  | set_shstk_status(current, false);
+  | set_shstk_base(current, 0, 0);
+  | set_active_shstk(current, 0);
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:166-183
+      "Activating Zicfiss in U-mode must be done explicitly per process.
+      Not activating Zicfiss at U-mode for a process when that application
+      is not compiled"
+
+[compliant] arch/riscv/kernel/usercfi.c:62-75  set_shstk_status
+  set_shstk_status manages the ENVCFG_SSE bit in task->thread.envcfg and also
+  writes it to the hardware CSR when task==current. This is called from
+  execve() (disable) and prctl (enable/disable). The implementation correctly
+  gates on is_user_shstk_enabled() which checks CPU feature + kernel config.
+  | if (enable)
+  |     task->thread.envcfg |= ENVCFG_SSE;
+  | else
+  |     task->thread.envcfg &= ~ENVCFG_SSE;
+  | csr_write(CSR_ENVCFG, task->thread.envcfg);
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:152-161
+      "U or VU: csr:senvcfg[sse]"
+
+[compliant] arch/riscv/kernel/usercfi.c:351-378  shstk_release
+  On task exit (via exit_thread), shstk_release unmaps the shadow stack VMA
+  and clears the base/size. Combined with the earlier SSE disable in
+  set_shstk_status(false) on the disable path, this ensures a dying task's
+  shadow stack memory is freed and cannot be accessed by a future task reusing
+  the same PID.
+  | vm_munmap(base, size);
+  | set_shstk_base(tsk, 0, 0);
+
+[compliant] arch/riscv/kernel/process.c:262-275  copy_thread
+  On fork/clone, copy_thread allocates a fresh shadow stack for the child via
+  shstk_alloc_thread_stack() and sets the child's SSP to the new stack top via
+  set_active_shstk(). The child's thread.envcfg (including SSE) is inherited
+  from the parent via dup_task_struct/copy_process. This is correct: a forked
+  child should inherit the parent's CFI state but have its own independent
+  shadow stack.
+  | ssp = shstk_alloc_thread_stack(p, args);
+  | if (ssp)
+  |     set_active_shstk(p, ssp);
+
+[compliant] arch/riscv/kernel/signal.c:145-172  save_cfiss_state
+  On signal delivery, save_cfiss_state saves the current SSP pointer into the
+  signal frame via RISCV_ZICFISS_MAGIC-tagged extension context. It uses the
+  token mechanism: saves a restore token on the shadow stack itself via
+  save_user_shstk(), then stores the token address in the sigframe. This
+  prevents an attacker from reusing a stolen signal frame to pivot the shadow
+  stack.
+  | err |= save_user_shstk(current, &ss_ptr);
+  | err |= __put_user(ss_ptr, &state->ss_ptr);
+
+[compliant] arch/riscv/kernel/signal.c:174-199  __restore_cfiss_state
+  On signal return, __restore_cfiss_state restores the SSP from the signal
+  frame's RISCV_ZICFISS_MAGIC extension context. It calls restore_user_shstk()
+  which validates the token on the shadow stack via ssamoswap before updating
+  the in-memory SSP and CSR. Token validation prevents shadow stack pivoting
+  attacks via signal return.
+  | err = __copy_from_user(&ss_ptr, &state->ss_ptr, sizeof(unsigned long));
+  | return restore_user_shstk(current, ss_ptr);
+
+[compliant] arch/riscv/kernel/entry.S:421-471  __switch_to
+  __switch_to saves/restores callee-saved GPRs and the SUM bit only. It does
+  NOT touch CSR_SSP because SSP is saved on trap entry by save_userssp and
+  restored on trap return by restore_userssp, both via the per-task
+  thread_info. The envcfg (including SSE) switch is handled by
+  __switch_to_envcfg called from the switch_to macro before __switch_to. This
+  layered design is correct.
+  | REG_S ra, TASK_THREAD_RA_RA(a3)
+  | ...
+  | REG_L ra, TASK_THREAD_RA_RA(a4)
+  | move tp, a1
+

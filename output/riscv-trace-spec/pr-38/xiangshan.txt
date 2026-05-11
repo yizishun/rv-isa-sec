@@ -1,0 +1,111 @@
+PR #38  target=xiangshan  overall=not_implemented
+Spec: irdepth field bit-width miscalculation omits required +1 term when return_stack_size_p > 0, causing trace encoder to generate malformed packets with truncated stack-depth/call-count values, corrupting program-flow reconstruction for all trace consumers
+Violation:
+  When XiangShan trace encoder parameter return_stack_size_p > 0, the irdepth
+  field width is computed as return_stack_size_p + call_counter_size_p (old
+  formula) instead of return_stack_size_p + 1 + call_counter_size_p (new
+  formula). This occurs when the Chisel/Verilog hardware trace packet
+  generator instantiates the irdepth field width as a compile-time Wire or Reg
+  parameter using the uncorrected expression, causing the field to be 1 bit
+  too narrow in Format 0/1/2 packets. The bit-level packet serializer then
+  shifts subsequent fields (irreport or padding) into the bit position that
+  should belong to irdepth[MSB], corrupting the entire packet bitstream
+  alignment for any downstream trace decoder.
+Consequence: data_corruption
+Pattern:
+  return_stack_size_p\+\s*call_counter_size_p
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/backend/trace/Interface.scala:42-61  TraceCoreInterface
+  The XiangShan repository only defines the core-side trace source interface
+  (TraceCoreInterface). The XSTOP trace encoder that performs E-Trace
+  packetization — including the irdepth field whose width is computed from
+  return_stack_size_p and call_counter_size_p — is an external IP block
+  integrated via XSTopPrefix. No irdepth, return_stack_size_p,
+  call_counter_size_p, or packet format logic exists in this repository or any
+  of its 10 submodules.
+  | class TraceCoreInterface(hasOffset: Boolean = false)(implicit val p: Parameters) extends Bundle with HasXSParameter {
+  |   val fromEncoder = Input(new Bundle {
+  |     val enable = Bool()
+  |     val stall  = Bool()
+  |   })
+  |   val toEncoder = Output(new Bundle {
+  |     val priv   = Priv()
+  |     val mstatus = UInt(XLEN.W)
+  |     val trap   = new Bundle{
+  |       val cause = UInt(CauseWidth.W)
+  |       val tval  = UInt(TvalWidth.W)
+  |     }
+  |     val groups = Vec(TraceGroupNum, ValidIO(new Bundle{
+  |       val iaddr     = UInt(IaddrWidth.W)
+  |       val ftqOffset = if (hasOffset)  Some(UInt(FetchBlockInstOffsetWidth.W)) else None
+  |       val itype     = UInt(ItypeWidth.W)
+  |       val iretire   = UInt(IretireWidthCompressed.W)
+  |       val ilastsize = UInt(IlastsizeWidth.W)
+  |     }))
+  |   })
+
+[not_implemented] src/main/scala/xiangshan/backend/trace/Trace.scala:28-65  Trace
+  The Trace module is a 4-stage pipeline (s0: ROB commit info, s1: register,
+  s2: TraceBuffer compress, s3: output to encoder) that produces raw trace
+  groups. It does NOT perform E-Trace packet generation, irdepth field
+  computation, or any packet format serialization. Those functions reside in
+  the external XSTOP encoder.
+  | class Trace(implicit val p: Parameters) extends Module with HasXSParameter {
+  |   val io = IO(new TraceIO)
+  |   // ...
+  |   traceBuffer.io.in.fromEncoder := fromEncoder
+  |   traceBuffer.io.in.fromRob := s2_in
+  |   // ...
+  |   io.out.toEncoder := s3_out_groups
+  | }
+
+[not_implemented] src/main/scala/xiangshan/backend/trace/TraceBuffer.scala:9-94  TraceBuffer
+  The TraceBuffer compresses per-cycle ROB commit info into trace groups and
+  feeds them to the external encoder. It implements a circular queue with
+  enq/deq pointers and backpressure (blockCommit). No packet format logic,
+  irdepth computation, or XSTOP encoder internals are present here.
+  | class TraceBuffer(implicit val p: Parameters) extends Module
+  |   with HasXSParameter
+  |   with HasCircularQueuePtrHelper {
+  |   val io = IO(new Bundle {
+  |     val in = new Bundle{
+  |       val fromEncoder = Input(new FromEncoder)
+  |       val fromRob     = Flipped(new TraceBundle(hasIaddr = false, CommitWidth, IretireWidthCompressed))
+  |     }
+  |     val out = new Bundle {
+  |       val blockCommit = Output(Bool())
+  |       val groups = new TraceBundle(hasIaddr = false, TraceGroupNum, IretireWidthCompressed)
+  |     }
+  |   })
+
+[not_implemented] src/main/scala/xiangshan/Parameters.scala:506-514  TraceParams / HasXSParameter trace defs
+  The XiangShan trace parameters define only group count, address width, itype
+  width, and ilastsize width. No XSTOP encoder parameters
+  (return_stack_size_p, call_counter_size_p, irdepth) or packet format
+  configuration exist in the parameter definitions.
+  | val traceParams: TraceParams = new TraceParams(
+  |     TraceGroupNum  = 3,
+  |     IaddrWidth     = GPAddrBitsSv48x4,
+  |     PrivWidth      = 3,
+  |     ItypeWidth     = 4,
+  |     IlastsizeWidth = 1,
+  |   )
+
+[not_implemented] src/main/scala/top/Top.scala:348-359  traceCoreInterface wiring
+  Top-level trace wiring flattens the core's trace group outputs into flat bit
+  vectors (valid, iaddr, itype, iretire, ilastsize) for the external XSTOP
+  encoder. This is the integration boundary — no packet format logic resides
+  here. The XSTOP encoder module itself is not instantiated in XiangShan RTL;
+  it is linked externally at build time via XSTopPrefix.
+  | val traceInterface = core.module.io.traceCoreInterface
+  |       traceInterface.fromEncoder := io.traceCoreInterface(i).fromEncoder
+  |       io.traceCoreInterface(i).toEncoder.priv := traceInterface.toEncoder.priv
+  |       io.traceCoreInterface(i).toEncoder.cause := traceInterface.toEncoder.trap.cause
+  |       io.traceCoreInterface(i).toEncoder.tval := traceInterface.toEncoder.trap.tval
+  |       io.traceCoreInterface(i).toEncoder.mstatus := traceInterface.toEncoder.mstatus
+  |       io.traceCoreInterface(i).toEncoder.valid := VecInit(traceInterface.toEncoder.groups.map(_.valid)).asUInt
+  |       io.traceCoreInterface(i).toEncoder.iaddr := VecInit(traceInterface.toEncoder.groups.map(_.bits.iaddr)).asUInt
+  |       io.traceCoreInterface(i).toEncoder.itype := VecInit(traceInterface.toEncoder.groups.map(_.bits.itype)).asUInt
+  |       io.traceCoreInterface(i).toEncoder.iretire := VecInit(traceInterface.toEncoder.groups.map(_.bits.iretire)).asUInt
+  |       io.traceCoreInterface(i).toEncoder.ilastsize := VecInit(traceInterface.toEncoder.groups.map(_.bits.ilastsize)).asUInt
+

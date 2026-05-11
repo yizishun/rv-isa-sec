@@ -1,0 +1,171 @@
+PR #29  target=qemu  overall=not_implemented
+Spec: PR tightens MDB semantics from 'any preceding store' to 'the last preceding store' and broadens the second clause to prohibit load data from 'any' subsequent instruction; QEMU currently has no Zisb implementation, so a future TCG implementation that treats MDB as a trivial no-op (relying on TCG's in-order execution) could violate 'last store' ordering under async interruption, and KVM passthrough without host capability checks would silently break guest speculation defenses.
+Violation:
+  QEMU TCG implements Zisb MDB as a NOP (since TCG is in-order and does not
+  speculate), but guest software relies on MDB to enforce 'last store'
+  visibility — i.e., a load after MDB must observe the *last* (not just any)
+  preceding store to the same physical address. If QEMU's sequential TCG
+  execution is interrupted by an asynchronous event (e.g., a timer IRQ causing
+  a longjmp out of a translation block) between two stores to the same address
+  before MDB, and the load after MDB reads stale data from a cached/delayed
+  earlier store, the 'last store' guarantee is violated. Additionally, on KVM-
+  accelerated setups, if QEMU does not validate that the host CPU supports
+  Zisb and passes MDB through as a NOP or illegal instruction, guest kernel
+  speculation barriers become ineffective, leaking transient execution
+  protection assumptions.
+Consequence: info_leak
+Pattern:
+  Zisb MDB/DPB/TEB instruction decode as no-op or illegal instruction raise in
+  QEMU TCG; missing MDB barrier enforcement between store queuing and load
+  forwarding in TCG memory model; KVM passthrough of MDB without host feature
+  check
+------------------------------------------------------------
+[potential_risk] target/riscv/insn_trans/trans_rvzimop.c.inc:25-37  trans_mop_r_n / trans_mop_rr_n
+  Zisb barrier instructions (MDB, DPB, TEB) are encoded in Zimop MOP.R/MOP.RR
+  code points. When ext_zimop is enabled (default on 'max' CPU, rva22s64,
+  rva23s64 profiles), these security barrier instructions silently decode as
+  functional NOPs that only write 0 to x[rd] — no memory barrier, no
+  speculation fence, and no TCG ordering is emitted. While the Zisb spec
+  explicitly allows Zimop fallback NOP behavior for processors without
+  speculative execution, QEMU does not expose a separate ext_zisb flag for
+  guest software to discover that the barriers are inactive. A guest kernel
+  that probes for Zisb barriers via ISA string will find no indication of
+  their presence, and one that blindly emits them (relying on the 'strict
+  contract' per the Zisb spec) will get NOPs with no barrier effect. On in-
+  order TCG this is functionally safe, but the 'last store' guarantee
+  tightened by the PR under review (PR #29: 'the last instruction that
+  stores') depends on TCG translation-block atomicity, not on explicit barrier
+  enforcement.
+  | static bool trans_mop_r_n(DisasContext *ctx, arg_mop_r_n *a)
+  | {
+  |     REQUIRE_ZIMOP(ctx);
+  |     gen_set_gpr(ctx, a->rd, ctx->zero);
+  |     return true;
+  | }
+  | 
+  | static bool trans_mop_rr_n(DisasContext *ctx, arg_mop_rr_n *a)
+  | {
+  |     REQUIRE_ZIMOP(ctx);
+  |     gen_set_gpr(ctx, a->rd, ctx->zero);
+  |     return true;
+  | }
+  References:
+    - riscv-spec-barrier/pr-3/diff.patch:397-407
+      "These instructions are encoded using Zimop code points, enabling
+      programs to functionally execute on processors that support the
+      Zimop extension, even"
+    - riscv-spec-barrier/pr-29/diff.patch:8-12
+      "An instruction that loads from memory and appears in program order
+      after MDB must obtain its data from the last instruction that stores
+      to the same ph"
+    - riscv-isa-manual/src/unpriv/zimop.adoc:30-34
+      "The Zimop extension defines 32 MOP instructions named MOP.R.n.
+      Unless redefined by another extension, these instructions simply
+      write 0 to x[rd]."
+
+[not_implemented] target/riscv/cpu.c:142-142  riscv_cpu_extensions_init
+  No ISA_EXT_DATA_ENTRY for 'zisb' exists in the extension table. The Zisb
+  extension cannot be enabled or advertised to guest software via ISA string,
+  device tree, or any discovery mechanism. Guest kernels have no way to
+  determine whether speculation barriers are available.
+  | ISA_EXT_DATA_ENTRY(zimop, PRIV_VERSION_1_13_0, ext_zimop),
+  References:
+    - riscv-spec-barrier/pr-3/diff.patch:323-325
+      "== "Zisb" Extension for Speculation Barrier Instructions, Version
+      0.0.1"
+
+[not_implemented] target/riscv/cpu.c:1252-1252  riscv_cpu_validate_bools
+  No MULTI_EXT_CFG_BOOL for 'zisb' property exists. There is no QEMU command-
+  line or QMP property to enable or disable the Zisb extension. Extension
+  validation (riscv_cpu_validate_extensions) has no dependency checks for Zisb
+  (e.g., requiring Zimop as a prerequisite).
+  | MULTI_EXT_CFG_BOOL("zimop", ext_zimop, false),
+  References:
+    - riscv-spec-barrier/pr-3/diff.patch:395-395
+      "The Zisb extension depends on the Zimop extension."
+
+[not_implemented] target/riscv/cpu_cfg_fields.h.inc:46-46  (BOOL_FIELD macro declarations)
+  No BOOL_FIELD(ext_zisb) exists in the CPU configuration fields. The ext_zisb
+  boolean is absent from the RISCVCPUConfig struct. Zisb state cannot be
+  tracked, migrated, or validated.
+  | BOOL_FIELD(ext_zimop)
+
+[not_implemented] target/riscv/kvm/kvm-cpu.c:305-305  kvm_riscv_isa_ext_cfgs
+  No KVM_EXT_CFG for 'zisb' (KVM_RISCV_ISA_EXT_ZISB) exists. Even if a host
+  kernel implements KVM Zisb support, QEMU lacks the plumbing to negotiate the
+  extension with KVM. Zimop passthrough (KVM_RISCV_ISA_EXT_ZIMOP at line 305)
+  means if a guest emits Zisb instructions on a KVM host that supports Zimop
+  but not Zisb, those instructions execute as Zimop NOPs in the host — guest
+  speculation barriers are silently ineffective. On a host that does support
+  Zisb, QEMU still cannot advertise it to the guest.
+  | KVM_EXT_CFG("zimop", ext_zimop, KVM_RISCV_ISA_EXT_ZIMOP),
+  References:
+    - riscv-spec-barrier/pr-3/diff.patch:399-406
+      "Unlike HINT instructions, which may or may not be honored by
+      hardware, Zisb instructions represent a strict contract between the
+      program and the hardw"
+
+[potential_risk] target/riscv/cpu.c:3182-3182  riscv_cpu_init_isa_extensions / profiles
+  Zimop is force-enabled (ext_zimop = true) in rva22s64 and rva23s64 CPU
+  profiles (lines 3182, 3286). This means all modern profile-conformant QEMU
+  CPUs silently treat Zisb instructions (MDB, DPB, TEB) as NOPs via the Zimop
+  fallback path, with no mechanism for guest software to distinguish 'Zisb is
+  active' from 'Zisb is inactive with Zimop NOP fallback'. A guest that emits
+  MDB barriers to contain Spectre-V1 gadgets will execute correctly but
+  receive NO speculation protection.
+  | .cfg.ext_zimop = true,
+  References:
+    - riscv-spec-barrier/pr-3/diff.patch:136-142
+      "The Zisb extension provides three barrier instructions to control
+      transient execution: TEB (Transient Execution Barrier): due to
+      control-flow predicti"
+
+[compliant] target/riscv/insn_trans/trans_rvi.c.inc:963-968  trans_fence
+  The FENCE instruction handler emits a full TCG memory barrier (TCG_MO_ALL |
+  TCG_BAR_SC) unconditionally, ignoring the pred/succ fields. Zisb MDB/DPB/TEB
+  are encoded in the Zimop SYSTEM opcode space (1110011), not the FENCE MISC-
+  MEM opcode space (0001111), so MDB does not route through trans_fence. The
+  FENCE implementation is correct and does not conflict with Zisb.
+  | static bool trans_fence(DisasContext *ctx, arg_fence *a)
+  | {
+  |     /* FENCE is a full memory barrier. */
+  |     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+  |     return true;
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zimop.adoc:55-57
+      "These MOPs are encoded in the SYSTEM major opcode in part because
+      it is expected their behavior will be modulated by privileged CSR
+      state."
+
+[compliant] target/riscv/machine.c:284-303  vmstate_riscv_cpu
+  Migration of menvcfg/henvcfg/senvcfg is properly implemented via
+  vmstate_envcfg subsection (version 2). No Zisb-specific migration state is
+  needed since the extension is not implemented and no Zisb-related CSR fields
+  exist in menvcfg. The existing migration infrastructure would correctly
+  carry any future Zisb-related CSR bits once added to menvcfg.
+  | VMSTATE_UINT64(env.menvcfg, RISCVCPU),
+  |         VMSTATE_UINT64(env.senvcfg, RISCVCPU),
+  |         VMSTATE_UINT64(env.henvcfg, RISCVCPU),
+
+[potential_risk] target/riscv/insn32.decode:1037-1054  (Zimop decode patterns)
+  The Zimop decode block at lines 1037-1054 carves out Zicfiss instructions
+  (ssrdp, sspopchk, sspush) from the MOP.R/MOP.RR space with a priority
+  decode, but does not similarly carve out Zisb instructions (MDB, DPB, TEB).
+  If Zisb were to be implemented with actual barrier semantics, its
+  instructions would need to be carved out ahead of the mop_r_n/mop_rr_n
+  fallback patterns (similar to the Zicfiss carve-out pattern at lines
+  1039-1044) to ensure barrier behavior rather than NOP behavior.
+  | {
+  |   # zicfiss instructions carved out of mop.r
+  |   [
+  |     ssrdp     1100110 11100 00000 100 rd:5  1110011
+  |     sspopchk  1100110 11100 00001 100 00000 1110011 &r2 rs1=1 rd=0
+  |     sspopchk  1100110 11100 00101 100 00000 1110011 &r2 rs1=5 rd=0
+  |   ]
+  |   mop_r_n    1 . 00 .. 0111 .. ..... 100 ..... 1110011 @mop5
+  | }
+  References:
+    - riscv-spec-barrier/pr-3/diff.patch:395-395
+      "The Zisb extension depends on the Zimop extension."
+

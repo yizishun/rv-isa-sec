@@ -1,0 +1,295 @@
+{
+  "pr_number": 2977,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2977,
+    "violation_condition": "Kernel M-mode firmware (e.g. OpenSBI) or KVM host accesses menvcfg or menvcfgh CSR on a non-conformant hart that supports U-mode but does not implement these registers, or on an RV32 hart with S-mode that omits menvcfgh. Access to a non-existent CSR raises an illegal-instruction exception in M-mode/HS-mode, crashing the firmware or hypervisor before the kernel can handle it.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csr_read\\s+menvcfg|csr_write\\s+menvcfg|csr_read\\s+menvcfgh|csr_write\\s+menvcfgh; SBI_EXT_SRST or SBI_EXT_DBENC paths that indirectly read/write menvcfg fields (CBZE, CBCFE, CBIE, STCE, PBMTE) without checking CSR existence",
+    "affected_entities": [
+      "menvcfg",
+      "menvcfgh"
+    ],
+    "summary": "Spec mandates menvcfg must exist when U-mode is implemented and menvcfgh must exist when S-mode+XLEN=32; kernel/firmware accessing these CSRs on a non-conformant hart triggers illegal-instruction trap and system crash."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "CSR_ENVCFG definition (M-mode path)",
+        "line_start": 487,
+        "line_end": 491,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Under CONFIG_RISCV_M_MODE, CSR_ENVCFG resolves to CSR_MENVCFG (0x30a). If the M-mode kernel runs on a hart that lacks U-mode, menvcfg does not exist per spec (norm:menvcfg_menvcfgh_no_U_mode), and any csr_read/csr_write via CSR_ENVCFG would raise an illegal-instruction exception. The XLINUXENVCFG guard is a synthetic extension inferred from extensions with envcfg bits (ZICBOZ, ZICBOM, etc.), but these extensions don't strictly require U-mode — a Zicboz implementation for M-mode-only is theoretically possible. No runtime probe checks actual menvcfg CSR existence.",
+      "snippet": "#ifdef CONFIG_RISCV_M_MODE\n# define CSR_ENVCFG  CSR_MENVCFG\n# define CSR_SCRATCH  CSR_MSCRATCH",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2324,
+          "line_end": 2328,
+          "excerpt": "In harts with U-mode, menvcfg must be implemented, but all WARL fields may be read-only zero. For harts with S-mode and XLEN=32, menvcfgh must be similarly implemented. If U-mode is not supported, then registers menvcfg and menvcfgh do not exist."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/switch_to.h",
+        "function_name": "__switch_to_envcfg",
+        "line_start": 84,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Context-switch path correctly uses ALTERNATIVE with RISCV_ISA_EXT_XLINUXENVCFG guard, patching to nop if the envcfg CSR is absent. Under normal S-mode, CSR_ENVCFG resolves to CSR_SENVCFG (0x10a), not CSR_MENVCFG (0x30a). The senvcfg is saved/restored per-task via thread.envcfg. This correctly avoids any direct menvcfg access.",
+      "snippet": "static inline void __switch_to_envcfg(struct task_struct *next)\n{\n    asm volatile (ALTERNATIVE(\"nop\", \"csrw \" __stringify(CSR_ENVCFG) \", %0\",\n                              0, RISCV_ISA_EXT_XLINUXENVCFG, 1)\n                    :: \"r\" (next->thread.envcfg) : \"memory\");\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/suspend.c",
+        "function_name": "suspend_save_csrs",
+        "line_start": 15,
+        "line_end": 42,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Suspend path saves envcfg only when XLINUXENVCFG extension is present. Under normal S-mode, this operates on senvcfg (CSR 0x10a), not menvcfg. The restore path at line 47 similarly guards with the same check. No direct menvcfg access.",
+      "snippet": "void suspend_save_csrs(struct suspend_context *context)\n{\n    if (riscv_has_extension_unlikely(RISCV_ISA_EXT_XLINUXENVCFG))\n        context->envcfg = csr_read(CSR_ENVCFG);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/usercfi.c",
+        "function_name": "set_shstk_status",
+        "line_start": 62,
+        "line_end": 74,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Shadow-stack and landing-pad enable/disable paths write SSE and LPE bits via csr_write(CSR_ENVCFG). In normal S-mode this resolves to senvcfg. The menvcfg.SSE bit is managed by M-mode firmware via the earlier SBI FWFT call in head.S. The kernel correctly operates only on the S-mode-visible alias. Writes to senvcfg.SSE when menvcfg.SSE=0 would be ignored (bit is read-only zero per spec), which is safe.",
+      "snippet": "if (enable)\n    task->thread.envcfg |= ENVCFG_SSE;\nelse\n    task->thread.envcfg &= ~ENVCFG_SSE;\ncsr_write(CSR_ENVCFG, task->thread.envcfg);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2302,
+          "line_end": 2313,
+          "excerpt": "When menvcfg.SSE is 0, the henvcfg.SSE and senvcfg.SSE fields are read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "try_to_set_pmm",
+        "line_start": 399,
+        "line_end": 403,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "WARL probing of PMM field uses csr_set/csr_read_clear on CSR_ENVCFG (senvcfg under S-mode). The menvcfg.PMM bits control pointer masking in M-mode; the kernel probes senvcfg.PMM (the S-mode alias) to determine supported PMLEN values. tagged_addr_init() first checks RISCV_ISA_EXT_SUPM before probing. No direct menvcfg access.",
+      "snippet": "static bool try_to_set_pmm(unsigned long value)\n{\n    csr_set(CSR_ENVCFG, value);\n    return (csr_read_clear(CSR_ENVCFG, ENVCFG_PMM) & ENVCFG_PMM) == value;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "riscv_xlinuxenvcfg_exts definition",
+        "line_start": 428,
+        "line_end": 436,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "XLINUXENVCFG pseudo-extension correctly models that envcfg CSR existence is implied by extensions defining envcfg bits (ZICBOM, ZICBOZ, ZICFILP, ZICFISS, SMNPM, SSNPM all declare XLINUXENVCFG as a superset). This provides the guard used by all csr_read/csr_write paths to avoid accessing non-existent CSRs. The design is sound: if no extension uses envcfg bits, the CSR is never touched.",
+      "snippet": "static const unsigned int riscv_xlinuxenvcfg_exts[] = {\n    RISCV_ISA_EXT_XLINUXENVCFG\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2324,
+          "line_end": 2328,
+          "excerpt": "In harts with U-mode, menvcfg must be implemented, but all WARL fields may be read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "riscv_user_isa_enable",
+        "line_start": 1171,
+        "line_end": 1186,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Startup code sets CBZE and CBCFE bits in current->thread.envcfg, which are later written to the hardware CSR via __switch_to_envcfg(). The guards check RISCV_ISA_EXT_ZICBOZ and RISCV_ISA_EXT_ZICBOM, which imply XLINUXENVCFG. The actual CSR write happens only after the ALTERNATIVE check passes. No direct menvcfg access.",
+      "snippet": "if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOZ))\n    current->thread.envcfg |= ENVCFG_CBZE;\nif (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOM))\n    current->thread.envcfg |= ENVCFG_CBCFE;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/head.S",
+        "function_name": ".Lsetup_trap_vector (SBI FWFT shadow stack)",
+        "line_start": 174,
+        "line_end": 186,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Boot path issues SBI_EXT_FWFT_SET for SHADOW_STACK to tell M-mode firmware (OpenSBI) to set menvcfg.SSE. The kernel does NOT write menvcfg itself — it delegates to firmware via the SBI ecall. The return value is checked (beqz a0, 1f) and gracefully degrades by setting the riscv_nousercfi flag. This is the correct architecture: firmware owns menvcfg, kernel uses the SBI abstraction.",
+      "snippet": "li a7, SBI_EXT_FWFT\nli a6, SBI_EXT_FWFT_SET\nli a0, SBI_FWFT_SHADOW_STACK\nli a1, 1\nli a2, SBI_FWFT_SET_FLAG_LOCK\necall\nbeqz a0, 1f",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/head.S",
+        "function_name": "smp_callin (secondary hart SBI FWFT)",
+        "line_start": 347,
+        "line_end": 359,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Secondary hart boot path mirrors the primary hart's SBI FWFT call, including the same error-path handling. SMP hotplug is correctly handled: each hart independently requests firmware to enable shadow stack access. No direct menvcfg access.",
+      "snippet": "li a7, SBI_EXT_FWFT\nli a6, SBI_EXT_FWFT_SET\nli a0, SBI_FWFT_SHADOW_STACK\nli a1, 1\nli a2, SBI_FWFT_SET_FLAG_LOCK\necall\nbeqz a0, 1f",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_setup_config",
+        "line_start": 543,
+        "line_end": 576,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM config setup sets henvcfg bits (PBMTE, STCE, CBIE, CBCFE, CBZE, ADUE), NOT menvcfg. Under HS-mode (the hypervisor extension), henvcfg (CSR 0x60a) is the HS-mode-local envcfg. If menvcfg has a corresponding bit set to 0, the henvcfg bit is read-only zero per spec and the write is silently ignored — no crash risk. The SMSTATEEN0_HSENVCFG bit is correctly set to grant HS-mode access to the henvcfg CSR. No direct menvcfg access.",
+      "snippet": "if (riscv_isa_extension_available(isa, SVPBMT))\n    cfg->henvcfg |= ENVCFG_PBMTE;\nif (riscv_isa_extension_available(isa, SSTC))\n    cfg->henvcfg |= ENVCFG_STCE;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2193,
+          "line_end": 2194,
+          "excerpt": "When menvcfg.PBMTE is zero, henvcfg.PBMTE is read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 578,
+        "line_end": 641,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VCPU load writes henvcfg to hardware via nacl_csr_write(CSR_HENVCFG) or csr_write(CSR_HENVCFG). On RV32, henvcfgh is also written (CSR_HENVCFGH). This is correct: henvcfg and henvcfgh always exist when the H extension is implemented. The NACL shared-memory CSR path (lines 596-598) correctly includes henvcfg in the batch-sync CSR set. No menvcfg/menvcfgh access.",
+      "snippet": "nacl_csr_write(nsh, CSR_HENVCFG, cfg->henvcfg);\nif (IS_ENABLED(CONFIG_32BIT))\n    nacl_csr_write(nsh, CSR_HENVCFGH, cfg->henvcfg >> 32);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_onereg.c",
+        "function_name": "kvm_riscv_vcpu_isa_enable_allowed",
+        "line_start": 160,
+        "line_end": 165,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SVADU enablement check correctly notes: 'henvcfg.ADUE is read-only zero if menvcfg.ADUE is zero'. Uses arch_has_hw_pte_young() as the runtime gate, which checks whether the kernel itself has ADUE enabled (implying menvcfg.ADUE=1 was set by firmware). This correctly prevents offering Svadu to guests when the host doesn't have menvcfg.ADUE=1. No direct menvcfg access.",
+      "snippet": "case KVM_RISCV_ISA_EXT_SVADU:\n    /* The henvcfg.ADUE is read-only zero if menvcfg.ADUE is zero.\n     * Guest OS can use Svadu only when host OS enable Svadu. */\n    return arch_has_hw_pte_young();",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2214,
+          "line_end": 2215,
+          "excerpt": "When menvcfg.ADUE is zero, henvcfg.ADUE is read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_sbi_fwft.c",
+        "function_name": "try_to_set_pmm / kvm_sbi_fwft_set_pointer_masking_pmlen",
+        "line_start": 130,
+        "line_end": 192,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM SBI FWFT pointer-masking PMLEN uses CSR_HENVCFG (henvcfg.PMM), not menvcfg.PMM. The code is CONFIG_32BIT-guarded (lines 130-148), correctly reflecting that menvcfg.PMM is read-only zero on RV32 (PMM is only meaningful at XLEN=64). The host kernel writes henvcfg.PMM to set VS-mode pointer masking. No direct menvcfg access.",
+      "snippet": "#ifndef CONFIG_32BIT\nstatic bool try_to_set_pmm(unsigned long value)\n{\n    csr_set(CSR_HENVCFG, value);\n    return (csr_read_clear(CSR_HENVCFG, ENVCFG_PMM) & ENVCFG_PMM) == value;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2273,
+          "line_end": 2289,
+          "excerpt": "PMM field in menvcfg controls pointer masking for S/HS-mode or U-mode. PMM field is read-only zero on RV32. When Smnpm is not implemented, PMM is read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_sbi_replace.c",
+        "function_name": "kvm_sbi_ext_srst_handler",
+        "line_start": 147,
+        "line_end": 187,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "KVM SRST handler is a pure system-reset SBI call translator (shutdown, cold/warm reboot forwarded as KVM_SYSTEM_EVENT). It does NOT read or write any envcfg/menvcfg fields (CBZE, CBCFE, CBIE, STCE, PBMTE). The spec concern about SBI_EXT_SRST indirectly accessing menvcfg fields is not applicable to this code path — SRST has no envcfg interaction in the kernel implementation.",
+      "snippet": "static int kvm_sbi_ext_srst_handler(struct kvm_vcpu *vcpu,\n                                    struct kvm_run *run,\n                                    struct kvm_vcpu_sbi_return *retdata)\n{\n    ...\n    case SBI_EXT_SRST_RESET:",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi.c",
+        "function_name": "sbi_srst_reset",
+        "line_start": 511,
+        "line_end": 517,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Host-side SRST is a pure SBI ecall for system reset. No envcfg/menvcfg CSR access. The SBI ecall is handled by M-mode firmware (OpenSBI), which performs the actual system reset. The kernel does not touch menvcfg in this path.",
+      "snippet": "static void sbi_srst_reset(unsigned long type, unsigned long reason)\n{\n    sbi_ecall(SBI_EXT_SRST, SBI_EXT_SRST_RESET, type, reason,\n              0, 0, 0, 0);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "CSR_MENVCFG / CSR_MENVCFGH definition",
+        "line_start": 420,
+        "line_end": 421,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR numbers defined as 0x30a (menvcfg) and 0x31a (menvcfgh). These are correct per the RISC-V privileged spec. Only referenced via CSR_ENVCFG aliasing under CONFIG_RISCV_M_MODE (line 491). Under normal S-mode configuration, CSR_ENVCFG resolves to CSR_SENVCFG (0x10a, line 516), so these M-mode CSR definitions are never used.",
+      "snippet": "#define CSR_MENVCFG    0x30a\n#define CSR_MENVCFGH   0x31a",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 771,
+          "line_end": 786,
+          "excerpt": "menvcfg CSR address 0x30A, MRW (Machine Read/Write); menvcfgh CSR address 0x31A, MRW"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/switch_to.h",
+        "function_name": "envcfg_update_bits",
+        "line_start": 73,
+        "line_end": 82,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "envcfg_update_bits updates task->thread.envcfg and writes to current CSR if task==current. Under S-mode, writes to senvcfg, not menvcfg. The task==current guard ensures only the running task's CSR is touched, avoiding races on remote tasks. Called from flush_thread and prctl PMLEN setter. No menvcfg involvement.",
+      "snippet": "static inline void envcfg_update_bits(struct task_struct *task,\n                                      unsigned long mask, unsigned long val)\n{\n    unsigned long envcfg;\n    envcfg = (task->thread.envcfg & ~mask) | val;\n    task->thread.envcfg = envcfg;\n    if (task == current)\n        csr_write(CSR_ENVCFG, envcfg);\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

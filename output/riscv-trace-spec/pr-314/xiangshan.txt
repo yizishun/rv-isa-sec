@@ -1,0 +1,68 @@
+PR #314  target=xiangshan  overall=not_implemented
+Spec: trTeInstMode hardcoded to 7 instead of corrected value 6 causes E-Trace encoder to operate in wrong instruction trace mode, corrupting branch prediction and implicit return trace packets
+Violation:
+  XiangShan's trace encoder hardware hardcodes the trTeInstMode CSR field to
+  the old spec value of 7 (binary 111) instead of the corrected value 6
+  (binary 110), which encodes a different instruction trace mode that governs
+  branch prediction tracing and implicit return detection behavior in the
+  encoder FSM
+Consequence: data_corruption
+Pattern:
+  trTeInstMode.*=.*7\.U|\"b111\".*trTeInstMode|TraceEncoder.*InstMode.*7|hardc
+  ode.*InstMode.*7
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/backend/trace/Interface.scala:64-143  Itype
+  XiangShan does not implement self-hosted trace (Smstrc/Ssstrc). The
+  trTeInstMode CSR field (trTeControl CSR at 0x7a6, bit[6:4]) is absent — no
+  trTeControl, trTeImpl, or any trTe* CSR exists in the CSR address map. The
+  trace subsystem is external-only: XiangShan generates trace data packets via
+  TraceCoreInterface.toEncoder, which are consumed by an off-core XSTOP
+  encoder. The Itype object (lines 64-143) defines instruction-trace type
+  encodings (0-15) for use in trace packet payloads, not the trTeInstMode CSR
+  configuration field. Value 6 ('UninferableJump') is correctly labeled as
+  reserved in 4-bit itype mode per the E-Trace specification. Value 7
+  ('reserved') is also correct. No CSR-based branch prediction tracing mode or
+  implicit return detection configuration exists in this codebase. The
+  vulnerability pattern (trTeInstMode hardcoded to 7 instead of 6) is
+  inapplicable because the target CSR field is not implemented.
+  | object Itype extends NamedUInt(4) {
+  |   def None                 = 0.U
+  |   def Exception            = 1.U    //rob
+  |   ...
+  |   def UninferableJump      = 6.U    //It's reserved when width of itype is 4.
+  |   def reserved             = 7.U    //reserved
+  |   def UninferableCall      = 8.U    //rename
+
+[compliant] rocket-chip/src/main/scala/util/TraceCoreInterface.scala:10-27  TraceItype
+  The rocket-chip TraceItype ChiselEnum correctly defines the E-Trace
+  instruction trace type encodings with ITReserved6 = 6 and ITReserved7 = 7,
+  matching the RISC-V E-Trace specification where values 6 and 7 are reserved
+  in 4-bit itype mode. This is a type enum for trace packet payloads, not a
+  CSR field. No trTeInstMode CSR logic is present.
+  | object TraceItype extends ChiselEnum {
+  |   val ITNothing   = Value(0.U)
+  |   val ITException = Value(1.U)
+  |   val ITInterrupt = Value(2.U)
+  |   val ITExcReturn = Value(3.U)
+  |   val ITBrNTaken  = Value(4.U)
+  |   val ITBrTaken   = Value(5.U)
+  |   val ITReserved6 = Value(6.U)
+  |   val ITReserved7 = Value(7.U)
+  |   val ITUnCall    = Value(8.U)
+  |   ...
+  | }
+
+[compliant] src/main/scala/xiangshan/Parameters.scala:506-514  XSCoreParameters
+  TraceParams configures ItypeWidth = 4, matching the 4-bit itype field width
+  defined in the RISC-V E-Trace spec. The itype width of 4 bits means values 6
+  and 7 are correctly reserved (per E-Trace Table 2.1, 'itype Encoding'). No
+  trTeInstMode CSR configuration parameter exists here or anywhere in the
+  codebase.
+  | val traceParams: TraceParams = new TraceParams(
+  |   TraceGroupNum  = 3,
+  |   IaddrWidth     = GPAddrBitsSv48x4,
+  |   PrivWidth      = 3,
+  |   ItypeWidth     = 4,
+  |   IlastsizeWidth = 1,
+  | )
+

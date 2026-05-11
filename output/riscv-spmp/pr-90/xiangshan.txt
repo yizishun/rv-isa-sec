@@ -1,0 +1,128 @@
+PR #90  target=xiangshan  overall=not_implemented
+Spec: PR #90 renames hspmpswitch→hspmpen, introduces vspmpen, defines hspmpdeleg CSR bit layout, gates vSPMP lock on V=1, and mandates virtual-instruction exception on vSPMP CSR access when hstatus.VTVM=1/V=1 — hardware must ensure lock-bit write-protection is context-aware (V-dependent) and hspmpdeleg WARL clamping cascades correctly on mpmpdeleg writes
+Violation:
+  When V=1, if the hardware SPMP checker uses hspmpen bit[i] (the new
+  hypervisor-level SPMP activation CSR) to gate SPMP entry i instead of
+  spmpen, but the CSR module does NOT properly enforce that hspmpen[i] becomes
+  read-only when spmpcfg[i].L==1 — OR symmetrically, when a vSPMP entry's
+  vspmpcfg[i].L lock bit is set but the hardware fails to gate write-ignore
+  behavior on V==1 (the spec now conditions lock enforcement on V==1),
+  allowing a guest in VS-mode to bypass the lock by clearing V before writing
+  — then the hypervisor's memory isolation is violated.
+Consequence: privilege_escape
+Pattern:
+  spmpcfg.*\.L.*locked.*hspmpen|vspmpcfg.*\.L.*!V.*write|when.*V.*===.*1.*io.*
+  hspmpen.*readonly|spmpcfg_i_L.*&.*!hspmpen_i_wren
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/CSRIND.scala:17-108  CSRIND trait (mireg2-mireg6, sireg2-sireg6, vsireg2-vsireg6)
+  All Smpmpind indirect CSR data registers (mireg2-mireg6, sireg2-sireg6,
+  vsireg2-sireg6) are ZeroFieldBundle stubs: regOut := 0.U, writes silently
+  discarded. The Smpmpind indirect access path (miselect selects SPMP register
+  set → mireg2-6 routes write to spmpcfg/spmpaddr entries) is entirely absent.
+  No SPMP configuration or address CSR writes can reach any SPMP entry memory
+  through the indirect CSR channel.
+  | val mireg2 = Module(new CSRModule("Mireg2", new ZeroFieldBundle(...)) { regOut := 0.U }).setAddr(CSRs.mireg2)
+  | val mireg3 = Module(new CSRModule("Mireg3", new ZeroFieldBundle(...)) { regOut := 0.U }).setAddr(CSRs.mireg3)
+  | val mireg4 = Module(new CSRModule("Mireg4", new ZeroFieldBundle(...)) { regOut := 0.U }).setAddr(CSRs.mireg4)
+  | val mireg5 = Module(new CSRModule("Mireg5", new ZeroFieldBundle(...)) { regOut := 0.U }).setAddr(CSRs.mireg5)
+  | val mireg6 = Module(new CSRModule("Mireg6", new ZeroFieldBundle(...)) { regOut := 0.U }).setAddr(CSRs.mireg6)
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:536-568  CSRPermitModule (rwMireg2_6_EX_II, rwSireg2_6_EX_II, rwSireg2_6_EX_VI)
+  All Smpmpind indirect CSR access is unconditionally blocked as illegal.
+  rwMireg2_6_EX_II is always true regardless of privState or miselect value.
+  rwSireg2_6_EX_II and rwVSireg2_6_EX_II similarly always trigger illegal-
+  instruction exception for any access to sireg2-6 or vsireg2-6. No privilege
+  mode (M/HS/VS) can access the SPMP indirect register window. The
+  Smcsrind/Sscsrind instruction extension is explicitly not implemented
+  (comment at line 257: 'Smcsrind/Sscsrind is not implemented').
+  | private val rwMireg2_6_EX_II = Ireg.isInMireg2_6(addr)
+  | ...
+  | private val rwSireg2_6_EX_VI = privState.isVirtual && (...) && Ireg.isInSireg2_6(addr)
+  | private val rwSireg2_6_EX_II = Ireg.isInSireg2_6(addr) && !rwSireg2_6_EX_VI
+  | private val rwVSireg2_6_EX_II = Ireg.isInVSireg2_6(addr)
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala:17-53  miselect/siselect WARL constraint (Iselect.isInLegal)
+  miselect CSR only recognizes AIA ranges (0x30-0x3F) and IMSIC ranges
+  (0x70-0xFF) as legal. All Smpmpind miselect values (which would be in ranges
+  0x00-0x2F or 0x40-0x6F for SPMP configuration/address sets) are classified
+  as illegal via isIllegal detection. The MISelectField WARL constraint
+  hardcodes these subranges as reserved. Consequently, no miselect value can
+  select an SPMP register set for indirect access.
+  | def isInAIA(iselect: UInt): Bool = iselect >= 0x30.U && iselect < 0x50.U
+  | def isInImsic(iselect: UInt): Bool = iselect >= 0x70.U && iselect < 0x100.U
+  | def isInOthers(iselect: UInt): Bool = !isInAIA(iselect) && !isInImsic(iselect)
+  | def isIllegal(iselect: UInt): Bool = isInOthers(iselect) && iselect =/= 0.U
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:319-327  MseccfgBundle (MMWP field)
+  mseccfg.MMWP (bit 1) is hardcoded as RO (read-only zero), making it
+  impossible to enable SPMP even if SPMP hardware existed. This is correct
+  behavior for a system without SPMP but means the entire SPMP activation path
+  (MMWP=1 → SPMP enabled for S-mode when mstatus.MPP != M) is absent. Without
+  MMWP being writable, no SPMP entry can ever be activated for checking.
+  | val MMWP = RO(1, lit = 0.U).withReset(0.U)  // MMWP is read-only zero
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:67-80  EnvCfg.SSE field
+  menvcfg.SSE (bit 3) and senvcfg.SSE are hardcoded RO(0), permanently
+  disabling S-mode access to the SPMP indirect CSR access window. With SSE=0,
+  even if Smpmpind indirect registers existed, they would trap on S-mode
+  access. This is correct for a system without SPMP, but confirms the complete
+  absence of SPMP infrastructure.
+  | val SSE = RO(3).withReset(0.U)  // SSE is read-only zero
+  | ...
+  | // inherited by MEnvCfg and SEnvCfg bundles
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPMP.scala:1-89  CSRPMP trait (spmpcfg/spmpaddr CSR modules)
+  Only M-mode pmpcfg0-pmpcfg3 (addresses 0x3A0-0x3A3) and pmpaddr0-pmpaddr63
+  (0x3B0-0x3EF) are instantiated. No SPMP configuration CSRs
+  (spmpcfg0-spmpcfg15 at 0x1CC-0x1CF via SME select, or direct 0x1D0-0x1DF)
+  exist. No SPMP address CSRs (spmpaddr0-spmpaddr63) exist. The PMPCfgBundle
+  is 8-bit (R/W/X/A/ATOMIC/C/L) with no SPMP fields (SHARED, U, RWX[2:0], E).
+  The CSR address constant definitions in CSRs.scala also contain no
+  spmpcfg/spmpaddr entries.
+  | val modules = Seq(
+  |   pmpcfg0, pmpcfg1, pmpcfg2, pmpcfg3,
+  |   pmpaddr0, pmpaddr1, ... pmpaddr63
+  | )
+  | // No spmpcfg0-spmpcfg15, spmpaddr0-spmpaddr63 instantiated
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/PMP.scala:556-617  PMPChecker / SPMPChecker (SPMP physical check hardware)
+  Only the M-mode PMPChecker module exists. No SPMPChecker module is
+  instantiated in parallel. The SPMP checker would need to: decode {SHARED, U,
+  RWX, SUM} fields into access decisions per the SPMP encoding table; generate
+  page-fault exception codes (12/13/15) instead of access-fault codes (1/5/7);
+  consume mseccfg.MMWP and menvcfg.SSE for enablement gating; and produce
+  independent exception signals that don't collide with PMP access-fault
+  outputs.
+  | class PMPChecker(implicit p: Parameters) extends BasePMPChecker {
+  |   // Only M-mode PMP checking logic exists
+  |   val resp = resp_pmp | resp_pma | resp_keyid
+  |   io.resp := resp
+  | }
+  | // No SPMPChecker class or instance present
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/PMPEntryModule.scala:41-78  PMPEntryHandleModule (spmpen/hspmpen/vspmpen enable + L-bit lock enforcement for SPMP)
+  Lock-bit enforcement exists only for M-mode PMP entries. No spmpen, hspmpen,
+  or vspmpen CSR modules exist. No SPMP-specific lock enforcement logic
+  exists. The security spec's violation condition — 'when spmpcfg[i].L==1 but
+  hspmpen[i] is not properly gated write-ignore' — cannot be evaluated because
+  neither the SPMP config registers, the SPMP enable registers, nor the lock
+  enforcement logic exist in the RTL. When V=1, there is no hspmpen CSR to
+  check, no vspmpcfg to validate, and no SPMP checker to bypass.
+  | // M-mode PMP lock enforcement only:
+  | when (!cfgOldTmp.L.asBool) { cfgVec(j) := cfgNewTmp }
+  | // No SPMP lock enforcement exists (no spmpen/hspmpen/vspmpen, no spmpcfg/vspmpcfg)
+
+[not_implemented] src/main/scala/xiangshan/PMParameters.scala:27-60  PMParameters (NumPMP, NumPMPReal, PlatformGrain)
+  Only M-mode PMP parameters are configured (NumPMP=64, NumPMPReal=32,
+  PlatformGrain). No SPMP-specific configuration parameters exist (e.g.,
+  NumSPMP for the number of SPMP entries, SPMPSupported flag, SPMPGrain for
+  SPMP address granularity). All Chisel elaboration for SPMP hardware would be
+  conditionally gated on such parameters; their absence means zero SPMP gates
+  are synthesized.
+  | case class PMPParameter(
+  |   NumPMP:       Int = 64,
+  |   NumPMPReal:   Int = 32,
+  |   PlatformGrain: Int = 2,
+  |   // No NumSPMP, SPMPSupported, or SPMPGrain parameters
+  | )
+

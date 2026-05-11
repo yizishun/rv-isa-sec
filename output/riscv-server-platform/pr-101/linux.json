@@ -1,0 +1,276 @@
+{
+  "pr_number": 101,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 101,
+    "violation_condition": "When the Linux kernel migrates a task across harts that diverge in ISA-UNSPECIFIED or implementation-defined behaviors (e.g., WFI wakeup latency, sfence.vma broadcast scope, trap prioritization order, reserved CSR field read values, cache-block size) that the kernel implicitly treats as uniform across all harts in the cpumask, without hart-specific capability re-validation at migration time",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "riscv_isa_extension_available() or __riscv_isa_extension_available() called on boot CPU with result cached globally; per-CPU capability probed once at boot and assumed SEE-wide homogeneous; context switch path saving/restoring CSRs with UNSPECIFIED/RESERVED fields assuming identical bit-level interpretation across harts; KVM vCPU migration without re-validating ISA homogeneity of target hart; cpumask_generation without hart-specific feature verification",
+    "affected_entities": [
+      "misa",
+      "mvendorid",
+      "marchid",
+      "mimpid",
+      "CSRs with RESERVED/UNSPECIFIED fields",
+      "henvcfg",
+      "senvcfg",
+      "dcsr",
+      "mcontext",
+      "scontext",
+      "hcontext"
+    ],
+    "summary": "Relaxed hart indistinguishability (RVA_040→RVA_050) now permits divergences in UNSPECIFIED/implementation-defined behavior across harts within an SEE, breaking the kernel's fundamental SMP assumption that all harts in a cpumask are ISA-identical for migration and capability caching"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "global riscv_isa bitmap + __riscv_isa_extension_available",
+        "line_start": 42,
+        "line_end": 82,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Global static DECLARE_BITMAP(riscv_isa, RISCV_ISA_EXT_MAX) stores the intersection (bitwise AND) of all harts' ISAs, computed at boot in riscv_fill_hwcap() at lines 916-919 and 1067-1070. __riscv_isa_extension_available(NULL, bit) at line 75 defaults to this global bitmap when isa_bitmap is NULL. All callers passing NULL implicitly assume all harts are ISA-homogeneous. On a heterogeneous system, extensions present on only some harts are silently disabled system-wide (safe), but per-hart decisions (FP/vector save/restore, timer config) that use the global intersection may skip state save on harts that actually possess the extension, corrupting state.",
+      "snippet": "static DECLARE_BITMAP(riscv_isa, RISCV_ISA_EXT_MAX) __read_mostly;\n\nbool __riscv_isa_extension_available(const unsigned long *isa_bitmap, unsigned int bit)\n{\n    const unsigned long *bmap = (isa_bitmap) ? isa_bitmap : riscv_isa;\n    return test_bit(bit, bmap);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 1185,
+          "line_end": 1199,
+          "excerpt": "Some read/write CSR fields are only defined for a subset of bit encodings, but allow any value to be written while guaranteeing to return a legal value whenever read... These fields are labeled WARL. Implementations will not raise an exception on writes of unsupported values to a WARL field. Implementations can return any legal value on the read of a WARL field when the last write was of an illegal value, but the legal value returned should deterministically depend on the illegal written value and the architectural state of the hart."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 578,
+        "line_end": 641,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "kvm_arch_vcpu_load() writes henvcfg, hedeleg, hstateen0, and other CSR values configured in kvm_riscv_vcpu_setup_config() at vCPU creation time based on the creating CPU's ISA (line 141: kvm_riscv_vcpu_setup_isa). On vCPU migration to a different physical hart via the scheduler (kvm_sched_in -> kvm_arch_vcpu_load), there is ZERO validation that the target hart supports the ISA features encoded in these CSRs. WRITE of CSR_HENVCFG (line 615) may set bits (PBMTE, STCE, CBIE, CBCFE, CBZE, ADUE) that the target hart does not implement as writable. The RISC-V spec (WARL fields) says no exception is raised on illegal writes, but the value actually latched is implementation-defined per hart, so the guest receives different hardware behavior after migration.",
+      "snippet": "void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)\n{\n    ...\n    csr_write(CSR_HENVCFG, cfg->henvcfg);   // line 615 - no target hart ISA check\n    if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SMSTATEEN)) {\n        csr_write(CSR_HSTATEEN0, cfg->hstateen0);  // line 619\n    }\n    ...\n    kvm_riscv_vcpu_guest_fp_restore(&vcpu->arch.guest_context, vcpu->arch.isa);  // line 630\n    kvm_riscv_vcpu_guest_vector_restore(&vcpu->arch.guest_context, vcpu->arch.isa);  // line 633\n    vcpu->cpu = cpu;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 772,
+          "line_end": 776,
+          "excerpt": "The Zicbom extension adds the CBIE (Cache Block Invalidate instruction Enable) WARL field to henvcfg. The CBIE field controls execution of the cache block invalidate instruction (CBO.INVAL) in privilege modes VS and VU. The encoding 10b is reserved. When the Zicbom extension is not implemented, CBIE is..."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 1195,
+          "line_end": 1199,
+          "excerpt": "Implementations will not raise an exception on writes of unsupported values to a WARL field. Implementations can return any legal value on the read of a WARL field when the last write was of an illegal value, but the legal value returned should deterministically depend on the illegal written value and the architectural state of the hart."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_create",
+        "line_start": 127,
+        "line_end": 176,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "kvm_arch_vcpu_create() stores mvendorid/marchid/mimpid (lines 144-146) from the current CPU via sbi_get_mvendorid() etc. and caches the vCPU ISA bitmap (line 141: kvm_riscv_vcpu_setup_isa) from the creating CPU's hart_isa. These values are never re-validated on migration. If a vCPU is created on a hart with extensions {D, V, SSTC} and later migrated to a hart with only {F, no-V, no-SSTC}, the vCPU's ISA bitmap and CSR config remain as if all those extensions are present, leading to invalid CSR writes on the target hart.",
+      "snippet": "kvm_riscv_vcpu_setup_isa(vcpu);                  // line 141 - once, from creating CPU\nvcpu->arch.mvendorid = sbi_get_mvendorid();      // line 144\nvcpu->arch.marchid = sbi_get_marchid();           // line 145\nvcpu->arch.mimpid = sbi_get_mimpid();             // line 146\n// ... never re-validated on kvm_arch_vcpu_load()",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_fp.c",
+        "function_name": "kvm_riscv_vcpu_host_fp_save",
+        "line_start": 59,
+        "line_end": 66,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Host FP save/restore functions use riscv_isa_extension_available(NULL, d/f) which queries the global riscv_isa intersection bitmap, NOT the current hart's ISA. If extension D is present on some harts but absent on others, the global intersection will have neither D nor F cleared, causing host FP state save/restore to be skipped on ALL harts including those that actually have D, potentially corrupting host FP registers across VM exits on D-capable harts.",
+      "snippet": "void kvm_riscv_vcpu_host_fp_save(struct kvm_cpu_context *cntx)\n{\n    if (riscv_isa_extension_available(NULL, d))      // line 62 - global, not hart\n        __kvm_riscv_fp_d_save(cntx);\n    else if (riscv_isa_extension_available(NULL, f)) // line 64 - global, not hart\n        __kvm_riscv_fp_f_save(cntx);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_vector.c",
+        "function_name": "kvm_riscv_vcpu_host_vector_save",
+        "line_start": 63,
+        "line_end": 68,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same pattern as host FP: host vector save uses riscv_isa_extension_available(NULL, v) querying the global intersection rather than the current hart's ISA. On a heterogeneous system where only some harts have vector, the global intersection won't have V, causing host vector state save to be skipped on vector-capable harts, risking host vector register corruption.",
+      "snippet": "void kvm_riscv_vcpu_host_vector_save(struct kvm_cpu_context *cntx)\n{\n    if (riscv_isa_extension_available(NULL, v))       // line 66 - global, not hart\n        __kvm_riscv_vector_save(cntx);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "tagged_addr_init",
+        "line_start": 423,
+        "line_end": 441,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Probes envcfg.PMM WARL field values only on the boot CPU via core_initcall. The comment at line 430 explicitly states 'Assume the supported PMLEN values are the same on all harts.' The have_user_pmlen_7 and have_user_pmlen_16 static globals are shared across all harts. envcfg.PMM is a WARL field (hypervisor.adoc:804) whose legal value set may differ across harts. If a task is migrated to a hart with different PMLEN support, envcfg_update_bits (switch_to.h:73-82) will write a PMM value that may be silently modified by the target hart's WARL behavior.",
+      "snippet": "/*\n * envcfg.PMM is a WARL field. Detect which values are supported.\n * Assume the supported PMLEN values are the same on all harts.\n */\ncsr_clear(CSR_ENVCFG, ENVCFG_PMM);              // line 432\nhave_user_pmlen_7 = try_to_set_pmm(ENVCFG_PMM_PMLEN_7);   // line 433\nhave_user_pmlen_16 = try_to_set_pmm(ENVCFG_PMM_PMLEN_16); // line 434",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 802,
+          "line_end": 806,
+          "excerpt": "Legal values of PMM WARL field [table showing encodings for PMLEN 0, 7, 16]"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 441,
+        "line_end": 451,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "__switch_to saves the full CSR_STATUS (sstatus) value and restores only the SR_SUM bit via csrs (set-bit). The full sstatus value is stored in task_struct. If harts differ in WARL behavior for sstatus fields (UXL/SXL encoding, UBE, SDT, FS/VS/XS state encoding variant), then: (a) sstatus bits set by hardware on one hart may be silently modified when restored on a different hart, and (b) the modified value gets saved back on the next context switch, propagating hart-local WARL translations across hart boundaries through the saved thread state.",
+      "snippet": "/* save the user space access flag */\ncsrr  s0, CSR_STATUS              // line 442 - full sstatus save\nREG_S s0, TASK_THREAD_SUM_RA(a3)  // line 443\n...\nREG_L s0,  TASK_THREAD_SUM_RA(a4) // line 448\nli    s1,  SR_SUM\nand   s0,  s0, s1                  // line 450 - only SUM bit extracted\ncsrs  CSR_STATUS, s0               // line 451 - set-bit, but full value saved",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 142,
+          "line_end": 146,
+          "excerpt": "When SXLEN=64, it [UXL] is a WARL field that encodes the current value of UXLEN. In particular, an implementation may make UXL be a read-only field whose value always ensures that UXLEN=SXLEN."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 259,
+          "line_end": 262,
+          "excerpt": "The S-mode-disable-trap (SDT) bit is a WARL field introduced by the Ssdbltrp extension."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_onereg.c",
+        "function_name": "kvm_riscv_vcpu_isa_check_host",
+        "line_start": 140,
+        "line_end": 150,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "kvm_riscv_vcpu_isa_check_host() uses __riscv_isa_extension_available(NULL, host_ext) (line 146) to check host ISA support when constructing the vCPU's ISA bitmap. The NULL argument queries the current CPU's hart_isa (via the global riscv_isa intersection). On a heterogeneous system, this captures only the intersection, meaning the vCPU ISA bitmap may be missing extensions that are available on the specific hart where the vCPU will run, or alternatively, the vCPU ISA bitmap is set from the creating CPU's individual hart_isa, which may include extensions not available on the migration target.",
+      "snippet": "if (!__riscv_isa_extension_available(NULL, host_ext))   // line 146 - NULL = current hart\n    return -ENOENT;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_timer.c",
+        "function_name": "kvm_riscv_vcpu_timer_init",
+        "line_start": 245,
+        "line_end": 269,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SSTC availability is checked once at vCPU creation (line 256: riscv_isa_extension_available(NULL, SSTC)), cached in t->sstc_enabled and the timer_next_event function pointer. On kvm_arch_vcpu_load (vcpu.c:627), kvm_riscv_vcpu_timer_restore writes VSTIMECMP CSR unconditionally based on this cached flag. If the vCPU migrates to a hart without SSTC, the VSTIMECMP CSR write goes to a hart that may not implement this CSR or may implement it with different WARL semantics.",
+      "snippet": "if (riscv_isa_extension_available(NULL, SSTC)) {    // line 256 - once at creation\n    t->sstc_enabled = true;\n    t->timer_next_event = kvm_riscv_vcpu_update_vstimecmp;\n} else {\n    t->sstc_enabled = false;\n    t->timer_next_event = kvm_riscv_vcpu_update_hrtimer;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_pmu.c",
+        "function_name": "kvm_riscv_vcpu_pmu_init",
+        "line_start": 811,
+        "line_end": 840,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "PMU hardware counter width and count are queried once at vCPU creation via riscv_pmu_get_hpm_info(&hpm_width, &num_hw_ctrs) (line 825). These values are cached in kvpmu->num_hw_ctrs and pmc->cinfo.width. On migration to a hart with different PMU dimensions (different number of hardware counters, different counter width), the cached values become inconsistent with the actual hardware, potentially causing out-of-bounds CSR accesses or incorrect counter value reads.",
+      "snippet": "if (!riscv_isa_extension_available(NULL, SSCOFPMF))  // line 822 - global check\n    return;\nret = riscv_pmu_get_hpm_info(&hpm_width, &num_hw_ctrs); // line 825 - once, creating CPU\n...\nkvpmu->num_hw_ctrs = num_hw_ctrs + 1;               // line 832 - cached forever",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_sbi_fwft.c",
+        "function_name": "kvm_sbi_fwft_pointer_masking_pmlen_supported",
+        "line_start": 138,
+        "line_end": 149,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Probes henvcfg.PMM WARL field values on the current physical hart at SBI call time by directly reading/writing CSR_HENVCFG (lines 132-136, 145-146). The probed values (have_vs_pmlen_7, have_vs_pmlen_16) are cached in the fwft struct. If the vCPU is later migrated to a different hart with different PMLEN write-ability, the cached values are stale: fwft_set_pointer_masking_pmlen() may accept a PMLEN value that the target hart does not support, or reject one that it does.",
+      "snippet": "fwft->have_vs_pmlen_7 = try_to_set_pmm(ENVCFG_PMM_PMLEN_7);    // line 145 - current hart\nfwft->have_vs_pmlen_16 = try_to_set_pmm(ENVCFG_PMM_PMLEN_16);  // line 146 - current hart\n// Both cached, never re-validated on migration",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 802,
+          "line_end": 806,
+          "excerpt": "Legal values of PMM WARL field"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/setup.c",
+        "function_name": "riscv_spinlock_init",
+        "line_start": 291,
+        "line_end": 298,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Queued spinlock variant selection checks global ISA intersection for ZABHA/ZACAS (lines 294-295) and ZICCRSE (line 297). On a heterogeneous system where only some harts have ZABHA/ZACAS, the intersection won't have these extensions, so the kernel falls back to ZICCRSE or ticket spinlocks. This is safe (conservative), but also means harts that do have ZABHA cannot use it for more efficient queued spinlocks. However, if a kernel is compiled without CONFIG_RISCV_COMBO_SPINLOCKS and ZABHA is in the intersection but a hart lacks it, that hart would execute Zabha instructions it doesn't support.",
+      "snippet": "riscv_isa_extension_available(NULL, ZABHA) &&      // line 294 - global\nriscv_isa_extension_available(NULL, ZACAS)) {       // line 295 - global\n    using_ext = \"using Zabha\";\n} else if (riscv_isa_extension_available(NULL, ZICCRSE)) {  // line 297 - global\n    using_ext = \"using Ziccrse\";\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sys_hwprobe.c",
+        "function_name": "hwprobe_init (VDSO setup)",
+        "line_start": 552,
+        "line_end": 559,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The VDSO hwprobe path assumes CPU homogeneity if mvendorid/marchid/mimpid match across all harts (line 559). However, WARL CSR field behavior (e.g., PMLEN values, cache block sizes, UXL/SXL encodings) can differ even between harts with identical vendor/arch/impl IDs if microarchitectural configuration differs (e.g., different synthesis parameters for FPGA soft cores, different fuses in production silicon revisions). The VDSO fast path would then return incorrect hwprobe values for tasks migrated across such harts.",
+      "snippet": "avd->homogeneous_cpus = id_bitsmash != 0 && id_bitsmash != -1;  // line 559\n// If mvendorid/marchid/mimpid match, assumes harts are identical",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/tlb.c",
+        "function_name": "kvm_riscv_local_tlb_sanitize",
+        "line_start": 161,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Detects vCPU CPU migration by comparing last_exit_cpu to vcpu->cpu (line 166) and flushes TLB entries. However, it performs ZERO ISA homogeneity check on the target hart. The TLB flush instructions (HFENCE.GVMA, HFENCE.VVMA) and the VMID scheme assume uniform gstage page table walk behavior across harts, which may differ if harts have different MMU implementations (e.g., different Svnapot/Svpbmt capabilities).",
+      "snippet": "if (!kvm_riscv_gstage_vmid_bits() ||\n    vcpu->arch.last_exit_cpu == vcpu->cpu)    // line 166 - CPU change detection\n    return;\n// ... flushes TLB but never validates target hart ISA",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "riscv_user_isa_enable",
+        "line_start": 1171,
+        "line_end": 1186,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correctly handles the heterogeneous case by using riscv_has_extension_unlikely() (global intersection) for enabling features and issuing pr_warn() when an extension is present on some harts but disabled due to absence on others (any_cpu_has_zicboz/any_cpu_has_zicbom/any_cpu_has_zicbop). This is the explicit documented design choice: extensions must be present on ALL harts to be enabled system-wide.",
+      "snippet": "if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOZ))\n    current->thread.envcfg |= ENVCFG_CBZE;\nelse if (any_cpu_has_zicboz)\n    pr_warn(\"Zicboz disabled as it is unavailable on some harts\\n\");",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

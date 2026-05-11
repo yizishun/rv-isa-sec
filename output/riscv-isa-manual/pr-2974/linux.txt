@@ -1,0 +1,103 @@
+PR #2974  target=linux  overall=potential_risk
+Spec: M-mode Linux writes zero to mip assuming all bits are writable for interrupt clearing, but read-only mip bits silently retain pending interrupts with no kernel-known clearing path
+Violation:
+  In a RISC-V M-mode Linux kernel (CONFIG_RISCV_M_MODE), early boot code at
+  arch/riscv/kernel/head.S and kexec_relocate.S executes csrw CSR_IP, zero to
+  clear all pending interrupts in mip before enabling interrupts. When a
+  platform implements a pending interrupt whose mip bit is read-only, the
+  write-zero has no effect on that bit—the interrupt remains pending. The
+  kernel has no code to invoke the platform-specific 'other mechanism'
+  mandated by the spec for clearing such read-only pending bits. Once mie is
+  configured and interrupts are enabled, the stale pending interrupt fires
+  immediately, potentially before trap handlers are installed or during a
+  critical section.
+Consequence: denial_of_service
+Pattern:
+  csrw CSR_IP.*zero|csr_clear.*CSR_IP|csrw CSR_MIP
+------------------------------------------------------------
+[potential_risk] arch/riscv/kernel/head.S:218-220  _start_kernel
+  Under CONFIG_RISCV_M_MODE, CSR_IP resolves to CSR_MIP (mip). The csrw
+  CSR_IP, zero writes 0 to mip, but per the RISC-V privileged spec, MEIP,
+  MTIP, and MSIP are read-only in mip — the write-zero has no effect on these
+  bits. The kernel does not invoke the platform-specific clearing mechanisms
+  (memory-mapped mtimecmp write for MTIP, memory-mapped MSIP register for
+  MSIP, platform interrupt controller for MEIP) at this early boot point. The
+  preceding csrw CSR_IE, zero (mie=0) masks all interrupts, preventing
+  immediate trap firing, but the stale pending bits will fire as soon as
+  interrupts are enabled later in the boot sequence. On pathological platforms
+  where the interrupt source remains asserted (e.g., mtimecmp already
+  expired), this causes an immediate interrupt storm once mie is configured,
+  though the installed handlers should service them.
+  | SYM_CODE_START(_start_kernel)
+  | 	/* Mask all interrupts */
+  | 	csrw CSR_IE, zero
+  | 	csrw CSR_IP, zero
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1373-1380
+      "The mip register must always be implemented, but can contain read-
+      only zeros in any position, indicating that interrupt can never
+      become pending. Each"
+    - riscv-isa-manual/src/priv/machine.adoc:1411-1414
+      "MEIP is read-only in mip, and is set and cleared by a platform-
+      specific interrupt controller."
+    - riscv-isa-manual/src/priv/machine.adoc:1416-1419
+      "MTIP is read-only in the mip register, and is cleared by writing to
+      the memory-mapped machine-mode timer compare register."
+    - riscv-isa-manual/src/priv/machine.adoc:1421-1424
+      "MSIP is read-only in mip, and is written by accesses to memory-
+      mapped control registers, which are used to provide machine-level
+      interprocessor interr"
+
+[potential_risk] arch/riscv/kernel/head.S:130-133  secondary_start_sbi
+  Same pattern as _start_kernel: under CONFIG_RISCV_M_MODE, csrw CSR_IP, zero
+  writes to mip but read-only bits (MEIP, MTIP, MSIP) are unaffected. This is
+  the secondary CPU boot path. The write follows csrw CSR_IE, zero which masks
+  interrupts. However, a stale MTIP (if platform mtimecmp has expired) or MEIP
+  (if external interrupt controller has a pending interrupt) will fire
+  immediately when interrupts are unmasked during smp_callin(). The trap
+  handler is installed via .Lsetup_trap_vector before smp_callin(), so the
+  interrupt will be handled, but the csrw CSR_IP, zero gives a false sense of
+  a clean interrupt state.
+  | secondary_start_sbi:
+  | 	/* Mask all interrupts */
+  | 	csrw CSR_IE, zero
+  | 	csrw CSR_IP, zero
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1373-1380
+      "The mip register must always be implemented, but can contain read-
+      only zeros in any position... Each individual bit in register mip
+      may be writable or"
+    - riscv-isa-manual/src/priv/machine.adoc:1416-1419
+      "MTIP is read-only in the mip register, and is cleared by writing to
+      the memory-mapped machine-mode timer compare register."
+
+[potential_risk] arch/riscv/kernel/sbi-ipi.c:27-27  sbi_ipi_handle
+  csr_clear(CSR_IP, IE_SIE) clears the software interrupt pending bit. Under
+  CONFIG_RISCV_M_MODE, CSR_IP resolves to CSR_MIP (mip), and IE_SIE resolves
+  to the MSIE bit. Per the spec, MSIP is read-only in mip and is controlled by
+  memory-mapped MSIP registers. Writing 0 to MSIP via csr_clear is a no-op.
+  The kernel relies on the SBI firmware to have already cleared the MSIP via
+  the memory-mapped register. In a pure M-mode kernel without SBI, this path
+  should not be used (ACLINT SSWI handles it instead with proper memory-mapped
+  clearing). In M-mode kernels that do use this SBI IPI path, the lack of a
+  platform-specific clear could cause the IPI to keep refiring.
+  | csr_clear(CSR_IP, IE_SIE);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1421-1424
+      "MSIP is read-only in mip, and is written by accesses to memory-
+      mapped control registers, which are used to provide machine-level
+      interprocessor interr"
+
+[compliant] arch/riscv/kernel/kexec_relocate.S:33-34  riscv_kexec_relocate
+  This code uses CSR_SIE and CSR_SIP directly (supervisor-level CSRs 0x104 and
+  0x144), not the CONFIG_RISCV_M_MODE-remapped CSR_IE/CSR_IP macros. In
+  S-mode, SSIP is writable per spec (supervisor.adoc line 443-446) so the
+  write-zero clears it. STIP is read-only when Sstc is implemented, but the
+  code's use of supervisor CSRs rather than the M-mode-remapped CSR_IP means
+  this is not the M-mode mip issue described in the vulnerability pattern. The
+  csrw CSR_SIE, zero masks all S-mode interrupts, providing protection during
+  the kexec transition.
+  | /* Disable / cleanup interrupts */
+  | csrw	CSR_SIE, zero
+  | csrw	CSR_SIP, zero
+

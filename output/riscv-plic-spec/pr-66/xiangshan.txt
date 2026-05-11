@@ -1,0 +1,119 @@
+PR #66  target=xiangshan  overall=compliant
+Spec: PLIC must internally assert a gateway completion notification wire upon valid claim/complete write; if this signal is missing and the implementation expects a separate MMIO write, interrupt sources become permanently blocked after first service
+Violation:
+  The PLIC hardware writes the completion ID to the claim/complete register
+  but does NOT internally assert the per-source gateway notification signal
+  (gateway_complete_o[src_id]). Instead, the implementation expects a separate
+  MMIO write (e.g., to a gateway-specific register) to trigger gateway re-
+  enablement. This means the gateway never receives the completion
+  notification and its internal state machine remains in 'claimed' state,
+  blocking all future interrupts from that source.
+Consequence: denial_of_service
+Pattern:
+  plic.*gateway.*notif|gateway.*complete|intr_completion.*gateway|completion_m
+  sg|gateway_reen|gw_.*_complete_o|plic_gateway_notify
+------------------------------------------------------------
+[compliant] rocket-chip/src/main/scala/devices/tilelink/Plic.scala:20-24  GatewayPLICIO
+  GatewayPLICIO interface correctly defines the 'complete' signal as part of
+  the per-source gateway-PLIC handshake. This is the internal wire that
+  carries the completion notification from the PLIC core back to each gateway,
+  matching the clarified spec intent that completion notification is an
+  internal signal, not a separate MMIO register access.
+  | class GatewayPLICIO extends Bundle {
+  |   val valid = Output(Bool())
+  |   val ready = Input(Bool())
+  |   val complete = Input(Bool())
+  | }
+
+[compliant] rocket-chip/src/main/scala/devices/tilelink/Plic.scala:26-36  LevelGateway
+  LevelGateway FSM correctly clears inFlight (the 'claimed' state) when
+  io.plic.complete is asserted. Line 34: 'when (io.plic.complete) { inFlight
+  := false.B }'. This re-enables the gateway to assert valid for future
+  interrupts from the same source. Without this signal being driven, the
+  gateway would remain permanently in claimed state — but the signal IS
+  correctly driven (see completion routing at lines 261-267).
+  | val inFlight = RegInit(false.B)
+  | when (io.interrupt && io.plic.ready) { inFlight := true.B }
+  | when (io.plic.complete) { inFlight := false.B }
+  | io.plic.valid := io.interrupt && !inFlight
+
+[compliant] rocket-chip/src/main/scala/devices/tilelink/Plic.scala:261-267  Impl (completion routing)
+  Completion notification routing is combinatorial: completerDev → UIntToOH →
+  completedDevs → gateway.complete. Each gateway's .complete input is driven
+  directly from the one-hot decode of the completed device ID on the same
+  cycle as the MMIO claim/complete write. This is the critical signal path
+  that proves the gateway completion notification IS internally asserted — no
+  separate MMIO write is required, and the spec violation condition does NOT
+  exist in this implementation.
+  | val completerDev = Wire(UInt(log2Up(nDevices + 1).W))
+  | val completedDevs = Mux(completer.reduce(_ || _), UIntToOH(completerDev, nDevices+1), 0.U)
+  | (gateways zip completedDevs.asBools.tail) foreach { case (g, c) =>
+  |    g.complete := c
+  | }
+
+[compliant] rocket-chip/src/main/scala/devices/tilelink/Plic.scala:282-306  Impl (claim/complete MMIO register)
+  The claim/complete register at offset 0x200004 implements the proper
+  read/write semantics. Read (claim): returns maxDevs(i) and de-pends the
+  claimed device via claimer assertion. Write (complete): sets completerDev to
+  the written interrupt ID and asserts completer(i), which triggers the
+  combinatorial chain that asserts gateway.complete. The assertion on line 292
+  enforces that completerDev is consistent across all harts (same interrupt ID
+  written). Correctly implements the spec requirement that writing the
+  interrupt number back completes the interrupt and re-enables the source
+  gateway.
+  | RegField(32,
+  |   RegReadFn { valid =>
+  |     claimer(i) := valid
+  |     (true.B, maxDevs(i))
+  |   },
+  |   RegWriteFn { (valid, data) =>
+  |     completerDev := data.extract(log2Ceil(nDevices+1)-1, 0)
+  |     completer(i) := valid && enableVec0(i)(completerDev)
+  |     true.B
+  |   }
+  | )
+
+[compliant] rocket-chip/src/main/scala/devices/tilelink/Plic.scala:245-253  Impl (pending/gateway handshake on claim)
+  Pending bit and gateway.ready handshake on claim: when a device is claimed,
+  its pending bit is cleared AND gateway.ready is asserted (g.ready := !p).
+  The pending bit stays cleared until the gateway asserts .valid again — which
+  requires .complete to first clear inFlight. This correctly implements the
+  full claim→complete handshake: the pending bit is not re-asserted until the
+  gateway receives its completion notification, preventing stale-state
+  exploits where an interrupt could be re-claimed before completion.
+  | ((pending zip gateways) zip claimedDevs.tail) foreach { case ((p, g), c) =>
+  |   g.ready := !p
+  |   when (c || g.valid) { p := !c }
+  | }
+
+[compliant] src/main/scala/device/AXI4Plic.scala:134-148  completionFn / inHandle
+  AXI4Plic (alternative implementation) uses inHandle register array instead
+  of LevelGateway modules. completionFn clears inHandle(wdata) on the
+  claim/complete MMIO write (line 137), which directly re-enables the pending
+  bit for that source (line 159-161: when(inHandle(id)) pending := false.B).
+  Functionally equivalent to the LevelGateway approach — the completion write
+  re-enables the source within the same cycle. No separate MMIO write needed.
+  The violation condition is absent.
+  | val inHandle = RegInit(0.U.asTypeOf(Vec(numExtIntrs + 1, Bool())))
+  | def completionFn(wdata: UInt) = {
+  |   inHandle(wdata(31, 0)) := false.B
+  |   0.U
+  | }
+  | // ...
+  | when(in.r.fire && (getOffset(raddr) === addr.U)) {
+  |   inHandle(r) := true.B
+  | }
+  | RegMap(addr, r, completionFn)
+
+[compliant] src/main/scala/system/SoC.scala:503-508  SoC PLIC integration
+  SoC-level PLIC integration correctly instantiates TLPLIC and connects it to
+  the interrupt source node and bus crossbar. No separate gateway notification
+  MMIO interface exists at the SoC level, confirming that gateway completion
+  is handled entirely within the PLIC module via the internal signal chain
+  documented above.
+  | val plic = LazyModule(new TLPLIC(PLICParams(soc.PLICRange.base), 8))
+  | val plicSource = LazyModule(new IntSourceNodeToModule(NrExtIntr))
+  | plic.intnode := plicSource.sourceNode
+  | if (enableCHI) { plic.node := device_xbar.get }
+  | else { plic.node := peripheralXbar.get }
+

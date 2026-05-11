@@ -1,0 +1,177 @@
+{
+  "pr_number": 96,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 96,
+    "violation_condition": "When XiangShan IOMMU (IOPMP/IOATC) does not implement the Non-Leaf PTE Invalidation or Address Range Invalidation extensions, software must fall back to coarser invalidation commands (e.g., IOTINVAL.VMA with GVMA/PSVMA granularity). Between the page table modification and the completion of the coarse invalidation, stale non-leaf PTE translations remain cached in the IOATC, allowing in-flight DMA transactions to use obsolete intermediate page table entries. This window is widened by the latency of broadcasting and completing a full-cache invalidation versus a targeted address-range or non-leaf-only invalidation command.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "IOATC invalidation handler only supports PSVMA/GVMA granularity; absence of NILE (Non-leaf Invalidation) and ADDR (Address Range) capability bits in iommu_capabilities; IOTINVAL command decoder does not decode non-leaf or address-range invalidation opcodes; IOATC tag comparator lacks partial-address match logic for range-based lookup and invalidation",
+    "affected_entities": [
+      "IOMMU_capabilities",
+      "IOTINVAL",
+      "IOATC",
+      "DDT",
+      "PDT"
+    ],
+    "summary": "Lack of fine-grained IOMMU TLB invalidation (non-leaf PTE, address-range) widens the window where stale intermediate translations cached in IOATC can be exploited by malicious DMA devices to access unauthorized physical memory after page table teardown"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "IopmpParams",
+        "line_start": 25,
+        "line_end": 129,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "IopmpParams defines only IOPMP (Physical Memory Protection) constants: vendor, specver, srcmd/mdcfg/entry table sizes, AXI parameters. There are no IOMMU-related parameters: no IOATC depth, IOATC ways, DDT/PDT enable flags, invalidation support flags, or iommu_capabilities register field widths. The module is an IOPMP, not an IOMMU, so IOATC/invalidation parameters are architecturally absent.",
+      "snippet": "val entry_num = 512  // [R   ] Indicate the number of entries\nval prio_entry = 0    // [WARL] Indicate the number of entries matched with priority\nval rrid_transl = 0   // [WARL] The RRID tagged to outgoing transactions\n// No IOATC depth, IOATC ways, DDT/PDT enable, NILE, ADDR capability params",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegHwcfg0",
+        "line_start": 469,
+        "line_end": 517,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "RegHwcfg0 is the primary capability register reporting only IOPMP (PMP) features: enable, addrh_en, md_num, chk_x, no_x, no_w, stall_en, peis, pees, mfr_en, tor_en, sps_en, srcmd_fmt, mdcfg_fmt. No IOMMU capability fields exist: no NILE (Non-leaf Invalidation Extension) bit, no ADDR (Address Range Invalidation) bit, no DDT/PDT enable bits, no IOATC-present bit. Software querying hwcfg0 sees only PMP capabilities.",
+      "snippet": "val enable            = UInt(1.W)  // [W1SS] Indicate if the IOPMP checks transactions by default\nval tor_en            = UInt(1.W)  // [R   ] Indicate if TOR is supported\nval srcmd_fmt         = UInt(2.W)  // [R   ] Indicate the SRCMD format\nval mdcfg_fmt         = UInt(2.W)  // [R   ] Indicate the MDCFG format\ndef toUInt: UInt = Cat(enable, addrh_en, md_num, md_entry_num, mfr_en, pees, peis, stall_en, no_w, no_x, chk_x, rrid_transl_prog, rrid_transl_en, prient_prog, user_cfg_en, sps_en, tor_en, srcmd_fmt, mdcfg_fmt)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "RegHwcfg1 / RegHwcfg2",
+        "line_start": 519,
+        "line_end": 549,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "hwcfg1 reports entry_num and rrid_num; hwcfg2 reports rrid_transl and prio_entry. Neither register contains IOATC-related fields (cache size, associativity, ways) or IOMMU capability reporting (DDT/PDT base, invalidation support). These registers serve only IOPMP PMP configuration.",
+      "snippet": "class RegHwcfg1 extends Bundle {\n  val entry_num  = UInt(16.W) // [R   ] Indicate the number of entries\n  val rrid_num   = UInt(16.W) // [R   ] Indicate the number of RRIDs\n}\nclass RegHwcfg2 extends Bundle {\n  val rrid_transl = UInt(16.W) // [WARL] The RRID tagged to outgoing transactions\n  val prio_entry  = UInt(16.W) // [WARL] Indicate the number of entries matched with priority\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "ReqBundle",
+        "line_start": 988,
+        "line_end": 993,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "ReqBundle carries only rrid, pa (physical address), rw (read/write), and len fields for PMP permission checking. There is no invalidation request type, no IOTINVAL opcode field, no GVMA/PSVMA/NILE/ADDR granularity selector, no PSCID/GSCID fields for process/device-scoped invalidation. The bundle is designed solely for per-transaction PMP lookups.",
+      "snippet": "class ReqBundle extends Bundle {\n  val rrid = UInt(IopmpParams.srcmd_addr_width.W)\n  val pa   = UInt(IopmpParams.soc_addr_width.W)\n  val rw   = Bool()\n  val len  = UInt(IopmpParams.soc_addr_width.W)\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl FSM (State enum)",
+        "line_start": 1035,
+        "line_end": 1037,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The Ctrl FSM defines states for PMP checking: sIdle, sSrcmd, sMdcfg, sMdcfgPre, sEntry, sPriority, sMatching, sErr, sDone. These walk the srcmd->mdcfg->entry tables to verify physical-address permissions. No IOTINVAL command decode states, no invalidation opcode processing, no IOATC tag lookup/invalidation states, and no invalidation completion signaling exist. The FSM is a PMP checker, not an IOMMU invalidation handler.",
+      "snippet": "object State extends ChiselEnum {\n  val sIdle, sSrcmd, sMdcfg, sMdcfgPre, sEntry, sPriority, sMatching, sErr, sDone = Value\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl FSM (full state machine)",
+        "line_start": 1075,
+        "line_end": 1162,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The full Ctrl FSM implements a PMP check pipeline: sIdle validates RRID legality, sSrcmd reads source-to-MD mapping, sMdcfg/sMdcfgPre walk MD-to-entry-index table, sPriority/sEntry/sMatching check NAPOT address ranges and read/write permissions, sErr records violation metadata, sDone returns the response. There is no IOTINVAL command processing path. The FSM is exclusively a stateless PMP permission checker per DMA transaction.",
+      "snippet": "is(State.sIdle) { when(io.req.fire) { when(io.reg.o_reg_hwcfg0_enable === 1.U) { when(io.req.bits.rrid < io.reg.o_reg_hwcfg1_rrid_num){ state:= State.sSrcmd } ... } } }\nis(State.sPriority) { when(pri_hit) { state := State.sMatching }.elsewhen(pri_part_hit) { etype := 0x4.U; state := State.sErr }.elsewhen(j_indx === md_t){ state := State.sMdcfg } }\nis(State.sMatching) { when(req.rw && !entry_attribute.w || io.reg.o_reg_hwcfg0_no_w.asBool) { etype := 0x2.U; state := State.sErr } ... }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "NAPOTDecoder",
+        "line_start": 945,
+        "line_end": 968,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "NAPOTDecoder computes addr_start and addr_end from a NAPOT-encoded entry address for PMP permission region matching. It finds trailing ones, computes a mask, and derives the address range. This range-decoding logic could theoretically serve as the basis for address-range-based IOATC invalidation, but it is wired only into the sPriority PMP check state (line 1243) and is not connected to any IOATC tag array or invalidation lookup. No IOATC tag comparator exists for range-based invalidation.",
+      "snippet": "object NAPOTDecoder {\n  def apply(entry_addr: UInt): (UInt, UInt) = {\n    val trailing_ones = Wire(UInt(log2Ceil(IopmpParams.soc_addr_width).W))\n    trailing_ones := PriorityEncoder(~entry_addr)\n    val size = trailing_ones + 1.U\n    val mask = (1.U << size) - 1.U\n    addr_start := entry_addr & (~mask).asUInt\n    addr_end := addr_start + mask\n    (addr_start, addr_end)\n  }\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl FSM (entry priority-hit matching)",
+        "line_start": 1233,
+        "line_end": 1268,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The entry matching logic compares a DMA request's physical address range against IOPMP entry NAPOT regions, detecting full-hit, partial-hit (for priority entries), and no-match. This is PMP address matching against physical addresses. It is not IOATC tag matching. An IOATC would need tag CAM/SRAM with VPN + PSCID/GSCID + ASID + V fields for both normal translation lookup and invalidation-triggered tag match, but no such structure exists.",
+      "snippet": "val (addr_start, addr_end) = NAPOTDecoder(entry_addr)\nwhen(io.entry.attribute.a === 0x2.U || io.entry.attribute.a === 0x3.U) {\n  val pa_end = req.pa + req.len - 1.U\n  when(pa_end < addr_start || req.pa > addr_end){ pri_hit := false.B; pri_part_hit := false.B }\n  .elsewhen(req.pa >= addr_start && pa_end <= addr_end) { pri_hit := true.B; pri_part_hit := false.B }\n  .otherwise { pri_hit := false.B; when(j_indx_d < io.reg.o_reg_hwcfg2_prio_entry) { pri_part_hit := true.B } }\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpChecker.scala",
+        "function_name": "Ctrl FSM (flush signal)",
+        "line_start": 1320,
+        "line_end": 1321,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The only flush output from the Ctrl module is `io.flush := EdgeDetect.falling(io.stall)`, a physical stall-to-unstall edge detector used to flush the bridge's in-flight transaction tracking counters. This is NOT an IOATC invalidation flush. It does not respond to IOTINVAL commands, page-table modifications, or any invalidation trigger. In a proper IOMMU, software would issue IOTINVAL after modifying page tables, and the IOATC hardware would flush matching entries.",
+      "snippet": "// flush\nio.flush := EdgeDetect.falling(io.stall)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/IopmpBridge.scala",
+        "function_name": "IopmpBridgeLazy",
+        "line_start": 51,
+        "line_end": 497,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "IopmpBridgeLazy implements an AXI4 slave/master passthrough bridge with error injection for failed PMP checks. It contains AR/AW FIFOs, round-robin arbitration, error-handling FSMs for draining in-flight transactions before injecting error responses, and bypass mode when IOPMP is disabled. There is no IOATC-side translation cache, no TLB-like tag array, and no invalidation interface. Every DMA transaction goes through the PMP check FSM only; there is no address translation step and therefore no cached translation to invalidate.",
+      "snippet": "class IopmpBridgeLazy(...) extends LazyModule(...) {\n  // AXI4 slave node -> master node passthrough\n  // Error injection for failed PMP checks\n  // Response suppression logic\n  // No IOATC, no translation cache, no invalidation interface\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/src/main/scala/Iopmp.scala",
+        "function_name": "IopmpLazy",
+        "line_start": 77,
+        "line_end": 130,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "IopmpLazy is the top-level IOPMP integration module. It instantiates APB2Reg (APB-to-register translator), IopmpChecker (PMP check FSM), and up to N IopmpBridge instances with request/response arbiters. There is no IOATC module instance, no DDT/PDT directory-table walker, no IOTINVAL command routing from the APB interface to any internal invalidation unit. The APB interface routes only to PMP register and table read/write operations (srcmd, mdcfg, entry tables).",
+      "snippet": "class IopmpLazy(numBridge: Int = 1)(implicit p: Parameters) extends LazyModule {\n  val checker = LazyModule(new IopmpChecker)\n  val apb = LazyModule(new APB2Reg)\n  val bridge = Seq.tabulate(numBridge) { i => LazyModule(new IopmpBridgeLazy(i, beatBytes = checker.axi_beatBytes)) }\n  // No IOATC, no DDT/PDT walker, no IOTINVAL command path\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "ChiselIOPMP/README.md",
+        "function_name": "README (documentation)",
+        "line_start": 1,
+        "line_end": 30,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The README documents ChiselIOPMP as an I/O Physical Memory Protection (IOPMP) implementation with srcmd format 0, mdcfg format 0, APB config interface, 1:1 AXI bridge, and wire interrupt support. There is no mention of IOATC, address translation, page table walking, DDT/PDT, or IOTINVAL invalidation commands. The component self-identifies as an IOPMP, not an IOMMU.",
+      "snippet": "ChiselIOPMP is an I/O Physical Memory Protection (IOPMP) implementation\n- srcmd format 0, mdcfg format 0\n- APB config interface\n- 1:1 AXI bridge\n- wire interrupt support\n// No IOATC, no address translation, no DDT/PDT, no IOTINVAL",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

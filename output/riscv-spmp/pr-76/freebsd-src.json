@@ -1,0 +1,97 @@
+{
+  "pr_number": 76,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 76,
+    "violation_condition": "FreeBSD kernel saves/restores spmpcfg[i] as a 16-bit value (e.g., uint16_t in struct pcb or vm context) across context switches, but the spec now defines spmpcfg as a full SXLEN-bit register. On RV64, bits 63:10 are WPRI (54 bits), and on RV32, bits 31:10 are WPRI (22 bits). Writing only 16 bits via the sireg2 indirect access (right-justified) zeroes upper WPRI bits, violating the WPRI contract that those bits be preserved.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "uint16_t.*spmpcfg|spmpcfg.*uint16_t|\\b16\\b.*spmpcfg|spmpcfg.*\\b16\\b|spmp_save|spmp_restore",
+    "affected_entities": [
+      "spmpcfg",
+      "sireg2",
+      "siselect"
+    ],
+    "summary": "spmpcfg register widened from 16-bit field to SXLEN-bit register; FreeBSD context-switch save/restore must use SXLEN-bit (uint64_t/uint32_t) storage width to preserve WPRI bits in upper region, otherwise zeroing them leaks or corrupts per-hart hardware state across protection domains"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/include/encoding.h",
+        "function_name": "CSR definitions (global scope)",
+        "line_start": 589,
+        "line_end": 608,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "No S-mode SPMP CSR definitions exist. Only M-mode PMP CSRs (CSR_PMPCFG0-3 at 0x3a0, CSR_PMPADDR0-15 at 0x3b0) are defined. Missing: CSR_SISELECT (0x150), CSR_SIREG (0x151), CSR_SIREG2 (0x152), CSR_SPMPCFG0-3 (0x1a0-0x1a3), CSR_SPMPADDR0-15 (0x1b0-0x1bf), CSR_MENVCFG (0x30a), CSR_SENVCFG (0x10a), CSR_MSECCFG (0x747). Without sireg2 indirect-access CSR definitions, the kernel cannot write spmpcfg entries at all, so the vulnerability condition (writing only 16 bits via sireg2, zeroing upper WPRI bits) is unreachable.",
+      "snippet": "#define CSR_PMPCFG0   0x3a0\n#define CSR_PMPCFG1   0x3a1\n#define CSR_PMPCFG2   0x3a2\n#define CSR_PMPCFG3   0x3a3\n#define CSR_PMPADDR0  0x3b0\n/* MISSING: all SPMP indirect-access CSRs (0x150-0x152, 0x1a0-0x1bf) */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb definition",
+        "line_start": 42,
+        "line_end": 55,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "struct pcb contains no spmpcfg fields. The pcb stores general-purpose registers (ra, sp, gp, tp, s[12]), FPU state (x[32][2], fcsr, fpflags), and onfault handler, but has no SPMP configuration slots. This confirms spmpcfg values are never saved/restored across context switches, so no 16-bit truncation of spmpcfg[i] can occur.",
+      "snippet": "struct pcb {\n        uint64_t        pcb_ra;\n        uint64_t        pcb_sp;\n        uint64_t        pcb_s[12];\n        uint64_t        pcb_x[32][2];\n        /* NO spmpcfg fields — SPMP not implemented */\n};",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx, cpu_switch, and fpu save/restore macros",
+        "line_start": 42,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The context-switch assembly saves/restores only integer registers (ra, sp, gp, tp, s0-s11), FPU registers (f0-f31, fcsr), and tp(gp for userret). No siselect/sireg/sireg2/SPMPCFG CSR accesses exist anywhere in the switch path. The vulnerability condition requires writing spmpcfg[i] via sireg2 with a truncated value during save/restore, which never happens.",
+      "snippet": "/* swtch.S savectx: */\n        sd      ra, (PCB_RA)(a0)\n        sd      sp, (PCB_SP)(a0)\n        sd      s0, (PCB_S + 0 * 8)(a0)\n        /* ... through s11 ... */\n        /* NO siselect/sireg/sireg2/SPMPCFG CSR accesses */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/pmap.c",
+        "function_name": "pmap_activate_sw",
+        "line_start": 5177,
+        "line_end": 5200,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The pmap activate path writes only satp and issues sfence_vma(). No SPMP CSR writes or reads occur. If SPMP were implemented, this would be the natural location to reprogram SPMP entries for the incoming address space. Since spmpcfg values are never touched, no truncated 16-bit write via sireg2 can occur here.",
+      "snippet": "csr_write(satp, pmap->pm_satp);\n/* ... */\nsfence_vma();\n/* No SPMP CSR writes — no spmpcfg truncation possible */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/identcpu.c",
+        "function_name": "identify_cpu",
+        "line_start": 262,
+        "line_end": 333,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "ISA extension detection probes for sstc, svnapot, svpbmt, svinval, sscofpmf, zicbom/zicboz/zicbop but does not detect Smspmp, Sspmp, or Sspmpss. Without extension detection, the kernel cannot conditionally initialize SPMP, further confirming no SPMP code path exists.",
+      "snippet": "/* Detects: sstc, svnapot, svpbmt, svinval, sscofpmf, zicbom/zicboz/zicbop */\n/* Does NOT detect: Smspmp, Sspmp, Sspmpss */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_restore_csrs",
+        "line_start": 161,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The VMM guest CSR restore path writes only vsatp. No SPMP CSR virtualization (siselect/sireg/sireg2/hviprio* via CSR alias) is performed. The struct hypcsr senvcfg field is dead storage — defined but never read/written. A guest cannot use SPMP via the VMM, so the vulnerability cannot be triggered through virtualization either.",
+      "snippet": "csr_write(vsatp, csrs->vsatp);\n/* No SPMP CSR writes — no spmpcfg virtualization */",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

@@ -1,0 +1,138 @@
+PR #38  target=freebsd-src  overall=potential_risk
+Spec: ASID/VMID reuse without fence.hpd on RISC-V enables transient-execution predictors to leak secrets across FreeBSD process boundaries or bhyve guest VMs
+Violation:
+  When the FreeBSD kernel reuses an ASID (satp.ASID) during context switch or
+  ASID space wrap-around without executing fence.hpd, or when bhyve reuses a
+  VMID (hgatp.VMID) without executing fence.hpd, predictions learned in the
+  previous protection domain (process or VM) can be used speculatively in the
+  new domain, enabling cross-domain transient execution attacks.
+Consequence: info_leak
+Pattern:
+  ASID allocation or recycling code (pmap_activate, pmap_invalidate_all, ASID
+  wrap handling in sys/riscv/riscv/pmap.c) that issues sfence.vma but does not
+  issue fence.hpd before reusing a previously-allocated ASID; bhyve VMID
+  allocation/reuse paths (hgatp.VMID management) without fence.hpd; any satp
+  write that assigns a recycled ASID without a preceding fence.hpd.
+------------------------------------------------------------
+[potential_risk] sys/riscv/riscv/pmap.c:5187-5199  pmap_activate_sw
+  csr_write(satp, ...) switches the page-table root (ASID=0 currently) on
+  context switch, followed only by sfence_vma() at line 5199. sfence.vma only
+  invalidates TLB entries; it does NOT clear hardware page-table-walker
+  prediction structures. If the kernel ever enables ASID allocation (the
+  sfence_vma_asid/asid_page wrappers already exist in cpufunc.h and
+  SATP_ASID_M/SATP_ASID_S are defined in riscvreg.h), recycled ASIDs would
+  allow speculative predictions from the prior protection domain to be used
+  transiently in the new domain. A fence.hpd before the satp write (or
+  fence.hpd x0, <old_asid>) would be required. Currently latent because ASIDs
+  are hardcoded to 0.
+  | csr_write(satp, pmap->pm_satp);
+  | 
+  | hart = PCPU_GET(hart);
+  | /* ... CPU_SET/CLR, PCPU_SET ... */
+  | 
+  | sfence_vma();
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:620-630  vmmops_run
+  hfence_gvma() at line 628 is issued before csr_write(hgatp, ...) at line
+  630, which switches the G-stage (stage-2) page-table root when entering a
+  different VM. The comment at lines 620-627 correctly cites the RISC-V spec
+  requirement for hfence.gvma before/after hgatp writes. However, hfence.gvma
+  only orders prior stores before G-stage implicit address-translation reads
+  (TLB invalidation). It does NOT cover hardware page-table-walker prediction
+  structures. When switching between VMs, predictions learned from VM A's page
+  tables can be used speculatively for VM B's address translations before the
+  TLB miss triggers an actual walk. This is a cross-VM transient execution
+  info-leak path on hardware with speculative page table walks.
+  | /*
+  |  * If the new virtual machine's guest physical page tables
+  |  * have been modified, it may be necessary to execute an HFENCE.GVMA
+  |  * instruction (see Section 5.3.2) before or after writing hgatp.
+  |  */
+  | hfence_gvma();
+  | 
+  | csr_write(hgatp, pmap->pm_satp);
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:1587-1600
+      "HFENCE.GVMA is used to synchronize G-stage address translation
+      updates. Executing HFENCE.GVMA guarantees that previous stores are
+      ordered before all i"
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:176-176  vmmops_vcpu_restore_csrs
+  csr_write(vsatp, csrs->vsatp) restores the guest's VS-stage address
+  translation. If the guest uses ASIDs and the restored vsatp contains a
+  different ASID than previously loaded, this is an ASID switch within the
+  guest without any fence.hpd. The hfence.gvma at line 628 covers stage-2
+  (G-stage) but not stage-1 (VS-stage) prediction structures. A fence.hpd
+  before this vsatp write would clear prediction structures for the guest's
+  own ASID switches.
+  | csr_write(vsatp, csrs->vsatp);
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:228-229  vmmops_vcpu_init
+  hstatus is initialized as HSTATUS_SPV | HSTATUS_VTW | HSTATUS_SPVP.
+  HSTATUS_VTSR (bit 22, defined at riscvreg.h:134 but unused) is NOT set. When
+  VTSR=1, SRET from VS-mode traps to HS-mode, giving the hypervisor an
+  intervention point to issue fence.hpd before the guest resumes execution.
+  Without VTSR, SRET in VS-mode executes directly, and the hypervisor cannot
+  insert fence.hpd on guest ASID switches performed via SRET+satp-write
+  sequences. This is a defense-in-depth gap.
+  | hypctx->guest_regs.hyp_hstatus = HSTATUS_SPV | HSTATUS_VTW;
+  | hypctx->guest_regs.hyp_hstatus |= HSTATUS_SPVP;
+
+[not_implemented] sys/riscv/include/cpufunc.h:122-127  (none - header)
+  No fence_hpd() inline wrapper function exists in cpufunc.h. The file defines
+  fence_i(), sfence_vma(), sfence_vma_page(), sfence_vma_asid(),
+  sfence_vma_asid_page(), and hfence_gvma(), but no fence_hpd() wrapper. The
+  MATCH_FENCE_HPD/MASK_FENCE_HPD opcode constants are also absent from
+  encoding.h. The Zihpd/Zifencehpd extensions are not ratified (not present in
+  any specification under spec_ref/), so this is expected — the kernel cannot
+  implement an unratified instruction.
+  | static __inline void
+  | hfence_gvma(void)
+  | {
+  | 
+  | 	__asm __volatile("hfence.gvma" ::: "memory");
+  | }
+
+[not_implemented] sys/riscv/vmm/vmm_fence.c:99-101  vmm_fence_process_one
+  The fence queue processes only VMM_RISCV_FENCE_VMA and
+  VMM_RISCV_FENCE_VMA_ASID request types. No VMM_RISCV_FENCE_HPD type is
+  defined, and no fence.hpd instruction is emitted when processing the fence
+  queue. If a guest issues a hypothetical fence.hpd, the KASSERT on line
+  99-101 would trigger a panic (wrong fence type). The kernel cannot
+  virtualize an instruction it doesn't know about.
+  | KASSERT(fence->type == VMM_RISCV_FENCE_VMA ||
+  |     fence->type == VMM_RISCV_FENCE_VMA_ASID,
+  |     ("%s: wrong fence type %d", __func__, fence->type));
+
+[compliant] sys/riscv/vmm/vmm_switch.S:67-78  (none - assembly)
+  vmm_switch atomically swaps sstatus, hstatus, scounteren, sscratch, stvec,
+  and sepc between host and guest contexts using csrrw. No hgatp or satp
+  change occurs here — the hgatp write is performed in vmmops_run() at
+  vmm_riscv.c:630 before vmm_switch is called. vmm_switch itself does not
+  perform a protection-domain switch and thus does not need fence.hpd. The
+  responsibility for fence.hpd lies with the hgatp write site.
+  | csrrw	t0, sstatus, t0
+  | csrrw	t1, hstatus, t1
+  | csrrw	t2, scounteren, t2
+  | csrrw	t3, sscratch, a0
+  | csrrw	t4, stvec, t4
+  | csrw	sepc, t5
+
+[compliant] sys/riscv/riscv/pmap.c:1123-1126  pmap_invalidate_all
+  The TLB invalidation sequence uses fence() → sbi_remote_sfence_vma() →
+  sfence_vma() for cross-CPU TLB shootdown. This correctly invalidates TLB
+  entries across all harts. fence.hpd is not required here because this is a
+  TLB invalidation path (for mapping changes within the same protection
+  domain), not a protection-domain switch. The sfence.vma suffices for its
+  stated purpose of ensuring that stale TLB entries for modified page table
+  mappings are flushed.
+  | fence();
+  | if (!CPU_EMPTY(&mask) && smp_started)
+  | 	sbi_remote_sfence_vma(mask.__bits, 0, 0);
+  | sfence_vma();
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1212-1217
+      "Executing an SFENCE.VMA instruction guarantees that any previous
+      stores already visible to the current hart are ordered before all
+      implicit reads by t"
+

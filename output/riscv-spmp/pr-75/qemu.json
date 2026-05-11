@@ -1,0 +1,286 @@
+{
+  "pr_number": 75,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 75,
+    "violation_condition": "When QEMU emulates the two-stage SPMP hierarchy (vSPMP followed by hSPMP) for VS/VU accesses with V=1 and both vsatp.MODE=Bare and hgatp.MODE=Bare, if the emulation raises the wrong exception code—specifically using guest-page-fault codes (20/21/23) when both vSPMP and hSPMP deny, instead of the required SPMP page-fault codes (12/13/15) directed at VS-mode—or conversely uses SPMP page-fault codes when only hSPMP denies, the fault is delivered to the wrong privilege level.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "riscv_cpu_tlb_fill.*spmp|get_physical_address.*spmp|riscv_spmp_check.*hv|spmp.*exception.*code|guest_page_fault.*spmp|RISCV_EXCP.*GUEST_PAGE|riscv_cpu_do_interrupt.*spmp",
+    "affected_entities": [
+      "spmpcfg",
+      "spmpaddr",
+      "hgatp",
+      "vsatp",
+      "hspmpswitch",
+      "vspmpswitch",
+      "hspmpdeleg",
+      "HLV",
+      "HLVX",
+      "HSV"
+    ],
+    "summary": "Two-stage SPMP (vSPMP→hSPMP) exception-code routing in QEMU must deliver fault to correct privilege level: vSPMP+vSPMP denial→codes 12/13/15 to VS-mode, hSPMP-only denial→codes 20/21/23 to HS-mode; misrouting enables guest-to-hypervisor privilege escalation via fault hijacking"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.h",
+        "function_name": "(header definitions)",
+        "line_start": 1,
+        "line_end": 88,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "This header defines only M-mode PMP types (pmp_priv_t, pmp_am_t, pmp_entry_t, pmp_table_t) and mseccfg fields. No SPMP (S-mode PMP), HSPMP, or VSPMP types, CSRs, or function declarations exist. The two-stage SPMP hierarchy (vSPMP + hSPMP) described in the security spec is absent.",
+      "snippet": "typedef struct {\n    pmp_entry_t pmp[MAX_RISCV_PMPS];\n    pmp_addr_t  addr[MAX_RISCV_PMPS];\n    uint32_t num_rules;\n} pmp_table_t;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "pmp_hart_has_privs_default",
+        "line_start": 311,
+        "line_end": 359,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Default PMP permission logic handles only M-mode PMP (MMWP for deny-all, MML for M-mode lockdown, standard PMP default for S/U-mode). No SPMP two-stage check exists; the function is unaware of any vSPMP/hSPMP hierarchy. The violation condition (wrong exception code when both vSPMP and hSPMP deny) cannot be triggered.",
+      "snippet": "if (MSECCFG_MMWP_ISSET(env)) {\n    *allowed_privs = 0;\n    return false;\n} else if (MSECCFG_MML_ISSET(env)) {\n    if (mode == PRV_M && !(privs & PMP_EXEC)) {",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "pmp_hart_has_privs",
+        "line_start": 375,
+        "line_end": 523,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "PMP permission check with Smepmp truth tables operates solely on M-mode PMP entries. The 'mode' parameter represents the current effective privilege level (M/S/U) for M-mode PMP enforcement, not an SPMP stage. No vSPMP or hSPMP rule tables exist, and no two-stage SPMP permission composition logic is present.",
+      "snippet": "if (!MSECCFG_MML_ISSET(env)) {\n    *allowed_privs = PMP_READ | PMP_WRITE | PMP_EXEC;\n    if ((mode != PRV_M) || pmp_is_locked(env, i)) {\n        *allowed_privs &= env->pmp_state.pmp[i].cfg_reg;\n    }\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "pmpcfg_csr_write / pmpcfg_csr_read",
+        "line_start": 528,
+        "line_end": 590,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "CSR read/write functions operate only on CSR_PMPCFG0-15 (M-mode PMP config CSRs at 0x3a0-0x3af). No spmpcfg*, hspmpcfg*, or vspmpcfg* CSR handlers exist. The TLB flush side-effect (line 546) is correct for M-mode PMP but no SPMP-related CSR side effects exist.",
+      "snippet": "if (modified) {\n    pmp_update_rule_nums(env);\n    tlb_flush(env_cpu(env));\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address_pmp",
+        "line_start": 1142,
+        "line_end": 1164,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Simple PMP check wrapper that delegates to pmp_hart_has_privs(). Returns TRANSLATE_PMP_FAIL on denial. No SPMP-specific checking logic exists — only M-mode PMP is checked against the final physical address. The two-stage SPMP hierarchy check (first vSPMP, then hSPMP) is absent.",
+      "snippet": "pmp_has_privs = pmp_hart_has_privs(env, addr, size, 1 << access_type,\n                                   &pmp_priv, mode);\nif (!pmp_has_privs) {\n    *prot = 0;\n    return TRANSLATE_PMP_FAIL;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "get_physical_address (PTE PMP check)",
+        "line_start": 1411,
+        "line_end": 1418,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Page table walk PMP checks hardcode PRV_S at line 1415 for checking PTE accesses: 'get_physical_address_pmp(env, &pmp_prot, pte_addr, sxlen_bytes, MMU_DATA_LOAD, PRV_S)'. This is correct per the M-mode PMP spec (PTE accesses are treated as S-mode for PMP), but if SPMP were added, VS-stage page table walk PTEs would need vSPMP checks at VS-mode privilege rather than S-mode PMP checks. This is a forward-compatibility concern.",
+      "snippet": "int pmp_ret = get_physical_address_pmp(env, &pmp_prot, pte_addr,\n                                       sxlen_bytes,\n                                       MMU_DATA_LOAD, PRV_S);\nif (pmp_ret != TRANSLATE_SUCCESS) {\n    return TRANSLATE_PMP_FAIL;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_tlb_fill (two-stage)",
+        "line_start": 1814,
+        "line_end": 1923,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Two-stage address translation (VS-stage + G-stage) for hypervisor guests applies M-mode PMP only at the final host physical address (line 1876). No SPMP checks are performed at either stage. In a two-stage SPMP design, vSPMP should be checked after VS-stage translation (guest physical address) and hSPMP after G-stage translation (host physical address), with appropriate exception codes. This logic is absent.",
+      "snippet": "if (ret == TRANSLATE_SUCCESS) {\n    ret = get_physical_address_pmp(env, &prot_pmp, pa,\n                                   size, access_type, mode);\n    tlb_size = pmp_get_tlb_size(env, pa);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "raise_mmu_exception",
+        "line_start": 1670,
+        "line_end": 1711,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Exception code mapping correctly differentiates PMP violations (access faults 1/5/7) from page faults (12/13/15) and guest-page faults (20/21/23). However, this mapping only covers M-mode PMP. The SPMP-specific case — where both vSPMP and hSPMP deny requiring SPMP page-fault codes (12/13/15) delivered to VS-mode versus only hSPMP denying requiring guest-page-fault codes (20/21/23) — does not exist because SPMP is not implemented.",
+      "snippet": "if (pmp_violation) {\n    cs->exception_index = RISCV_EXCP_INST_ACCESS_FAULT;\n} else if (env->virt_enabled && !first_stage) {\n    cs->exception_index = RISCV_EXCP_INST_GUEST_PAGE_FAULT;\n} else {\n    cs->exception_index = RISCV_EXCP_INST_PAGE_FAULT;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2206,
+        "line_end": 2250,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Interrupt dispatch correctly handles delegation, virtualization, and exception types from raise_mmu_exception. No SPMP-specific dispatch logic is needed since SPMP does not exist. The existing PMP access-fault exceptions are properly routed through the standard delegation chain.",
+      "snippet": "bool async = !!(cs->exception_index & RISCV_EXCP_INT_FLAG);\ntarget_ulong cause = cs->exception_index & RISCV_EXCP_INT_MASK;\nuint64_t deleg = async ? env->mideleg : env->medeleg;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/pmp.c",
+        "function_name": "pmpaddr_csr_read / pmp_get_tlb_size",
+        "line_start": 620,
+        "line_end": 732,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "PMP address CSR read with correct A-field-dependent WARL masking (OFF/TOR: low g bits zero; NAPOT: low g-1 bits one) and TLB size calculation for partial PMP coverage. These functions are M-mode PMP only — no SPMP address CSRs exist.",
+      "snippet": "case PMP_AMATCH_TOR:\n    if (g >= 1 && g < TARGET_LONG_BITS) {\n        val &= ~((1ULL << g) - 1ULL);\n    }\n    break;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_mseccfg / vmstate_pmp / vmstate_hyper",
+        "line_start": 1,
+        "line_end": 200,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Migration VMState correctly includes: (1) vmstate_pmp with PMP entries and post_load handler that reconstructs rule addresses, (2) vmstate_hyper with all hypervisor CSR state including hgatp/vsatp/mtval2, and (3) the newly added vmstate_mseccfg (commit eef85399b1ab) that migrates mseccfg when ext_smepmp/ext_zkr/ext_smmpm/ext_zicfilp are enabled. No SPMP VMState is needed since SPMP is not implemented.",
+      "snippet": "static const VMStateDescription vmstate_mseccfg = {\n    .name = \"cpu/mseccfg\",\n    .version_id = 1,\n    .minimum_version_id = 1,\n    .needed = mseccfg_needed,\n    .fields = (const VMStateField[]) {\n        VMSTATE_UINTTL(env.mseccfg, RISCVCPU),\n        VMSTATE_END_OF_LIST()\n    }\n};",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_vsatp / write_vsatp",
+        "line_start": 5280,
+        "line_end": 5300,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Standard VSATP CSR accessors with legalize_xatp() WARL constraint. No SPMP-related side effects. Correct for the current PMP-only implementation.",
+      "snippet": "static RISCVException write_vsatp(CPURISCVState *env, int csrno,\n                                  target_ulong val, uintptr_t ra)\n{\n    env->vsatp = legalize_xatp(env, env->vsatp, val);\n    return RISCV_EXCP_NONE;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_hgatp / write_hgatp",
+        "line_start": 4990,
+        "line_end": 5010,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Standard HGATP CSR accessors with legalize_xatp() WARL constraint. No SPMP-related side effects. Correct for the current implementation.",
+      "snippet": "static RISCVException write_hgatp(CPURISCVState *env, int csrno,\n                                  target_ulong val, uintptr_t ra)\n{\n    env->hgatp = legalize_xatp(env, env->hgatp, val);\n    return RISCV_EXCP_NONE;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "CSR table entries (hypervisor CSRs)",
+        "line_start": 6146,
+        "line_end": 6175,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR table correctly registers hypervisor CSRs (hgatp, vsatp, mtval2, etc.) with hmode predicate and min_priv_ver 1.12.0. No SPMP CSRs (spmpcfg*, hspmpcfg*, vspmpcfg*, spmpaddr*, etc.) are registered because they are not defined.",
+      "snippet": "[CSR_HGATP]       = { \"hgatp\",       hgatp,   read_hgatp,   write_hgatp,\n                      .min_priv_ver = PRIV_VERSION_1_12_0                },",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_pmpaddr / write_pmpaddr / read_tselect",
+        "line_start": 5350,
+        "line_end": 5375,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Standard PMP address CSR wrappers delegating to pmp.c functions. TSELECT CSR read. All correctly implement M-mode PMP CSR access. No SPMP CSR handlers exist.",
+      "snippet": "static RISCVException write_pmpaddr(CPURISCVState *env, int csrno,\n                                    target_ulong val, uintptr_t ra)\n{\n    pmpaddr_csr_write(env, csrno - CSR_PMPADDR0, val);\n    return RISCV_EXCP_NONE;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "(PMP constants and hypervisor state)",
+        "line_start": 177,
+        "line_end": 178,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Defines MAX_RISCV_PMPS (64) and OLD_MAX_RISCV_PMPS (16) for M-mode PMP regions. No SPMP region count constants (e.g., MAX_RISCV_SPMPS) exist. The two-stage SPMP hierarchy requires separate region counts for vSPMP and hSPMP.",
+      "snippet": "#define MAX_RISCV_PMPS (64)\n#define OLD_MAX_RISCV_PMPS (16)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "(Hypervisor CPU state fields)",
+        "line_start": 352,
+        "line_end": 384,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "CPURISCVState includes hypervisor fields (hgatp, vsatp, mtval2, etc.) and virtual CSR state (vsstatus, vsepc, vscause, vstval), but no SPMP state fields (e.g., spmp_state, hspmp_state, vspmp_state). The two-stage SPMP hierarchy requires separate PMP-like tables for each stage.",
+      "snippet": "uint64_t hgatp;\n...\nuint64_t vsatp;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "(PMP state in CPURISCVState)",
+        "line_start": 442,
+        "line_end": 442,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "CPURISCVState contains only one pmp_table_t (pmp_state) and one mseccfg field. No spmp_state, hspmp_state, or vspmp_state fields exist. SPMP requires separate state for HS-mode and VS-mode SPMP configurations.",
+      "snippet": "pmp_table_t pmp_state;\ntarget_ulong mseccfg;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_pmp / vmstate_hyper (migration state fields)",
+        "line_start": 67,
+        "line_end": 116,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Migration only includes M-mode PMP state (vmstate_pmp with pmp_entry_t array) and hypervisor state (vmstate_hyper with hgatp, vsatp, mtval2, etc.). No SPMP migration VMState sections exist. If SPMP were implemented, missing migration state would cause silent corruption on live migration.",
+      "snippet": "VMSTATE_STRUCT_ARRAY(env.pmp_state.pmp, RISCVCPU, MAX_RISCV_PMPS,\n                     0, vmstate_pmp_entry, pmp_entry_t),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "pmp_post_load / pmp_needed",
+        "line_start": 43,
+        "line_end": 63,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PMB post_load callback correctly reconstructs rule addresses and updates rule count after migration. pmp_needed predicate checks cpu->cfg.pmp. These are correct for M-mode PMP migration.",
+      "snippet": "static int pmp_post_load(void *opaque, int version_id)\n{\n    ...\n    for (i = 0; i < pmp_regions; i++) {\n        pmp_update_rule_addr(env, i);\n    }\n    pmp_update_rule_nums(env);\n    return 0;\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

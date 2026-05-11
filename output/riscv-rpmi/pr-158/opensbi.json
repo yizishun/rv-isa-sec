@@ -1,0 +1,198 @@
+{
+  "pr_number": 158,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 158,
+    "violation_condition": "When OpenSBI (M-mode, acting as the RPMI TEE 'framework') modifies PMP/ePMP CSR entries to change memory access permissions during TEE_MEMORY_PARCEL_CREATE, TEE_MEMORY_PARCEL_ACCEPT, TEE_MEMORY_PARCEL_RELEASE, or TEE_MEMORY_PARCEL_RECLAIM service handling—specifically writing to pmpcfg/pmpaddr CSRs to grant, revoke, or re-map memory between REE and TEE domains—without executing SFENCE.VMA (or the hart-specific PMP synchronization sequence) between the CSR write and the return-to-S-mode mret, stale PMP/TLB state may leave the previous access permissions in effect on the calling hart.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "pmpcfg_write|pmpaddr_write|csrw.*pmpcfg|csrw.*pmpaddr followed by mret without intervening sfence\\.vma|fence\\.i|fence w,o within same SBI trap handler",
+    "affected_entities": [
+      "pmpcfg0",
+      "pmpaddr0",
+      "sfence.vma",
+      "mret"
+    ],
+    "summary": "OpenSBI implementing TEE memory parcel operations must fence PMP/ePMP changes before returning to S-mode, or REE/TEE memory access boundaries are not architecturally enforced"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_map_range",
+        "line_start": 220,
+        "line_end": 250,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Writes PMP entry 0 via pmp_set() (line 247) to grant M-mode temporary shared R/W access to S/U memory, but does NOT execute SFENCE.VMA afterward. Called via sbi_hart_protection_map_range() from MPXY channel operations (sbi_mpxy.c:379,411,469,620,709,756)—the path that carries TEE memory-parcel traffic through RPMI MM. After map_range returns, the trap handler executes mret (fw_base.S:690) without any intervening SFENCE.VMA, so stale PMP checks cached by speculative address translation may remain in effect on the calling hart.",
+      "snippet": "sbi_platform_pmp_set(sbi_platform_ptr(scratch), SBI_SMEPMP_RESV_ENTRY,\n                     SBI_DOMAIN_MEMREGION_SHARED_SURW_MRW,\n                     pmp_flags, base, order);\npmp_set(SBI_SMEPMP_RESV_ENTRY, pmp_flags, base, order);\n\nreturn SBI_OK;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3629,
+          "line_end": 3633,
+          "excerpt": "when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches. This is accomplished by executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0, after the PMP CSRs are written."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_unmap_range",
+        "line_start": 252,
+        "line_end": 257,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Revokes M-mode shared access by disabling PMP entry 0 via pmp_disable() (line 256), but does NOT execute SFENCE.VMA afterward. Called via sbi_hart_protection_unmap_range() from MPXY channel operations (sbi_mpxy.c:382,438,508,677,726,761). Stale PMP permissions cached in TLB structures could allow the calling hart's S-mode to continue accessing memory that was just revoked, until the next natural TLB flush.",
+      "snippet": "sbi_platform_pmp_disable(sbi_platform_ptr(scratch), SBI_SMEPMP_RESV_ENTRY);\nreturn pmp_disable(SBI_SMEPMP_RESV_ENTRY);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3629,
+          "line_end": 3633,
+          "excerpt": "when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches. This is accomplished by executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0, after the PMP CSRs are written."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_domain_context.c",
+        "function_name": "switch_to_next_domain_context",
+        "line_start": 126,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Calls sbi_hart_protection_unconfigure() (line 127) which disables all non-firmware PMP entries via pmp_disable() in sbi_hart_pmp_unconfigure() without SFENCE.VMA. The subsequent sbi_hart_protection_configure() (line 128) does fence internally on success, but: (1) there is a window between unconfigure and configure where stale PMP state persists, and (2) the return value of configure() is DISCARDED—if configure() returns EFAIL (insufficient PMP entries, firmware inconsistency), execution continues to CSR swaps and eventually sbi_hart_switch_mode()/mret with potentially incomplete PMP coverage and no fence. Between the configure call and the SATP SFENCE.VMA at line 140, PMP CSRs written by configure may also lack synchronization.",
+      "snippet": "/* Reconfigure PMP settings for the new domain */\nsbi_hart_protection_unconfigure(scratch);\nsbi_hart_protection_configure(scratch);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3629,
+          "line_end": 3633,
+          "excerpt": "when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches. This is accomplished by executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0, after the PMP CSRs are written."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "platform/generic/eswin/eic770x.c",
+        "function_name": "eswin_eic7700_pmp_unconfigure",
+        "line_start": 357,
+        "line_end": 368,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Platform-specific PMP unconfigure writes PMP CSRs via pmp_set() (line 360-361) and pmp_disable() (lines 363-367) but does NOT execute SFENCE.VMA afterward. This implementation has rating -1UL (highest priority), overriding the generic sbi_hart_pmp_unconfigure(). Called via sbi_hart_protection_unconfigure() during domain context switches. Unlike eswin_eic7700_pmp_configure() which correctly fences at line 350, the unconfigure path has no synchronization at all.",
+      "snippet": "pmp_set(PMP_FREE_A_START + PMP_FREE_A_COUNT - 1, 0, 0,\n        log2roundup(EIC770X_MEMPORT_BASE));\n\nfor (unsigned int i = 0; i < PMP_FREE_A_COUNT - 1; i++)\n        pmp_disable(i + PMP_FREE_A_START);\n\nfor (unsigned int i = 0; i < PMP_FREE_B_COUNT; i++)\n        pmp_disable(i + PMP_FREE_B_START);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3629,
+          "line_end": 3633,
+          "excerpt": "when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches. This is accomplished by executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0, after the PMP CSRs are written."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_smepmp_configure",
+        "line_start": 182,
+        "line_end": 216,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "After programming all PMP entries, correctly calls sbi_hart_pmp_fence() (line 216) which executes __sbi_sfence_vma_all() (and __sbi_hfence_gvma_all() if H-extension present), satisfying the RISC-V spec requirement for PMP synchronization before returning to S-mode. However, note that early-return error paths (lines 151, 170, 194) jump past the fence, leaving the partially-programmed PMP entries unsynchronized.",
+      "snippet": "for(; pmp_idx < pmp_count; pmp_idx++)\n        pmp_disable(pmp_idx);\n\nsbi_hart_pmp_fence();\nreturn 0;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3629,
+          "line_end": 3633,
+          "excerpt": "when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches. This is accomplished by executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0, after the PMP CSRs are written."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart_pmp.c",
+        "function_name": "sbi_hart_oldpmp_configure",
+        "line_start": 259,
+        "line_end": 298,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "After programming PMP entries for non-ePMP systems, correctly calls sbi_hart_pmp_fence() (line 296) which executes SFENCE.VMA all, satisfying the spec requirement for PMP-TLB synchronization. Same caveat applies: the early return at line 276 (invalid PMP index) skips the fence.",
+      "snippet": "for(; pmp_idx < pmp_count; pmp_idx++)\n        pmp_disable(pmp_idx);\n\nsbi_hart_pmp_fence();\nreturn 0;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3629,
+          "line_end": 3633,
+          "excerpt": "when the PMP settings are modified, M-mode software must synchronize the PMP settings with the virtual memory system and any PMP or address-translation caches. This is accomplished by executing an SFENCE.VMA instruction with rs1=x0 and rs2=x0, after the PMP CSRs are written."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_init.c",
+        "function_name": "init_coldboot",
+        "line_start": 390,
+        "line_end": 404,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Cold boot path correctly calls sbi_hart_protection_configure() (line 394) which internally invokes sbi_hart_smepmp_configure() or sbi_hart_oldpmp_configure(), both of which issue sbi_hart_pmp_fence() (SFENCE.VMA) at their successful conclusion, before sbi_hsm_hart_start_finish() eventually does mret to S-mode. Configure failure results in hart hang (lines 395-399), preventing S-mode entry with unsynchronized PMP.",
+      "snippet": "rc = sbi_hart_protection_configure(scratch);\nif (rc) {\n        sbi_printf(\"%s: hart isolation configure failed (error %d)\\n\",\n                   __func__, rc);\n        sbi_hart_hang();\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_init.c",
+        "function_name": "init_warm_startup",
+        "line_start": 469,
+        "line_end": 480,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Warm startup path correctly calls sbi_hart_protection_configure() (line 473) before sbi_hsm_hart_start_finish() (line 480). The configure() handlers fence internally. Configure failure is fatal (hart hang). No PMP writes occur between configure() and the eventual mret to S-mode.",
+      "snippet": "rc = sbi_hart_protection_configure(scratch);\nif (rc)\n        sbi_hart_hang();\n\nsbi_hsm_hart_start_finish(scratch, hartid);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_init.c",
+        "function_name": "init_warm_resume",
+        "line_start": 490,
+        "line_end": 498,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Warm resume path correctly calls sbi_hart_protection_configure() (line 494) before sbi_hsm_hart_resume_finish() (line 498). The configure() handlers fence internally. Configure failure is fatal (hart hang). No window between PMP writes and S-mode entry.",
+      "snippet": "rc = sbi_hart_protection_configure(scratch);\nif (rc)\n        sbi_hart_hang();\n\nsbi_hsm_hart_resume_finish(scratch, hartid);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/utils/mpxy/fdt_mpxy_rpmi_mm.c",
+        "function_name": "mpxy_rpmi_mm_setup",
+        "line_start": 33,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "This is the RPMI MM (Management Mode/TEE) transport driver—not the TEE Memory Parcel service itself. It registers the shared memory region with the root domain via sbi_domain_root_add_memrange() (line 58) during cold boot, and forwards RPMI_MM_SRV_COMMUNICATE requests to the external PuC via mbox_chan_xfer(). The actual TEE_MEMORY_PARCEL_CREATE/ACCEPT/RELEASE/RECLAIM operations are handled by firmware on the external Platform Controller (PuC), not by OpenSBI. OpenSBI's role is limited to message transport via the MPXY shared memory and PMP-based domain memory enforcement. The PMP synchronization issues for the MPXY shared memory mapping/unmapping are captured in findings for sbi_hart_smepmp_map_range and sbi_hart_smepmp_unmap_range above.",
+      "snippet": "mm_region_flags = SBI_DOMAIN_MEMREGION_SHARED_SURW_MRW;\n\nrc = sbi_domain_root_add_memrange(mm_region_addr, mm_region_size,\n                                  PAGE_SIZE, mm_region_flags);",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

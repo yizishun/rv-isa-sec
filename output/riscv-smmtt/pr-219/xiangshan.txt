@@ -1,0 +1,112 @@
+PR #219  target=xiangshan  overall=not_implemented
+Spec: PR #219 removes mstatus.MXR and HLVX override from MPT permission checking (step 7 of MPT lookup); XiangShan MPT hardware must NOT read mstatus.MXR during MPT access checks and must NOT allow HLVX to suppress MPT execute-fault detection, else execute-only MPT pages become readable/writable via MXR=1 or HLVX.
+Violation:
+  In XiangShan RTL, the MPT (Memory Protection Table) permission checker
+  incorrectly applies mstatus.MXR to override MPT-encoded XWR permissions, or
+  the HLVX instruction handler bypasses MPT execute permission checks.
+  Specifically, when the MPT lookup FSM (likely in the PTW/LoadUnit pipeline)
+  evaluates step 7 of the access type permission algorithm, if it reads
+  mstatus.MXR and treats execute-only pages as readable (violating the
+  explicit prohibition 'MXR mechanisms cannot be used to affect or override
+  the interpretation of permissions encoded in memory-protection-table
+  entries'), or if the HLVX instruction decoder causes the PTW to suppress MPT
+  execute fault checks on execute-only pages.
+Consequence: privilege_escape
+Pattern:
+  mstatus\.MXR.*mpt|mpt.*mstatus\.MXR|HLVX.*mpt|mpt.*permission.*MXR|MPT.*chec
+  k.*MXR|mstatus\.MXR
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/cache/mmu/TLB.scala:407-449  perm_check (def)
+  TLB permission check applies MXR to PTE-based permissions only. Stage 1:
+  `Mux(hlvx, perm.x, perm.r || mxr(idx) && perm.x)` (line 428). Stage 2:
+  `Mux(hlvx, g_perm.x, (g_perm.r || csr.priv.mxr && g_perm.x))` (line 443).
+  This is spec-compliant because MPT (Smpt) is not implemented — MXR only
+  affects page-table-encoded permissions as allowed by the spec. The RISC-V
+  privileged spec (machine.adoc lines 633-636) explicitly states: 'The MXR and
+  SUM mechanisms only affect the interpretation of permissions encoded in
+  page-table entries. In particular, they have no impact on whether access-
+  fault exceptions are raised due to PMAs or PMP.' No MPT permission table
+  entries exist to be incorrectly overridden.
+  | val ldPermFail = !(modeCheck && Mux(hlvx, perm.x, perm.r || mxr(idx) && perm.x))
+  | val g_ldPermFail = !Mux(hlvx, g_perm.x, (g_perm.r || csr.priv.mxr && g_perm.x))
+
+[compliant] src/main/scala/xiangshan/cache/mmu/TLB.scala:86-94  TLB main body (MXR per-port selection)
+  MXR value correctly computed per-port: `Mux(virt_out(i) || isHyperInst(i),
+  csr.priv.vmxr || csr.priv.mxr, csr.priv.mxr)`. For virtualized contexts,
+  both vmxr (VS-stage) and mxr (HS-stage) are OR'd per the hypervisor spec
+  (hypervisor.adoc line 1473-1477): 'HS-level sstatus.MXR makes execute-only
+  pages readable by explicit loads for both stages of address translation.' No
+  MPT entries exist, so this cannot override MPT-encoded permissions.
+  | val mxr = (0 until Width).map(i => Mux(virt_out(i) || isHyperInst(i), csr.priv.vmxr || csr.priv.mxr, csr.priv.mxr))
+
+[compliant] src/main/scala/xiangshan/cache/mmu/TLB.scala:159-168  TLB PMM/HLVX logic
+  HLVX correctly disables pointer masking (`pmm := 0.U` at line 164) and HLVX
+  flag correctly flows to perm_check where it forces execute-permission check
+  (perm.x) instead of MXR-augmented read check. HLVX does NOT bypass PMP
+  checks — the PMP checker operates independently on physical addresses
+  without any MXR influence. This matches the HLVX spec (hypervisor.adoc lines
+  1499-1503): 'HLVX cannot override machine-level physical memory protection
+  (PMP), so attempting to read memory that PMP designates as execute-only
+  still results in an access-fault exception.'
+  | when (ifetch || req(i).bits.hlvx) {
+  |   pmm := 0.U
+  | } .elsewhen (Mux(virt_in || req_in(i).bits.hyperinst, csr.priv.vmxr || csr.priv.mxr, csr.priv.mxr)) {
+  |   pmm := 0.U
+  | }
+
+[compliant] src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala:402-420  PTW hptw response (legacy FSM)
+  G-stage MXR permission check at line 409 correctly applies MXR only to
+  G-stage PTE permissions: `!io.hptw.resp.bits.h_resp.entry.perm.get.r &&
+  !(io.csr.priv.mxr && io.hptw.resp.bits.h_resp.entry.perm.get.x)`. This
+  allows MXR to make execute-only pages readable at G-stage, which is spec-
+  compliant for PTE-based translation. No MPT table entries are involved.
+  | val g_perm_fail = !io.hptw.resp.bits.h_resp.gaf && (!io.hptw.resp.bits.h_resp.entry.perm.get.r && !(io.csr.priv.mxr && io.hptw.resp.bits.h_resp.entry.perm.get.x))
+
+[compliant] src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala:997-1023  PTW hptw response (main FSM, per-entry)
+  Identical MXR-based G-stage permission check at line 1000 of the main PTW
+  FSM: `!io.hptw.resp.bits.h_resp.entry.perm.get.r && !(io.csr.priv.mxr &&
+  io.hptw.resp.bits.h_resp.entry.perm.get.x)`. Same analysis as above — MXR
+  applied to PTE-based checks only, which is correct per spec in the absence
+  of MPT.
+  | val check_g_perm_fail = !io.hptw.resp.bits.h_resp.gaf && (!io.hptw.resp.bits.h_resp.entry.perm.get.r && !(io.csr.priv.mxr && io.hptw.resp.bits.h_resp.entry.perm.get.x))
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:403-412  pmp_check
+  PMP checker is entirely independent of MXR. The `pmp_check()` function
+  performs a pure lookup of PMP config bits (r, w, x) from matched PMP entries
+  against the access command. No reference to mstatus.MXR exists anywhere in
+  the PMP checker code path. This is correct per spec (machine.adoc lines
+  633-636): MXR 'has no impact on whether access-fault exceptions are raised
+  due to PMAs or PMP.' HLVX executes against the PMP using the same TlbCmd-
+  based check but with the hlvx flag handled upstream in the TLB perm_check,
+  not in PMP.
+  | def pmp_check(cmd: UInt, cfg: PMPConfig) = {
+  |   resp.ld := TlbCmd.isRead(cmd) && !TlbCmd.isAmo(cmd) && !cfg.r
+  |   resp.st := (TlbCmd.isWrite(cmd) || TlbCmd.isAmo(cmd)) && !cfg.w
+  |   resp.instr := TlbCmd.isExec(cmd) && !cfg.x
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:511-521  MstatusBundle CSR definition
+  MXR defined at bit 19 of mstatus (line 516):
+  `CSRRWField(19).withReset(0.U)`. Bit position and reset value are correct
+  per RISC-V privileged spec. No MPT-enable field (e.g., mptcfg or Smpt
+  extension) is defined, consistent with MPT not being implemented.
+  | val MXR  = CSRRWField     (19).withReset(0.U).withDescription("Make executable pages readable when set.")
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1462-1464  CSR-to-TLB MXR routing
+  MXR correctly routed from mstatus/vsstatus CSRs to TLB: `io.tlb.mxr :=
+  mstatus.regOut.MXR.asBool` and `io.tlb.vmxr := vsstatus.regOut.MXR.asBool`.
+  This is the single point where CSR state enters the TLB pipeline. The
+  routing is correct — there is no MPT CSR to route.
+  | io.tlb.mxr  :=  mstatus.regOut.MXR.asBool
+  | io.tlb.vmxr := vsstatus.regOut.MXR.asBool
+
+[compliant] src/main/scala/xiangshan/mem/pipeline/NewLoadUnit.scala:255-260  Load unit TLB request generation
+  HLVX flag correctly computed from LSUOpType: `val tlbHlvx =
+  LSUOpType.isHlvx(tlbFuOpType)` (line 260), then wired to
+  `io.tlbReq.bits.hlvx := tlbHlvx` (line 421). The HLVX instruction correctly
+  sets the hlvx flag, which in TLB perm_check forces execute-permission
+  checking (perm.x) instead of MXR-augmented read checking. No MPT interaction
+  exists because MPT is not implemented.
+  | val tlbHlvx = LSUOpType.isHlvx(tlbFuOpType)
+  | io.tlbReq.bits.hlvx := tlbHlvx
+

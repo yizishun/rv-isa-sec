@@ -1,0 +1,160 @@
+{
+  "pr_number": 2996,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2996,
+    "violation_condition": "",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "",
+    "affected_entities": [],
+    "summary": "Agent error: exit code 1"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/rob/Rob.scala",
+        "function_name": "Rob",
+        "line_start": 449,
+        "line_end": 510,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "WRS instructions (WRS.NTO/WRS.STO) are decoded but execute as no-ops — they never stall execution in the ROB. Only a 'hasWFI' stall state machine exists; there is no 'hasWRS' register, no WRS enqueue trigger, and no WRS wakeup condition. Per spec norm:Zawrs_wrs-nto_stall_exec, WRS.NTO 'would cause the hart to temporarily stall execution in a low-power state until a store occurs to the reservation set or an interrupt is observed.' WRS.STO is specified to work similarly with a bounded timeout (norm:Zawrs_wrs-sto_stall_duration). The complete absence of stall logic means software using WRS in polling loops will busy-wait, defeating the energy-efficiency purpose of the Zawrs extension.",
+      "snippet": "val hasWFI = RegInit(false.B)  // line 449 — no hasWRS equivalent\nwhen(enqUop.isWFI && !enqHasException && !enqTriggerActionIsDebugMode) {\n  hasWFI := true.B  // line 489-491 — no WRS enqueue trigger\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zawrs.adoc",
+          "line_start": 25,
+          "line_end": 27,
+          "excerpt": "Then a subsequent WRS.NTO instruction would cause the hart to temporarily stall execution in a low-power state until a store occurs to the reservation set or an interrupt is observed."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zawrs.adoc",
+          "line_start": 31,
+          "line_end": 34,
+          "excerpt": "WRS.STO is provided that works like WRS.NTO but bounds the stall duration to an implementation-define short timeout."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/rob/Rob.scala",
+        "function_name": "Rob",
+        "line_start": 463,
+        "line_end": 463,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "No interrupt wakeup mechanism for WRS. The 'wfiEvent' signal (computed in NewCSR.scala:1124 from pending interrupts) only wakes WFI. Per spec norm:Zawrs_exec_resume_rules, 'WRS.NTO and WRS.STO instructions follow the rules of the WFI instruction for resuming execution on a locally enabled pending interrupt.' Even if the WRS stall were implemented, there is no 'wrsEvent' signal or any mechanism for pending interrupts to terminate a WRS stall.",
+      "snippet": "when(RegNext(RegNext(io.csr.wfiEvent)) || io.flushOut.valid || wfi_timeout) {\n  hasWFI := false.B  // only WFI wakeup, no WRS\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zawrs.adoc",
+          "line_start": 76,
+          "line_end": 77,
+          "excerpt": "WRS.NTO and WRS.STO instructions follow the rules of the WFI instruction for resuming execution on a locally enabled pending interrupt."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/rob/Rob.scala",
+        "function_name": "Rob",
+        "line_start": 800,
+        "line_end": 801,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "WRS instructions do not block commit. blockCommit signal only includes 'hasWFI', not any WRS stall state. This means WRS instructions are committed immediately without waiting for a store to the reservation set or an interrupt, violating the fundamental semantic guarantee of the Zawrs extension.",
+      "snippet": "val blockCommit = misPredBlock || lastCycleFlush || hasWFI || io.redirect.valid ||\n  (deqNeedFlush && !deqHasFlushed) || deqFlushBlock || criticalErrorState || traceBlock",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zawrs.adoc",
+          "line_start": 67,
+          "line_end": 71,
+          "excerpt": "Hart execution may be stalled while the following conditions are all satisfied: (a) The reservation set is valid (b) If WRS.STO, a short duration since start of stall has not elapsed (c) No locally enabled interrupt at any privilege level is pending"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/Bundle.scala",
+        "function_name": "CfCtrl",
+        "line_start": 171,
+        "line_end": 171,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "No 'isWrsNto' or 'isWrsSto' predicate exists on MicroOp/CfCtrl bundles. The 'isWFI' predicate exists and is used by Rob.scala to trigger the WFI stall state machine on enqueue. Without corresponding WRS predicates, the ROB cannot detect WRS instructions to initiate stalling.",
+      "snippet": "def isWFI: Bool = fuType === FuType.csr.U && fuOpType === CSROpType.wfi",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRCustom.scala",
+        "function_name": "SrnctlBundle",
+        "line_start": 118,
+        "line_end": 121,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SrnctlBundle has 'WFI_ENABLE' (bit 2) to disable WFI at runtime, but no 'WRS_ENABLE' bit. If WRS stall logic is later added, it cannot be gated like WFI, creating an operational asymmetry.",
+      "snippet": "class SrnctlBundle extends CSRBundle {\n  val WFI_ENABLE     = RW(2).withReset(true.B).withDescription(\"Enable WFI execution.\")\n  val FUSION_ENABLE  = RW(0).withReset(true.B).withDescription(\"Enable instruction fusion.\")\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR",
+        "line_start": 1499,
+        "line_end": 1502,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "WRS.NTO illegal-instruction trap logic correctly implements spec: traps when TW=1 in non-M-mode, does NOT trap in U-mode when TW=0 (unlike WFI which uses 'isModeHU ||'). This matches spec note at zawrs.adoc:100-105. WRS.NTO virtual-instruction trap correctly covers VS/VU-mode with VTW=1 and TW=0. WRS.STO has no trap logic, which is correct since it always completes within a bounded timeout.",
+      "snippet": "io.toDecode.illegalInst.wrs_nto    := !isModeM && mstatus.regOut.TW\nio.toDecode.virtualInst.wrs_nto    := privState.V && !mstatus.regOut.TW && hstatus.regOut.VTW",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zawrs.adoc",
+          "line_start": 79,
+          "line_end": 87,
+          "excerpt": "When the TW bit in mstatus is set and WRS.NTO is executed in any privilege mode other than M-mode [...] will cause an illegal-instruction exception."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zawrs.adoc",
+          "line_start": 100,
+          "line_end": 105,
+          "excerpt": "WRS.NTO, unlike WFI, is not specified to cause an illegal-instruction exception if executed in U-mode when the governing TW bit is 0."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/DecodeUnit.scala",
+        "function_name": "DecodeUnit",
+        "line_start": 254,
+        "line_end": 256,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "WRS decode table entries correctly map to FuType.csr with noSpec=T, blockBack=T. CSROpType values (wrs_nto='b100_010', wrs_sto='b100_011') are correct. Instruction encodings in Instructions.scala match the RISC-V spec: WRS.NTO funct12=0x0d, WRS.STO funct12=0x1d.",
+      "snippet": "WRS_NTO -> XSDecode(SrcType.pc, SrcType.imm, SrcType.X, FuType.csr, CSROpType.wrs_nto, SelImm.X, noSpec = T, blockBack = T),\nWRS_STO -> XSDecode(SrcType.pc, SrcType.imm, SrcType.X, FuType.csr, CSROpType.wrs_sto, SelImm.X, noSpec = T, blockBack = T),",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zawrs.adoc",
+          "line_start": 54,
+          "line_end": 63,
+          "excerpt": "opcode=SYSTEM(0x73), rd=0, funct3=0, rs1=0, funct12: WRS.NTO(0x0d), WRS.STO(0x1d)"
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

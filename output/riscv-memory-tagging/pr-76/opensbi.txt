@@ -1,0 +1,70 @@
+PR #76  target=opensbi  overall=not_implemented
+Spec: HSM suspend/resume CSR save/restore path must include mtval3 to preserve deferred async tag-mismatch fault address when M-mode memory tagging is active
+Violation:
+  OpenSBI HSM suspend handler saves/restores M-mode CSR context but does not
+  include mtval3; when M-mode memory tagging is enabled (mseccfg.MT_MODE !=
+  00), the tag-mismatch faulting virtual address in mtval3 is lost across
+  suspend/resume cycles, and the stale mtval3 value after resume points to a
+  wrong or invalid address
+Consequence: data_corruption
+Pattern:
+  sbi_hsm_hart_suspend.*csr_(read|write|swap).*m(?:tval|epc|status|cause).*(?!
+  mtval3)
+------------------------------------------------------------
+[not_implemented] lib/sbi/sbi_hsm.c:408-433  __sbi_hsm_suspend_non_ret_save
+  HSM non-retentive suspend save path saves MIE, MIP, MEDELEG, MIDELEG, and
+  MENVCFG but does not save mtval3. The mtval3 CSR (part of the proposed Zimt
+  memory-tagging extension, CSR address not yet assigned in the ratified spec)
+  holds the faulting virtual address for tag mismatches in M-mode. When/if
+  Zimt is ratified and mseccfg.MT_MODE enables M-mode memory tagging, a tag-
+  mismatch faulting address in mtval3 would be lost across non-retentive
+  suspend/resume cycles, causing the stale mtval3 value after warm-boot resume
+  to point to a wrong or invalid address. Neither CSR_MTVAL3 nor
+  MSECCFG.MT_MODE are defined in OpenSBI's riscv_encoding.h.
+  | hdata->saved_mie = csr_read(CSR_MIE);
+  | hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+  | hdata->saved_medeleg = csr_read(CSR_MEDELEG);
+  | hdata->saved_mideleg = csr_read(CSR_MIDELEG);
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+  References:
+    - riscv-memory-tagging/pr-76/diff.patch:66-69
+      "Zimt extension extends privileged specification with stval2, htval2
+      and mtval3 CSR to S, H and M mode respectively. On a tag mismatch
+      and subsequent t"
+
+[not_implemented] lib/sbi/sbi_hsm.c:435-446  __sbi_hsm_suspend_non_ret_restore
+  HSM non-retentive suspend restore path in sbi_hsm_hart_resume_finish
+  restores MENVCFG, MIDELEG, MEDELEG, MIE, and MIP but does not restore
+  mtval3. When the hart resumes from non-retentive suspend, the mtval3 CSR is
+  left in its hardware-reset state (likely 0) rather than the pre-suspend tag-
+  mismatch faulting address. If mseccfg.MT_MODE was non-zero before suspend
+  and a tag mismatch was pending or had been captured in mtval3, that address
+  information is irrecoverably lost. The sbi_hsm_data struct (lines 44-53) has
+  no saved_mtval3 field.
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	csr_write64(CSR_MENVCFG, hdata->saved_menvcfg);
+  | csr_write(CSR_MIDELEG, hdata->saved_mideleg);
+  | csr_write(CSR_MEDELEG, hdata->saved_medeleg);
+  | csr_write(CSR_MIE, hdata->saved_mie);
+  References:
+    - riscv-memory-tagging/pr-76/diff.patch:66-69
+      "Zimt extension extends privileged specification with stval2, htval2
+      and mtval3 CSR to S, H and M mode respectively. On a tag mismatch
+      and subsequent t"
+
+[not_implemented] include/sbi/riscv_encoding.h:509-512  
+  OpenSBI's CSR encoding header defines CSR_MTVAL (0x343) and CSR_MTVAL2
+  (0x34b) but does not define CSR_MTVAL3. There is also no MSECCFG_MT_MODE or
+  MSECCFG_MT_ASYNC field definition in the mseccfg register block (lines
+  727-740), which only defines MML, MMWP, RLB, USEED, and SSEED. The RISC-V
+  memory tagging (Zimt) extension is not yet ratified and OpenSBI has no
+  awareness of it.
+  | #define CSR_MTVAL			0x343
+  | #define CSR_MTVAL2			0x34b
+  References:
+    - riscv-memory-tagging/pr-76/diff.patch:40-46
+      "In asynchronous mode, tag mismatch reporting can happen on any trap
+      (exception or interrupt). This change adds additional CSR which can
+      hold address w"
+

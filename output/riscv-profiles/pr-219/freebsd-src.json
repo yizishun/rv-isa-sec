@@ -1,0 +1,186 @@
+{
+  "pr_number": 219,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 219,
+    "violation_condition": "Kernel code (in trap handler or vmm) reads stval on SCAUSE_BREAKPOINT and treats it as a valid address, when the hardware breakpoint source (e.g., certain Sdtrig trigger types) is not defined by the ISA to write an address to stval — the CSR may hold stale data from a prior exception",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "SCAUSE_BREAKPOINT.*tf_stval|case SCAUSE_BREAKPOINT.*stval|breakpoint.*csr_read.*stval",
+    "affected_entities": [
+      "stval",
+      "vstval",
+      "htval"
+    ],
+    "summary": "Sstvala narrowed: stval not guaranteed valid for all breakpoint sources; FreeBSD currently uses sepc for SIGTRAP delivery (safe), but bhyve unconditionally saves stval on guest breakpoint exits which could propagate stale CSR state to VMM userland"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_run",
+        "line_start": 699,
+        "line_end": 701,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "stval CSR is unconditionally captured from hardware (csr_read(stval)) on every VM exit and stored into vm_exit.stval, regardless of scause type. For SCAUSE_BREAKPOINT (delegated at line 148 via hedeleg), the breakpoint falls through to the 'default' case in riscv_handle_world_switch (line 515-519), which sets exitcode=VM_EXITCODE_BOGUS. The full vm_exit struct — including the captured stval — is copyout'd to userspace via vmm_dev_machdep.c:85 (case VM_RUN). Per the RISC-V privileged spec, stval is NOT guaranteed to contain a valid/architecturally-defined value for all breakpoint exception types; ebreak and certain Sdtrig trigger types may leave stale CSR data in stval. This unconditionally exposes potentially stale hardware CSR state to the bhyve userspace process, constituting a kernel information leak.",
+      "snippet": "vme->scause = csr_read(scause);\nvme->sepc = csr_read(sepc);\nvme->stval = csr_read(stval);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 706,
+          "line_end": 717,
+          "excerpt": "When a trap is taken into S-mode, stval is written with exception-specific information to assist software in handling the trap. Otherwise, stval is never written by the implementation, though it may be explicitly written by software. The hardware platform will specify which exceptions must set stval informatively, which may unconditionally set it to zero, and which may exhibit either behavior, depending on the underlying event that caused the exception."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 726,
+          "line_end": 729,
+          "excerpt": "On a breakpoint exception raised by an EBREAK or C.EBREAK instruction, stval is written with either zero or the virtual address of the instruction."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/sstvala.adoc",
+          "line_start": 4,
+          "line_end": 9,
+          "excerpt": "If the Sstvala extension is implemented, then stval must be written with the faulting virtual address for load, store, and instruction page-fault, access-fault, and misaligned exceptions, and for breakpoint exceptions that are defined to write an address to stval, other than those caused by execution of the EBREAK or C.EBREAK instructions."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "riscv_handle_world_switch",
+        "line_start": 515,
+        "line_end": 519,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The default case in riscv_handle_world_switch catches SCAUSE_BREAKPOINT (since it has no explicit case) and sets exitcode=VM_EXITCODE_BOGUS, handled=false. This causes the VMM run loop to exit (line 712-713) and deliver the vm_exit struct — including the unconditionally-captured stval from line 701 — to userspace. The stval value for a breakpoint exception is not architecturally guaranteed (especially for ebreak-triggered breakpoints where no faulting address exists), creating an info-leak path from hardware CSR to userspace.",
+      "snippet": "default:\n\tprintf(\"unknown scause %lx\\n\", vme->scause);\n\tvmm_stat_incr(hypctx->vcpu, VMEXIT_UNHANDLED, 1);\n\tvme->exitcode = VM_EXITCODE_BOGUS;\n\thandled = false;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 726,
+          "line_end": 729,
+          "excerpt": "On a breakpoint exception raised by an EBREAK or C.EBREAK instruction, stval is written with either zero or the virtual address of the instruction."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/sstvala.adoc",
+          "line_start": 4,
+          "line_end": 9,
+          "excerpt": "stval must be written with the faulting virtual address ... for breakpoint exceptions that are defined to write an address to stval, other than those caused by execution of the EBREAK or C.EBREAK instructions."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_delegate",
+        "line_start": 146,
+        "line_end": 148,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SCAUSE_BREAKPOINT is delegated from M-mode to HS-mode via hedeleg (bit 3). This is the precondition that routes guest breakpoint exceptions through the VMM trap path where stval is unconditionally captured and exposed. Delegation itself is architecturally correct for a hypervisor, but combined with the unconditional stval capture at line 701, it enables the info-leak.",
+      "snippet": "hedeleg  = (1UL << SCAUSE_INST_MISALIGNED);\nhedeleg |= (1UL << SCAUSE_ILLEGAL_INSTRUCTION);\nhedeleg |= (1UL << SCAUSE_BREAKPOINT);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_dev_machdep.c",
+        "function_name": "vmmdev_machdep_ioctl",
+        "line_start": 74,
+        "line_end": 86,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The VM_RUN ioctl handler copyouts the entire vm_exit struct (sizeof(*vme)) to userspace without filtering stval based on exit type. This is the final step in the info-leak chain: stval captured unconditionally at vmm_riscv.c:701 is delivered unfiltered to the bhyve process for all exit types including breakpoints.",
+      "snippet": "case VM_RUN: {\n\tstruct vm_exit *vme;\n\tstruct vm_run *vmrun;\n\tvmrun = (struct vm_run *)data;\n\tvme = vm_exitinfo(vcpu);\n\terror = vm_run(vcpu);\n\tif (error != 0)\n\t\tbreak;\n\terror = copyout(vme, vmrun->vm_exit, sizeof(*vme));\n\tbreak;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 450,
+        "line_end": 454,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The native user-trap handler for SCAUSE_BREAKPOINT correctly passes frame->tf_sepc (not frame->tf_stval) as the signal address to call_trapsignal(). stval is not exposed to userspace through this path. This is the correct behavior — only architectural state (sepc, which points to the ebreak instruction) is delivered to the faulting process.",
+      "snippet": "case SCAUSE_BREAKPOINT:\n\tcall_trapsignal(td, SIGTRAP, TRAP_BRKPT, (void *)frame->tf_sepc,\n\t    exception);\n\tuserret(td, frame);\n\tbreak;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 353,
+        "line_end": 365,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The kernel-mode breakpoint handler dispatches to DDB/KDB (kdb_trap). stval is available in the trapframe but only within the kernel debugger context, which requires kernel privileges. No userspace information leak here.",
+      "snippet": "case SCAUSE_BREAKPOINT:\n#ifdef KDTRACE_HOOKS\n\tif (dtrace_invop_jump_addr != NULL &&\n\t    dtrace_invop_jump_addr(frame) == 0)\n\t\tbreak;\n#endif\n#ifdef KDB\n\tkdb_trap(exception, 0, frame);\n#else\n\tdump_regs(frame);\n\tpanic(\"No debugger in kernel.\");\n#endif\n\tbreak;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/gdb_machdep.c",
+        "function_name": "gdb_cpu_signal",
+        "line_start": 128,
+        "line_end": 135,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "gdb_cpu_signal simply maps SCAUSE_BREAKPOINT to SIGTRAP for GDB protocol translation. It does not access or expose stval. Compliant.",
+      "snippet": "int\ngdb_cpu_signal(int type, int code)\n{\n\tif (type == SCAUSE_BREAKPOINT)\n\t\treturn (SIGTRAP);\n\treturn (SIGEMT);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "cpu_exception_handler_user / save_regs",
+        "line_start": 110,
+        "line_end": 111,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The assembly trap entry saves stval to the trapframe (TF_STVAL) unconditionally for all exceptions. This is the correct low-level behavior — the trapframe is a complete architectural state snapshot. The actual security decision (whether to expose stval to userspace) is made by higher-level C handlers (do_trap_user/do_trap_supervisor/vmmops_run), not at the save-site.",
+      "snippet": "csrr\tt0, stval\nsd\tt0, (TF_STVAL)(sp)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_unpriv_trap",
+        "line_start": 206,
+        "line_end": 220,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The vmm_unpriv_trap handler (for hlvx/hu page faults on hypervisor loads) saves stval to the hypctx trap structure. This is for unprivileged load emulation faults, which are page faults (not breakpoints), so stval is architecturally valid. Compliant for this specific context.",
+      "snippet": "csrr\ta1, stval\nsd\ta1, HYP_TRAP_STVAL(a0)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/db_trace.c",
+        "function_name": "db_stack_trace_cmd",
+        "line_start": 100,
+        "line_end": 103,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "DDB stack trace prints tf_stval for informational/debugging purposes within the kernel debugger. DDB requires kernel access (break-to-debugger or panic), so this is not a userspace exposure risk.",
+      "snippet": "db_printf(\"--- exception %ld, tval = %#lx\\n\",\n    tf->tf_scause & SCAUSE_CODE,\n    tf->tf_stval);",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

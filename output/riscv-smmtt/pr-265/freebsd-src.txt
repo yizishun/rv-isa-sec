@@ -1,0 +1,181 @@
+PR #265  target=freebsd-src  overall=potential_risk
+Spec: Spec removes well-defined fail-safe behavior for invalid msdcfg.SIDN—SEIP suppression and IMSIC-access traps are no longer guaranteed, shifting all SIDN-validation burden onto software and creating info-leak/undefined-behavior risk during context switch on implementations where invalid SIDN does not trap
+Violation:
+  FreeBSD kernel (or bhyve) writes an unimplemented supervisor interrupt
+  domain number into msdcfg.SIDN during context switch or domain selection.
+  Under the old spec text, this invalid SIDN guaranteed well-defined fail-safe
+  behavior (mip.SEIP=0, siselect/sireg raise illegal-instruction exceptions,
+  stopei raises illegal-instruction exception, hgeip/hgeie read-only 0,
+  msideip still visible for monitoring). Under the updated spec, these rules
+  are deleted, making behavior UNSPECIFIED: hardware may spuriously assert
+  SEIP, leak stale interrupt-pending state through siselect, or expose guest
+  interrupt file state rather than trapping.
+Consequence: info_leak
+Pattern:
+  write to msdcfg CSR without prior validation that SIDN field value ≤ maximum
+  implemented supervisor interrupt domain number; context-switch save/restore
+  of msdcfg that does not sanitize SIDN on restore path; RDSM/hypervisor
+  emulation code relying on deleted illegal-instruction-trap guarantee for
+  invalid-SIDN siselect/sireg/stopei access to intercept and emulate
+------------------------------------------------------------
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:228-229  vmmops_vcpu_init
+  Guest hstatus.VGEIN (bits 12:15, the hypervisor analogue of msdcfg.SIDN for
+  VS-mode) is implicitly initialized to 0 via bitmask omission—no explicit
+  validation that VGEIN ≤ maximum implemented guest interrupt file count.
+  Under the deleted spec guarantees, wrote '0' to an unimplemented domain was
+  fail-safe (hgeip/hgeie read-only 0). Now UNSPECIFIED.
+  | hypctx->guest_regs.hyp_hstatus = HSTATUS_SPV | HSTATUS_VTW;
+  | hypctx->guest_regs.hyp_hstatus |= HSTATUS_SPVP;
+  References:
+    - riscv-fast-interrupt/src/aclic.adoc:245-257
+      "An ACLIC system requires at most two domains. It only requires one
+      domain if M-mode but not S-mode has been implemented, and two
+      domains if M- and S-m"
+
+[potential_risk] sys/riscv/vmm/vmm_switch.S:68-74  vmm_switch (VM entry path)
+  Guest hstatus (including VGEIN field) is atomically swapped into hardware
+  CSR via csrrw on VM entry without any pre-validation of VGEIN against
+  maximum implemented guest interrupt file count. If a malicious guest OS
+  wrote an out-of-range VGEIN value to hstatus, the hardware will execute with
+  that value—behavior now UNSPECIFIED under the updated spec.
+  | ld      t1, (HYP_G_HSTATUS)(a0)
+  | ...
+  | csrrw   t1, hstatus, t1
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:171-173
+      "The behavior upon accessing sireg* from M-mode or S-mode, while
+      siselect holds a value that is not implemented at supervisor level,
+      is UNSPECIFIED."
+
+[potential_risk] sys/riscv/vmm/vmm_switch.S:161-174  vmm_switch (VM exit path)
+  On VM exit, host hstatus is restored via csrrw, and the guest's hstatus
+  value read back from hardware is saved to hypctx without VGEIN field
+  sanitization. Under the old spec, hardware was guaranteed to leave VGEIN
+  unchanged; under the new spec, hardware behavior with an invalid VGEIN is
+  UNSPECIFIED and may modify or poison the field.
+  | ld      t4, (HYP_H_HSTATUS)(a0)
+  | ...
+  | csrrw   t4, hstatus, t4
+  | ...
+  | sd      t4, (HYP_G_HSTATUS)(a0)
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:155-158  vmmops_delegate
+  hideleg unconditionally delegates IRQ_EXTERNAL_HYPERVISOR (bit 12) to the
+  guest without checking whether a valid IMSIC supervisor domain is
+  configured. Under old spec, invalid msdcfg.SIDN guaranteed mip.SEIP=0 making
+  this harmless. Under new spec, delegated external interrupt behavior is
+  UNSPECIFIED when the domain configuration is invalid.
+  | hideleg  = (1UL << IRQ_SOFTWARE_HYPERVISOR);
+  | hideleg |= (1UL << IRQ_TIMER_HYPERVISOR);
+  | hideleg |= (1UL << IRQ_EXTERNAL_HYPERVISOR);
+  | csr_write(hideleg, hideleg);
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:633-633  vmmops_run
+  hie is configured with HIE_VSEIE | HIE_VSSIE | HIE_SGEIE enabling virtual
+  supervisor external interrupts and guest external interrupts without
+  validating the guest interrupt file domain configuration. With the deleted
+  fail-safe guarantees, enabling SGEIE with an invalid VGEIN may expose
+  UNSPECIFIED hardware behavior on hgeip/hgeie.
+  | csr_write(hie, HIE_VSEIE | HIE_VSSIE | HIE_SGEIE);
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:584-599  riscv_sync_interrupts
+  hvip.VSEIP is synchronized based solely on virtual APLIC pending state,
+  assuming full software control over guest external interrupt signaling.
+  Under the deleted spec guarantees, hardware mip.SEIP was guaranteed 0 for
+  invalid SIDN. Under the new spec, hardware IMSIC may independently assert
+  SEIP for an invalid/ambiguous domain, creating a conflict with the VMM's
+  hvip state and potential spurious guest interrupts.
+  | pending = aplic_check_pending(hypctx);
+  | if (pending)
+  |     hypctx->guest_csrs.hvip |= HVIP_VSEIP;
+  | else
+  |     hypctx->guest_csrs.hvip &= ~HVIP_VSEIP;
+  | ...
+  | csr_write(hvip, hypctx->guest_csrs.hvip);
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:283-283  riscv_unpriv_read
+  During hlvx.hu unprivileged instruction fetch, host hstatus is temporarily
+  replaced with guest hstatus (including VGEIN) via csr_swap. Under old spec,
+  invalid guest VGEIN was harmless during this window. Under new spec, the
+  temporary VGEIN exposure during hlvx.hu execution may trigger UNSPECIFIED
+  IMSIC state side effects.
+  | old_hstatus = csr_swap(hstatus, hypctx->guest_regs.hyp_hstatus);
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:489-497  riscv_handle_world_switch
+  SCAUSE_ILLEGAL_INSTRUCTION exits are treated as fatal BOGUS with no CSR-
+  emulation path for siselect/sireg/stopei. The VMM implicitly relies on
+  hardware illegal-instruction traps to intercept guest access to these
+  CSRs—traps whose behavior is now 'recommended' rather than guaranteed for
+  unimplemented siselect values. If hardware silently permits access instead
+  of trapping, guest IMSIC CSR access bypasses VMM interception entirely.
+  | case SCAUSE_ILLEGAL_INSTRUCTION:
+  |     /*
+  |      * TODO: handle illegal instruction properly.
+  |      */
+  |     printf("%s: Illegal instruction at %lx ...", ...);
+  |     vmm_stat_incr(hypctx->vcpu, VMEXIT_UNHANDLED, 1);
+  |     vme->exitcode = VM_EXITCODE_BOGUS;
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:171-181
+      "The behavior upon accessing sireg* from M-mode or S-mode, while
+      siselect holds a value that is not implemented at supervisor level,
+      is UNSPECIFIED. NO"
+
+[potential_risk] sys/riscv/vmm/vmm_instruction_emul.c:60-86  vmm_emulate_instruction
+  The VMM instruction emulator handles only load/store MMIO emulation. No CSR
+  emulation exists for siselect, sireg, or stopei. If a guest accesses these
+  CSRs with a valid SIDN (causing them to execute rather than trap), the VMM
+  has no interception path. If the access traps (as recommended), the VMM's
+  SCAUSE_ILLEGAL_INSTRUCTION handler treats it as fatal.
+  | int
+  | vmm_emulate_instruction(struct vcpu *vcpu, uint64_t gpa, struct vie *vie, ...)
+  | {
+  |     // Only handles load/store to MMIO GPA, not CSR emulation
+  |     if (vie->dir == VM_DIR_READ) {
+  |         error = memread(vcpu, gpa, &val, vie->access_size, memarg);
+
+[not_implemented] sys/riscv/riscv/locore.S:65-94  _alt_start
+  FreeBSD kernel entry point does not configure msdcfg. The kernel inherits
+  whatever msdcfg.SIDN value firmware (OpenSBI) left. msdcfg is an M-mode CSR
+  inaccessible from S-mode, so the kernel cannot directly write it. However,
+  the kernel has no mechanism to verify or sanitize the inherited state. This
+  is not_implemented because the S-mode kernel has no code path that writes
+  msdcfg.
+  | ENTRY(_alt_start)
+  |     ...
+  |     /* No CSR configuration beyond stvec, sscratch, satp */
+
+[not_implemented] sys/riscv/riscv/intc.c:208-208  intc_enable_intr
+  SIE_SEIE is set unconditionally via csr_set(sie, 1ul << irq) for
+  IRQ_EXTERNAL_SUPERVISOR (bit 9). The kernel has no code to validate that the
+  IMSIC supervisor interrupt domain is configured before enabling external
+  interrupts. However, since the APLIC driver (aplic.c:455-458) rejects IMSIC-
+  based setups, on current FreeBSD-supported hardware this path always uses
+  APLIC direct delivery mode where msdcfg.SIDN is irrelevant.
+  | csr_set(sie, 1ul << irq);
+
+[not_implemented] sys/riscv/riscv/trap.c:318-322  do_trap_supervisor
+  All interrupts including external (scause=9) are dispatched through
+  intr_irq_handler() without any msdcfg.SIDN domain validation or IMSIC state
+  verification. The kernel implicitly trusts that firmware configured a valid
+  supervisor interrupt domain. This is not_implemented because the kernel has
+  no msdcfg-related code to audit.
+  | exception = frame->tf_scause & SCAUSE_CODE;
+  | if ((frame->tf_scause & SCAUSE_INTR) != 0) {
+  |     /* Interrupt */
+  |     intr_irq_handler(frame, INTR_ROOT_IRQ);
+  |     return;
+  | }
+
+[potential_risk] sys/riscv/vmm/vmm_riscv.c:162-177  vmmops_vcpu_restore_csrs
+  On VM resume, guest CSRs (vsstatus, vsie, vstvec, vsscratch, vsepc, vscause,
+  vstval, hvip, vsatp) are restored without corresponding hstatus.VGEIN
+  sanitization. The hstatus restore happens separately in assembly
+  (vmm_switch.S), but there is no C-level validation gate between CSR restore
+  and VM entry that checks VGEIN ≤ max implemented guest interrupt files.
+  | csr_write(vsstatus, csrs->vsstatus);
+  | csr_write(vsie, csrs->vsie);
+  | csr_write(vstvec, csrs->vstvec);
+  | ...
+  | csr_write(vsatp, csrs->vsatp);
+

@@ -1,0 +1,174 @@
+{
+  "pr_number": 80,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 80,
+    "violation_condition": "In the FreeBSD kernel, when Sspmpsw is implemented, a context switch writes sspmpswitch to activate the incoming thread's SPMP entries and deactivate the outgoing thread's entries, but the code path omits the mandatory SFENCE.VMA (rs1=x0, rs2=x0) after the CSR write — allowing subsequent S-mode memory accesses (load/store/instruction fetch) to be reordered before the sspmpswitch write takes effect.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "csrw sspmpswitch.*(?!SFENCE\\.VMA|sfence_vma)|writes to sspmpswitch CSR not immediately followed by SFENCE.VMA with rs1=x0 and rs2=x0 before any subsequent load, store, or instruction fetch in the same code path",
+    "affected_entities": [
+      "sspmpswitch",
+      "sspmpswitchh"
+    ],
+    "summary": "Writes to sspmpswitch during SPMP context switch require a subsequent SFENCE.VMA(x0, x0) fence to order SPMP entry activation with memory accesses; omitting it creates a window where the old thread's memory protections are lifted before the new thread's are enforced, enabling cross-process memory access"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/include/encoding.h",
+        "function_name": "(CSR address constants, global scope)",
+        "line_start": 589,
+        "line_end": 1100,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "No SPMP CSR address constants defined. Only M-mode PMP CSRs (CSR_PMPCFG0-3 at 0x3a0, CSR_PMPADDR0-15 at 0x3b0) exist. Missing: CSR_SISELECT (0x150), CSR_SIREG (0x151), CSR_SIREG2 (0x152), CSR_SPMPCFG0-3 (0x1a0), CSR_SPMPADDR0-15 (0x1b0), CSR_SSPMPSWITCH, CSR_SSPMPSWITCHH, CSR_MENVCFG (0x30a), CSR_SENVCFG (0x10a), CSR_MSECCFG (0x747). Without CSR address constants, no code can reference sspmpswitch — the vulnerability pattern of 'csrw sspmpswitch not followed by SFENCE.VMA' cannot occur.",
+      "snippet": "#define CSR_PMPCFG0 0x3a0\n#define CSR_PMPCFG1 0x3a1\n#define CSR_PMPCFG2 0x3a2\n#define CSR_PMPCFG3 0x3a3\n#define CSR_PMPADDR0 0x3b0\n// ... PMPADDR1-15 continue to 0x3bf\n// No SPMP CSR constants exist anywhere in this file",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "(HENVCFG bit definitions, global scope)",
+        "line_start": 176,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "HENVCFG bit definitions include STCE (bit 63), PBMTE (bit 62), CBZE/CBCFE/CBIE (bits 4-7), FIOM (bit 0). Missing: HENVCFG_SSE (bit 3) which controls SPMP enable for VS-mode. Also entirely absent: MENVCFG_SSE, SENVCFG_SSE, and all MENVCFG/SENVCFG bit definitions. Without the SSE bit, no privilege level can enable SPMP.",
+      "snippet": "#define HENVCFG_STCE   (1ULL << 63)\n#define HENVCFG_PBMTE  (1ULL << 62)\n#define HENVCFG_CBZE   (1ULL << 7)\n#define HENVCFG_CBCFE  (1ULL << 6)\n#define HENVCFG_CBIE   (0x3ULL << 4)\n#define HENVCFG_FIOM   (1ULL << 0)\n// Missing: HENVCFG_SSE (bit 3)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/identcpu.c",
+        "function_name": "identify_cpu",
+        "line_start": 92,
+        "line_end": 97,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "ISA extension detection defines smode_extensions bitmap with SV_SSTC, SV_SVNAPOT, SV_SVPBMT, SV_SVINVAL, SV_SSCOFPMF. No slot for Smspmp, Sspmp, Sspmpss, Smnpm, Ssnpm, or Smepmp. The kernel cannot discover whether hardware supports SPMP.",
+      "snippet": "static const struct isa_ext smode_extensions[] = {\n    ISA_EXT(SV_SSTC),\n    ISA_EXT(SV_SVNAPOT),\n    ISA_EXT(SV_SVPBMT),\n    ISA_EXT(SV_SVINVAL),\n    ISA_EXT(SV_SSCOFPMF),\n    // No SPMP-related extension slot",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/pmap.c",
+        "function_name": "pmap_activate_sw",
+        "line_start": 5177,
+        "line_end": 5200,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "pmap_activate_sw() handles address-space switching: csr_write(satp, ...) at line 5187, then CPU_SET/CPU_CLR/PCPU_SET bookkeeping (loads/stores, lines 5189-5197), then sfence_vma() at line 5199. No SPMP context-switch logic exists. No sspmpswitch CSR write exists to evaluate for the SFENCE.VMA ordering requirement. The existing sfence_vma() would cover SPMP visibility IF sspmpswitch were written before it — but no such write exists.",
+      "snippet": "csr_write(satp, pmap->pm_satp);\n\nhart = PCPU_GET(hart);\nCPU_SET_ATOMIC(hart, &pmap->pm_active);\nCPU_CLR_ATOMIC(hart, &oldpmap->pm_active);\nPCPU_SET(curpmap, pmap);\n\nsfence_vma();",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fork_trampoline",
+        "line_start": 365,
+        "line_end": 431,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "fork_trampoline is the new-process entry to U-mode. Calls fork_exit() (line 369), restores sstatus/sepc/GPRs/sscratch, then sret (line 431). No sfence.vma appears before sret. If SPMP were implemented and fork_exit() configured thread-specific SPMP entries, the sret would lack the required fence before entering U-mode. Currently harmless because no SPMP configuration occurs.",
+      "snippet": "call _C_LABEL(fork_exit)\n/* Restore sstatus */\ncsrw sstatus, t0\n/* Restore exception program counter */\ncsrw sepc, t0\n/* ... GPR restore ... */\ncsrw sscratch, sp\nsret",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "cpu_exception_handler_user",
+        "line_start": 227,
+        "line_end": 235,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "User trap-return path: do_trap_user → do_ast → load_registers → sret. No sfence.vma in this path. If do_trap_user/do_ast were to reprogram SPMP (e.g., during preemption or signal delivery), the sret would execute without the SPMP visibility fence. load_registers performs CSR writes (sstatus, sepc, sscratch) and GPR loads but no sfence.vma. Currently harmless because no SPMP manipulation occurs.",
+      "snippet": "ENTRY(cpu_exception_handler_user)\n    save_registers 0\n    mv a0, sp\n    call _C_LABEL(do_trap_user)\n    do_ast\n    load_registers 0\n    csrrw sp, sscratch, sp\n    sret",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "cpu_exception_handler_supervisor",
+        "line_start": 219,
+        "line_end": 225,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Supervisor trap-return path: do_trap_supervisor → load_registers → sret. No sfence.vma in this path. If do_trap_supervisor were to reprogram SPMP, the sret would lack the required fence. Currently harmless because no SPMP manipulation occurs.",
+      "snippet": "ENTRY(cpu_exception_handler_supervisor)\n    save_registers 1\n    mv a0, sp\n    call _C_LABEL(do_trap_supervisor)\n    load_registers 1\n    sret",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_restore_csrs",
+        "line_start": 161,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Restores guest VM CSRs: vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, hvip, vsatp. No SFENCE.VMA follows the vsatp write (line 176) — a pre-existing gap. Also, the senvcfg field in struct hypcsr (riscv.h:67) exists but is never written here. If SPMP were added, any sspmpswitch write here would also be unfenced, and the guest's SPMP enable state would be lost across VM exit/entry.",
+      "snippet": "csr_write(vsstatus, csrs->vsstatus);\ncsr_write(vsie, csrs->vsie);\n// ... other CSR writes ...\ncsr_write(vsatp, csrs->vsatp);\n} // No SFENCE.VMA after vsatp; no sspmpswitch write",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_save_csrs",
+        "line_start": 179,
+        "line_end": 195,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Saves guest CSRs on VM exit but does not read vsenvcfg (missing at line 194). If guest sets senvcfg.SSE to enable SPMP for VS-mode, that state is silently discarded. The stored hypcsr.senvcfg field (riscv.h:67) remains stale/zero, and vmmops_vcpu_restore_csrs never writes senvcfg — so guest SPMP enable state is lost across VM exit.",
+      "snippet": "csrs->vsstatus = csr_read(vsstatus);\ncsrs->vsie = csr_read(vsie);\n// ... other CSR reads ...\ncsrs->vsatp = csr_read(vsatp);\n} // Missing: csrs->senvcfg = csr_read(vsenvcfg)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_run",
+        "line_start": 628,
+        "line_end": 677,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "VMM guest entry sequence: hfence_gvma() (G-stage only) → csr_write(hgatp, ...) → csr_write(henvcfg, HENVCFG_STCE) (SSE bit never set) → vmmops_vcpu_restore_csrs (restores vsatp without SFENCE.VMA) → vmm_fence_process (no SPMP fence type) → vmm_switch. henvcfg.SSE is never set, so even if hardware supports SPMP, the hypervisor never enables it for VS-mode. No SFENCE.VMA or HFENCE.VVMA for VS-stage state.",
+      "snippet": "hfence_gvma();\ncsr_write(hgatp, pmap->pm_satp);\nif (has_sstc)\n    csr_write(henvcfg, HENVCFG_STCE);  // SSE bit (bit 3) never set\n// ...\nvmmops_vcpu_restore_csrs(hypctx);  // restores vsatp, no SFENCE.VMA\n// ...\nvmm_switch(hypctx);  // enters guest, zero fence instructions in vmm_switch.S",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 41,
+        "line_end": 204,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Host↔guest world-switch in assembly. Performs atomic CSR swaps for sstatus, hstatus, scounteren, sscratch, stvec, sepc (lines 73-78), loads all guest GPRs (lines 86-118), executes sret (line 120) into the guest VM. Contains ZERO fence instructions — no sfence.vma, no hfence.gvma, no hfence.vvma. All fences must be provided by the caller. If sspmpswitch were written in vmmops_vcpu_restore_csrs (called before vmm_switch), the guest's first instruction fetch and all subsequent loads/stores could observe stale SPMP state.",
+      "snippet": "/* Atomic CSR swaps */\n// sstatus, hstatus, scounteren, sscratch, stvec, sepc\n/* Load guest GPRs */\n// t0-t6, s0-s11, a0-a7, ra, gp, tp, sp\nsret  // No fence instruction anywhere in this function",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_fence.c",
+        "function_name": "vmm_fence_process_one",
+        "line_start": 85,
+        "line_end": 154,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "VMM fence queue system only handles FENCE_I (line 135) and FENCE_VMA/FENCE_VMA_ASID (lines 95-121). Enum vmm_fence_type (riscv.h:70-75) defines only VMM_RISCV_FENCE_I, VMM_RISCV_FENCE_VMA, VMM_RISCV_FENCE_VMA_ASID. vmm_fence_process() processes FENCE_REQ_I and FENCE_REQ_VMA. No VMM_RISCV_FENCE_SPMP type, no HFENCE.VVMA support, no infrastructure to synchronize guest SPMP visibility across vCPUs. The KASSERT at line 95 only accepts VMA and VMA_ASID fence types.",
+      "snippet": "KASSERT(type == VMM_RISCV_FENCE_VMA ||\n        type == VMM_RISCV_FENCE_VMA_ASID,\n        (\"%s: invalid fence type %d\",\n        __func__, type));\n// No SPMP fence type exists",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

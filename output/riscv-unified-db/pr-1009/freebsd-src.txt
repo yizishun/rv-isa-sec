@@ -1,0 +1,227 @@
+PR #1009  target=freebsd-src  overall=not_implemented
+Spec: Zicfiss shadow stack CSR (ssp) must be saved/restored on FreeBSD context switch and populated on signal delivery, or cross-process shadow stack corruption enables ROP-based privilege escalation bypassing CFI
+Violation:
+  When Zicfiss is enabled (menvcfg.SSE=1) but the FreeBSD kernel context
+  switch path (cpu_switch() / savectx() in sys/riscv/riscv/swtch.S) does not
+  save and restore the ssp CSR (address 0x011), causing the shadow stack
+  pointer to bleed between processes. Additionally, when the kernel signal
+  delivery path (sendsig() in sys/riscv/riscv/machdep.c) sets up a signal
+  frame without pushing the intercepted return address onto the shadow stack,
+  then upon sigreturn the sspopchk instruction raises an unhandled
+  SoftwareCheck (exception code 18) whose lack of a trap handler entry causes
+  a kernel panic.
+Consequence: privilege_escape
+Pattern:
+  \b(cpu_switch|savectx|pcb)\b.*|ssp(?!ush|opchk|rdp)
+------------------------------------------------------------
+[not_implemented] sys/riscv/include/pcb.h:42-54  struct pcb
+  The PCB structure has no pcb_ssp field. When Zicfiss is enabled
+  (menvcfg.SSE=1), the shadow stack pointer (ssp CSR, address 0x011) cannot be
+  saved/restored per-thread, causing ssp to bleed between processes on context
+  switch. The structure only holds ra, sp, gp, tp, s[12], FPU state, and
+  fpflags — no shadow-stack-related fields exist.
+  | struct pcb {
+  |     uint64_t    pcb_ra;         /* Return address */
+  |     uint64_t    pcb_sp;         /* Stack pointer */
+  |     uint64_t    pcb_gp;         /* Global pointer */
+  |     uint64_t    pcb_tp;         /* Thread pointer */
+  |     uint64_t    pcb_s[12];      /* Saved registers */
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:410-416
+      "[#norm:ssp_op]#The ssp CSR is an unprivileged read-write (URW) CSR
+      that reads and writes XLEN low order bits of the shadow stack
+      pointer.# [#norm:ssp_"
+    - riscv-isa-manual/src/priv/cfi.adoc:145-164
+      "xSSE determines whether shadow stack is enabled: S/HS mode →
+      menvcfg.SSE; VS mode → henvcfg.SSE; U/VU mode → senvcfg.SSE."
+
+[not_implemented] sys/riscv/riscv/swtch.S:258-357  cpu_switch
+  cpu_switch saves/restores ra, sp, s0-s11 and FPU state via PCB, but does not
+  save or restore the ssp CSR. When Zicfiss is enabled and a user process uses
+  shadow stacks, the ssp value from the outgoing thread will persist into the
+  incoming thread's execution, violating per-process shadow stack isolation.
+  | /* Store ra, sp and the callee-saved registers */
+  | sd  ra, (PCB_RA)(x13)
+  | sd  sp, (PCB_SP)(x13)
+  | /* s[0-11] */
+  | sd  s0, (PCB_S + 0 * 8)(x13)
+  | ...
+  | /* No ssp save/restore anywhere */
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:128-143
+      "Access to ssp depends on envcfg.SSE: when menvcfg.SSE=1 and
+      senvcfg.SSE=1, U-mode access to ssp is permitted. The OS must
+      save/restore ssp across cont"
+    - riscv-isa-manual/src/unpriv/cfi.adoc:849-899
+      "When switching stacks, the program needs to additionally switch the
+      shadow stack pointer. The pointer to the top of the deactivated
+      shadow stack may b"
+
+[not_implemented] sys/riscv/riscv/swtch.S:434-457  savectx
+  savectx saves ra, sp, tp, gp, s0-s11, and FPU state to PCB but does not save
+  ssp. This function is used for forking and core dumps — without ssp, the
+  shadow stack pointer is lost on fork, and a child process inheriting the
+  parent's shadow stack pointer would corrupt the parent's shadow stack on
+  first sspush.
+  | ENTRY(savectx)
+  |     sd  ra, (PCB_RA)(a0)
+  |     sd  sp, (PCB_SP)(a0)
+  |     sd  tp, (PCB_TP)(a0)
+  |     sd  gp, (PCB_GP)(a0)
+  |     /* s[0-11] saved, no ssp save */
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:410-416
+      "The ssp CSR is an unprivileged read-write (URW) CSR at address
+      0x011. Bits 1:0 are read-only zero."
+
+[not_implemented] sys/riscv/riscv/swtch.S:206-248  cpu_throw
+  cpu_throw restores registers from PCB for a new thread (similar to
+  cpu_switch restore path). Does not restore ssp. A newly scheduled thread
+  will inherit whatever ssp value was left in the hardware CSR by the previous
+  thread.
+  | /* cpu_throw restores ra, sp, s0-s11 from PCB */
+  | /* No ssp restore — new thread gets stale ssp */
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:145-164
+      "When xSSE=1 (shadow stack enabled for current privilege), ssp is
+      active and must be managed by the OS on context switch."
+
+[not_implemented] sys/riscv/riscv/exec_machdep.c:336-413  sendsig
+  sendsig constructs a signal frame on the user stack and sets tf_sepc to the
+  signal handler and tf_ra to the sigcode trampoline. It does NOT push the
+  intercepted return address onto the shadow stack via sspush. When Zicfiss is
+  enabled, the sigcode trampoline's sspopchk instruction will raise a
+  SoftwareCheck exception (cause=18) because the return address was not pushed
+  onto the shadow stack before delivering the signal.
+  | tf->tf_sepc = (register_t)catcher;
+  | tf->tf_sp = (register_t)fp;
+  | /* tf_ra set to sigcode trampoline — but no sspush of return address */
+  | if (PROC_HAS_SHP(p))
+  |     tf->tf_ra = (register_t)PROC_SIGCODE(p);
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:608-617
+      "[#norm:sspop_exception] If the value loaded from the address in ssp
+      does not match the value in rs1, a software-check exception
+      (cause=18) is raised w"
+
+[not_implemented] sys/riscv/riscv/exec_machdep.c:317-334  sys_sigreturn
+  sys_sigreturn restores the user context from the signal frame via
+  set_mcontext() but does not restore ssp. After sigreturn, the shadow stack
+  pointer is left at whatever position the signal handler left it, not at the
+  position expected for the resumed execution context.
+  | /* Restore signal mask. */
+  | kern_sigprocmask(td, SIG_SETMASK, &uc.uc_sigmask, NULL, 0);
+  | return (EJUSTRETURN);
+  | /* No ssp restoration from mcontext */
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:718-763
+      "A program that uses shadow stacks must unwind the shadow stack in
+      addition to the stack used to store data... setjmp() saves current
+      ssp to jmp_buf; l"
+
+[not_implemented] sys/riscv/riscv/exec_machdep.c:205-228  get_mcontext
+  get_mcontext copies trapframe registers into mcontext_t but does not read or
+  store the ssp CSR. The mcontext_t structure (static-asserted at 864 bytes on
+  line 74) has no field for ssp. Signal frames and core dumps lose shadow
+  stack state.
+  | /* Copies tf_ra, tf_sp, tf_gp, tf_tp, tf_t[], tf_s[], tf_a[], tf_sepc */
+  | /* No ssp captured into mcontext */
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:410-416
+      "The ssp CSR is an unprivileged read-write (URW) CSR at address
+      0x011."
+
+[not_implemented] sys/riscv/riscv/exec_machdep.c:230-262  set_mcontext
+  set_mcontext restores trapframe registers from mcontext_t but does not write
+  the ssp CSR. After sigreturn or context restore, the thread's shadow stack
+  pointer is not restored to the saved value.
+  | /* Restores tf_ra, tf_sp, tf_gp, tf_tp, tf_t[], tf_s[], tf_a[], tf_sepc, tf_sstatus */
+  | /* No ssp restoration from mcontext */
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:410-416
+      "The ssp CSR is an unprivileged read-write (URW) CSR at address
+      0x011."
+
+[not_implemented] sys/riscv/riscv/trap.c:410-459  do_trap_user
+  do_trap_user's switch statement handles scause values 0-15, 20-23 but has no
+  case for scause=18 (Software Check exception). When Zicfiss is enabled and
+  sspopchk raises a shadow stack fault, the exception falls to the default
+  case which calls panic(), crashing the kernel. The fault should instead be
+  translated to a SIGSEGV sent to the offending user process.
+  | switch (exception) {
+  |     case SCAUSE_LOAD_ACCESS_FAULT: ...
+  |     /* ... cases 0-15, 20-23 ... */
+  |     default:
+  |         dump_regs(frame);
+  |         panic("Unknown userland exception %#lx, trap value %#lx",
+  |             exception, frame->tf_stval);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1896-1896
+      "18 | Software check  — synchronous exception triggered when there
+      are violations of checks and assertions defined by ISA extensions
+      that aim to safegu"
+    - riscv-isa-manual/src/unpriv/cfi.adoc:608-612
+      "[#norm:sspop_exception] If the value loaded from the address in ssp
+      does not match the value in rs1, a software-check exception
+      (cause=18) is raised w"
+
+[not_implemented] sys/riscv/riscv/trap.c:372-376  do_trap_supervisor
+  do_trap_supervisor likewise has no SCAUSE_SOFTWARE_CHECK handler. A shadow
+  stack violation in kernel mode (unlikely but possible via corrupted ssp or
+  kernel shadow stack) would panic the kernel with 'Unknown kernel exception'.
+  | default:
+  |     dump_regs(frame);
+  |     panic("Unknown kernel exception %#lx trap value %#lx",
+  |         exception, frame->tf_stval);
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:685-703
+      "Supervisor-level exception codes include 18 = Software check."
+
+[not_implemented] sys/riscv/include/riscvreg.h:40-58  (SCAUSE definitions)
+  SCAUSE exception code definitions skip from 15 (STORE_PAGE_FAULT) to 20
+  (FETCH_GUEST_PAGE_FAULT). SCAUSE_SOFTWARE_CHECK (18) is not defined. No
+  MENVCFG, SENVCFG, or HENVCFG SSE bit (bit 3) is defined. The kernel has no
+  symbolic constants for Zicfiss-related CSRs or bits.
+  | #define SCAUSE_STORE_PAGE_FAULT      15
+  | /* SCAUSE 16-19: Double trap (16), Reserved (17), Software check (18), Hardware error (19) — all missing */
+  | #define SCAUSE_FETCH_GUEST_PAGE_FAULT 20
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1896-1896
+      "18 | Software check"
+    - riscv-isa-manual/src/priv/supervisor.adoc:955-964
+      "The SSE field (bit 3) in senvcfg activates Zicfiss for VU/U-mode.
+      When menvcfg.SSE=1, the SSE field in senvcfg controls U-mode shadow
+      stack enablement"
+
+[not_implemented] sys/riscv/riscv/identcpu.c:209-236  parse_ext_z
+  parse_ext_z recognizes zicbom, zicboz, zicbop but not zicfiss. The kernel
+  has no mechanism to detect Zicfiss hardware support. Without detection, the
+  kernel cannot conditionally enable menvcfg.SSE or configure per-thread
+  shadow stacks.
+  | CHECK_Z_EXT("zicbom",  Z_ZICBOM);
+  | CHECK_Z_EXT("zicboz",  Z_ZICBOZ);
+  | CHECK_Z_EXT("zicbop",  Z_ZICBOP);
+  | /* No CHECK_Z_EXT("zicfiss", Z_ZICFISS) */
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2302-2313
+      "[#norm:menvcfg_sse_op_lead-in] The Zicfiss extension adds the SSE
+      field to menvcfg. When the SSE field is set to 1 the Zicfiss
+      extension is activated "
+
+[not_implemented] sys/riscv/riscv/sigtramp.S:48-61  sigcode
+  The sigcode trampoline simply calls sigreturn(2) via ecall. When Zicfiss is
+  enabled, user mode's ra has been pushed onto the shadow stack (by hardware
+  or sspush), but the trampoline does not perform sspopchk to validate the
+  return address before jumping to it. The signal-return path has no shadow
+  stack integration.
+  | mv  a0, sp
+  | addi a0, a0, SF_UC
+  | li  t0, SYS_sigreturn
+  | ecall
+  | /* No sspopchk before returning to intercepted code */
+  References:
+    - riscv-isa-manual/src/unpriv/cfi.adoc:608-617
+      "sspopchk validates that the value at ssp matches rs1. If not,
+      software-check exception (cause=18) is raised."
+

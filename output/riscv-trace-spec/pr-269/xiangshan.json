@@ -1,0 +1,95 @@
+{
+  "pr_number": 269,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 269,
+    "violation_condition": "XiangShan hardware trace encoder (TraceEncoder module) generates data trace packets using the old v2.0 format field encoding (3-bit format: 000/001/010/011/100/101/110) while an external trace decoder expects the MMA/CAS extension format (variable 0/1/2-bit format: 00=load/store, 01=multi-memory-access, 10=atomic/CSR, 11=split-load-data) — or vice versa. Additionally, the subtype field width mismatch (old: 2-3 bits, new subformat: 2 bits for load/store, 4 bits for atomic/CSR) causes bit-level misalignment of all subsequent fields (size, diff, data, address), completely corrupting the decoded trace stream.",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "TraceEncoder.*format.*Cat\\(|te_data.*format.*UInt|data_trace.*packet.*encode|trTeData.*packet|EfficientTrace.*packet.*format|dtype.*encoding|TraceEncoderModule",
+    "affected_entities": [
+      "TraceEncoder",
+      "trTeDataControl",
+      "te_data_packet",
+      "format_field",
+      "subformat_field",
+      "subtype_field"
+    ],
+    "summary": "MMA/CAS extension restructures data trace packet format/subformat fields with different bit widths and encodings from v2.0; hardware trace encoder implementing mismatched format version produces bit-level decoding failures across all trace packet fields"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/trace/Trace.scala",
+        "function_name": "Trace (module)",
+        "line_start": 28,
+        "line_end": 65,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The XiangShan Trace module implements the RISC-V Processor Trace Specification V1.0 core interface (TraceCoreInterface), producing structured trace groups (iaddr, itype, iretire, ilastsize, priv, trap) at its output boundary. It does NOT contain any data trace packet encoding logic — no TraceEncoder module, no format field (000/001/010/...), no dtype encoding, no load/store/atomic/CSR data trace generation. The actual packet formatting (including MMA/CAS extension format fields) is offloaded to an external encoder downstream of the TraceCoreInterface. The vulnerability condition (v2.0 format vs MMA/CAS format mismatch in a TraceEncoder) describes a component that does not exist in this codebase.",
+      "snippet": "class Trace(implicit val p: Parameters) extends Module with HasXSParameter {\n  val io = IO(new TraceIO)\n  ...\n  // stage 3: groups with iaddr from pcMem(ftqidx & ftqOffset -> iaddr) -> encoder\n  val s3_out_groups = RegNext(s3_in_groups)\n  toPcMem := s3_in_groups\n  io.out.toEncoder := s3_out_groups\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/trace/Interface.scala",
+        "function_name": "TraceCoreInterface",
+        "line_start": 42,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The TraceCoreInterface defines only instruction-trace-relevant signals: priv, mstatus, trap (cause/tval), and groups containing iaddr, itype, iretire, ilastsize. There are no data trace signals (no dtype, no data value, no address for load/store data, no format field). This interface follows the RISC-V Processor Trace V1.0 core interface format, not the Efficient Trace v2.0 data trace packet encoding that the security spec references. The MMA/CAS data trace format encoding vulnerability is inapplicable — the interface does not carry data trace information at all.",
+      "snippet": "class TraceCoreInterface(hasOffset: Boolean = false)(implicit val p: Parameters) extends Bundle with HasXSParameter {\n  val fromEncoder = Input(new Bundle {\n    val enable = Bool()\n    val stall  = Bool()\n  })\n  val toEncoder = Output(new Bundle {\n    val priv   = Priv()\n    val mstatus = UInt(XLEN.W)\n    val trap   = new Bundle{\n      val cause = UInt(CauseWidth.W)\n      val tval  = UInt(TvalWidth.W)\n    }\n    val groups = Vec(TraceGroupNum, ValidIO(new Bundle{\n      val iaddr     = UInt(IaddrWidth.W)\n      val itype     = UInt(ItypeWidth.W)\n      val iretire   = UInt(IretireWidthCompressed.W)\n      val ilastsize = UInt(IlastsizeWidth.W)\n    }))\n  })\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/trace/Interface.scala",
+        "function_name": "Itype (object)",
+        "line_start": 64,
+        "line_end": 121,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The Itype encodings correctly match the RISC-V Efficient Trace Spec v2.0 Table 4.4 transfer type definitions as reproduced in the Smctr specification (smctr.adoc lines 574-596): None=0, Exception=1, Interrupt=2, ExpIntReturn=3, NonTaken=4, Taken=5, reserved=6, reserved=7, UninferableCall=8, InferableCall=9, UninferableTailCall=10, InferableTailCall=11, CoRoutineSwap=12, FunctionReturn=13, OtherUninferableJump=14, OtherInferableJump=15. The jumpTypeGen function correctly classifies JAL/JALR/branch instructions using rd/rs link register detection matching the spec opcode table.",
+      "snippet": "object Itype extends NamedUInt(4) {\n  def None                 = 0.U\n  def Exception            = 1.U\n  def Interrupt            = 2.U\n  def ExpIntReturn         = 3.U\n  def NonTaken             = 4.U\n  def Taken                = 5.U\n  def UninferableJump      = 6.U\n  def reserved             = 7.U\n  def UninferableCall      = 8.U\n  def InferableCall        = 9.U\n  def UninferableTailCall  = 10.U\n  def InferableTailCall    = 11.U\n  def CoRoutineSwap        = 12.U\n  def FunctionReturn       = 13.U\n  def OtherUninferableJump = 14.U\n  def OtherInferableJump   = 15.U",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 574,
+          "line_end": 596,
+          "excerpt": "Control Transfer Type Definitions: 0=Not used by CTR, 1=Exception, 2=Interrupt, 3=Trap return, 4=Not-taken branch, 5=Taken branch, 6=reserved, 7=reserved, 8=Indirect call, 9=Direct call, 10=Indirect jump (without linkage), 11=Direct jump (without linkage), 12=Co-routine swap, 13=Function return, 14=Other indirect jump (with linkage), 15=Other direct jump (with linkage)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/trace/TraceBuffer.scala",
+        "function_name": "TraceBuffer (enqueue/compress logic)",
+        "line_start": 30,
+        "line_end": 46,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The TraceBuffer correctly compresses consecutive trace entries where intermediate instructions have itype=None (uninteresting). It accumulates iretire counts and propagates ftqIdx/ftqOffset from the preceding meaningful entry. This follows the spec definition that only control-transfer instructions should produce trace records — non-branch instructions (itype=None) are compressed away.",
+      "snippet": "for(i <- 0 until CommitWidth) {\n  val rightHasValid = if(i == CommitWidth - 1) false.B  else (inValidVec.asUInt(CommitWidth-1, i+1).orR)\n  needPcVec(i) := inValidVec(i) & (inTypeIsNotNoneVec(i) || !rightHasValid) & !blockCommit\n}\n...\nfor(i <- 1 until CommitWidth){\n  when(!needPcVec(i-1)){\n    blocksUpdate(i).bits.tracePipe.iretire := blocksUpdate(i - 1).bits.tracePipe.iretire + io.in.fromRob.blocks(i).bits.tracePipe.iretire\n    blocksUpdate(i).bits.ftqOffset.get := blocksUpdate(i - 1).bits.ftqOffset.get\n    blocksUpdate(i).bits.ftqIdx.get := blocksUpdate(i - 1).bits.ftqIdx.get\n  }\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/trace/Interface.scala",
+        "function_name": "Priv (object)",
+        "line_start": 151,
+        "line_end": 158,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The Priv enum encoding (HU=0, HS=1, M=3, D=4, VU=5, VS=6) skips value 2 between HS(1) and M(3). While this matches the RISC-V privilege mode encodings (U=0, S=1, H=2, M=3, VU=5, VS=6) with H(2) corresponding to the hypervisor-specific state that might not need a distinct trace encoding, the priv field in XiangShan's TraceCoreInterface uses only 3 bits — but the rocket-chip reference TraceCoreInterface uses 4 bits for priv. If an external encoder expects a 4-bit priv field, this 3-bit encoding could cause misalignment at the encoder input boundary. However, since the actual downstream encoder is external to XiangShan, this is a potential integration risk rather than a confirmed bug.",
+      "snippet": "object Priv extends NamedUInt(3) {\n  def HU = 0.U\n  def HS = 1.U\n  def M  = 3.U\n  def D  = 4.U\n  def VU = 5.U\n  def VS = 6.U\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

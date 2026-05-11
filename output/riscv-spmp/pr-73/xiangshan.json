@@ -1,0 +1,330 @@
+{
+  "pr_number": 73,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 73,
+    "violation_condition": "The spec now removes the sentence 'Modifications to locked spmpcfg[i] and spmpaddr[i] registers are only permitted through execution environment access via miselect.' If XiangShan RTL still implements a write path via miselect (or any other M-mode CSR access mechanism) that bypasses the L-bit lock on SPMP entries, the hardware allows modification of locked entries that should be immutable—violating the revised specification that no longer carves out a miselect bypass.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "mis.*lect.*spmp|miselect.*write.*spmpcfg|miselect.*spmpaddr|spmp.*lock.*bypass|spmpcfg_i_lock.*ignore|L_bit.*miselect",
+    "affected_entities": [
+      "spmpcfg",
+      "spmpaddr",
+      "siselect",
+      "miselect",
+      "sireg",
+      "sireg2"
+    ],
+    "summary": "Removal of the miselect bypass for locked SPMP entries means M-mode must not be able to silently unlock/modify S-mode-locked SPMP rules; any remaining miselect write path to locked spmpcfg/spmpaddr in RTL constitutes a hardware privilege escape"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRIND.scala",
+        "function_name": "mireg2/mireg3/mireg4/mireg5/mireg6 (CSRIND trait)",
+        "line_start": 17,
+        "line_end": 40,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All mireg2-6 are ZeroFieldBundle stubs: regOut := 0.U, writes silently dropped. The Smpmpind indirect data registers through which miselect->spmpcfg/spmpaddr writes would be routed are entirely non-functional. No miselect bypass of SPMP L-bit exists because SPMP is not implemented.",
+      "snippet": "val mireg2 = Module(new CSRModule(\"Mireg2\", new ZeroFieldBundle(...)) {\n    regOut := 0.U\n  })\n    .setAddr(CSRs.mireg2)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRIND.scala",
+        "function_name": "sireg2/sireg3/sireg4/sireg5/sireg6 (CSRIND trait)",
+        "line_start": 42,
+        "line_end": 65,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All sireg2-6 are ZeroFieldBundle stubs. The Sscsrind indirect data path (siselect->spmpcfg/spmpaddr in S-mode) is non-existent. No S-mode indirect SPMP access path exists, so no L-bit bypass is possible.",
+      "snippet": "val sireg2 = Module(new CSRModule(\"Sireg2\", new ZeroFieldBundle(...)) {\n    regOut := 0.U\n  })\n    .setAddr(CSRs.sireg2)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRIND.scala",
+        "function_name": "Iselect.isInOthers (object Iselect)",
+        "line_start": 120,
+        "line_end": 125,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Iselect classification: isInAIA(0x30-0x3F), isInImsic(0x70-0xFF), isInOthers(everything else). Any Smpmpind miselect value (e.g., 0x02-0x41) falls into isInOthers, triggering isIllegal. No Smpmpind category exists.",
+      "snippet": "object Iselect {\n  def isInAIA(iselect: UInt): Bool = iselect >= 0x30.U && iselect <= 0x3f.U\n  def isInImsic(iselect: UInt): Bool = iselect >= 0x70.U && iselect <= 0xff.U\n  def isInOthers(iselect: UInt): Bool = !(isInAIA(iselect) || isInImsic(iselect))\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "miselect (CSRAIA trait, HasISelectBundle)",
+        "line_start": 17,
+        "line_end": 26,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "miselect legal ranges: 0x30-0x3F (AIA, even only) and 0x70-0xFF (IMSIC). Values 0x00-0x2F and 0x40-0x6F are illegal. Any Smpmpind miselect value (0x02-0x41 for 64 entries) falls in illegal range. No miselect->SPMP entry selection is possible.",
+      "snippet": "isIllegal :=\n      value < 0x30.U ||\n      value >= 0x30.U && value < 0x40.U && value(0) === 1.U ||\n      value >= 0x40.U && value < 0x70.U ||\n      value >= 0x100.U",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcsrind.adoc",
+          "line_start": 68,
+          "line_end": 74,
+          "excerpt": "The value of miselect determines which register is accessed upon read or write of each of the machine indirect alias CSRs (mireg*). miselect is a WARL register."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "MISelectField (WARL constraint object)",
+        "line_start": 225,
+        "line_end": 231,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MISelectField WARL constraint: maxValue=0xFF, reserved subranges 0x00-0x2F and 0x40-0x6F. These WARL constraints prevent any Smpmpind miselect value from being accepted; any such write would be coerced by WARL to a legal AIA/IMSIC range value.",
+      "snippet": "object MISelectField extends ISelectField(\n  maxValue = 0xFF,\n  reserved = Seq(\n    Range.inclusive(0x00, 0x2F),\n    Range.inclusive(0x40, 0x6F),\n  ),\n)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "siselect (CSRAIA trait, HasISelectBundle)",
+        "line_start": 44,
+        "line_end": 53,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "siselect CSR has same restrictions as miselect. Smpmpind siselect values for S-mode indirect SPMP access (e.g., 2+PMP_entry_number) would be illegal per the WARL constraints.",
+      "snippet": "isIllegal :=\n      value < 0x30.U ||\n      value >= 0x30.U && value < 0x40.U && value(0) === 1.U ||\n      value >= 0x40.U && value < 0x70.U ||",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "SISelectField (WARL constraint object)",
+        "line_start": 233,
+        "line_end": 240,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SISelectField WARL: maxValue=0xFFF, reserved 0x00-0x2F, 0x40-0x6F, 0x100-0xFFF. Even though WARL max supports 0xFFF (per spec), the reserved subrange blocks all Smpmpind-usable siselect values.",
+      "snippet": "object SISelectField extends ISelectField(\n  maxValue = 0xFFF,\n  reserved = Seq(\n    Range.inclusive(0x000, 0x02F),\n    Range.inclusive(0x040, 0x06F),\n    Range.inclusive(0x100, 0xFFF),",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcsrind.adoc",
+          "line_start": 148,
+          "line_end": 151,
+          "excerpt": "The siselect register will support the value range 0..0xFFF at a minimum."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala",
+        "function_name": "rwMireg2_6_EX_II (IndirectCSRPermitModule)",
+        "line_start": 536,
+        "line_end": 536,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All mireg2-6 CSR accesses unconditionally flagged illegal. The Smpmpind indirect CSR access channel is actively blocked at the permit stage.",
+      "snippet": "private val rwMireg2_6_EX_II = Ireg.isInMireg2_6(addr)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcsrind.adoc",
+          "line_start": 98,
+          "line_end": 109,
+          "excerpt": "The behavior upon accessing mireg* from M-mode, while miselect holds a value that is not implemented, is UNSPECIFIED. It is expected that implementations will typically raise an illegal-instruction exception for such accesses."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala",
+        "function_name": "rwSireg2_6_EX_VI / rwSireg2_6_EX_II (IndirectCSRPermitModule)",
+        "line_start": 557,
+        "line_end": 559,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sireg2-6 accesses flagged EX_VI for VS-mode or EX_II for other modes. S-mode indirect CSR access for SPMP is blocked at the permit stage.",
+      "snippet": "private val rwSireg2_6_EX_VI = privState.isVirtual && (...) && Ireg.isInSireg2_6(addr)\nprivate val rwSireg2_6_EX_II = Ireg.isInSireg2_6(addr) && !rwSireg2_6_EX_VI",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala",
+        "function_name": "rwVSireg2_6_EX_II (IndirectCSRPermitModule)",
+        "line_start": 566,
+        "line_end": 566,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VS-mode sireg2-6 accesses unconditionally illegal. All indirect CSR data register channels blocked at permit stage.",
+      "snippet": "private val rwVSireg2_6_EX_II = Ireg.isInVSireg2_6(addr)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala",
+        "function_name": "accessIND_EX_II (MLevelPermitModule)",
+        "line_start": 252,
+        "line_end": 257,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Indirect CSR access gate: 'csrIsIND && !privState.isModeM && !mstateen0.CSRIND.asBool'. Comment says 'Smcsrind/Sscsrind is not implemented'. This gate blocks all non-M-mode indirect CSR access, preventing any S-mode SPMP manipulation.",
+      "snippet": "// CSRIND bit 60 indirect reg (Sscsrind extensions), this is not implemented\nprivate val accessIND_EX_II = csrIsIND && !privState.isModeM && !mstateen0.CSRIND.asBool",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcsrind.adoc",
+          "line_start": 308,
+          "line_end": 316,
+          "excerpt": "If extension Smstateen is implemented together with Smcsrind, bit 60 of state-enable register mstateen0 controls access."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "mseccfg.MMWP (MachineLevel trait)",
+        "line_start": 325,
+        "line_end": 325,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MMWP is hardwired Read-Only (RO) with reset=0. Even if SPMP checker hardware existed, SPMP cannot be activated because MMWP is not writable. No L-bit bypass can occur because the SPMP mechanism is architecturally disabled.",
+      "snippet": "val MMWP  = RO( 1).withDescription(\"Machine-mode whitelist policy control from the Smepmp extension.\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smepmp.adoc",
+          "line_start": 39,
+          "line_end": 43,
+          "excerpt": "this extension introduces the RLB, MMWP, and MML fields in the mseccfg CSR and their associated rules."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPMP.scala",
+        "function_name": "PMPCfgBundle",
+        "line_start": 80,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PMPCfgBundle is 8-bit M-mode PMP config layout: R(0), W(1), X(2), A(4:3), ATOMIC(5), C(6), L(7). No SPMP-specific config bundle exists (no SHARED, U, RWX, E fields). Without an SPMP config bundle, there is no SPMP L-bit to bypass.",
+      "snippet": "class PMPCfgBundle extends CSRBundle {\n  override val len = 8\n  val R      = WARL(0, wNoFilter)\n  val W      = WARL(1, wNoFilter)\n  val X      = WARL(2, wNoFilter)\n  val L      = PMPCfgLField(7, wNoFilter)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/PMPEntryModule.scala",
+        "function_name": "PMP cfg write L-bit check (PMPEntryHandleModule)",
+        "line_start": 41,
+        "line_end": 57,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "M-mode PMP L-bit lock logic: 'when (!cfgOldTmp.L.asBool) { cfgVec(j) := cfgNewTmp }'. Locked pmpcfg entries correctly protected on direct CSR address writes. There is no equivalent SPMP L-bit logic to audit because SPMP does not exist.",
+      "snippet": "when (!cfgOldTmp.L.asBool) {\n          cfgVec(j) := cfgNewTmp\n          cfgVec(j).W := cfgNewTmp.W.asBool && cfgNewTmp.R.asBool",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smepmp.adoc",
+          "line_start": 68,
+          "line_end": 68,
+          "excerpt": "Locked rules cannot be removed or modified until a PMP reset, unless mseccfg.RLB is set."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/PMPEntryModule.scala",
+        "function_name": "PMP addr write L-bit check (PMPEntryHandleModule)",
+        "line_start": 68,
+        "line_end": 78,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "M-mode PMP address lock logic: checks addrNextLocked/addrLocked. Correctly prevents modification of locked PMP address entries on direct CSR writes. No equivalent SPMP address lock logic exists because SPMP is not implemented.",
+      "snippet": "val addrNextLocked: Bool = PMPCfgLField.addrLocked(pmpEntry(i).cfg, pmpEntry(i + 1).cfg)\n        pmpAddrW(i) := Mux(!addrNextLocked, wdata, pmpEntry(i).addr.ADDRESS.asUInt)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "pmpcfg write dispatch loop",
+        "line_start": 554,
+        "line_end": 557,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PMP cfg writes dispatched per-entry via direct CSR address match (addr === CSRs.pmpcfg0 + i/8*2).U. No miselect-based routing to PMP entries exists. indCSRMods are ZeroFieldBundle stubs with no side effects.",
+      "snippet": "mod.w.wen   := wenLegalReg && (addr === (CSRs.pmpcfg0 + i / 8 * 2).U)\n    mod.w.wdata := pmpEntryMod.io.out.pmpCfgWData(8*((i%8)+1)-1,8*(i%8))",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "pmpaddr write dispatch loop",
+        "line_start": 559,
+        "line_end": 563,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "PMP addr writes dispatched per-entry via direct CSR address match. No miselect-based routing exists. All PMP entry writes go through the direct path which enforces L-bit locking.",
+      "snippet": "mod.w.wen   := wenLegalReg && (addr === (CSRs.pmpaddr0 + i).U)\n      mod.w.wdata := pmpEntryMod.io.out.pmpAddrWData(i)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "CSR address definitions",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Only M-mode pmpcfg/pmpaddr CSR addresses (0x3A0-0x3EF) are defined. No spmpcfg (0x1CC-0x1CF) or spmpaddr CSR addresses exist in the decoder, so they cannot be accessed via CSR instructions.",
+      "snippet": "(No spmpcfg/spmpaddr CSR definitions in decoder)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRAIA.scala",
+        "function_name": "ISelectField WARL constraint (MISelectField/VSISelectField/SISelectField)",
+        "line_start": 202,
+        "line_end": 240,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ISelectField WARL constraint: all Smpmpind select values fall into reserved subranges for all three select CSRs (miselect reserved 0x00-0x2F, siselect/vsiselect reserved 0x00-0x2F and 0x100-0xFFF). WARL coercion prevents any SPMP indirect entry selection from succeeding.",
+      "snippet": "class ISelectField(final val maxValue: Int, reserved: Seq[Range]) extends CSREnum with WARLApply {\n  override protected def legalRange: Option[(BigInt, BigInt)] = Some(0, maxValue)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRIND.scala",
+        "function_name": "vsireg2/vsireg3/vsireg4/vsireg5/vsireg6 (CSRIND trait)",
+        "line_start": 67,
+        "line_end": 90,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All vsireg2-vsireg6 are ZeroFieldBundle stubs. The VS-mode indirect CSR access for SPMP is non-existent.",
+      "snippet": "val vsireg2 = Module(new CSRModule(\"VSireg2\", new ZeroFieldBundle(...)) {\n    regOut := 0.U\n  })",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

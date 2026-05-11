@@ -1,0 +1,121 @@
+{
+  "pr_number": 2974,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2974,
+    "violation_condition": "In a RISC-V M-mode Linux kernel (CONFIG_RISCV_M_MODE), early boot code at arch/riscv/kernel/head.S and kexec_relocate.S executes csrw CSR_IP, zero to clear all pending interrupts in mip before enabling interrupts. When a platform implements a pending interrupt whose mip bit is read-only, the write-zero has no effect on that bit—the interrupt remains pending. The kernel has no code to invoke the platform-specific 'other mechanism' mandated by the spec for clearing such read-only pending bits. Once mie is configured and interrupts are enabled, the stale pending interrupt fires immediately, potentially before trap handlers are installed or during a critical section.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csrw CSR_IP.*zero|csr_clear.*CSR_IP|csrw CSR_MIP",
+    "affected_entities": [
+      "mip"
+    ],
+    "summary": "M-mode Linux writes zero to mip assuming all bits are writable for interrupt clearing, but read-only mip bits silently retain pending interrupts with no kernel-known clearing path"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/head.S",
+        "function_name": "_start_kernel",
+        "line_start": 218,
+        "line_end": 220,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Under CONFIG_RISCV_M_MODE, CSR_IP resolves to CSR_MIP (mip). The csrw CSR_IP, zero writes 0 to mip, but per the RISC-V privileged spec, MEIP, MTIP, and MSIP are read-only in mip — the write-zero has no effect on these bits. The kernel does not invoke the platform-specific clearing mechanisms (memory-mapped mtimecmp write for MTIP, memory-mapped MSIP register for MSIP, platform interrupt controller for MEIP) at this early boot point. The preceding csrw CSR_IE, zero (mie=0) masks all interrupts, preventing immediate trap firing, but the stale pending bits will fire as soon as interrupts are enabled later in the boot sequence. On pathological platforms where the interrupt source remains asserted (e.g., mtimecmp already expired), this causes an immediate interrupt storm once mie is configured, though the installed handlers should service them.",
+      "snippet": "SYM_CODE_START(_start_kernel)\n\t/* Mask all interrupts */\n\tcsrw CSR_IE, zero\n\tcsrw CSR_IP, zero",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1373,
+          "line_end": 1380,
+          "excerpt": "The mip register must always be implemented, but can contain read-only zeros in any position, indicating that interrupt can never become pending. Each individual bit in register mip may be writable or may be read-only. When bit i in mip is writable, a pending interrupt i can be cleared by writing 0 to this bit. If interrupt i can become pending but bit i in mip is read-only, the implementation must provide some other mechanism for clearing the pending interrupt."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1411,
+          "line_end": 1414,
+          "excerpt": "MEIP is read-only in mip, and is set and cleared by a platform-specific interrupt controller."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1416,
+          "line_end": 1419,
+          "excerpt": "MTIP is read-only in the mip register, and is cleared by writing to the memory-mapped machine-mode timer compare register."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1421,
+          "line_end": 1424,
+          "excerpt": "MSIP is read-only in mip, and is written by accesses to memory-mapped control registers, which are used to provide machine-level interprocessor interrupts."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/head.S",
+        "function_name": "secondary_start_sbi",
+        "line_start": 130,
+        "line_end": 133,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Same pattern as _start_kernel: under CONFIG_RISCV_M_MODE, csrw CSR_IP, zero writes to mip but read-only bits (MEIP, MTIP, MSIP) are unaffected. This is the secondary CPU boot path. The write follows csrw CSR_IE, zero which masks interrupts. However, a stale MTIP (if platform mtimecmp has expired) or MEIP (if external interrupt controller has a pending interrupt) will fire immediately when interrupts are unmasked during smp_callin(). The trap handler is installed via .Lsetup_trap_vector before smp_callin(), so the interrupt will be handled, but the csrw CSR_IP, zero gives a false sense of a clean interrupt state.",
+      "snippet": "secondary_start_sbi:\n\t/* Mask all interrupts */\n\tcsrw CSR_IE, zero\n\tcsrw CSR_IP, zero",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1373,
+          "line_end": 1380,
+          "excerpt": "The mip register must always be implemented, but can contain read-only zeros in any position... Each individual bit in register mip may be writable or may be read-only... If interrupt i can become pending but bit i in mip is read-only, the implementation must provide some other mechanism for clearing the pending interrupt."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1416,
+          "line_end": 1419,
+          "excerpt": "MTIP is read-only in the mip register, and is cleared by writing to the memory-mapped machine-mode timer compare register."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/sbi-ipi.c",
+        "function_name": "sbi_ipi_handle",
+        "line_start": 27,
+        "line_end": 27,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "csr_clear(CSR_IP, IE_SIE) clears the software interrupt pending bit. Under CONFIG_RISCV_M_MODE, CSR_IP resolves to CSR_MIP (mip), and IE_SIE resolves to the MSIE bit. Per the spec, MSIP is read-only in mip and is controlled by memory-mapped MSIP registers. Writing 0 to MSIP via csr_clear is a no-op. The kernel relies on the SBI firmware to have already cleared the MSIP via the memory-mapped register. In a pure M-mode kernel without SBI, this path should not be used (ACLINT SSWI handles it instead with proper memory-mapped clearing). In M-mode kernels that do use this SBI IPI path, the lack of a platform-specific clear could cause the IPI to keep refiring.",
+      "snippet": "csr_clear(CSR_IP, IE_SIE);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1421,
+          "line_end": 1424,
+          "excerpt": "MSIP is read-only in mip, and is written by accesses to memory-mapped control registers, which are used to provide machine-level interprocessor interrupts."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/kexec_relocate.S",
+        "function_name": "riscv_kexec_relocate",
+        "line_start": 33,
+        "line_end": 34,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "This code uses CSR_SIE and CSR_SIP directly (supervisor-level CSRs 0x104 and 0x144), not the CONFIG_RISCV_M_MODE-remapped CSR_IE/CSR_IP macros. In S-mode, SSIP is writable per spec (supervisor.adoc line 443-446) so the write-zero clears it. STIP is read-only when Sstc is implemented, but the code's use of supervisor CSRs rather than the M-mode-remapped CSR_IP means this is not the M-mode mip issue described in the vulnerability pattern. The csrw CSR_SIE, zero masks all S-mode interrupts, providing protection during the kexec transition.",
+      "snippet": "/* Disable / cleanup interrupts */\ncsrw\tCSR_SIE, zero\ncsrw\tCSR_SIP, zero",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

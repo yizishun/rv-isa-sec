@@ -1,0 +1,169 @@
+PR #210  target=freebsd-src  overall=not_implemented
+Spec: Zyhybrid context switch must scrub capability tags when switching to non-CHERI processes, else pure-RV64I processes inherit dangling capability authority across process boundaries
+Violation:
+  In the FreeBSD kernel on RVYA25 hardware implementing Zyhybrid, when the
+  context-switch path (cpu_switch) saves or restores capability registers
+  without clearing tag bits when transitioning from a CHERI process to a pure
+  RV64I process, the non-CHERI process inherits valid capability tags and can
+  exercise authority it should not possess
+Consequence: privilege_escape
+Pattern:
+  cpu_switch|cpu_throw|set_user_capregs|capability.*tag.*clear|cheri_capabilit
+  y_build_user|capregs_save|capregs_restore|CTSTATUS|DDC|PCC
+------------------------------------------------------------
+[not_implemented] sys/riscv/riscv/swtch.S:258-358  cpu_switch
+  cpu_switch saves/restores only integer registers (ra, sp, s0-s11) and
+  optional FPE state. No CHERI capability registers (DDC, PCC, capability GPRs
+  with their tag bits) are saved or restored. The PCB structure
+  (sys/riscv/include/pcb.h) has no capability register fields. On
+  Zyhybrid/RVYA25 hardware, a context switch from a CHERI process to a pure
+  RV64I process would leak valid capability tags because this kernel has zero
+  awareness of capability state. The CHERI spec (riscv-cheri/src/cheri/riscv-
+  priv-integration.adoc:437-482) defines the CHERI disable mechanism via [CRE]
+  bits in misa/menvcfg/senvcfg, and specifies that CHERI-disabled privilege
+  levels must not be able to observe or exercise capability state — but this
+  kernel has no code to clear tags on mode transition.
+  | ENTRY(cpu_switch)
+  |   sd a1, PC_CURTHREAD(tp)
+  |   ld x13, TD_PCB(a1)
+  |   sd x13, PC_CURPCB(tp)
+  |   ld x13, TD_PCB(a0)
+  |   sd ra, (PCB_RA)(x13)
+  |   sd sp, (PCB_SP)(x13)
+  |   /* s[0-11] saved — no capability regs */
+  |   ...
+  |   /* s[0-11] restored — no capability regs */
+  References:
+    - riscv-cheri/src/cheri/riscv-priv-integration.adoc:437-482
+      "When using a system with {cheri_default_ext_name}, it may be
+      desirable to disable CHERI register and instruction access to some
+      (or all) privilege lev"
+    - riscv-cheri/src/cheri/riscv-hybrid-integration.adoc:1-64
+      "{cheri_default_ext_name} is an optional extension to
+      {cheri_base_ext_name} which adds the ability to dynamically change
+      the base architecture of the h"
+    - riscv-cheri/src/cheri/riscv-unpriv-integration.adoc:96-145
+      "The {ctag} is an additional bit added to addressable memory and all
+      YLEN-bit registers. ... Writing non-capability data into a register
+      or memory loca"
+
+[not_implemented] sys/riscv/riscv/swtch.S:206-248  cpu_throw
+  cpu_throw activates a new thread's pmap and restores only integer registers
+  (ra, sp, s0-s11) and optional FPE state. It has no capability register
+  restoration logic. On Zyhybrid hardware, the new thread would inherit
+  whatever capability state (DDC, PCC tag, GPR tags) was left in the hardware
+  registers from the previous thread — a direct privilege_escape path if the
+  previous thread was CHERI-aware and the new thread is a pure RV64I process.
+  | ENTRY(cpu_throw)
+  |   mv s0, a1
+  |   mv a0, a1
+  |   call _C_LABEL(pmap_activate_sw)
+  |   mv a0, s0
+  |   sd a0, PC_CURTHREAD(tp)
+  |   ld x13, TD_PCB(a0)
+  |   sd x13, PC_CURPCB(tp)
+  |   ld ra, (PCB_RA)(x13)
+  |   ld sp, (PCB_SP)(x13)
+  |   /* s[0-11] restored — no capability regs */
+  References:
+    - riscv-cheri/src/cheri/riscv-priv-integration.adoc:437-471
+      "The following occurs when executing code in a privilege mode that
+      has CHERI disabled: ... Disabling CHERI has no effect on implicit
+      accesses or securi"
+
+[not_implemented] sys/riscv/include/pcb.h:42-54  struct pcb
+  The PCB structure stores only standard 64-bit integer registers (ra, sp, gp,
+  tp, s[12]) and FP state. There are no fields for capability register state:
+  no DDC save slot, no PCC metadata/tag save slot, no capability GPR
+  metadata/tag save slots. On Zyhybrid hardware implementing full YLEN
+  (129-bit) capability registers with tag bits, this PCB is structurally
+  incapable of saving/restoring the hardware register state across context
+  switches.
+  | struct pcb {
+  |   uint64_t pcb_ra;
+  |   uint64_t pcb_sp;
+  |   uint64_t pcb_gp;
+  |   uint64_t pcb_tp;
+  |   uint64_t pcb_s[12];
+  |   uint64_t pcb_x[32][2];
+  |   uint64_t pcb_fcsr;
+  |   uint64_t pcb_fpflags;
+  |   vm_offset_t pcb_onfault;
+  | };
+  References:
+    - riscv-cheri/src/cheri/riscv-unpriv-integration.adoc:56-65
+      "{cheri_base_ext_name} extends all registers that have to be able to
+      hold addresses to 2*XLEN bits (hereafter referred to as YLEN),
+      adding metadata to "
+    - riscv-cheri/src/cheri/riscv-unpriv-integration.adoc:619-643
+      "As stated above, all state which can hold addresses are extended
+      from XLEN to YLEN bits. ... The <<gprs,XLEN-wide integer registers>>
+      (e.g., sp, a0) a"
+
+[not_implemented] sys/riscv/riscv/swtch.S:365-432  fork_trampoline
+  fork_trampoline returns to userspace via sret after restoring only standard
+  RISC-V trapframe registers (sstatus, sepc, t0-t6, s0-s11, a0-a7, ra, sp, gp,
+  tp). No capability register state is restored. On Zyhybrid hardware, a newly
+  forked process would receive undefined capability register state (DDC, PCC
+  metadata, GPR tags) from kernel context — potentially inheriting valid
+  capability tags from the parent process or kernel execution context.
+  | ENTRY(fork_trampoline)
+  |   mv a0, s0
+  |   mv a1, s1
+  |   mv a2, sp
+  |   call _C_LABEL(fork_exit)
+  |   ld t0, (TF_SSTATUS)(sp)
+  |   li t1, ~SSTATUS_SIE
+  |   and t0, t0, t1
+  |   csrw sstatus, t0
+  |   ld t0, (TF_SEPC)(sp)
+  |   csrw sepc, t0
+  |   /* t0-t6, s0-s11, a0-a7 restored — no capability regs */
+  |   sret
+
+[not_implemented] sys/riscv/riscv/swtch.S:434-457  savectx
+  savectx saves only standard integer registers (ra, sp, tp, gp, s0-s11) and
+  FPE state. No capability registers or metadata are preserved. This function
+  is called during context dumps (e.g., panic, debugger entry). On Zyhybrid
+  hardware, any forensic analysis after a crash would lose all CHERI
+  capability state, making it impossible to determine whether a capability
+  violation caused the crash.
+  | ENTRY(savectx)
+  |   sd ra, (PCB_RA)(a0)
+  |   sd sp, (PCB_SP)(a0)
+  |   sd tp, (PCB_TP)(a0)
+  |   sd gp, (PCB_GP)(a0)
+  |   /* s[0-11] saved — no capability regs */
+  |   __fpe_state_save a0
+  |   ret
+
+[not_implemented] sys/sys/_types.h:70-76  __intptr_t / __uintptr_t typedefs
+  This file contains CHERI-compatible type scaffolding
+  (__intcap_t/__uintcap_t) guarded by #ifdef __CHERI__, but the kernel is not
+  built with __CHERI__ defined. On RVYA25/Zyhybrid hardware, pointer-sized
+  types would be XLEN (64-bit) instead of YLEN (128-bit), making all pointer
+  arithmetic in the kernel structurally incompatible with capability-aware
+  hardware. This is not a bug per se — it means the entire CHERI feature is
+  absent from this build configuration.
+  | #ifdef __CHERI__
+  | typedef __intcap_t   __intptr_t;
+  | typedef __intcap_t   __intfptr_t;
+  | typedef __uintcap_t  __uintptr_t;
+  | typedef __uintcap_t  __uintfptr_t;
+  | #else
+  | /* fallback to integer pointers */
+
+[not_implemented] sys/riscv/conf/GENERIC:22-22  machine config
+  The RISC-V GENERIC kernel config specifies 'machine riscv riscv64' with no
+  CHERI ISA extension options (no 'cpu CHERI', no Zyhybrid capability format
+  option, no RVYA25 profile). The kernel binary is compiled as pure RV64I and
+  lacks all CHERI instruction encodings, CSR definitions, and capability-aware
+  runtime support required to operate on Zyhybrid hardware implementing the
+  RVYA25 profile.
+  | machine   riscv riscv64
+  References:
+    - riscv-cheri/src/cheri/riscv-priv-integration.adoc:122-135
+      "The <<mycfg>> register is used to identify which CHERI capability
+      encoding is used by the platform. The capability encoding both
+      determines the in-mem"
+

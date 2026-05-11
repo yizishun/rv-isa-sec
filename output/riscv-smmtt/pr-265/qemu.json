@@ -1,0 +1,137 @@
+{
+  "pr_number": 265,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 265,
+    "violation_condition": "When QEMU writes an out-of-range value to msdcfg.SIDN (i.e., SIDN >= number of implemented supervisor interrupt domains), the removed spec rules no longer mandate that mip.SEIP be forced to 0, that siselect/sireg and stopei accesses raise illegal instruction exceptions, or that hstatus.vgein/hgeip/hgeie be read-only zero. QEMU may inadvertently expose stale or uninitialized interrupt state from internal arrays indexed by the invalid SIDN, or allow CSR access paths that should trap.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "msdcfg.*SIDN.*write|siselect.*sireg.*SIDN|stopei.*SIDN|hgeip.*SIDN|hgeie.*SIDN|mip.*SEIP.*SIDN|msideip.*SIDN",
+    "affected_entities": [
+      "msdcfg",
+      "siselect",
+      "sireg",
+      "stopei",
+      "hgeip",
+      "hgeie",
+      "hstatus",
+      "mip",
+      "msideip"
+    ],
+    "summary": "PR removes all mandated trap-and-zero behavior when msdcfg.SIDN is invalid, leaving QEMU without a spec-defined safe fallback; unvalidated SIDN can index into internal interrupt-domain arrays out-of-bounds, leaking interrupt state across supervisor domains."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xireg_aia",
+        "line_start": 2645,
+        "line_end": 2718,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The msdcfg CSR and SIDN (supervisor interrupt domain number) concept are not implemented in this QEMU version. The Smidctrl/Ssidctrl extensions from the ACLIC specification have no CSR definitions, no read/write handlers, and no CPU state fields. The existing AIA vgein-based IMSIC interrupt file indexing in rmw_xireg_aia, rmw_xtopei, and rmw_mip64 uses the HSTATUS_VGEIN field (a different concept from SIDN) and does include proper bounds checking (line 2699: 'virt && (!vgein || env->geilen < vgein)').",
+      "snippet": "vgein = (virt) ? get_field(env->hstatus, HSTATUS_VGEIN) : 0;\n/* Selected guest interrupt file should not be zero */\nif (virt && (!vgein || env->geilen < vgein)) {\n    goto done;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-fast-interrupt",
+          "file_path": "src/aclic.adoc",
+          "line_start": 300,
+          "line_end": 303,
+          "excerpt": "=== Interrupt domain control interface (Smidctrl, Ssidctrl)\n\nSmidctrl depends on the Smcsrind and Smaia extensions.\nSsidctrl depends on the Sscsrind and Ssaia extensions."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xtopei",
+        "line_start": 2931,
+        "line_end": 2986,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The stopei CSR handler does not recognize SIDN from msdcfg. The stopei path uses vgein from HSTATUS_VGEIN to index INTO the IMSIC virtual interrupt file, with proper bounds checking at line 2971. If msdcfg.SIDN were implemented, setting an invalid SIDN would need to make stopei accesses trap (illegal instruction), but no such logic exists because the entire msdcfg/SIDN feature is absent.",
+      "snippet": "vgein = (virt) ? get_field(env->hstatus, HSTATUS_VGEIN) : 0;\nif (virt && (!vgein || env->geilen < vgein)) {\n    goto done;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_mip64",
+        "line_start": 3760,
+        "line_end": 3767,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The mip.SEIP handling uses vgein (from HSTATUS_VGEIN) to index into hgeip (line 3764-3765), computing VSEIP. This vgein-indexed path is a different concept from msdcfg.SIDN. If msdcfg.SIDN were implemented, an out-of-range SIDN would need to force mip.SEIP to 0 — but no msdcfg/SIDN code exists to trigger this scenario.",
+      "snippet": "gin = get_field(env->hstatus, HSTATUS_VGEIN);\nold_mip |= (env->hgeip & ((target_ulong)1 << gin)) ? MIP_VSEIP : 0;\nold_mip |= env->vstime_irq ? MIP_VSTIP : 0;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_hgeie",
+        "line_start": 4946,
+        "line_end": 4955,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "hgeie/hgeip CSRs are implemented using env->geilen to mask writable bits (line 4949). These are per-guest-external-interrupt, not per-supervisor-interrupt-domain. If msdcfg.SIDN were implemented, an out-of-range SIDN would need to make hgeie/hgeip read-only zero — but the msdcfg/SIDN feature controlling this behavior does not exist.",
+      "snippet": "val &= ((((target_ulong)1) << env->geilen) - 1) << 1;\nenv->hgeie = val;\nriscv_cpu_update_mip(env, MIP_SGEIP,\n                     BOOL_TO_MASK(!!(env->hgeie & env->hgeip)));",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xiselect",
+        "line_start": 2417,
+        "line_end": 2462,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The siselect CSR handler (rmw_xiselect) does not consider msdcfg.SIDN. If msdcfg.SIDN were implemented with an out-of-range value, siselect/sireg accesses should raise illegal instruction exceptions. No such logic exists because the msdcfg CSR is entirely absent from this QEMU codebase.",
+      "snippet": "case CSR_SISELECT:\n    iselect = &env->siselect;\n    break;\ncase CSR_VSISELECT:\n    iselect = &env->vsiselect;\n    break;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "N/A",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "No CSR number is defined for msdcfg. The RISC-V ACLIC specification defines Smidctrl/Ssidctrl extensions with interrupt domain control interfaces, but the corresponding CSRs (including msdcfg) have no definitions in cpu_bits.h. Searched for 0xBC0-0xBFF range (custom read/write CSR space where such a CSR might be allocated) — no msdcfg-related constants exist.",
+      "snippet": "No CSR definition for msdcfg or any interrupt domain select CSR",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "N/A",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "No vmstate entry for msdcfg or SIDN in the migration state structures. If the feature were implemented, it would need to be included in vmstate for correct live-migration. Its absence is consistent with the feature not being implemented.",
+      "snippet": "No VMSTATE entry for msdcfg or SIDN in any vmstate structure",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/kvm/kvm-cpu.c",
+        "function_name": "N/A",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The KVM path (kvm-cpu.c) has no references to msdcfg, SIDN, or interrupt domain control. KVM CSR synchronization for the Smidctrl/Ssidctrl feature is absent.",
+      "snippet": "No kvm_cpu_riscv.c code for msdcfg/SIDN synchronization",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

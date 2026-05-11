@@ -1,0 +1,107 @@
+PR #0  target=qemu  overall=bug_confirmed
+Spec: Failed to parse agent output as JSON
+Violation:
+
+Consequence: function_loss
+Pattern:
+
+------------------------------------------------------------
+[bug_confirmed] target/riscv/cpu.c:757-764  riscv_cpu_reset_hold
+  mseccfg reset only clears the register when ext_smepmp is active, but the
+  CSR also exists when ext_zkr, ext_smmpm, or ext_zicfilp are enabled without
+  smepmp. Per spec: norm:mseccfg_mml_mmwp_rlb_rst requires MML/MMWP/RLB reset
+  to 0; norm:mseccfg_useed_sseed_rst requires USEED/SSEED have defined reset
+  values; norm:mseccfg_mlpe_rst requires MLPE reset to 0; norm:warl_rst
+  requires no WARL field contains an illegal value. If zkr/smmpm/zicfilp is
+  enabled without smepmp, mseccfg retains stale values across reset, violating
+  all these reset requirements.
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         env->mseccfg = 0;
+  |     }
+  | 
+  |     pmp_unlock_entries(env);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2793-2808
+      "[#norm:mseccfg_mlpe_rst]#If the Zicfilp extension is implemented,
+      the mseccfg.MLPE field is reset to 0.# [...]
+      [#norm:mseccfg_mml_mmwp_rlb_rst]#The MM"
+    - riscv-isa-manual/src/priv/machine.adoc:2793-2793
+      "[#norm:warl_rst]#No WARL field contains an illegal value.#"
+
+[potential_risk] target/riscv/csr.c:775-788  have_mseccfg
+  have_mseccfg() does not check ext_zicfilp, but the new VMState
+  mseccfg_needed() in machine.c does check it. If zicfilp were enabled without
+  smepmp/zkr/smmpm, the CSR would be inaccessible (ILLEGAL_INST) but the
+  VMState subsection would still activate, leading to inconsistency. In
+  current profiles this doesn't trigger because zicfilp is only enabled
+  alongside smepmp, but the mismatch is a maintenance hazard.
+  | static RISCVException have_mseccfg(CPURISCVState *env, int csrno)
+  | {
+  |     if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     if (riscv_cpu_cfg(env)->ext_zkr) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     if (riscv_cpu_cfg(env)->ext_smmpm) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  | 
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2335-2335
+      "[#norm:mseccfg_presence]#It exists if any extension that adds a
+      field to mseccfg is implemented. Otherwise, it is reserved.#"
+    - riscv-isa-manual/src/priv/cfi.adoc:2499-2501
+      "[#norm:mseccfg_mlpe_presence]#The Zicfilp extension adds the MLPE
+      field in mseccfg.#"
+
+[compliant] target/riscv/machine.c:426-432  mseccfg_needed
+  The new vmstate_mseccfg subsection correctly identifies when mseccfg
+  migration is needed by checking all four extensions that add fields to
+  mseccfg (ext_smepmp, ext_zkr, ext_smmpm, ext_zicfilp). The VMSTATE_UINTTL
+  correctly saves/restores the full register value. The subsection is properly
+  registered in vmstate_riscv_cpu.subsections.
+  | static bool mseccfg_needed(void *opaque)
+  | {
+  |     RISCVCPU *cpu = opaque;
+  | 
+  |     return cpu->cfg.ext_smepmp || cpu->cfg.ext_zkr
+  |         || cpu->cfg.ext_smmpm || cpu->cfg.ext_zicfilp;
+  | }
+
+[compliant] target/riscv/csr.c:662-703  write_mseccfg / mseccfg_csr_write
+  The mseccfg write path correctly enforces WARL sticky-bit semantics for
+  MMWP/MML (once set cannot be unset until PMP reset), RLB (cannot be re-
+  enabled when locked regions exist and RLB is 0), PMM (only writable with
+  valid non-reserved values on RV64 with smmpm), and MLPE (forced to 1 when
+  zicfilp is implemented). TLB flush is correctly triggered when MMWP/MML
+  change.
+  | uint64_t mask = MSECCFG_MMWP | MSECCFG_MML;
+  |     ...
+  |     if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         val |= (env->mseccfg & mask);
+  |         if ((val ^ env->mseccfg) & mask) {
+  |             tlb_flush(env_cpu(env));
+  |         }
+  |     } else {
+  |         mask |= MSECCFG_RLB;
+  |         val &= ~(mask);
+  |     }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2392-2397
+      "[#norm:mseccfg_rlb_op_warl]#When mseccfg.RLB is 0 and pmpcfg.L is 1
+      in any rule, then mseccfg.RLB remains 0 and any further
+      modifications to mseccfg.R"
+
+[compliant] target/riscv/csr.c:708-712  read_mseccfg / mseccfg_csr_read
+  The mseccfg read path simply returns the cached env->mseccfg value, which is
+  correct since all WARL filtering happens on write. No reserved bits leak
+  since writes filter through the mask.
+  | target_ulong mseccfg_csr_read(CPURISCVState *env)
+  | {
+  |     trace_mseccfg_csr_read(env->mhartid, env->mseccfg);
+  |     return env->mseccfg;
+  | }
+

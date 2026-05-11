@@ -1,0 +1,105 @@
+PR #38  target=linux  overall=not_implemented
+Spec: Context switch and KVM VM enter/exit paths must issue fence.hpd when changing hardware protection domain identifiers (ASID, VMID, SDID) to prevent cross-domain predictor-based transient execution leaks between processes or VMs sharing a physical CPU.
+Violation:
+  Linux kernel writes satp (changing ASID) or hgatp (changing VMID) during
+  context switch or VM enter/exit without a preceding or subsequent fence.hpd
+  instruction, allowing predictor state tagged with the old domain to
+  influence speculation in the new domain. Additionally, ASID or VMID
+  recycling on a CPU without an intervening fence.hpd violates the spec's
+  explicit reuse requirement.
+Consequence: info_leak
+Pattern:
+  satp write (csr_write/csr_set/CSR_STATUS/satp=) on context-switch path OR
+  hgatp write on KVM vcpu-load path NOT paired with fence.hpd
+------------------------------------------------------------
+[potential_risk] arch/riscv/mm/context.c:192-194  set_mm_asid
+  csr_write(CSR_SATP, ...) writes satp with a new ASID during context switch
+  without a preceding or subsequent fence.hpd instruction. If the CPU
+  implements Zihpd/Zifencehpd, hardware predictor state tagged with the old
+  ASID can influence speculation in the new address space, resulting in an
+  info leak across address spaces.
+  | csr_write(CSR_SATP, virt_to_pfn(mm->pgd) |
+  | 	  (cntx2asid(cntx) << SATP_ASID_SHIFT) |
+  | 	  satp_mode);
+
+[potential_risk] arch/riscv/mm/context.c:203-203  set_mm_noasid
+  csr_write(CSR_SATP, ...) writes satp during context switch (no-ASID path)
+  without fence.hpd. When changing the page table root, hardware predictor
+  state from the old address space can linger and influence speculation in the
+  new address space.
+  | csr_write(CSR_SATP, virt_to_pfn(mm->pgd) | satp_mode);
+
+[potential_risk] arch/riscv/mm/context.c:130-133  __new_context
+  ASID version rollover: when the ASID space is exhausted, current_version is
+  incremented and all ASIDs are recycled (__flush_context) without any
+  fence.hpd instruction. On CPUs implementing Zihpd, ASID recycling without
+  fence.hpd violates the spec's explicit reuse requirement, allowing predictor
+  state from old-version ASIDs to leak into new-version ASIDs.
+  | ver = atomic_long_add_return_relaxed(BIT(SATP_ASID_BITS), &current_version);
+  | 
+  | /* Flush everything  */
+  | __flush_context();
+
+[potential_risk] arch/riscv/kvm/mmu.c:606-616  kvm_riscv_mmu_update_hgatp
+  ncsr_write(CSR_HGATP, hgatp) writes hgatp with a new VMID during VCPU load
+  (via kvm_arch_vcpu_load at vcpu.c:625) without a fence.hpd instruction. On
+  CPUs implementing Zihpd/Zifencehpd, hardware predictor state tagged with the
+  old VMID can influence speculation in the new guest VM, resulting in cross-
+  VM info leaks.
+  | hgatp |= (READ_ONCE(k->vmid.vmid) << HGATP_VMID_SHIFT) & HGATP_VMID;
+  | hgatp |= (k->pgd_phys >> PAGE_SHIFT) & HGATP_PPN;
+  | 
+  | ncsr_write(CSR_HGATP, hgatp);
+
+[potential_risk] arch/riscv/kvm/vmid.c:92-98  kvm_riscv_gstage_vmid_update
+  VMID version rollover and recycling: when vmid_next wraps to zero,
+  vmid_version is incremented and all VMIDs are recycled. The on_each_cpu_mask
+  call does HFENCE_GVMA (TLB flush) but not fence.hpd. On CPUs implementing
+  Zihpd, VMID recycling without fence.hpd violates the spec's reuse
+  requirement, allowing predictor state from old-version VMIDs to leak into
+  new-version VMIDs.
+  | if (unlikely(vmid_next == 0)) {
+  | 	WRITE_ONCE(vmid_version, READ_ONCE(vmid_version) + 1);
+  | 	vmid_next = 1;
+  | 	/* ... */
+  | 	on_each_cpu_mask(cpu_online_mask, __local_hfence_gvma_all,
+  | 			 NULL, 1);
+
+[potential_risk] arch/riscv/kernel/suspend.c:61-61  suspend_restore_csrs
+  csr_write(CSR_SATP, context->satp) restores satp on resume from suspend.
+  This restores the original satp value (same ASID), but on CPUs implementing
+  Zihpd, even restoring satp may require fence.hpd to clear predictor state
+  that may have been polluted during the suspend period.
+  | csr_write(CSR_SATP, context->satp);
+
+[compliant] arch/riscv/include/asm/switch_to.h:84-88  __switch_to_envcfg
+  The switch_to macro handles FPU, vector, and envcfg switch but does not
+  handle Zihpd/Zifencehpd. This is expected since the kernel has no awareness
+  of these extensions. However, if Zihpd support is added, a fence.hpd would
+  logically fit in or near this sequence.
+  | static inline void __switch_to_envcfg(struct task_struct *next)
+  | {
+  | 	asm volatile (ALTERNATIVE("nop", "csrw " __stringify(CSR_ENVCFG) ", %0",
+  | 				  0, RISCV_ISA_EXT_XLINUXENVCFG, 1)
+  | 			:: "r" (next->thread.envcfg) : "memory");
+
+[potential_risk] arch/riscv/kvm/vcpu.c:578-641  kvm_arch_vcpu_load
+  kvm_arch_vcpu_load writes CSRs including VSATP (line 595/614) as part of
+  guest state restoration, then calls kvm_riscv_mmu_update_hgatp (line 625)
+  which writes HGATP with VMID. Neither satp-related nor hgatp write is paired
+  with fence.hpd. This is the main KVM VM-enter path where hardware predictor
+  state must be cleared.
+  | csr_write(CSR_VSATP, csr->vsatp);
+  | /* ... */
+  | kvm_riscv_mmu_update_hgatp(vcpu);
+
+[potential_risk] arch/riscv/kvm/tlb.c:93-107  kvm_riscv_local_hfence_vvma_asid_gva
+  csr_swap(CSR_HGATP, ...) at line 93 and csr_write(CSR_HGATP, hgatp) at line
+  107 temporarily change and restore HGATP VMID for TLB shootdown purposes.
+  While the old VMID is restored, the intermediate hgatp write with a
+  different VMID happens without fence.hpd, potentially polluting predictor
+  state.
+  | hgatp = csr_swap(CSR_HGATP, vmid << HGATP_VMID_SHIFT);
+  | /* ... HFENCE_VVMA operations ... */
+  | csr_write(CSR_HGATP, hgatp);
+

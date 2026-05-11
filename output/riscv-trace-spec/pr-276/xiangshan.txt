@@ -1,0 +1,262 @@
+PR #276  target=xiangshan  overall=potential_risk
+Spec: XiangShan TraceCoreInterface has no encoder-configuration readback channel; external encoder's Standard Support Packet content (feature flags, sizing parameters, protocol version) is unverifiable by the core, enabling trace-decoder mis-synchronization that can silently drop or misattribute privilege transitions, exception sequences, and branch behavior in security-audit trace streams.
+Violation:
+  XiangShan TraceCoreInterface FromEncoder struct carries only enable/stall
+  Booleans (Interface.scala:37-40) with no encoder configuration readback
+  path. The external encoder (XSTOP/Tessent) independently generates the
+  Standard Support Packet. If the encoder advertises features in the support
+  packet (implicit_return=1, branch_predictor=1, resync_disabled, sizing
+  parameters) that diverge from what the core actually emits on the trace
+  interface—or if the encoder implements protocol version >=2.1 without this
+  extension—the trace decoder reconstructs an instruction stream inconsistent
+  with architectural execution. The core has zero visibility into or
+  validation of support packet content.
+Consequence: info_leak
+Pattern:
+  TraceCoreInterface.*FromEncoder|class FromEncoder|io\.in\.fromEncoder\.(enab
+  le|stall)|support.*packet|format3.*subformat.*3|trTeImpl|trTeProtocol(Versio
+  n|Major|Minor)
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/trace/Interface.scala:37-40  FromEncoder
+  FromEncoder Bundle carries only enable:Bool and stall:Bool — 2 bits of
+  encoder→core communication. The external encoder (XSTOP/Tessent)
+  independently generates the Standard Support Packet (Format3 Subformat3).
+  There is no field for encoder protocol version, feature advertisement
+  (implicit_return, branch_predictor, resync_disabled), or sizing parameters
+  (irdepth, notrace support). If the encoder advertises features in the
+  support packet that diverge from what the core actually emits on the trace
+  interface, the trace decoder reconstructs an instruction stream inconsistent
+  with architectural execution. The core has zero visibility into or
+  validation of support packet content.
+  | class FromEncoder extends Bundle {
+  |   val enable = Bool()
+  |   val stall  = Bool()
+  | }
+
+[potential_risk] src/main/scala/xiangshan/backend/trace/Interface.scala:42-62  TraceCoreInterface
+  TraceCoreInterface defines the complete trace boundary. fromEncoder is
+  Input({enable, stall}) — the encoder can only assert enable or stall.
+  toEncoder is Output with priv/mstatus/trap/groups — the core pushes trace
+  groups out. There is no signal path for encoder→core readback of support
+  packet fields. A MUX-based encoder that claims implicit_return=1 (Format 2
+  branch prediction mode) while the core emits explicit return types
+  (Itype=FunctionReturn=13) would cause the trace decoder to skip return stack
+  validation, producing an incorrect instruction trace. Similarly, if
+  resync_disabled is advertised but the encoder falls back to Format 0 resync,
+  the decoder's expectation of continuous trace would silently produce wrong
+  output.
+  | class TraceCoreInterface(hasOffset: Boolean = false) extends Bundle ... {
+  |   val fromEncoder = Input(new Bundle {
+  |     val enable = Bool()
+  |     val stall  = Bool()
+  |   })
+  |   val toEncoder = Output(new Bundle {
+  |     val priv   = Priv()
+  |     val mstatus = UInt(XLEN.W)
+  |     val trap   = new Bundle{
+  |       val cause = UInt(CauseWidth.W)
+  |       val tval  = UInt(TvalWidth.W)
+  |     }
+  |     val groups = Vec(TraceGroupNum, ValidIO(new Bundle{
+  |       val iaddr     = UInt(IaddrWidth.W)
+  |       val ftqOffset = if (hasOffset) Some(...) else None
+  |       val itype     = UInt(ItypeWidth.W)
+  |       val iretire   = UInt(IretireWidthCompressed.W)
+  |       val ilastsize = UInt(IlastsizeWidth.W)
+  |     }))
+  |   })
+
+[potential_risk] src/main/scala/xiangshan/backend/trace/Trace.scala:16-26  TraceIO
+  TraceIO bundles the FromEncoder input alongside ROB commit data. The only
+  encoder→core signals are enable/stall. No protocol negotiation or
+  configuration readback channel exists. The core cannot distinguish between
+  'encoder stall due to bandwidth congestion' and 'encoder stall due to
+  protocol version mismatch in support packet'. In both cases the core blindly
+  obeys, gating all architectural forward progress through blockCommit.
+  | class TraceIO extends Bundle ... {
+  |   val in = new Bundle {
+  |     val fromEncoder    = Input(new FromEncoder)
+  |     val fromRob        = Flipped(new TraceBundle(hasIaddr = false, ...))
+  |   }
+  |   val out = new Bundle {
+  |     val toPcMem        = new TraceBundle(hasIaddr = false, ...)
+  |     val toEncoder      = new TraceBundle(hasIaddr = false, ...)
+  |     val blockRobCommit = Output(Bool())
+  |   }
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/trace/Trace.scala:28-65  Trace
+  The Trace module's 4-stage pipeline (s0→s1→s2→s3) correctly passes trace
+  groups from the ROB through compression (TraceBuffer) to pcMem and encoder
+  output. The fromEncoder signals are correctly forwarded to TraceBuffer. This
+  module correctly implements its part of the trace pipeline. The visibility
+  gap exists at the interface definition level
+  (FromEncoder/TraceCoreInterface), not in this module's logic.
+  | class Trace extends Module ... {
+  |   val traceBuffer = Module(new TraceBuffer)
+  |   traceBuffer.io.in.fromEncoder := fromEncoder
+  |   traceBuffer.io.in.fromRob := s2_in
+  |   val s2_out_groups = traceBuffer.io.out.groups
+  |   blockCommit := traceBuffer.io.out.blockCommit
+  | }
+
+[potential_risk] src/main/scala/xiangshan/backend/trace/TraceBuffer.scala:61-62  TraceBuffer (blockCommit gate)
+  Critical commit gate: blockCommit := io.in.fromEncoder.enable &&
+  (canNotTraceAll || io.in.fromEncoder.stall). When the encoder asserts
+  enable+stall, the entire ROB commit pipeline blocks. This is architecturally
+  correct behavior per the trace spec (the encoder controls flow), but the
+  core has no way to validate that the stall is legitimate vs caused by a
+  support packet misconfiguration. An attacker with physical access to the
+  encoder interface pins could stall the core indefinitely (DoS) or at
+  specific trace points to create side-channel timing signatures.
+  | val canNotTraceAll = distanceBetween(enqPtrNext, deqPtrNext) > 0.U
+  | blockCommit := io.in.fromEncoder.enable && (canNotTraceAll || io.in.fromEncoder.stall)
+
+[potential_risk] src/main/scala/xiangshan/backend/trace/TraceBuffer.scala:13-22  TraceBuffer
+  TraceBuffer IO also uses Input(new FromEncoder) for its in.fromEncoder —
+  same limited 2-bit interface. The encoder cannot communicate buffer sizing
+  parameters (TraceGroupNum, CommitWidth) or backpressure policy through this
+  channel. If the external encoder's support packet advertises irdepth or
+  max_payload_size that exceeds the core's actual buffer dimensions, the
+  encoder may overrun the trace buffer, causing trace data loss without
+  detection.
+  | val io = IO(new Bundle {
+  |   val in = new Bundle{
+  |     val fromEncoder = Input(new FromEncoder)
+  |     val fromRob     = Flipped(new TraceBundle(hasIaddr = false, ...))
+  |   }
+  |   val out = new Bundle {
+  |     val blockCommit = Output(Bool())
+  |     val groups = ...
+  |   }
+  | })
+
+[compliant] src/main/scala/xiangshan/backend/CtrlBlock.scala:291-295  CtrlBlock (trace wiring)
+  CtrlBlock correctly wires fromEncoder enable/stall from TraceCoreInterface
+  to the Trace module, and correctly resolves iaddr from pcMem for trace
+  groups. The dedicated pcMem port and itype-based priv resolution (lastPriv
+  for trap/xret, currentPriv otherwise) are correct. This module does its job
+  correctly within the constraints of the interface it's given.
+  | val trace = Module(new Trace)
+  | trace.io.in.fromEncoder.stall  := io.traceCoreInterface.fromEncoder.stall
+  | trace.io.in.fromEncoder.enable := io.traceCoreInterface.fromEncoder.enable
+  | trace.io.in.fromRob            := rob.io.trace.traceCommitInfo
+  | rob.io.trace.blockCommit       := trace.io.out.blockRobCommit
+
+[potential_risk] src/main/scala/xiangshan/XSTileWrap.scala:84-84  XSTileWrap (traceCoreInterface port)
+  XSTileWrap IO declares val traceCoreInterface = new TraceCoreInterface —
+  this IS the external encoder boundary. The only encoder→core signals at the
+  top-level tile interface are fromEncoder.enable and fromEncoder.stall. No
+  additional encoder configuration pins exist. The support packet content is
+  completely external and unreachable by any RTL or software on the core side.
+  An external encoder that generates an incorrect support packet yields an
+  undetectable trace reconstruction error.
+  | val traceCoreInterface = new TraceCoreInterface
+
+[compliant] src/main/scala/xiangshan/XSTileWrap.scala:154-160  XSTileWrap (async encoder input sync)
+  The fromEncoder enable/stall signals are correctly resynchronized with
+  AsyncResetSynchronizerShiftReg(3 stages) on the reset_sync clock domain.
+  This is proper CDC handling for the encoder interface signals. No additional
+  encoder→core signals exist at this boundary because none are defined in
+  TraceCoreInterface. The resynchronization itself is correct.
+  | withClockAndReset(clock, reset_sync) {
+  |   tile.module.io.traceCoreInterface.fromEncoder.enable := 
+  |     AsyncResetSynchronizerShiftReg(io.traceCoreInterface.fromEncoder.enable, 3, 0)
+  |   tile.module.io.traceCoreInterface.fromEncoder.stall := 
+  |     AsyncResetSynchronizerShiftReg(io.traceCoreInterface.fromEncoder.stall, 3, 0)
+  | }
+
+[compliant] src/main/scala/xiangshan/mem/MemBlock.scala:1497-1525  MemBlock (trace pipeline)
+  MemBlock's traceCoreInterfaceBypass correctly adds pipeline registers
+  (RegNext, RegEnable) on trace data and fromEncoder signals. RegEnable used
+  for trap/priv data gated on group validity; RegNext for fromEncoder,
+  mstatus, groups valid/iretire/itype/iaddr/ilastsize. These are correct
+  timing optimizations that do not affect functional correctness. The
+  fromEncoder passthrough is a simple RegNext — no encoder validation logic is
+  added because the interface doesn't carry configuration fields to validate.
+  | traceFromBackend.fromEncoder := RegNext(traceToL2Top.fromEncoder)
+  | traceToL2Top.toEncoder.trap  := RegEnable(traceFromBackend.toEncoder.trap, ...)
+  | traceToL2Top.toEncoder.priv := RegEnable(traceFromBackend.toEncoder.priv, ...)
+  | traceToL2Top.toEncoder.mstatus := RegNext(traceFromBackend.toEncoder.mstatus)
+
+[compliant] src/main/scala/xiangshan/mem/MemBlock.scala:421-424  MemBlockIO (traceCoreInterfaceBypass)
+  MemBlock declares traceCoreInterfaceBypass with fromBackend (Flipped) and
+  toL2Top, both using the same TraceCoreInterface. This is a standard bypass
+  pattern for routing the trace interface through the memory block without
+  functional modification. The interface itself is correctly defined for pass-
+  through routing.
+  | val traceCoreInterfaceBypass = new Bundle{
+  |   val fromBackend = Flipped(new TraceCoreInterface(hasOffset = true))
+  |   val toL2Top = new TraceCoreInterface
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/trace/Interface.scala:64-80  Itype
+  Itype enumeration correctly encodes all RISC-V Efficient Trace v2.0 transfer
+  types: None=0, Exception=1, Interrupt=2, ExpIntReturn=3, NonTaken=4,
+  Taken=5, UninferableCall=8, InferableCall=9, FunctionReturn=13, etc. These
+  match the standard E-trace itype encodings from the trace spec Table 4.4.
+  Encoding 6 (UninferableJump) is correctly annotated as reserved when itype
+  width is 4 bits. The jumpTypeGen function correctly distinguishes
+  call/return/tail-call/coroutine-swap using rd/rs register operand analysis.
+  | object Itype extends NamedUInt(4) {
+  |   def None                 = 0.U
+  |   def Exception            = 1.U    //rob
+  |   def Interrupt            = 2.U    //rob
+  |   def ExpIntReturn         = 3.U    //rename
+  |   def NonTaken             = 4.U    //commit
+  |   def Taken                = 5.U    //commit
+  |   def UninferableJump      = 6.U    //It's reserved when width of itype is 4.
+  |   def reserved             = 7.U    //reserved
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:574-596
+      "Control Transfer Type Definitions: 0=Not used by CTR, 1=Exception,
+      2=Interrupt, 3=Trap return, 4=Not-taken branch, 5=Taken branch,
+      6=reserved, 7=reser"
+
+[compliant] rocket-chip/src/main/scala/util/TraceCoreInterface.scala:43-48  rocket-chip TraceCoreInterface
+  The upstream rocket-chip TraceCoreInterface (per RISC-V Processor Trace Spec
+  V1.0) carries only group, priv, tval, cause — the core→encoder output side.
+  It has no encoder→core fields at all (no enable/stall, no support packet
+  readback). XiangShan's version extends this with FromEncoder (enable/stall)
+  for flow control, which is an architectural improvement, but still lacks
+  support packet visibility. The rocket-chip standard does not define support
+  packet readback either — this gap is inherent in the trace architecture
+  where the support packet is encoder-generated.
+  | class TraceCoreInterface (val params: TraceCoreParams) extends Bundle {
+  |   val group = Vec(params.nGroups, new TraceCoreGroup(params))
+  |   val priv = UInt(4.W)
+  |   val tval = UInt(params.xlen.W)
+  |   val cause = UInt(params.xlen.W)
+  | }
+
+[potential_risk] src/main/scala/xiangshan/backend/trace/Interface.scala:151-158  Priv
+  Priv encoding uses NamedUInt(3) with values: HU=0, HS=1, M=3, D=4, VU=5,
+  VS=6. Encoding 2 is undefined/left unencoded. The RISC-V privilege spec
+  defines M=3, S=1, U=0 — so HS=1 and HU=0 are consistent with H-extension
+  virtualization (S→HS, U→HU). However, the trace spec version 1.0 (rocket-
+  chip TraceCoreInterface) uses 4-bit priv encoding. XiangShan uses only 3
+  bits. While sufficient for the currently supported privilege modes, encoding
+  2 is reserved and could cause ambiguity with future privilege modes or when
+  passed to a decoder expecting 4-bit standard encoding.
+  | object Priv extends NamedUInt(3) {
+  |   def HU = 0.U
+  |   def HS = 1.U
+  |   def M  = 3.U
+  |   def D  = 4.U
+  |   def VU = 5.U
+  |   def VS = 6.U
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/rob/Rob.scala:799-804  Rob (trace blockCommit)
+  Rob correctly gates commit using trace blockCommit alongside other stall
+  conditions. The blockCommit signal from the trace subsystem (via CtrlBlock)
+  correctly incorporates the encoder's enable/stall state. At line 804,
+  io.commits.isCommit := state === s_idle && !blockCommit — this correctly
+  allows the trace encoder to stall the core to avoid trace buffer overflow,
+  which is architecturally necessary per the processor trace flow control
+  model.
+  | blockCommit := misPredBlock || lastCycleFlush || hasWFI || io.redirect.valid ||
+  |   (deqNeedFlush && !deqHasFlushed) || deqFlushBlock || criticalErrorState || traceBlock
+  | ...
+  | io.commits.isCommit := state === s_idle && !blockCommit
+

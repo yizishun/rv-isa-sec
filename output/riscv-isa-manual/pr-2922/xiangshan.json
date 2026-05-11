@@ -1,0 +1,247 @@
+{
+  "pr_number": 2922,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2922,
+    "violation_condition": "When the Ziccrse extension is implemented in XiangShan but the PMA checker hardwires or is configured to report RsrvNone or RsrvNonEventual for any coherent cacheable main memory region, or when the LR/SC reservation hardware (LSU reservation station / reservation monitor) does not guarantee RsrvEventual forward progress semantics on those regions despite reporting PMA support for it.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "RsrvEventual|RsrvNonEventual|RsrvNone|reservation.*eventual|lr_sc.*pma|ziccrse.*pma|pma_checker.*rsrv|reservability.*PMA|LrScForwardProgress",
+    "affected_entities": [
+      "Ziccrse",
+      "PMA_checker",
+      "LR_SC_reservation_unit",
+      "LSU_reservation_monitor",
+      "misaligned_atomicity_granule_PMA",
+      "coherence_PMA",
+      "cacheability_PMA"
+    ],
+    "summary": "Ziccrse extension norm requires RsrvEventual (guaranteed forward progress) for LR/SC on coherent cacheable main memory — PMA checker must enforce or deny CSRSC operations to non-RsrvEventual regions, and the LR/SC reservation hardware must provide the eventual success guarantee to avoid infinite livelock in synchronization primitives"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/Parameters.scala",
+        "function_name": "ISAExtensions",
+        "line_start": 302,
+        "line_end": 302,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "ISA string declares Ziccrse (\"ziccrse\") support but the microarchitecture has zero implementation of the RsrvEventual PMA attribute — no RsrvEventual field in PMA config data structures, no RsrvEventual bits in PMA checker output, no RsrvEventual propagation to LSU. This is a false claim of spec compliance: the extension is advertised to software but the hardware cannot provide RsrvEventual guarantees.",
+      "snippet": "\"zicbom\", \"zicbop\", \"zicboz\", \"ziccamoa\", \"ziccif\", \"zicclsm\", \"ziccrse\", \"zicntr\", \"zicond\",",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/ziccrse.adoc",
+          "line_start": 4,
+          "line_end": 6,
+          "excerpt": "If the Ziccrse extension is implemented, then main memory regions with both the coherence and cacheability PMAs must support the RsrvEventual PMA."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMA.scala",
+        "function_name": "PMAConfigEntry",
+        "line_start": 42,
+        "line_end": 52,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "PMAConfigEntry case class defines PMA attributes (l, c, atomic, a, x, w, r) but has NO rsrv_eventual field. This is the root data structure that defines all PMA region attributes for the entire SoC. Without a reservability field, it is impossible to encode RsrvEventual/RsrvNonEventual/RsrvNone for any memory region, making Ziccrse compliance architecturally impossible.",
+      "snippet": "case class PMAConfigEntry(\n  base_addr: BigInt,\n  range: BigInt = 0L,\n  l: Boolean = false,\n  c: Boolean = false,\n  atomic: Boolean = false,\n  a: Int = 0,\n  x: Boolean = false,\n  w: Boolean = false,\n  r: Boolean = false\n)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3057,
+          "line_end": 3064,
+          "excerpt": "For LR/SC, there are three levels of support indicating combinations of the reservability and eventuality properties: RsrvNone, RsrvNonEventual, and RsrvEventual."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "PMPConfig",
+        "line_start": 41,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "PMPConfig class defines the hardware bit layout for PMP/PMA config registers with fields l, c (reserved bit 1), atomic (reserved bit 0), a, x, w, r. The two reserved bits at positions 6 and 5 (c and atomic) occupy the space that the spec allocates for PMA attribute bits. No bits are allocated for RsrvEventual/RsrvNonEventual/RsrvNone encodings. The hardware-level PMA config register layout cannot express reservability levels.",
+      "snippet": "class PMPConfig(implicit p: Parameters) extends PMPBundle {\n  val l = Bool()\n  val c = Bool() // res(1), unuse in pmp\n  val atomic = Bool() // res(0), unuse in pmp\n  val a = UInt(2.W)\n  val x = Bool()\n  val w = Bool()\n  val r = Bool()\n  def res: UInt = Cat(c, atomic)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3080,
+          "line_end": 3081,
+          "excerpt": "The Ziccrse extension requires RsrvEventual support to main memory regions with both the coherence and cacheability PMAs."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "PMPRespBundle",
+        "line_start": 385,
+        "line_end": 401,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "PMPRespBundle is the response bundle that carries PMA/PMP check results from the checker through the TLB/L2TLB to all LSU sub-units (LoadUnit, AtomicsUnit, VSegmentUnit). It contains ld, st, instr, mmio, atomic but has NO rsrv_eventual field. Every consumer of PMA results in the processor receives zero information about whether a memory region supports RsrvEventual. The LSU reservation monitor has no way to distinguish RsrvEventual from RsrvNonEventual or RsrvNone regions.",
+      "snippet": "class PMPRespBundle(implicit p: Parameters) extends PMPBundle {\n  val ld = Output(Bool())\n  val st = Output(Bool())\n  val instr = Output(Bool())\n  val mmio = Output(Bool())\n  val atomic = Output(Bool())\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3057,
+          "line_end": 3064,
+          "excerpt": "For LR/SC, there are three levels of support indicating combinations of the reservability and eventuality properties: RsrvNone, RsrvNonEventual, and RsrvEventual."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMA.scala",
+        "function_name": "pma_check",
+        "line_start": 211,
+        "line_end": 219,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "pma_check() is the PMA evaluation function that determines the PMA attributes for a given access. It computes ld, st, instr, mmio, atomic fault signals from PMPConfig, but never evaluates or propagates any RsrvEventual/RsrvNonEventual/RsrvNone attribute. The function has no input for reservability configuration and produces no reservability output. This is the point where Ziccrse PMA enforcement should occur but is entirely absent.",
+      "snippet": "def pma_check(cmd: UInt, cfg: PMPConfig) = {\n    val resp = Wire(new PMPRespBundle)\n    resp.ld := TlbCmd.isRead(cmd) && !cfg.r\n    resp.st := Mux(TlbCmd.isAmo(cmd), !cfg.atomic || !cfg.w, ...)\n    resp.instr := TlbCmd.isExec(cmd) && !cfg.x\n    resp.mmio := !cfg.c\n    resp.atomic := cfg.atomic\n    resp\n  }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/ziccrse.adoc",
+          "line_start": 4,
+          "line_end": 6,
+          "excerpt": "If the Ziccrse extension is implemented, then main memory regions with both the coherence and cacheability PMAs must support the RsrvEventual PMA."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMA.scala",
+        "function_name": "pma_match_res",
+        "line_start": 237,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "pma_match_res() resolves overlapping PMA entries and aligns attributes for the matched region. It aligns r, w, x, atomic, c fields (line 244-248) but does NOT align or propagate any reservability attribute. Even if PMAConfigEntry were extended with a reservability field, this match resolution logic would drop it, meaning the PMA entry priority resolution path cannot convey RsrvEventual to downstream consumers.",
+      "snippet": "cur.cfg.r := aligned && pma.cfg.r\ncur.cfg.w := aligned && pma.cfg.w\ncur.cfg.x := aligned && pma.cfg.x\ncur.cfg.atomic := aligned && pma.cfg.atomic\ncur.cfg.c := aligned && pma.cfg.c",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3080,
+          "line_end": 3081,
+          "excerpt": "The Ziccrse extension requires RsrvEventual support to main memory regions with both the coherence and cacheability PMAs."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/PMA.scala",
+        "function_name": "addPMA / pma_init",
+        "line_start": 163,
+        "line_end": 169,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "pma_init() calls addPMA() to encode each PMAConfigEntry into PMPConfigUInt hardware register format. It passes only (conf.l, conf.c, conf.atomic, conf.a, conf.x, conf.w, conf.r) — no reservability bits. Since PMAConfigEntry has no reservability field, and PMPConfigUInt has no bit positions for reservability encoding, the hardware initialization path has no mechanism to configure any memory region as RsrvEventual.",
+      "snippet": "def addPMA(conf: PMAConfigEntry) = {\n      val addr = if (conf.a < 2) { shift_addr(conf.base_addr) }\n        else { get_napot(conf.base_addr, conf.range) }\n      cfg_list.append(PMPConfigUInt(conf.l, conf.c, conf.atomic, conf.a, conf.x, conf.w, conf.r))\n      addr_list.append(genAddr(addr))\n      mask_list.append(genMask(addr, conf.a))\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 3080,
+          "line_end": 3081,
+          "excerpt": "The Ziccrse extension requires RsrvEventual support to main memory regions with both the coherence and cacheability PMAs."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/system/SoC.scala",
+        "function_name": "SoCParameters.PMAConfigs",
+        "line_start": 58,
+        "line_end": 73,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The default SoC PMA configuration defines the main DDR memory region at 0x80000000000L as cacheable (c=true) and atomic (atomic=true). Per Ziccrse, this region MUST also have RsrvEventual, but the PMAConfigEntry struct has no field to specify it, and no reservability attribute is configured. All 13 PMA entries default to unspecified reservability. Software reading the PMA registers for this coherent-cacheable main memory region will see no RsrvEventual indication, violating Ziccrse.",
+      "snippet": "PMAConfigs: Seq[PMAConfigEntry] = Seq(\n    PMAConfigEntry(0x0L, range = 0x1000000000000L, a = 3),\n    PMAConfigEntry(0x80000000000L, c = true, atomic = true, a = 1, x = true, w = true, r = true),\n    PMAConfigEntry(0x80000000L, a = 1, w = true, r = true),",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/ziccrse.adoc",
+          "line_start": 4,
+          "line_end": 6,
+          "excerpt": "If the Ziccrse extension is implemented, then main memory regions with both the coherence and cacheability PMAs must support the RsrvEventual PMA."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/profiles/rva23.adoc",
+          "line_start": 43,
+          "line_end": 45,
+          "excerpt": "Ziccrse: Main memory regions with both the coherence and cacheability PMAs must support RsrvEventual."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/cache/dcache/mainpipe/MainPipe.scala",
+        "function_name": "LR/SC reservation monitor",
+        "line_start": 619,
+        "line_end": 679,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The reservation monitor is a single-entry tracker (lrsc_count counter + lrsc_addr register) with a fixed 64-cycle window. The reservation is tied to the L1 D$ cacheline presence: reservation invalidation (invalid_resv_set) occurs only on eviction of the reserved cache block (DCacheWrapper.scala:1566-1570). The spec note (zalrsc.adoc:261-264) states 'cache evictions caused by another hart sharing the cache cannot impede LR/SC progress indefinitely. Typically, this implies reservations are tracked independently of evictions from any shared cache.' Pathological cache pressure from unrelated accesses can evict the reserved line and invalidate the reservation, causing repeated SC failure. The 64-cycle fixed window with backoff does not provide an architectural guarantee of eventual success.",
+      "snippet": "val lrsc_count = RegInit(0.U(log2Ceil(LRSCCycles).W))\nval lrsc_valid = lrsc_count > LRSCBackOff.U\nval lrsc_addr = Reg(UInt())\n// ...\ns3_sc_fail  := s3_sc && (!s3_lrsc_addr_match || !s3_hit)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zalrsc.adoc",
+          "line_start": 232,
+          "line_end": 241,
+          "excerpt": "If a hart H enters a constrained LR/SC loop, the execution environment must guarantee that one of the following events eventually occurs: (1) H or some other hart executes a successful SC to the reservation set... (2) Some other hart executes an unconditional store or AMO... (3) H executes a branch or jump that exits... (4) H traps."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zalrsc.adoc",
+          "line_start": 260,
+          "line_end": 266,
+          "excerpt": "For example, cache evictions caused by another hart sharing the cache cannot impede LR/SC progress indefinitely. Typically, this implies reservations are tracked independently of evictions from any shared cache. Similarly, cache misses caused by speculative execution within a hart cannot impede LR/SC progress indefinitely."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/cache/dcache/DCacheWrapper.scala",
+        "function_name": "reservation invalidation path",
+        "line_start": 1566,
+        "line_end": 1570,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The reservation set invalidation (invalid_resv_set) is wired ONLY to the writeback/eviction path — it triggers when a cache block is evicted and the address matches lrsc_locked_block. There is NO reservation invalidation on incoming coherent probes (TileLink Probe messages) from other harts' stores. Instead, probes to the reserved block are simply blocked (Probe.scala:87-91) during the reservation window. This means: (a) if the probe arrives after reservation expiry, the reservation sees stale data; (b) there is no mechanism to forward progress guarantee when coherence is maintained by a shared L2. The probe-blocking approach conflicts with RsrvEventual's requirement for reservations that are aware of coherent external stores.",
+      "snippet": "mainPipe.io.invalid_resv_set := RegNext(\n    wb.io.req.fire &&\n    wb.io.req.bits.addr === mainPipe.io.lrsc_locked_block.bits &&\n    mainPipe.io.lrsc_locked_block.valid\n  )",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zalrsc.adoc",
+          "line_start": 237,
+          "line_end": 239,
+          "excerpt": "Some other hart executes an unconditional store or AMO instruction to the reservation set of the LR instruction in H's constrained LR/SC loop, or some other device in the system writes to that reservation set."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

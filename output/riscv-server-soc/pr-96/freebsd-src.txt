@@ -1,0 +1,103 @@
+PR #96  target=freebsd-src  overall=bug_confirmed
+Spec: Without capability checks for Non-Leaf PTE Invalidation (IOM_330) and Address Range Invalidation (IOM_340), stale IOMMU TLB entries can survive partial invalidation — a DMA device continues accessing memory through freed/reassigned page table entries, bypassing FreeBSD's pmap-driven memory protection for device contexts.
+Violation:
+  FreeBSD kernel IOMMU driver issues non-leaf PTE invalidation or address-
+  range invalidation commands without first checking the IOMMU capabilities
+  register for support of these extensions, or assumes all IOMMUs support
+  fine-grained invalidation and skips full TLB flushes. This is most likely on
+  RISC-V server SoCs where multiple IOMMUs may govern different PCIe
+  hierarchies and may have heterogeneous capability sets, or where a non-PCIe
+  IOMMU lacks extensions present on the PCIe-attached IOMMU.
+Consequence: privilege_escape
+Pattern:
+  IOMMU_CAP.*INVAL|iotlb_inval|ioatc_inval|non_leaf.*inval|range.*inval|IOMMU_
+  CMD.*INV|iommu_invalidate|command.*VMA|command.*GVA|ATS.*INVAL
+------------------------------------------------------------
+[bug_confirmed] sys/arm64/iommu/smmu.c:626-634  smmu_invalidate_all_sid
+  smmu_invalidate_all_sid() unconditionally issues CMD_CFGI_STE_RANGE (a
+  range-based STE invalidation command) without first checking the
+  SMMU_FEATURE_RANGE_INV capability flag. The capability is detected from
+  IDR3_RIL at line 1470-1471 and stored in sc->features, but the guard is
+  never consulted before emitting the command. On SMMUv3 implementations where
+  IDR3.RIL=0, issuing CMD_CFGI_STE_RANGE results in CERROR_ILL (Illegal
+  Command), which halts command queue processing and breaks all subsequent
+  IOMMU invalidation. On RISC-V server SoCs with heterogeneous SMMU instances,
+  some may lack range invalidation support even when others have it, making
+  the unconditional use unsafe.
+  | cmd.opcode = CMD_CFGI_STE_RANGE;
+  | smmu_cmdq_enqueue_cmd(sc, &cmd);
+  | smmu_sync(sc);
+
+[potential_risk] sys/arm64/iommu/smmu.c:660-671  smmu_tlbi_va
+  smmu_tlbi_va() unconditionally sets cmd.tlbi.leaf = true with the comment
+  'We change only L3'. The SMMUv3 architecture defines IDR3.BBML (bit 11) to
+  indicate whether the TLB invalidation leaf parameter is supported. IDR3.BBML
+  is not defined in smmureg.h and is never checked anywhere in the driver. On
+  implementations where BBML=0 (leaf not supported), setting TLBI_1_LEAF in a
+  CMD_TLBI_NH_VA produces architecturally UNPREDICTABLE behavior, potentially
+  causing incomplete TLB invalidation and stale translation entries.
+  | cmd.opcode = CMD_TLBI_NH_VA;
+  | cmd.tlbi.asid = asid;
+  | cmd.tlbi.vmid = 0;
+  | cmd.tlbi.leaf = true; /* We change only L3. */
+  | cmd.tlbi.addr = va;
+
+[bug_confirmed] sys/x86/iommu/intel_qi.c:185-206  dmar_qi_invalidate_emit
+  dmar_qi_invalidate_emit() unconditionally sets both DMAR_IQ_DESCR_IOTLB_DW
+  (Drain Writes) and DMAR_IQ_DESCR_IOTLB_DR (Drain Reads) in every page-
+  selective IOTLB invalidation descriptor on the QI path. These operations
+  require DMAR_CAP_DWD (bit 54) and DMAR_CAP_DRD (bit 55) capability bits
+  respectively. While the driver prints these capability bits during
+  initialization (intel_drv.c:343), it never checks them before emitting DW/DR
+  in the QI path. The non-QI register-based path (intel_idpgtbl.c:773)
+  correctly checks DMAR_CAP_PSI before issuing page-selective invalidation and
+  falls back to domain-selective invalidation when PSI is absent. The QI path
+  has no such fallback. On hardware without drain read/write support, these
+  bits are reserved and may cause command errors or be ignored, leading to
+  incomplete invalidation and potential DMA to stale mappings.
+  | dmar_qi_emit(unit, DMAR_IQ_DESCR_IOTLB_INV |
+  |     DMAR_IQ_DESCR_IOTLB_PAGE | DMAR_IQ_DESCR_IOTLB_DW |
+  |     DMAR_IQ_DESCR_IOTLB_DR |
+  |     DMAR_IQ_DESCR_IOTLB_DID(domain->domain),
+  |     base | am);
+
+[bug_confirmed] sys/x86/iommu/amd_cmd.c:200-224  amdiommu_qi_invalidate_emit
+  The AMD IOMMU kernel driver never issues INVALIDATE_IOTLB_PAGES commands
+  (opcode 0x04, defined in amd_reg.h:666) to invalidate device IOTLBs. The
+  qi_invalidate_emit function only issues INVALIDATE_IOMMU_PAGES (IOMMU TLB
+  invalidation, not device IOTLB). PCIM_AMDIOMMU_CAP_IOTLB (pcireg.h:1148),
+  which indicates hardware device-IOTLB support, is never referenced anywhere
+  in the kernel IOMMU driver (amd_cmd.c, amd_drv.c, amd_ctx.c). Without device
+  IOTLB invalidation, devices with ATS (Address Translation Services) retain
+  stale cached translations after the IOMMU page tables are modified. This
+  allows a device to continue DMA to memory pages that the OS has unmapped or
+  reassigned — a direct privilege escalation path via stale ATS translations.
+  Notably, the bhyve VMM AMD backend (amdvi_hw.c) does correctly check and
+  handle device IOTLB invalidation, but the bare-metal kernel mapping path
+  does not.
+  | c.op = AMDIOMMU_CMD_INVALIDATE_IOMMU_PAGES;
+  | c.domainid = domain->domain;
+  | isize = IOMMU_PAGE_SIZE; /* XXXKIB handle superpages */
+  | 
+  | for (; size > 0; base += isize, size -= isize) {
+  |     amdiommu_cmd_ensure(AMD2IOMMU(unit), 1);
+  |     c.s = 0;
+  |     c.pde = 1;
+
+[potential_risk] sys/x86/iommu/amd_cmd.c:214-219  amdiommu_qi_invalidate_emit
+  amdiommu_qi_invalidate_emit() unconditionally sets c.pde = 1 in every
+  INVALIDATE_IOMMU_PAGES command, requesting non-leaf (intermediate page
+  table) entry invalidation. The comment 'XXXKIB handle superpages' confirms
+  this is known-incomplete. The code also sets isize = IOMMU_PAGE_SIZE and
+  iterates page-by-page, which contradicts the non-leaf invalidation intent.
+  The behavior of setting pde=1 without checking any hardware capability for
+  non-leaf invalidation support, combined with the page-by-page loop, may
+  cause incomplete or incorrect TLB invalidation on AMD IOMMU implementations
+  that handle non-leaf invalidation differently.
+  | isize = IOMMU_PAGE_SIZE; /* XXXKIB handle superpages */
+  | 
+  | for (; size > 0; base += isize, size -= isize) {
+  |     amdiommu_cmd_ensure(AMD2IOMMU(unit), 1);
+  |     c.s = 0;
+  |     c.pde = 1;
+

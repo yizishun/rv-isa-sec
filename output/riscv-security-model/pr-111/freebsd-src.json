@@ -1,0 +1,141 @@
+{
+  "pr_number": 111,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 111,
+    "violation_condition": "In the FreeBSD/riscv kernel, if the Svukte extension is not implemented or enabled, the pmap page-fault handler (riscv/pmap.c) resolves U-mode-to-S-mode address accesses with timing that varies by target address — e.g., a fault to an unmapped kernel address may resolve faster (invalid PTE) than a fault to a valid kernel PTE that requires TLB fill or table walk. A userspace attacker can probe the supervisor address range, measure fault latencies via rdtime, and infer the kernel's virtual address layout (KASLR bypass), text segment boundaries, or heap structure.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "riscv/pmap.c page-fault handler path from U-mode accesses that does not enforce constant-time fault resolution; absence of Svukte CSR checks or menvcfg.CBZE/menvcfg.CBCFE configuration in locore.S or identcpu.c; pmap_fault() or trap_pfault() returning to userland without Svukte-guaranteed constant-latency semantics",
+    "affected_entities": [
+      "Svukte extension",
+      "satp",
+      "menvcfg",
+      "stvec",
+      "scause"
+    ],
+    "summary": "Svukte (Address-Independent Fault Latency) missing from FreeBSD/riscv enables KASLR-defeating timing side channel via U-mode probing of S-mode address space through pmap fault latency measurement"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/pmap.c",
+        "function_name": "pmap_fault",
+        "line_start": 2909,
+        "line_end": 2954,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "pmap_fault() resolves U-mode-triggered page faults to supervisor addresses with address-dependent timing. The function has at least four distinct execution paths with different costs: (a) null/invalid L2 PTE → immediate goto done (line 2921-2922); (b) valid L2 → invalid L3 PTE → goto done (line 2925-2926); (c) valid PTE with permission failure (e.g., PTE_U=0 for user access) → goto done (line 2932-2936); (d) valid PTE needing A/D bit update → atomic_set_64 + sfence_vma (line 2947-2949). A U-mode attacker probing kernel addresses can measure these timing variations via rdtime to infer which kernel addresses have valid PTEs, revealing KASLR layout, text segment boundaries, and heap structure. No Svukte constant-time fault resolution is enforced.",
+      "snippet": "2920:    l2 = pmap_l2(pmap, va);\n2921:    if (l2 == NULL || ((l2e = pmap_load(l2)) & PTE_V) == 0)\n2922:        goto done;\n2923:    if ((l2e & PTE_RWX) == 0) {\n2924:        pte = pmap_l2_to_l3(l2, va);\n2925:        if (((oldpte = pmap_load(pte)) & PTE_V) == 0)\n2926:            goto done;\n...\n2932:    if ((pmap != kernel_pmap && (oldpte & PTE_U) == 0) ||\n2933:        (ftype == VM_PROT_WRITE && (oldpte & PTE_W) == 0) ||\n2934:        (ftype == VM_PROT_EXECUTE && (oldpte & PTE_X) == 0) ||\n2935:        (ftype == VM_PROT_READ && (oldpte & PTE_R) == 0))\n2936:        goto done;\n...\n2947:    if ((oldpte & bits) != bits)\n2948:        pmap_store_bits(pte, bits);\n2949:    sfence_vma();",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 230,
+        "line_end": 264,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "page_fault_handler() processes U-mode page faults to kernel addresses (va >= VM_MIN_KERNEL_ADDRESS) through the full fault resolution pipeline. The VIRT_IS_VALID() macro at line 231 treats any address in the kernel virtual range (>= 0xffffffc000000000) as 'valid', allowing the fault to proceed into pmap_fault() at line 264 rather than being immediately rejected. This means a U-mode attacker can probe the entire kernel virtual address space and observe timing differences between mapped and unmapped addresses. The canonical hole between user and kernel space is rejected immediately (fast path), but kernel-range addresses enter the timing-variable pmap_fault path.",
+      "snippet": "230:    if (usermode) {\n231:        if (!VIRT_IS_VALID(stval)) {\n232:            call_trapsignal(td, SIGSEGV, SEGV_MAPERR, (void *)stval,\n233:                frame->tf_scause & SCAUSE_CODE);\n234:            goto done;\n235:        }\n236:        map = &p->p_vmspace->vm_map;\n...\n264:    if (VIRT_IS_VALID(va) && pmap_fault(map->pmap, va, ftype))\n265:        goto done;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pmap.h",
+        "function_name": "VIRT_IS_VALID",
+        "line_start": 126,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "VIRT_IS_VALID() macro treats any address >= VM_MIN_KERNEL_ADDRESS (0xffffffc000000000) as a 'valid' address for fault processing, even when the fault originated from U-mode. This is the gate that enables the KASLR-probing side channel: it allows U-mode faults to kernel addresses to enter the timing-variable pmap_fault() code path. Only the non-canonical hole between user space and kernel space is rejected immediately. The macro should explicitly reject kernel-range addresses when the faulting context is U-mode, or Svukte constant-time semantics should be enforced.",
+      "snippet": "126:#define VIRT_IS_VALID(va)                                              \\\n127:    ((va) < (pmap_mode == PMAP_MODE_SV39 ? VM_MAX_USER_ADDRESS_SV39 : \\\n128:        VM_MAX_USER_ADDRESS_SV48) || (va) >= VM_MIN_KERNEL_ADDRESS)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/identcpu.c",
+        "function_name": "parse_ext_s",
+        "line_start": 164,
+        "line_end": 180,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "FreeBSD RISC-V CPU identification does not detect the Svukte ISA extension. The CHECK_S_EXT macro recognizes only five supervisor extensions (sstc, svnapot, svpbmt, svinval, sscofpmf) at lines 176-180. There is no CHECK_S_EXT(\"svukte\", SV_SVUKTE) entry and no SV_SVUKTE flag definition in the smode_extensions bitmask (only SV_SSTC through SV_SSCOFPMF defined at lines 93-97). The kernel cannot detect Svukte hardware support even if the underlying hardware implements it, making it impossible to conditionally enable constant-time fault resolution.",
+      "snippet": "176:    CHECK_S_EXT(\"sstc\",    SV_SSTC);\n177:    CHECK_S_EXT(\"svnapot\", SV_SVNAPOT);\n178:    CHECK_S_EXT(\"svpbmt\",  SV_SVPBMT);\n179:    CHECK_S_EXT(\"svinval\", SV_SVINVAL);\n180:    CHECK_S_EXT(\"sscofpmf\",        SV_SSCOFPMF);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "_alt_start/_start",
+        "line_start": 65,
+        "line_end": 391,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The RISC-V boot assembly does not configure menvcfg at all. Only stvec (lines 212, 232, 369, 387), satp (lines 220, 375), and sscratch (lines 236, 391) are written during boot. No CSR write to menvcfg exists anywhere in the kernel source under sys/. The menvcfg register (CSR 0x30A) is never read, written, or configured. This means menvcfg.CBZE, menvcfg.CBCFE, and any Svukte-related control bits remain at hardware reset defaults (typically 0, disabled). Even if firmware (OpenSBI) configures some menvcfg bits, the kernel has no visibility into or control over the configuration.",
+      "snippet": "No menvcfg CSR write exists in the entire file or anywhere under sys/riscv/.\nOnly stvec, satp, and sscratch are configured during boot.",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2136,
+          "line_end": 2147,
+          "excerpt": "The menvcfg CSR is a 64-bit read/write register, formatted as shown, that controls certain characteristics of the execution environment for modes less privileged than M."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "CSR bit definitions",
+        "line_start": 176,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Only HENVCFG_* (hypervisor) bit macros are defined for the envcfg registers. MENVCFG_CBZE, MENVCFG_CBCFE, and any Svukte-related bit definitions are absent. The kernel has no constants to express mtvecfg bit manipulation even if menvcfg configuration code were added. The existing HENVCFG_CBZE (line 178) and HENVCFG_CBCFE (line 179) definitions at bits 7 and 6 would be at the same bit positions for menvcfg and senvcfg, but no MENVCFG_* or SENVCFG_* prefixed aliases exist.",
+      "snippet": "176:#define HENVCFG_STCE   (1UL << 63)\n177:#define HENVCFG_PBMTE  (1UL << 62)\n178:#define HENVCFG_CBZE   (1UL << 7)\n179:#define HENVCFG_CBCFE  (1UL << 6)\n180:#define HENVCFG_CBIE_S 4\n181:#define HENVCFG_CBIE_M (0x3 << HENVCFG_CBIE_S)\n182:#define HENVCFG_FIOM   (1UL << 0)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2241,
+          "line_end": 2253,
+          "excerpt": "The Zicboz extension adds the CBZE field to menvcfg. When the CBZE field is set to 1, it enables execution of the cache block zero instruction, CBO.ZERO, in modes less privileged than M... The Zicbom extension adds the CBCFE field to menvcfg."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 425,
+        "line_end": 428,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "do_trap_user() dispatches all U-mode page faults (instruction, load, store) to page_fault_handler() with usermode=1 without first checking whether the faulting address (stval) targets kernel virtual space. The faulting address is only checked later inside page_fault_handler() via VIRT_IS_VALID(). An early rejection of kernel-address faults at this dispatch point would prevent the timing-variable pmap_fault() walk entirely, but would still need constant-time rejection to avoid leaking the address-range boundary.",
+      "snippet": "425:    case SCAUSE_STORE_PAGE_FAULT:\n426:    case SCAUSE_LOAD_PAGE_FAULT:\n427:    case SCAUSE_INST_PAGE_FAULT:\n428:        page_fault_handler(frame, 1);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "call_trapsignal",
+        "line_start": 83,
+        "line_end": 94,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "call_trapsignal() delivers SIGSEGV to the faulting user process without any constant-time delay or execution equalization. The trapsignal() call at line 93 immediately returns to userland via userret(). On RISC-V systems without Svukte, the total fault-to-signal latency (measured via rdtime before the faulting access and after SIGSEGV handler entry) reveals whether the kernel walked page tables (slower for mapped kernel addresses) or short-circuited (faster for unmapped/non-canonical addresses). rdtime access from U-mode is not gated by scounteren configuration in the kernel.",
+      "snippet": "83:static __inline void\n84:call_trapsignal(struct thread *td, int sig, int code, void *addr, int trapno)\n85:{\n86:    ksiginfo_t ksi;\n87:\n88:    ksiginfo_init_trap(&ksi);\n89:    ksi.ksi_signo = sig;\n90:    ksi.ksi_code = code;\n91:    ksi.ksi_addr = addr;\n92:    ksi.ksi_trapno = trapno;\n93:    trapsignal(td, &ksi);\n94:}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

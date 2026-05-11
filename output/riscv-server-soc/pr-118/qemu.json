@@ -1,0 +1,57 @@
+{
+  "pr_number": 118,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 118,
+    "violation_condition": "QEMU TCG's IMSIC MMIO write handler (riscv_imsic_write) processes MSI writes synchronously: the pending bit is set atomically and the external interrupt line is raised inline before the MMIO write returns. Because QEMU's device model serializes all MMIO/DMA operations on the BQL (Big QEMU Lock) or per-device iothread, a device MSI write to IMSIC will always appear to complete before any subsequent DMA read from the same device, thereby implicitly providing the load-acquire ordering that the spec (PR #118) intentionally removed. Guest drivers that incorrectly rely on MSI acting as a read barrier will work on QEMU but fail on real RISC-V hardware.",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "riscv_imsic_write.*qatomic_or.*eistate.*IMSIC_EISTATE_PENDING; synchronous MSI delivery without deferred/batched interrupt injection; IMSIC MMIO write processed inline on BQL before device DMA read completion dispatch",
+    "affected_entities": [
+      "IMSIC",
+      "MSI"
+    ],
+    "summary": "QEMU's synchronous IMSIC MSI write handling implicitly enforces load-acquire ordering (interrupt observed before subsequent device reads) that the spec intentionally removed, masking guest driver race conditions on real hardware"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_imsic.c",
+        "function_name": "riscv_imsic_write",
+        "line_start": 285,
+        "line_end": 333,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "QEMU's IMSIC MMIO write handler processes MSI writes synchronously on the BQL: the pending bit is set atomically (qatomic_or) and the external interrupt line is raised inline (qemu_irq_raise via riscv_imsic_update) before the MMIO write returns. Because QEMU serializes all device MMIO/DMA operations under the BQL, a device MSI write to IMSIC will always appear to complete before any subsequent DMA read from the same device, thereby implicitly providing load-acquire ordering that the RISC-V AIA spec (PR #118) intentionally removed. Guest drivers developed on QEMU that incorrectly rely on MSI acting as a read barrier will function correctly on QEMU but will fail on real RISC-V hardware where the device may read stale data after MSI delivery. This is a fidelity gap in the emulation model, not a code correctness bug — QEMU's synchronous device model inherently provides stronger ordering than real hardware.",
+      "snippet": "static void riscv_imsic_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)\n{\n    ...\n    if (value && (value < imsic->num_irqs)) {\n        qatomic_or(&imsic->eistate[(page * imsic->num_irqs) + value], IMSIC_EISTATE_PENDING);\n        riscv_imsic_update(imsic, page);\n    }\n    return;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_imsic.c",
+        "function_name": "riscv_imsic_update",
+        "line_start": 67,
+        "line_end": 88,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "riscv_imsic_update correctly implements IMSIC interrupt evaluation: lowering the line, checking eidelivery and topei for pending+enabled interrupts, and raising the line if any exist. Atomic operations on eistate are correct for concurrent CSR and MSI access. The enpend flag at eistate[base] correctly tracks whether the external IRQ line is currently asserted. Functionally correct per the AIA specification.",
+      "snippet": "    if (qatomic_fetch_and(&imsic->eistate[base], ~IMSIC_EISTATE_ENPEND)) {\n        qemu_irq_lower(imsic->external_irqs[page]);\n    }\n    if (imsic->eidelivery[page] && riscv_imsic_topei(imsic, page)) {\n        qemu_irq_raise(imsic->external_irqs[page]);\n        qatomic_or(&imsic->eistate[base], IMSIC_EISTATE_ENPEND);\n    }",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "hw/intc/riscv_imsic.c",
+        "function_name": "riscv_imsic_rmw",
+        "line_start": 200,
+        "line_end": 260,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR RMW path correctly dispatches to the appropriate handler based on ISELECT register encoding. Page selection logic correctly handles M-mode (page 0 only), S-mode with virtualization (vgein-based page selection with bounds check), and S-mode without virtualization (page 0). All handlers (eidelivery, eithreshold, topei, eip, eie) correctly call riscv_imsic_update after modification.",
+      "snippet": "    switch (isel) {\n    case ISELECT_IMSIC_EIDELIVERY:\n        return riscv_imsic_eidelivery_rmw(imsic, page, val, new_val, wr_mask);\n    case ISELECT_IMSIC_EITHRESHOLD:\n        return riscv_imsic_eithreshold_rmw(imsic, page, val, new_val, wr_mask);\n    ...\n    }",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}
