@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # 改时间: 编辑 ~/.config/systemd/user/daily-report-trigger.timer 的 OnCalendar=
+#         每天 08:00 和 20:00 各触发一次
 #         然后 systemctl --user daemon-reload && systemctl --user restart daily-report-trigger.timer
 # token:  ~/.config/daily-report/gh-token
 REPO="yizishun/rv-isa-sec"

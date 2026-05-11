@@ -2,9 +2,9 @@
 set -euo pipefail
 
 REPO="/home/yzs/riscv/rv-isa-sec"
-TODAY=$(date +%F)
-REPORT_FILE="$REPO/reports/${TODAY}.md"
-SUMMARY_FILE="/tmp/spechunter-summary-${TODAY}.txt"
+TIMESTAMP=$(date +%F-%H)
+REPORT_FILE="$REPO/reports/${TIMESTAMP}.md"
+SUMMARY_FILE="/tmp/spechunter-summary-${TIMESTAMP}.txt"
 
 mkdir -p "$REPO/reports"
 cd "$REPO"
@@ -39,7 +39,7 @@ done
 # ---- 步骤 2: 提交所有文件 ----
 echo "=== Step 2: Committing all new files ==="
 
-git commit -m "wip: staged daily scan output for ${TODAY}" || true
+git commit -m "wip: staged daily scan output for ${TIMESTAMP}" || true
 echo "Committed."
 
 # ---- 步骤 3: 分类并生成摘要 ----
@@ -76,7 +76,7 @@ done <<< "$STAGED"
 echo "BUG=$BUG_COUNT RISK=$RISK_COUNT COMPLIANT=$COMPLIANT_COUNT OTHER=$OTHER_COUNT"
 
 cat > "$SUMMARY_FILE" <<EOF
-# specHunter Daily Scan — ${TODAY}
+# specHunter Daily Scan — ${TIMESTAMP}
 Total: ${STAGED_COUNT} | bug_confirmed: ${BUG_COUNT} | potential_risk: ${RISK_COUNT} | compliant: ${COMPLIANT_COUNT}
 EOF
 if [ -n "$SUMMARY_BODY" ]; then
@@ -88,7 +88,7 @@ fi
 if [ "$BUG_COUNT" -eq 0 ] && [ "$RISK_COUNT" -eq 0 ]; then
   echo "=== Nothing to analyze. Finalizing. ==="
   git commit --amend -m "$(cat <<EOF
-daily: scan report for ${TODAY}
+daily: scan report for ${TIMESTAMP}
 
 Co-Authored-By: Claude (via Claude Code) <noreply@anthropic.com>
 EOF
@@ -117,7 +117,7 @@ ${SUMMARY_CONTENT}
 ## 报告格式
 
 \`\`\`markdown
-# 每日扫描报告 — ${TODAY}
+# 每日扫描报告 — ${TIMESTAMP}
 
 ## 概览
 | 严重程度 | 数量 |
@@ -164,7 +164,7 @@ cd "$REPO"
 if [ -f "$REPORT_FILE" ]; then
   git add "$REPORT_FILE"
   git commit --amend -m "$(cat <<EOF
-daily: scan report for ${TODAY}
+daily: scan report for ${TIMESTAMP}
 
 Co-Authored-By: Claude (via Claude Code) <noreply@anthropic.com>
 EOF
