@@ -1,0 +1,102 @@
+PR #2631  target=linux  overall=compliant
+Spec: Hypervisor CSR address range (csr[9:8]=10) is now normatively reserved for HS-mode access; kernel S-mode paths touching these CSRs directly will unconditionally fault, requiring audit of all RISC-V CSR access wrappers to ensure hypervisor CSRs are gated behind is_hs_mode() or kvm_arch entry guards.
+Violation:
+  Linux kernel code running at S-mode (not HS-mode or M-mode) accesses a CSR
+  with csr[9:8]=10 (hypervisor-level CSR address range), triggering an
+  illegal-instruction or virtual-instruction exception per the Zicsr privilege
+  encoding convention now explicitly clarified to reserve pattern '10' for
+  hypervisor CSRs.
+Consequence: denial_of_service
+Pattern:
+  csr_[read|write|read_write|set|clear|swap]\(.*\b(0x[23]|0x[67]|0x[AaEe][0-
+  9a-fA-F])[0-9a-fA-F]{2}\b
+------------------------------------------------------------
+[compliant] arch/riscv/kvm/main.c:36-55  kvm_arch_enable_virtualization_cpu
+  Writes to hypervisor CSRs (CSR_HEDELEG=0x602, CSR_HIDELEG=0x603,
+  CSR_HCOUNTEREN=0x606, CSR_HVIP=0x645, CSR_VSIE=0x204) are legitimate because
+  KVM runs in HS-mode. The H-extension is verified present at module init
+  (main.c:88). All accessed CSRs have csr[9:8]=10 which is the correct
+  hypervisor encoding.
+  | csr_write(CSR_HEDELEG, KVM_HEDELEG_DEFAULT);
+  | csr_write(CSR_HIDELEG, KVM_HIDELEG_DEFAULT);
+  | csr_write(CSR_HCOUNTEREN, 0x02);
+  | csr_write(CSR_HVIP, 0);
+  References:
+    - riscv-isa-manual/src/priv/csrs.adoc:27-49
+      "The next two bits (csr[9:8]) encode the lowest privilege level that
+      can access the CSR, with the pattern '10' representing hypervisor
+      CSRs. [...] Atte"
+
+[compliant] arch/riscv/kvm/vcpu.c:586-621  kvm_arch_vcpu_load
+  VCPU load path writes VS-level CSRs (CSR_VSSTATUS=0x200, CSR_VSIE=0x204,
+  CSR_VSTVEC=0x205, etc.) and hypervisor CSRs (CSR_HEDELEG=0x602,
+  CSR_HVIP=0x645, CSR_HENVCFG=0x60a). All accessed CSRs have csr[9:8]=10
+  (hypervisor range), which is valid for HS-mode execution after H-extension
+  verification.
+  | csr_write(CSR_VSSTATUS, csr->vsstatus);
+  | csr_write(CSR_VSIE, csr->vsie);
+  | csr_write(CSR_VSTVEC, csr->vstvec);
+  | csr_write(CSR_VSSCRATCH, csr->vsscratch);
+  | csr_write(CSR_VSEPC, csr->vsepc);
+  References:
+    - riscv-isa-manual/src/priv/csrs.adoc:27-49
+      "The next two bits (csr[9:8]) encode the lowest privilege level that
+      can access the CSR, with the pattern '10' representing hypervisor
+      CSRs."
+
+[compliant] arch/riscv/kernel/suspend.c:16-40  __cpu_suspend_save
+  Suspend save/restore accesses only supervisor-level CSRs: CSR_ENVCFG=0x10a
+  (csr[9:8]=01), CSR_STVEC=0x105 (csr[9:8]=01), CSR_SIE=0x104 (csr[9:8]=01),
+  CSR_STIMECMP=0x14D (csr[9:8]=01), CSR_SATP=0x180 (csr[9:8]=01),
+  CSR_SCRATCH=0x140 (csr[9:8]=01). No hypervisor CSR accesses.
+  | context->envcfg = csr_read(CSR_ENVCFG);
+  | context->tvec = csr_read(CSR_TVEC);
+  | context->ie = csr_read(CSR_IE);
+  | context->satp = csr_read(CSR_SATP);
+
+[compliant] arch/riscv/kernel/cpu.c:195-217  riscv_cpuinfo_starting
+  Accesses M-mode CSRs (CSR_MVENDORID=0xf11, CSR_MARCHID=0xf12,
+  CSR_MIMPID=0xf13, csr[9:8]=11) only under CONFIG_RISCV_M_MODE guard (line
+  205-210). Under S-mode, uses SBI calls instead (lines 199-204). No
+  hypervisor CSRs are accessed in S-mode paths.
+  | #if IS_ENABLED(CONFIG_RISCV_M_MODE)
+  | ci->mvendorid = csr_read(CSR_MVENDORID);
+  | ci->marchid = csr_read(CSR_MARCHID);
+  | ci->mimpid = csr_read(CSR_MIMPID);
+  | #else
+
+[compliant] arch/riscv/kernel/process.c:126-134  arch_align_stack
+  Accesses only CSR_STATUS (maps to CSR_SSTATUS=0x100 in S-mode, csr[9:8]=01)
+  and CSR_ENVCFG=0x10a (csr[9:8]=01). Both are supervisor-level CSRs, correct
+  for S-mode execution.
+  | unsigned long tmp = csr_read(CSR_STATUS);
+  | csr_write(CSR_STATUS, (tmp & ~SR_UXL) | SR_UXL_32);
+  | csr_write(CSR_STATUS, tmp);
+
+[compliant] arch/riscv/errata/thead/errata.c:24-44  errata_probe_mae
+  Accesses CSR_TH_SXSTATUS=0x5c0. csr[11:8]=0101, so csr[9:8]=01 (supervisor-
+  level). Correctly in the custom S-mode read/write range (0x5C0-0x5FF per the
+  CSR address table).
+  | #define CSR_TH_SXSTATUS 0x5c0
+  | if (!(csr_read(CSR_TH_SXSTATUS) & SXSTATUS_MAEE))
+  References:
+    - riscv-isa-manual/src/priv/csrs.adoc:91-98
+      "Supervisor-Level CSRs: |01 |01 |11XX |0x5C0-0x5FF |Custom
+      read/write"
+
+[compliant] arch/riscv/kernel/vector.c:104-108  insn_is_vector
+  Checks CSR ranges CSR_VSTART=0x008 through CSR_VCSR=0x00F and CSR_VL=0xC20
+  through CSR_VLENB=0xC22. All are unprivileged CSRs (csr[9:8]=00 for VSTART-
+  VCSR, csr[11:8]=1100 for VL-VLENB). Correct access level for any privilege
+  mode.
+  | if ((csr >= CSR_VSTART && csr <= CSR_VCSR) ||
+  |     (csr >= CSR_VL && csr <= CSR_VLENB))
+  |     return true;
+
+[compliant] arch/riscv/include/asm/switch_to.h:84-89  __switch_to_envcfg
+  Context switch writes CSR_ENVCFG=0x10a (csr[9:8]=01, supervisor-level).
+  Correct for S-mode context switching. No hypervisor CSRs touched in the
+  switch_to() fast path.
+  | asm volatile (ALTERNATIVE("nop", "csrw " __stringify(CSR_ENVCFG) ", %0",
+  |                   0, RISCV_ISA_EXT_XLINUXENVCFG, 1)
+

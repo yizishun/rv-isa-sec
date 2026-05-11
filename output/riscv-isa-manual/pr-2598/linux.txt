@@ -1,0 +1,263 @@
+PR #2598  target=linux  overall=compliant
+Spec: Ziccid's I-fetch ordering is per-hart; cross-hart I-D coherence still requires FENCE W,O + IPI-triggered remote FENCE.I — kernel code patches that assume Ziccid eliminates the need for cross-hart fencing would cause remote harts to execute stale instructions
+Violation:
+  On a Ziccid platform, the kernel relies on FENCE.I for I-D coherence after
+  text patching (bpftrace, kprobes, ftrace, alternatives, module loading). If
+  FENCE.I is executed on a hart other than the one that performed the store,
+  and Ziccid's 'eventuality' property is relied upon without proper
+  synchronization (FENCE W,O + IPI or FENCE W,W + flag + remote FENCE.I), the
+  remote hart may indefinitely execute stale instructions because Ziccid
+  explicitly scopes instruction-fetch ordering to the local hart — instruction
+  fetches only appear in program order *per hart*, and cross-hart visibility
+  of stores to instruction fetches requires explicit synchronization in
+  addition to FENCE.I. The kernel's existing stop_machine()/on_each_cpu()
+  FENCE.I broadcast pattern in patch_text() and flush_icache_mm() already
+  handles this correctly. The vulnerable pattern would be code that performs a
+  local FENCE.I after a store on one hart and expects another hart to
+  eventually see the store via Ziccid's eventuality guarantee, without the
+  required FENCE W,O+IPI or FENCE W,W+flag synchronization that the spec
+  explicitly requires for cross-hart I-fetch visibility.
+Consequence: data_corruption
+Pattern:
+  local_flush_icache_all\(\)|fence\.i.*(?!on_each_cpu|stop_machine|sbi_remote_
+  fence_i|ipi_remote_fence_i|RISCV_FENCE.*w.*o)
+------------------------------------------------------------
+[compliant] arch/riscv/include/asm/cacheflush.h:11-14  local_flush_icache_all
+  Bare 'fence.i' primitive, correctly documented as local-only. As the
+  fundamental building block, it is never relied upon for cross-hart I-D
+  coherence without proper synchronization.
+  | static inline void local_flush_icache_all(void)
+  | {
+  | 	asm volatile ("fence.i" ::: "memory");
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "A FENCE.I instruction ensures that a subsequent instruction fetch
+      on a RISC-V hart will see any previous data stores already visible
+      to the same RISC-"
+
+[compliant] arch/riscv/mm/cacheflush.c:21-44  flush_icache_all
+  Correctly implements the spec-mandated cross-hart pattern: local FENCE.I on
+  writer, then RISCV_FENCE(w,o) to order prior stores before the IPI/MMIO
+  write that triggers remote FENCE.I via sbi_remote_fence_i() or
+  on_each_cpu().
+  | local_flush_icache_all();
+  | if (num_online_cpus() < 2)
+  | 	return;
+  | RISCV_FENCE(w, o);
+  | if (riscv_use_sbi_for_rfence())
+  | 	sbi_remote_fence_i(NULL);
+  | else
+  | 	on_each_cpu(ipi_remote_fence_i, NULL, 1);
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "FENCE.I does _not_ ensure that other RISC-V harts' instruction
+      fetches will observe the local hart's stores in a multiprocessor
+      system. To make a stor"
+
+[compliant] arch/riscv/mm/cacheflush.c:57-95  flush_icache_mm
+  Correct cross-hart I-D coherence for MM context: sets stale mask for all
+  harts, does local FENCE.I on caller, then sends remote FENCE.I (via SBI or
+  on_each_cpu_mask) to harts running this MM. The smp_mb() in the deferred
+  path pairs with smp_mb() in flush_icache_deferred() for harts not currently
+  running the MM.
+  | cpumask_setall(mask);
+  | cpu = smp_processor_id();
+  | cpumask_clear_cpu(cpu, mask);
+  | local_flush_icache_all();
+  | // ...
+  | if (mm == current->active_mm && local) {
+  | 	smp_mb();
+  | } else if (riscv_use_sbi_for_rfence()) {
+  | 	sbi_remote_fence_i(&others);
+  | } else {
+  | 	on_each_cpu_mask(&others, ipi_remote_fence_i, NULL, 1);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "To make a store to instruction memory visible to all RISC-V harts,
+      the writing hart also has to execute a data FENCE before requesting
+      that all remote"
+
+[compliant] arch/riscv/mm/context.c:298-316  flush_icache_deferred
+  Context-switch deferred flush: smp_mb() pairs with writer's barrier in
+  flush_icache_mm() to ensure remote stores are visible before the local
+  FENCE.I on the newly-scheduled hart. This implements the FENCE W,W + flag +
+  local FENCE.I pattern correctly.
+  | if (cpumask_test_and_clear_cpu(cpu, &mm->context.icache_stale_mask)) {
+  | 	smp_mb();
+  | 	if (!(task && switch_to_should_flush_icache(task)))
+  | 		local_flush_icache_all();
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "A FENCE.I instruction ensures that a subsequent instruction fetch
+      on a RISC-V hart will see any previous data stores already visible
+      to the same RISC-"
+
+[compliant] arch/riscv/kernel/patch.c:251-274  patch_text_cb
+  stop_machine() rendezvous with correct synchronization: writer CPU does
+  atomic_inc_return_release (FENCE W,W release), other CPUs spin-wait then do
+  local_flush_icache_all(). The RELEASE + local FENCE.I pattern on each remote
+  hart ensures the writer's stores are visible before FENCE.I executes.
+  | if (atomic_inc_return(&patch->cpu_count) == num_online_cpus()) {
+  | 	ret = patch_insn_write(patch->addr, patch->insns, patch->len);
+  | 	atomic_inc_return_release(&patch->cpu_count);
+  | } else {
+  | 	while (atomic_read(&patch->cpu_count) <= num_online_cpus())
+  | 		cpu_relax();
+  | 	local_flush_icache_all();
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "FENCE.I does _not_ ensure that other RISC-V harts' instruction
+      fetches will observe the local hart's stores in a multiprocessor
+      system. To make a stor"
+
+[compliant] arch/riscv/kernel/patch.c:239-249  patch_text_nosync
+  Does patch_insn_write (local FENCE.I on writer via __patch_insn_write) then
+  flush_icache_range → flush_icache_all() which performs FENCE W,O + remote
+  FENCE.I. The inner local flush is an optimization; the outer
+  flush_icache_all provides the required cross-hart synchronization.
+  | ret = patch_insn_write(addr, insns, len);
+  | if (!ret)
+  | 	flush_icache_range((uintptr_t)addr, (uintptr_t)addr + len);
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "To make a store to instruction memory visible to all RISC-V harts,
+      the writing hart also has to execute a data FENCE before requesting
+      that all remote"
+
+[compliant] arch/riscv/kernel/smpboot.c:253-258  smpboot
+  Secondary CPU boot-time precautionary flush. The CPU was offline and missed
+  prior FENCE.I broadcasts, so flushing now before enabling interrupts is
+  correct. No cross-hart concern — this is self-flush after onlining.
+  | /*
+  |  * Remote cache and TLB flushes are ignored while the CPU is offline,
+  |  * so flush them both right now just in case.
+  |  */
+  | local_flush_icache_all();
+  | local_flush_tlb_all();
+
+[compliant] arch/riscv/kernel/machine_kexec.c:174-176  machine_kexec
+  Kexec path: all other CPUs are stopped via CPU hotplug before reaching this
+  point, so a local FENCE.I is sufficient to make the relocation code visible
+  to the sole remaining hart.
+  | /* Make sure the relocation code is visible to the hart */
+  | local_flush_icache_all();
+
+[compliant] arch/riscv/errata/thead/errata.c:222-223  thead_errata_patch_func
+  EARLY_BOOT stage: only the boot CPU is running (SMP not yet initialized), so
+  memcpy + local FENCE.I is sufficient. Non-early stage uses patch_text_nosync
+  which calls flush_icache_all() with full cross-hart synchronization.
+  | if (stage == RISCV_ALTERNATIVES_EARLY_BOOT)
+  | 	local_flush_icache_all();
+
+[compliant] arch/riscv/include/asm/switch_to.h:122-123  switch_to
+  User-space icache flush on task migration. Only flushes when
+  switch_to_should_flush_icache() is true (thread migrated +
+  force_icache_flush set). This handles the case where userspace uses fence.i
+  and then migrates — the new hart gets a flush. On Ziccid, migration still
+  requires this flush since the new hart hasn't seen the prior stores.
+  | if (switch_to_should_flush_icache(__next))
+  | 	local_flush_icache_all();
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:44-53
+      "The FENCE.I only synchronizes the local hart, and the OS can
+      reschedule the user hart to a different physical hart after the
+      FENCE.I. This would requi"
+
+[compliant] arch/riscv/include/asm/sync_core.h:9-12  sync_core_before_usermode
+  Membarrier sync_core path: called from ipi_sync_core() which runs on remote
+  CPUs via IPI. The IPI + smp_mb() in the membarrier path provides cross-hart
+  ordering, then the local fence.i on each remote hart provides instruction-
+  fetch coherence. This is the FENCE W,W + IPI + fence.i pattern.
+  | static inline void sync_core_before_usermode(void)
+  | {
+  | 	asm volatile ("fence.i" ::: "memory");
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "To make a store to instruction memory visible to all RISC-V harts,
+      the writing hart also has to execute a data FENCE before requesting
+      that all remote"
+
+[compliant] arch/riscv/kvm/tlb.c:191-195  kvm_riscv_fence_i_process
+  Virtualizes guest fence.i with local_flush_icache_all(). Correct: the
+  guest's fence.i only orders stores visible to the same vCPU, and the host's
+  local FENCE.I achieves this. Cross-vCPU I-D coherence in the guest is the
+  guest's responsibility (it would need its own cross-hart sync).
+  | void kvm_riscv_fence_i_process(struct kvm_vcpu *vcpu)
+  | {
+  | 	kvm_riscv_vcpu_pmu_incr_fw(vcpu, SBI_PMU_FW_FENCE_I_RCVD);
+  | 	local_flush_icache_all();
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "A FENCE.I instruction ensures that a subsequent instruction fetch
+      on a RISC-V hart will see any previous data stores already visible
+      to the same RISC-"
+
+[compliant] arch/riscv/kernel/vdso/flush_icache.S:19-19  __vdso_flush_icache
+  VDSO flush: on SMP uses syscall (sys_riscv_flush_icache → flush_icache_mm
+  with full cross-hart sync); on UP uses bare fence.i which is correct since
+  there are no other harts.
+  | #ifdef CONFIG_SMP
+  | 	li a7, __NR_riscv_flush_icache
+  | 	ecall
+  | #else
+  | 	fence.i
+  | #endif
+
+[compliant] arch/riscv/kernel/head.S:222-224  _start_kernel
+  Early boot (M-mode) fence.i: only the boot hart is running at this point. No
+  cross-hart concern.
+  | #ifdef CONFIG_RISCV_M_MODE
+  | 	/* flush the instruction cache */
+  | 	fence.i
+
+[compliant] arch/riscv/kernel/kexec_relocate.S:137-141  riscv_kexec_relocate
+  Kexec relocation: the relocation code was just copied, and this runs on the
+  sole surviving hart after all other CPUs are stopped. Local fence.i is
+  sufficient.
+  | /*
+  |  * Make sure the relocated code is visible
+  |  * and jump to the new kernel
+  |  */
+  | fence.i
+
+[compliant] arch/riscv/kernel/alternative.c:91-91  riscv_alternative_fix_offsets
+  Uses patch_text_nosync → patch_insn_write + flush_icache_all(). The outer
+  flush_icache_all performs FENCE W,O + remote FENCE.I, satisfying the cross-
+  hart synchronization requirement.
+  | patch_text_nosync(ptr, call, sizeof(u32) * 2);
+
+[compliant] arch/riscv/kernel/ftrace.c:96-101  ftrace_rec_set_ops
+  Uses patch_text_nosync which internally does local flush in
+  __patch_insn_write + cross-hart flush_icache_all(). Correct.
+  | static int ftrace_rec_set_ops(const struct dyn_ftrace *rec, const struct ftrace_ops *ops)
+  | {
+  | 	unsigned long literal = ALIGN_DOWN(rec->ip - 12, 8);
+  | 	return patch_text_nosync((void *)literal, &ops, sizeof(ops));
+  | }
+
+[compliant] arch/riscv/kernel/probes/kprobes.c:32-33  arch_prepare_ss_slot
+  Uses patch_text_nosync which calls patch_insn_write (local I$ flush on
+  writer) then flush_icache_range → flush_icache_all() with FENCE W,O + remote
+  FENCE.I. Cross-hart synchronization is satisfied.
+  | patch_text_nosync(p->ainsn.api.insn, &p->opcode, len);
+  | patch_text_nosync((void *)p->ainsn.api.insn + len, &insn, GET_INSN_LENGTH(insn));
+
+[compliant] arch/riscv/net/bpf_jit_core.c:222-234  bpf_arch_text_copy
+  BPF JIT code patching uses patch_text_nosync/patch_text_set_nosync under
+  text_mutex, which internally does local flush + flush_icache_all() with full
+  FENCE W,O + remote FENCE.I. Correct cross-hart synchronization.
+  | mutex_lock(&text_mutex);
+  | ret = patch_text_nosync(dst, src, len);
+  | mutex_unlock(&text_mutex);
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "To make a store to instruction memory visible to all RISC-V harts,
+      the writing hart also has to execute a data FENCE before requesting
+      that all remote"
+

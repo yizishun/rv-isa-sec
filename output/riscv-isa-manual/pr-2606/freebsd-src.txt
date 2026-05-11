@@ -1,0 +1,58 @@
+PR #2606  target=freebsd-src  overall=not_implemented
+Spec: siselect/sireg* indirect CSR window is inherently TOCTOU-prone: a preemptible kernel path or missing context-switch save/restore of the selector register leaks CSR state between processes or VMs on the same hart
+Violation:
+  FreeBSD kernel code on RISC-V accesses sireg* (or vsireg*) without first
+  saving/restoring the corresponding siselect (or vsiselect) across context
+  switches, or performs a non-atomic siselect-write + sireg-read sequence on a
+  preemptible kernel path. Because siselect and sireg* form an indirect
+  register window, a context switch or interrupt handler that modifies
+  siselect between the two operations causes the kernel to read CSR state
+  selected by a different execution context, violating the spec's implicit
+  atomicity expectation for the select+access pair.
+Consequence: info_leak
+Pattern:
+  csr_write[^;]*siselect[^;]*;[^;]*csr_read[^;]*sireg|csr_write[^;]*vsiselect[
+  ^;]*;[^;]*csr_read[^;]*vsireg
+------------------------------------------------------------
+[not_implemented] sys/riscv/include/riscvreg.h:1-1  N/A
+  FreeBSD does not implement the Sscsrind/Smcsrind indirect CSR access
+  extension. No CSR definitions exist for siselect (0x150), sireg*
+  (0x151-0x157), vsiselect (0x250), vsireg* (0x251-0x257), miselect (0x350),
+  or mireg* (0x351-0x357). The riscvreg.h header contains no macros for any
+  indirect CSR access registers.
+  | N/A — no siselect/sireg/vsiselect/vsireg/miselect/mireg definitions exist in the file
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:134-144
+      "Supervisor-level CSRs: siselect (0x150), sireg (0x151), sireg2
+      (0x152), sireg3 (0x153), sireg4 (0x155), sireg5 (0x156), sireg6
+      (0x157). The CSRs in th"
+    - riscv-isa-manual/src/priv/smcsrind.adoc:68-74
+      "The value of miselect determines which register is accessed upon
+      read or write of each of the machine indirect alias CSRs (mireg*).
+      miselect value ran"
+
+[not_implemented] sys/riscv/riscv/swtch.S:258-358  cpu_switch
+  The context switch routine does not save or restore siselect or any sireg*
+  CSRs, because the Sscsrind extension is not currently supported. If this
+  extension were implemented without corresponding context-switch support, a
+  context switch between the siselect write and sireg read would cause CSR
+  state to be read from the wrong execution context (info leak).
+  | cpu_switch:
+  |   sd a1, PC_CURTHREAD(tp)
+  |   ld x13, TD_PCB(a1)
+  |   sd x13, PC_CURPCB(tp)
+  |   ld x13, TD_PCB(a0)
+  |   sd ra, (PCB_RA)(x13)
+  |   ... // no siselect/sireg save/restore
+
+[not_implemented] sys/riscv/vmm/vmm_riscv.c:1-1  N/A
+  The bhyve hypervisor (vmm) does not virtualize vsiselect or vsireg* CSRs for
+  guest VMs, because the Sscsrind/Smcsrind extension is not currently
+  supported. No vmm code references any indirect CSR access registers.
+  | N/A — no vsiselect/vsireg handling exists in the vmm subsystem
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:274-275
+      "A virtual-instruction exception is raised for attempts from VS-mode
+      or VU-mode to directly access vsiselect or vsireg*, or attempts from
+      VU-mode to ac"
+

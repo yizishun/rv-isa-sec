@@ -1,0 +1,214 @@
+{
+  "pr_number": 2686,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2686,
+    "violation_condition": "Linux kernel issues CBO instructions (CBO.INVAL, CBO.CLEAN, CBO.FLUSH, CBO.ZERO) using a hardcoded or unverified cache block size rather than the size discovered via the execution environment's cache discovery mechanism (e.g., CPUID CBOBLOCK field, device tree), causing cache operations to target memory ranges beyond or short of the intended cache block boundaries",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "CBO_(INVAL|CLEAN|FLUSH|ZERO)|cbo_block_size|cboz_block_size|riscv_cbom_block_size|riscv_cboz_block_size|L1_CACHE_BYTES.*riscv|alternative_cmo",
+    "affected_entities": [
+      "CBO.INVAL",
+      "CBO.CLEAN",
+      "CBO.FLUSH",
+      "CBO.ZERO",
+      "Zicbom",
+      "Zicboz",
+      "cbo_block_size",
+      "cboz_block_size"
+    ],
+    "summary": "Cache block size is implementation-defined and shall be uniform system-wide; kernel must discover it via hardware enumeration before issuing any CMO instructions, otherwise CBO operations may corrupt data outside intended cache-block-aligned ranges"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/cache.h",
+        "function_name": "N/A (header macro)",
+        "line_start": 10,
+        "line_end": 16,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "L1_CACHE_BYTES is hardcoded to 64 (1 << 6) and used as ARCH_DMA_MINALIGN. On a system where Zic64b is not present and the discovered riscv_cbom_block_size is > 64, the DMA alignment would be insufficient for cache-block-aligned CBO operations. The kernel does emit a WARN_TAINT in arch_setup_dma_ops() for this case, but continues execution rather than refusing to operate.",
+      "snippet": "#define L1_CACHE_SHIFT      6\n#define L1_CACHE_BYTES      (1 << L1_CACHE_SHIFT)\n#ifdef CONFIG_RISCV_DMA_NONCOHERENT\n#define ARCH_DMA_MINALIGN L1_CACHE_BYTES",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/cmo.adoc",
+          "line_start": 86,
+          "line_end": 93,
+          "excerpt": "The capacity and organization of a cache and the size of a cache block are both implementation-specific, and the execution environment provides software a means to discover information about the caches and cache blocks in a system."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zic64b.adoc",
+          "line_start": 4,
+          "line_end": 6,
+          "excerpt": "If the Zic64b extension is implemented, then cache blocks must be 64 bytes in size, naturally aligned in the address space."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/cache.h",
+        "function_name": "arch_setup_dma_ops",
+        "line_start": 131,
+        "line_end": 137,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "arch_setup_dma_ops() in dma-noncoherent.c correctly detects and warns when riscv_cbom_block_size > ARCH_DMA_MINALIGN, tainting the kernel as CPU_OUT_OF_SPEC. This is a defensive check that catches the L1_CACHE_BYTES/block_size mismatch at runtime.",
+      "snippet": "WARN_TAINT(!coherent && riscv_cbom_block_size > ARCH_DMA_MINALIGN,\n           TAINT_CPU_OUT_OF_SPEC,\n           \"%s %s: ARCH_DMA_MINALIGN smaller than riscv,cbom-block-size (%d < %d)\",\n           dev_driver_string(dev), dev_name(dev),\n           ARCH_DMA_MINALIGN, riscv_cbom_block_size);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/cacheflush.c",
+        "function_name": "riscv_init_cbo_blocksizes",
+        "line_start": 142,
+        "line_end": 177,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The kernel correctly discovers cache block sizes from the device tree (riscv,cbom-block-size, riscv,cboz-block-size, riscv,cbop-block-size properties) or ACPI RHCT table. Block sizes are validated as non-zero and power-of-2 in cpufeature.c before CBO extensions are enabled. This is the correct discovery mechanism required by the spec.",
+      "snippet": "for_each_of_cpu_node(node) {\n    cbo_get_block_size(node, \"riscv,cbom-block-size\", &cbom_block_size, &cbom_hartid);\n    cbo_get_block_size(node, \"riscv,cboz-block-size\", &cboz_block_size, &cboz_hartid);\n    cbo_get_block_size(node, \"riscv,cbop-block-size\", &cbop_block_size, &cbop_hartid);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/cmo.adoc",
+          "line_start": 527,
+          "line_end": 537,
+          "excerpt": "The initial set of CMO extensions requires the following information to be discovered by software: The size of the cache block for management and prefetch instructions; The size of the cache block for zero instructions; csr-cbie support at each privilege level."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/errata/thead/errata.c",
+        "function_name": "errata_probe_cmo",
+        "line_start": 109,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "T-Head C9xx errata hardcodes riscv_cbom_block_size = L1_CACHE_BYTES (64) at line 122, bypassing the DT/ACPI discovery mechanism. While T-Head C9xx cores are known to have 64-byte cache blocks and use vendor-specific th.dcache.* instructions (not standard Zicbom CBOs), the hardcoded value is used as the iteration stride in THEAD_CMO_OP. If a future T-Head variant had a different cache block size, the stride would be incorrect. There is no DT property discovery for these vendor-specific instructions.",
+      "snippet": "if (stage == RISCV_ALTERNATIVES_BOOT) {\n    riscv_cbom_block_size = L1_CACHE_BYTES;\n    riscv_noncoherent_supported();\n    riscv_noncoherent_register_cache_ops(&thead_errata_cmo_ops);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/cmo.adoc",
+          "line_start": 86,
+          "line_end": 93,
+          "excerpt": "The capacity and organization of a cache and the size of a cache block are both implementation-specific, and the execution environment provides software a means to discover information about the caches and cache blocks in a system."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/errata/andes/errata.c",
+        "function_name": "errata_probe_iocp",
+        "line_start": 42,
+        "line_end": 63,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Andes AX45MP errata sets riscv_cbom_block_size = 1 as an intentional IOCP workaround after confirming the workaround is needed via SBI call. The value 1 makes the CBO loop iterate byte-by-byte, which is the correct behavior when the IOCP is missing and cache is software-controlled. The comment explicitly states this is to satisfy the CBO framework validation, not an incorrect block size assumption.",
+      "snippet": "/* Set this just to make core cbo code happy */\nriscv_cbom_block_size = 1;\nriscv_noncoherent_supported();",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/dma-noncoherent.c",
+        "function_name": "arch_dma_cache_wback",
+        "line_start": 18,
+        "line_end": 29,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "arch_dma_cache_wback() correctly uses the discovered riscv_cbom_block_size as the stride for ALT_CMO_OP(CLEAN, ...). The ALT_CMO_OP macro aligns the start address to the block size boundary and iterates by the block size, ensuring cache operations cover exact cache block boundaries. Same pattern applies to arch_dma_cache_inv() and arch_dma_cache_wback_inv().",
+      "snippet": "ALT_CMO_OP(CLEAN, vaddr, size, riscv_cbom_block_size);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/cmo.adoc",
+          "line_start": 336,
+          "line_end": 344,
+          "excerpt": "The access size for CMO instructions is equal to the size of the cache block, however in some cases that access can be decomposed into multiple memory operations."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/pmem.c",
+        "function_name": "arch_wb_cache_pmem",
+        "line_start": 12,
+        "line_end": 21,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "arch_wb_cache_pmem() and arch_invalidate_pmem() correctly use riscv_cbom_block_size via ALT_CMO_OP, same pattern as the DMA non-coherent path. No hardcoded block size.",
+      "snippet": "ALT_CMO_OP(CLEAN, addr, size, riscv_cbom_block_size);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/lib/clear_page.S",
+        "function_name": "clear_page",
+        "line_start": 20,
+        "line_end": 69,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The clear_page function loads riscv_cboz_block_size at runtime (line 29: lw a1, riscv_cboz_block_size) and uses it as the CBO.ZERO stride. The CBOZ_ALT alternative patching is guardrailed by the cpufeature.c:1216 runtime check that ensures alternative is only applied when riscv_cboz_block_size <= (1U << order). If Zicboz is absent or the block size exceeds PAGE_SIZE, it falls back to memset. No hardcoded block size is used for the CBO.ZERO stride.",
+      "snippet": "lw a1, riscv_cboz_block_size\nadd a2, a0, a2\n.Lzero_loop:\nCBO_ZERO(a0)\nadd a0, a0, a1",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "riscv_ext_zicbom_validate",
+        "line_start": 93,
+        "line_end": 107,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Zicbom/Zicboz/Zicbop extensions are validated against the discovered block size before being enabled. The validation rejects the extension if block_size is zero (not yet discovered) or not a power-of-2, preventing CBO instructions from being patched in when the block size is unknown or invalid.",
+      "snippet": "if (!riscv_cbom_block_size) {\n    pr_err(\"Zicbom detected in ISA string, disabling as no cbom-block-size found\\n\");\n    return -EINVAL;\n}\nif (!is_power_of_2(riscv_cbom_block_size)) {\n    pr_err(\"Zicbom disabled as cbom-block-size present, but is not a power-of-2\\n\");\n    return -EINVAL;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/cpufeature.c",
+        "function_name": "riscv_cpufeature_patch_check",
+        "line_start": 1203,
+        "line_end": 1217,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The Zicboz alternative patching runtime check ensures that a compiled alternative with a given block size order is only applied if the actual riscv_cboz_block_size does not exceed the alternative's maximum block size, preventing a too-large-stride CBO.ZERO from being used.",
+      "snippet": "case RISCV_ISA_EXT_ZICBOZ:\n    return riscv_cboz_block_size <= (1U << value);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/errata_list.h",
+        "function_name": "ALT_CMO_OP macro",
+        "line_start": 101,
+        "line_end": 115,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The ALT_CMO_OP macro correctly aligns the start address down to the cache block boundary (~((_cachesize) - 1UL)) and iterates forward by the cache block size, ensuring CBO instructions cover exact cache block boundaries. The _cachesize parameter at all call sites is riscv_cbom_block_size, the runtime-discovered value.",
+      "snippet": "\"r\"((unsigned long)(_start) & ~((_cachesize) - 1UL))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/cmo.adoc",
+          "line_start": 86,
+          "line_end": 88,
+          "excerpt": "Caches organize copies of data into cache blocks, each of which represents a contiguous, naturally aligned power-of-two (NAPOT) range of memory locations."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

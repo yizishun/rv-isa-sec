@@ -1,0 +1,132 @@
+PR #2521  target=qemu  overall=not_implemented
+Spec: SPMP adds S-level physical memory protection checked on every non-M-mode memory access with priority over PMP/PMA; QEMU must integrate SPMP checks into the TCG memory translation path, enforce WARL field constraints on all SPMP CSRs, correctly handle lock-bit write-ignore semantics on indirect CSR accesses, enforce SPMP/paging mutual exclusion, and implement SFENCE.VMA ordering for SPMP CSR writes on multi-hart SMP
+Violation:
+  QEMU's TCG memory access path (get_physical_address or equivalent) performs
+  PMP/PMA checks but omits SPMP checks for S-mode and U-mode memory accesses
+  when satp.MODE == Bare and Sspmp is enabled, or SPMP checks are performed
+  but PMP/PMA exceptions incorrectly take priority over SPMP exceptions, or
+  SPMP matching logic fails to require all bytes of an access to match the
+  same entry, or indirect CSR writes (via siselect/sireg/sireg2) succeed on
+  locked SPMP entries (spmpcfg[i].L == 1), or sspmpswitch writes take effect
+  without subsequent SFENCE.VMA ordering on multi-hart SMP, or
+  spmpcfg.SHARED/U/R/W/X WARL fields accept and expose reserved/illegal bit
+  patterns on read-back, or SPMP checks are applied when satp.MODE != Bare
+  (mutual exclusion violation with paging).
+Consequence: privilege_escape
+Pattern:
+  get_physical_address.*spmp|pmp_hart_has_privs|spmpcfg|spmpaddr|sspmpswitch|s
+  iselect|miselect|sireg|mireg|RISCV_CPU.*spmp|pmp_is_active|spmp_.*check|ssta
+  tus.*SUM.*spmp
+------------------------------------------------------------
+[not_implemented] target/riscv/cpu_helper.c:1142-1164  get_physical_address_pmp
+  SPMP is not implemented in QEMU. get_physical_address_pmp() only performs
+  M-mode PMP checks via pmp_hart_has_privs(). No SPMP check exists for S-mode
+  and U-mode memory accesses when satp.MODE == Bare and Sspmp is enabled.
+  S-mode/U-mode accesses that would be blocked by SPMP rules are instead
+  granted full permissions (or only M-mode PMP applies), enabling
+  privilege_escape from S/U-mode into M-mode-protected regions.
+  | static int get_physical_address_pmp(CPURISCVState *env, int *prot, hwaddr addr,
+  |                                     int size, MMUAccessType access_type,
+  |                                     int mode)
+  | {
+  |     pmp_priv_t pmp_priv;
+  |     bool pmp_has_privs;
+  | 
+  |     if (!riscv_cpu_cfg(env)->pmp) {
+  |         *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+  |         return TRANSLATE_SUCCESS;
+  |     }
+  | 
+  |     pmp_has_privs = pmp_hart_has_privs(env, addr, size, 1 << access_type,
+  |                                        &pmp_priv, mode);
+
+[not_implemented] target/riscv/pmp.c:375-523  pmp_hart_has_privs
+  pmp_hart_has_privs() implements only M-mode PMP access control. No SPMP
+  counterpart (spmp_hart_has_privs) exists. Without SPMP matching logic,
+  S-mode-controlled memory protection regions cannot be enforced. The function
+  iterates pmp_regions and applies M-mode PMP rules regardless of whether the
+  access is initiated from S/U-mode under SPMP control.
+  | bool pmp_hart_has_privs(CPURISCVState *env, hwaddr addr,
+  |                         target_ulong size, pmp_priv_t privs,
+  |                         pmp_priv_t *allowed_privs, target_ulong mode)
+  | {
+  |     int i = 0;
+  |     int pmp_size = 0;
+  |     hwaddr s = 0;
+  |     hwaddr e = 0;
+  |     uint8_t pmp_regions = riscv_cpu_cfg(env)->pmp_regions;
+
+[not_implemented] target/riscv/csr.c:2421-2466  rmw_xiselect
+  The siselect CSR write handler (rmw_xiselect) routes to either AIA
+  (xiselect_aia_range) or generic CSR indirect (rmw_xireg_csrind). No SPMP-
+  specific siselect range is recognized, so writing an siselect value that
+  indexes an SPMP CSR (spmpcfg/spmpaddr) would fall through to
+  rmw_xireg_csrind, which has no SPMP ISP callback registered, resulting in
+  illegal-instruction or reads/writes to nonexistent CSRs.
+  | static RISCVException rmw_xiselect(CPURISCVState *env, int csrno,
+  |                                    target_ulong *val, target_ulong new_val,
+  |                                    target_ulong wr_mask)
+  | {
+  |     target_ulong *iselect;
+  |     int ret;
+  | 
+  |     ret = smstateen_acc_ok(env, 0, SMSTATEEN0_SVSLCT);
+  |     if (ret != RISCV_EXCP_NONE) {
+  |         return ret;
+  |     }
+
+[not_implemented] target/riscv/csr.c:2886-2933  rmw_xireg
+  rmw_xireg() dispatches sireg reads/writes to either AIA or generic CSR
+  indirect handlers. No SPMP indirect CSR access path exists. Indirect CSR
+  writes via sireg/sireg2/sireg3 etc. to SPMP configuration registers
+  (spmpcfg/spmpaddr) are unimplemented, meaning locked SPMP entries cannot be
+  bypassed (because no entries exist), but valid SPMP configuration is also
+  impossible.
+  | static RISCVException rmw_xireg(CPURISCVState *env, int csrno,
+  |                                 target_ulong *val, target_ulong new_val,
+  |                                 target_ulong wr_mask)
+  | {
+  |     int ret = -EINVAL;
+  |     target_ulong isel;
+  | 
+  |     ret = smstateen_acc_ok(env, 0, SMSTATEEN0_SVSLCT);
+  |     if (ret != RISCV_EXCP_NONE) {
+  |         return ret;
+  |     }
+
+[not_implemented] target/riscv/cpu.h:440-450  CPURISCVState
+  CPURISCVState contains pmp_state (M-mode PMP table) and mseccfg but no SPMP
+  state (spmpcfg/spmpaddr arrays, sspmpswitch CSR, spmp-related mseccfg
+  extensions). Without SPMP state storage, the Sspmp extension cannot function
+  at all.
+
+[not_implemented] target/riscv/pmp.c:662-695  mseccfg_csr_write
+  mseccfg_csr_write() handles MML, MMWP, RLB, USEED, SSEED, MLPE, and PMM
+  fields but has no SPMP-related mseccfg bits (e.g., SPMP enable bit, SPMP MM-
+  mode control). The SPMP specification defines additional mseccfg fields
+  (such as a bit enabling/disabling SPMP) that are not recognized here.
+
+[not_implemented] target/riscv/machine.c:426-504  vmstate_riscv_cpu
+  VMState migration structures include pmp_state (vmstate_pmp) and siselect
+  but contain no SPMP state (spmpcfg, spmpaddr, sspmpswitch). Live-migration
+  of a VM with SPMP configured would silently lose all SPMP configuration on
+  the destination, causing privilege_escape on the migrated VM as SPMP
+  protections disappear.
+
+[not_implemented] target/riscv/cpu.c:757-766  riscv_cpu_reset_hold
+  cpu_reset() clears mseccfg and unlocks M-mode PMP entries. No SPMP reset
+  logic exists: spmpcfg/spmpaddr registers are not cleared, spmp entry locks
+  are not reset, and sspmpswitch is not initialized. This is consistent with
+  SPMP being entirely unimplemented.
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         env->mseccfg = 0;
+  |     }
+  | 
+  |     pmp_unlock_entries(env);
+
+[not_implemented] target/riscv/cpu_cfg_fields.h.inc:1-200  RISCVCPUConfig
+  RISCVCPUConfig defines ext_smepmp, ext_smpmpmt, ext_smmpm, ext_smcsrind,
+  ext_sscsrind but has no ext_sspmp or ext_spmp configuration flag. The Sspmp
+  ISA extension is not recognized as a configurable CPU feature, making it
+  impossible for any QEMU machine model to declare SPMP support.
+

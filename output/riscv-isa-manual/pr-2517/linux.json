@@ -1,0 +1,122 @@
+{
+  "pr_number": 2517,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2517,
+    "violation_condition": "Kernel trap handler for illegal-instruction exceptions in U-mode checks mstatus.TW before deciding whether a U-mode WFI trap is legitimate. With the clarified spec, TW is irrelevant for U-mode WFI: the trap always fires. Code that treats U-mode WFI differently based on TW=0 (e.g., resuming execution as if WFI were a no-op, because TW=0 previously suggested S-mode could 'permit' U-mode WFI) would incorrectly suppress a mandatory signal (SIGILL) to the offending user process, or in KVM, incorrectly forward WFI to a guest VU-mode vCPU instead of injecting an illegal-instruction exception into the guest.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "mstatus.*TW.*WFI|WFI.*TW.*U-mode|TW=0.*illegal_instruction.*WFI|WFI.*seccomp|WFI.*SIGILL",
+    "affected_entities": [
+      "mstatus.TW",
+      "WFI"
+    ],
+    "summary": "mstatus.TW does not gate U-mode WFI trapping: kernel must always deliver SIGILL to user-space on WFI regardless of TW, or KVM must always inject illegal-instruction into guest VU-mode."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "do_trap_insn_illegal",
+        "line_start": 173,
+        "line_end": 196,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "U-mode illegal-instruction handler does NOT inspect mstatus.TW when deciding how to handle a potential U-mode WFI trap. The handler unconditionally delivers SIGILL/ILL_ILLOPC after checking vector first-use. This is correct per the clarified spec (machine.adoc §norm:mstatus_tw_umode_op): U-mode WFI always causes an illegal-instruction exception regardless of TW. The kernel delegates the TW/WFI trapping decision to hardware and simply delivers the appropriate signal.",
+      "snippet": "asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *regs)\n{\n\tbool handled;\n\tif (user_mode(regs)) {\n\t\tirqentry_enter_from_user_mode(regs);\n\t\tlocal_irq_enable();\n\t\thandled = riscv_v_first_use_handler(regs);\n\t\tif (!handled)\n\t\t\tdo_trap_error(regs, SIGILL, ILL_ILLOPC, regs->epc,\n\t\t\t\t      \"Oops - illegal instruction\");",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 775,
+          "line_end": 777,
+          "excerpt": "When S-mode is implemented, then executing WFI in U-mode causes an illegal-instruction exception, regardless of the value of the TW bit, unless the instruction completes within an implementation-specific, bounded time limit."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_create",
+        "line_start": 74,
+        "line_end": 74,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VCPU reset correctly sets hstatus.VTW=1 (cntx->hstatus |= HSTATUS_VTW). This causes hardware to trap VS-mode WFI as a virtual-instruction exception when mstatus.TW=0, per hypervisor spec §norm:hstatus_vtw_op. The VU-mode WFI path is also correct: hardware traps VU-mode WFI as virtual-instruction exception per §norm:H_virtinst_vu_wfi_tw0, and KVM emulates it via kvm_riscv_vcpu_virtual_insn -> system_opcode_insn -> wfi_insn. No TW-inspection logic exists in the emulation path—the hardware/trap delegation handles the decision.",
+      "snippet": "cntx->hstatus |= HSTATUS_VTW;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 242,
+          "line_end": 248,
+          "excerpt": "When VTW=1 (and assuming mstatus.TW=0), an attempt in VS-mode to execute WFI raises a virtual-instruction exception if the WFI does not complete within an implementation-specific, bounded time limit."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 2379,
+          "line_end": 2380,
+          "excerpt": "in VU-mode, attempts to execute WFI when mstatus.TW=0"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_insn.c",
+        "function_name": "wfi_insn",
+        "line_start": 76,
+        "line_end": 81,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "WFI emulation handler (wfi_insn) correctly emulates WFI for guest VCPUs via kvm_halt. It does not inspect hstatus.VTW or mstatus.TW—the decision to reach this emulation path is made by hardware, which traps VU-mode WFI as virtual-instruction exception (§norm:H_virtinst_vu_wfi_tw0) and VS-mode WFI when VTW=1 (§norm:vtw_virtinstr). The kernel simply emulates the instruction once the trap is delivered.",
+      "snippet": "static int wfi_insn(struct kvm_vcpu *vcpu, struct kvm_run *run, ulong insn)\n{\n\tvcpu->stat.wfi_exit_stat++;\n\tkvm_riscv_vcpu_wfi(vcpu);\n\treturn KVM_INSN_CONTINUE_NEXT_SEPC;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 2379,
+          "line_end": 2380,
+          "excerpt": "in VU-mode, attempts to execute WFI when mstatus.TW=0 [raises a virtual-instruction exception]"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/vector.c",
+        "function_name": "riscv_v_first_use_handler",
+        "line_start": 185,
+        "line_end": 209,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The vector first-use handler checked in the illegal-instruction trap path only inspects whether the faulting instruction is a vector instruction. It does NOT inspect mstatus.TW or decode WFI, meaning it cannot incorrectly suppress a SIGILL for U-mode WFI. This is correct—the handler's only purpose is to lazily enable V extension on first vector instruction use.",
+      "snippet": "bool riscv_v_first_use_handler(struct pt_regs *regs)\n{\n\tu32 __user *epc = (u32 __user *)regs->epc;\n\tu32 insn = (u32)regs->badaddr;\n\tif (!(has_vector() || has_xtheadvector()))\n\t\treturn false;\n\tif (!riscv_v_vstate_ctrl_user_allowed())\n\t\treturn false;\n\tif (riscv_v_vstate_query(regs))\n\t\treturn false;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "",
+        "line_start": 1,
+        "line_end": 200,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The RISC-V CSR header defines HSTATUS_VTW for KVM's VTW control but does NOT define SR_TW for mstatus.TW. This absence is itself evidence that the kernel does not and should not be inspecting mstatus.TW in software—the TW/WFI trap decision is a hardware mechanism. The kernel does not need a software TW constant because it never performs a TW-based decision on U-mode illegal instruction traps.",
+      "snippet": "#define HSTATUS_VTW\t\t_AC(0x00200000, UL)\n(No SR_TW or MSTATUS_TW definition exists in this file)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 754,
+          "line_end": 765,
+          "excerpt": "The TW (Timeout Wait) bit is a WARL field that supports intercepting the WFI instruction. When TW=0, the WFI instruction may execute in modes less privileged than M when not prevented for some other reason. When TW=1, then if WFI is executed in any less-privileged mode, and it does not complete within an implementation-specific, bounded time limit, the WFI instruction causes an illegal-instruction exception."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

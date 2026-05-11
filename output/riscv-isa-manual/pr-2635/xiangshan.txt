@@ -1,0 +1,100 @@
+PR #2635  target=xiangshan  overall=not_implemented
+Spec: Zvknhb-implies-Zvknha: if XiangShan decoder gates SEW=32 vsha2 instructions exclusively on the Zvknha enable signal without also enabling them when Zvknhb is set, software on a Zvknhb-only-configured core will encounter illegal-instruction traps on valid SEW=32 SHA-2 operations, causing function loss
+Violation:
+  When XiangShan RTL implements Zvknhb (vsha2 at SEW=32 and SEW=64) but fails
+  to also decode and execute the Zvknha subset (vsha2 at SEW=32 only), e.g.,
+  the instruction decoder gates SEW=32 vsha2 instructions solely on the Zvknha
+  CSR enable bit without also enabling them when the Zvknhb CSR enable bit is
+  set, or the ISA discovery CSR reports Zvknhb=1 but Zvknha=0
+Consequence: denial_of_service
+Pattern:
+  (isZvknhb && !isZvknha) | (Zvknhb_enable & ~Zvknha_enable) |
+  zvknhb.*valid.*!zvknha | Zvknhb.*decode.*vsha2.*SEW=32.*disabled |
+  misa.*Zvknhb.*set.*Zvknha.*clear
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/Parameters.scala:292-304  ISAExtensions
+  Neither Zvknhb nor Zvknha appears in the ISAExtensions list. The
+  vulnerability condition (isZvknhb && !isZvknha) cannot occur because neither
+  extension string is present. Scalar equivalents (zkn, zknd, zkne, zknh) are
+  present at line 303, but their vector counterparts are absent. The list is a
+  flat Seq with no subset/family group enforcement, so if Zvknhb were added in
+  the future, nothing would enforce the spec requirement that it implies
+  Zvknha.
+  | "zksed", "zksh", "zkt", "zvbb", "zvfh", "zvfhmin", "zvkt", "zvl128b", "zvl32b", "zvl64b"
+  | // No zvknha, zvknhb entries exist
+  References:
+    - riscv-isa-manual/src/unpriv/zvk.adoc:483-483
+      "`Zvknhb` implies `Zvknha`."
+
+[not_implemented] src/main/scala/xiangshan/backend/decode/Instructions.scala:5-27  (Zvknhb/Zvknha BitPat object missing)
+  No Zvknhb, Zvknha, or Zvknh BitPat object exists. Only Zvbb (lines 5-22) and
+  Zimop (lines 24-27) are defined. The vsha2{ms, c.vv, c.vx, cl.vv, cl.vx}
+  instructions have no encoding definitions anywhere in the codebase and are
+  unconditionally treated as reserved/illegal. Since no decode entries exist,
+  the vulnerability pattern (Zvknhb decode without Zvknha decode) cannot
+  manifest.
+  | object Zvbb { val VANDN_VV = ... }
+  | object Zimop { val MOP_R = ... }
+  | // No Zvknhb, Zvknha, or vsha2* objects exist
+  References:
+    - riscv-isa-manual/src/unpriv/zvk.adoc:306-307
+      "Zvknha: vsha2* | 32 Zvknhb: vsha2* | 32 or 64"
+
+[not_implemented] src/main/scala/xiangshan/backend/decode/VecDecoder.scala:14-14  VecDecode
+  The vector decode module only imports Zvbb._ (line 14). No import for
+  Zvknhb/Zvknha/Zvknh BitPat objects exists because none are defined. The
+  decode table (vset ++ opivv ++ ...) contains no entries for vsha2
+  instructions. All vsha2 opcodes will fall through to the default illegal-
+  instruction path regardless of configuration.
+  | import xiangshan.backend.decode.Zvbb._
+  | // No Zvknhb, Zvknha import — none exists
+  References:
+    - riscv-isa-manual/src/unpriv/zvk.adoc:306-307
+      "Zvknha: vsha2* | 32 Zvknhb: vsha2* | 32 or 64"
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/vector/Bundles.scala:135-151  VSew.isReserved
+  VSew.isReserved treats all b1?? patterns as reserved encoding. This is
+  extension-agnostic with no mechanism to conditionally reserve SEW=64 based
+  on whether Zvknha (SEW=32 only) or Zvknhb (SEW=32 or 64) is enabled.
+  However, since neither extension is implemented, this is latent
+  infrastructure gap, not an active vulnerability.
+  | def isReserved(sew: UInt) : Bool = {
+  |   if (sew.getWidth == 3) { sew === reserved } else { false.B }
+  | }
+  | // Extension-agnostic — cannot enforce Zvknha's SEW=32-only constraint
+  References:
+    - riscv-isa-manual/src/unpriv/zvk.adoc:296-297
+      "All other SEW values are _reserved_."
+    - riscv-isa-manual/src/unpriv/zvk.adoc:3164-3165
+      "zvknha: SEW is any value other than 32 zvknhb: SEW is any value
+      other than 32 or 64"
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/FuConfig.scala:377-387  BkuCfg
+  The BKU (Bit-manipulation/Crypto Unit) FuConfig only accepts IntData()
+  source data and writes only the integer register file (writeIntRf=true,
+  writeVecRf=false). It contains the SHA-256/SHA-512 round function datapath
+  (sha256sum0/1, sha256sig0/1, sha512sum0/1, sha512sig0/1) needed by vsha2,
+  but there is no vector register file interface. Vector vsha2 instructions
+  would need either a new vector-to-BKU interface or a dedicated vector crypto
+  execution unit.
+  | val BkuCfg: FuConfig = FuConfig (
+  |   srcData = Seq(Seq(IntData(), IntData())),
+  |   writeIntRf = true,
+  |   // writeVecRf = false — no vector register file write port
+  | )
+
+[potential_risk] src/main/scala/xiangshan/Parameters.scala:292-304  ISAExtensions
+  The ISAExtensions list is a flat Seq[String] with no subset/family group
+  enforcement. If future development adds Zvknhb to this list without also
+  adding Zvknha, no compile-time or runtime check would prevent the violation.
+  The security requirement is that Zvknhb implies Zvknha (spec
+  norm:Zvknhb_impZvknha). The current infrastructure provides no guard against
+  an implementer accidentally omitting Zvknha while declaring Zvknhb.
+  | def ISAExtensions = Seq(
+  |   "i", "m", "a", "f", "d", "c", "v", "h",
+  |   // Flat list — no implication/subset enforcement
+  | )
+  References:
+    - riscv-isa-manual/src/unpriv/zvk.adoc:483-483
+      "`Zvknhb` implies `Zvknha`."
+

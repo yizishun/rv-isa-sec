@@ -1,0 +1,150 @@
+{
+  "pr_number": 2646,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2646,
+    "violation_condition": "Kernel KVM code running in HS-mode reads senvcfg.SSE to determine whether shadow stacks are active for guest U/VU-mode while henvcfg.SSE=0. Under the clarified spec, senvcfg.SSE reads as 0 in this state but the underlying value is preserved—it is not cleared. If the kernel caches this zero read, or makes a security-sensitive decision (e.g., skipping shadow stack page-table setup, skipping ssp save/restore, or reporting SSE=0 to the guest) without accounting for the fact that the underlying SSE bit may be 1 and will take effect as soon as henvcfg.SSE transitions to 1, the kernel's internal SSE tracking diverges from hardware state.",
+    "security_consequence": "race_condition",
+    "vulnerability_pattern": "senvcfg.*read|csr_read.*SENVCFG|kvm.*senvcfg|__kvm_riscv.*senvcfg|vcpu_arch.*senvcfg|switch.*senvcfg",
+    "affected_entities": [
+      "senvcfg",
+      "henvcfg",
+      "ssp"
+    ],
+    "summary": "henvcfg.SSE=0 makes senvcfg.SSE read-as-zero without clearing the underlying bit; kernel KVM code reading senvcfg.SSE to track guest SSE state may operate on a stale view, causing shadow stack state corruption when henvcfg.SSE is later set to 1"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_setup_config",
+        "line_start": 543,
+        "line_end": 576,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "henvcfg.SSE is never set in cfg->henvcfg even when Zicfiss is available to the guest. All other envcfg features (SVPBMT→PBMTE, SSTC→STCE, ZICBOM→CBIE|CBCFE, ZICBOZ→CBZE, SVADU→ADUE) are configured but SSE is omitted. Since henvcfg.SSE defaults to 0, guest VS-mode xSSE is always 0, making Zicfiss instructions trap regardless of what the VMM writes to senvcfg.SSE via ONE_REG.",
+      "snippet": "if (riscv_isa_extension_available(isa, SVPBMT))\n  cfg->henvcfg |= ENVCFG_PBMTE;\nif (riscv_isa_extension_available(isa, SSTC))\n  cfg->henvcfg |= ENVCFG_STCE;\nif (riscv_isa_extension_available(isa, ZICBOM))\n  cfg->henvcfg |= (ENVCFG_CBIE | ENVCFG_CBCFE);\nif (riscv_isa_extension_available(isa, ZICBOZ))\n  cfg->henvcfg |= ENVCFG_CBZE;\nif (riscv_isa_extension_available(isa, SVADU) &&\n    !riscv_isa_extension_available(isa, SVADE))\n  cfg->henvcfg |= ENVCFG_ADUE;\n/* NOTE: No ENVCFG_SSE for Zicfiss */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 822,
+          "line_end": 833,
+          "excerpt": "The Zicfiss extension adds the SSE field in henvcfg. If the SSE field is set to 1, the Zicfiss extension is activated in VS-mode. When the SSE field is 0, the Zicfiss extension remains inactive in VS-mode, and the following rules apply when V=1: ... The senvcfg.SSE field will read as zero and is read-only."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_sbi_fwft.c",
+        "function_name": "features (feature table)",
+        "line_start": 218,
+        "line_end": 239,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "SBI_FWFT_SHADOW_STACK is listed in kvm_fwft_defined_features[] (line 69) so it is recognized as a defined feature, but it has NO entry in the features[] table. Only MISALIGNED_EXC_DELEG and POINTER_MASKING_PMLEN have set/get/reset callbacks. Consequently, kvm_fwft_get_feature() returns SBI_ERR_NOT_SUPPORTED for shadow stack. A guest SBI FWFT_SET(SHADOW_STACK) call can never enable shadow stacks because the feature has no implementation. This means the guest VS-mode can never get henvcfg.SSE=1 via the SBI path either.",
+      "snippet": "static const struct kvm_sbi_fwft_feature features[] = {\n  { .id = SBI_FWFT_MISALIGNED_EXC_DELEG, ... },\n  { .id = SBI_FWFT_POINTER_MASKING_PMLEN, ... },\n  /* NOTE: SBI_FWFT_SHADOW_STACK, SBI_FWFT_LANDING_PAD,\n     SBI_FWFT_DOUBLE_TRAP have no entries */\n};",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_swap_in_guest_state",
+        "line_start": 749,
+        "line_end": 761,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "csr_swap(CSR_SENVCFG, csr->senvcfg) runs in HS-mode (V=0) before the V=1 guest entry. In HS-mode, senvcfg.SSE is fully writable and readable regardless of henvcfg.SSE — the read-as-zero masking applies only when V=1 per the spec. The guest senvcfg value (potentially with SSE=1 from VMM ONE_REG) is correctly written to hardware where it is preserved across the V=1 guest run. The csr_swap is followed by __kvm_riscv_switch_to() which executes sret to V=1.",
+      "snippet": "vcpu->arch.host_scounteren = csr_swap(CSR_SCOUNTEREN, csr->scounteren);\nvcpu->arch.host_senvcfg = csr_swap(CSR_SENVCFG, csr->senvcfg);\nif (riscv_has_extension_unlikely(RISCV_ISA_EXT_SMSTATEEN) &&\n    (cfg->hstateen0 & SMSTATEEN0_SSTATEEN0))\n  vcpu->arch.host_sstateen0 = csr_swap(CSR_SSTATEEN0, smcsr->sstateen0);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 822,
+          "line_end": 833,
+          "excerpt": "When the SSE field is 0, the Zicfiss extension remains inactive in VS-mode, and the following rules apply when V=1: ... The senvcfg.SSE field will read as zero and is read-only."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_swap_in_host_state",
+        "line_start": 763,
+        "line_end": 775,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "After V=1 guest exit, csr_swap(CSR_SENVCFG, host_senvcfg) at line 770 reads back the hardware SENVCFG register in HS-mode (V=0). In HS-mode the SSE bit is fully readable — the underlying value preserved during the V=1 execution is returned intact. This correctly updates csr->senvcfg with the full value. The host envcfg is then restored. No stale-zero-cache problem exists because the read occurs in HS-mode, not VS-mode.",
+      "snippet": "csr->scounteren = csr_swap(CSR_SCOUNTEREN, vcpu->arch.host_scounteren);\ncsr->senvcfg = csr_swap(CSR_SENVCFG, vcpu->arch.host_senvcfg);\nif (riscv_has_extension_unlikely(RISCV_ISA_EXT_SMSTATEEN) &&\n    (cfg->hstateen0 & SMSTATEEN0_SSTATEEN0))\n  smcsr->sstateen0 = csr_swap(CSR_SSTATEEN0, vcpu->arch.host_sstateen0);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 822,
+          "line_end": 826,
+          "excerpt": "When the SSE field is 0, the Zicfiss extension remains inactive in VS-mode, and the following rules apply when V=1"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_onereg.c",
+        "function_name": "kvm_riscv_vcpu_general_get_csr",
+        "line_start": 505,
+        "line_end": 522,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ONE_REG read of KVM_REG_RISCV_CSR_REG(senvcfg) returns csr->senvcfg from the software cache, which was last populated by csr_swap at exit time (line 770, V=0 context). The returned value correctly reflects the preserved SSE bit because the read-back occurred in HS-mode where the SSE bit is not masked. VMM sees the correct SSE state.",
+      "snippet": "if (reg_num == KVM_REG_RISCV_CSR_REG(sip)) {\n  kvm_riscv_vcpu_flush_interrupts(vcpu);\n  *out_val = (csr->hvip >> VSIP_TO_HVIP_SHIFT) & VSIP_VALID_MASK;\n  *out_val |= csr->hvip & ~IRQ_LOCAL_MASK;\n} else\n  *out_val = ((unsigned long *)csr)[reg_num];",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/switch_to.h",
+        "function_name": "__switch_to_envcfg",
+        "line_start": 84,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Host context switch writes next->thread.envcfg to CSR_ENVCFG (which is CSR_SENVCFG in S-mode). When shadow stack is enabled for the next task, thread.envcfg includes ENVCFG_SSE (set by set_shstk_status in usercfi.c:70). This correctly propagates SSE across host task switches.",
+      "snippet": "static inline void __switch_to_envcfg(struct task_struct *next)\n{\n  asm volatile (ALTERNATIVE(\"nop\", \"csrw \" __stringify(CSR_ENVCFG) \", %0\",\n                0, RISCV_ISA_EXT_XLINUXENVCFG, 1)\n          :: \"r\" (next->thread.envcfg) : \"memory\");\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 955,
+          "line_end": 964,
+          "excerpt": "The Zicfiss extension adds the SSE field in senvcfg. When the SSE field is set to 1, the Zicfiss extension is activated in VU/U-mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/usercfi.c",
+        "function_name": "set_shstk_status",
+        "line_start": 62,
+        "line_end": 75,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Host userspace shadow stack management properly sets ENVCFG_SSE in task->thread.envcfg and writes CSR_ENVCFG. The envcfg_update_bits helper from switch_to.h:73-82 writes directly to hardware when task==current, which is the case here since prctl comes from the calling task. Host-side SSE handling is correct.",
+      "snippet": "if (enable)\n  task->thread.envcfg |= ENVCFG_SSE;\nelse\n  task->thread.envcfg &= ~ENVCFG_SSE;\n\ncsr_write(CSR_ENVCFG, task->thread.envcfg);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 955,
+          "line_end": 964,
+          "excerpt": "When the SSE field is set to 1, the Zicfiss extension is activated in VU/U-mode."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

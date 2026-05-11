@@ -1,0 +1,70 @@
+PR #2561  target=qemu  overall=bug_confirmed
+Spec: mseccfg CSR existence predicate (have_mseccfg) incomplete: doesn't check ext_zicfilp (MSECCFG_MLPE field), violating spec rule that mseccfg exists if any extension adds a field to it
+Violation:
+  In QEMU TCG/KVM, when ext_zicfilp is enabled but ext_smepmp, ext_zkr, and
+  ext_smmpm are all disabled, the have_mseccfg() CSR predicate at
+  target/riscv/csr.c:779 returns RISCV_EXCP_ILLEGAL_INST, making mseccfg
+  inaccessible despite zicfilp adding the MSECCFG_MLPE field. Conversely, if a
+  future extension adds an mseccfg field but have_mseccfg() is not updated,
+  the CSR will be incorrectly invisible to the guest.
+Consequence: function_loss
+Pattern:
+  have_mseccfg\b.*ext_smepmp.*ext_zkr.*ext_smmpm(?!.*ext_\w+).*RISCV_EXCP_ILLE
+  GAL_INST — incomplete extension-to-field mapping where CSR existence check
+  does not enumerate all extensions that contribute fields to mseccfg
+------------------------------------------------------------
+[bug_confirmed] target/riscv/csr.c:779-792  have_mseccfg
+  have_mseccfg() gates mseccfg CSR visibility on ext_smepmp, ext_zkr, and
+  ext_smmpm, but does NOT check ext_zicfilp. The Zicfilp extension adds the
+  MLPE field (bit 10) to mseccfg per the privileged spec (machine.adoc:2338).
+  When ext_zicfilp is enabled but smepmp/zkr/smmpm are all disabled, mseccfg
+  is incorrectly invisible to the guest (RISCV_EXCP_ILLEGAL_INST), making the
+  MLPE field inaccessible despite being architecturally required. Conversely,
+  if a future extension adds mseccfg fields but have_mseccfg() is not updated,
+  the same pattern will recur.
+  | static RISCVException have_mseccfg(CPURISCVState *env, int csrno)
+  | {
+  |     if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     if (riscv_cpu_cfg(env)->ext_zkr) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     if (riscv_cpu_cfg(env)->ext_smmpm) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  | 
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+  References:
+    - riscv-cheri/src/machine.adoc:2338-2340
+      "The Zicfilp extension adds the `MLPE` field in `mseccfg`. When
+      `MLPE` field is 1, Zicfilp extension is enabled in M-mode."
+    - riscv-cheri/src/machine.adoc:2320-2324
+      "==== Machine Security Configuration (`mseccfg`) Register  `mseccfg`
+      is an optional 64-bit read/write register, formatted as shown in
+      <<mseccfg>>, that"
+    - riscv-cheri/src/scalar-crypto.adoc:3838-3839
+      "`mseccfg` exists if `Zkr` is implemented, or if it is required by
+      other processor features."
+
+[potential_risk] target/riscv/pmp.c:697-700  mseccfg_csr_write
+  The ext_zicfilp handling in mseccfg_csr_write() applies a self-OR no-op: val
+  |= (val & MSECCFG_MLPE). This statement has no semantic effect since it ORs
+  val with a value already contained in val. If the intent was to
+  unconditionally set MLPE (sticky bit), it should be `val |= MSECCFG_MLPE`.
+  If the intent was to make MLPE WARL=0 (always 0), it should clear it. As
+  written, it does nothing, which may be correct passive behavior for a
+  regular read/write field (MLPE is not sticky), but the dead-code pattern is
+  suspicious and may mask a copy-paste error from the smepmp sticky-bit logic
+  above.
+  | /* M-mode forward cfi to be enabled if cfi extension is implemented */
+  |     if (env_archcpu(env)->cfg.ext_zicfilp) {
+  |         val |= (val & MSECCFG_MLPE);
+  |     }
+  | 
+  |     env->mseccfg = val;
+  References:
+    - riscv-cheri/src/priv-cfi.adoc:29-30
+      "|  M           | `mseccfg.MLPE`"
+

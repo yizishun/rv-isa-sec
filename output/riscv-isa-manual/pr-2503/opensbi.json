@@ -1,0 +1,109 @@
+{
+  "pr_number": 2503,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 2503,
+    "violation_condition": "OpenSBI M-mode trap handler does not distinguish between illegal-instruction exceptions raised by `seed` CSR access from S-mode (due to SSEED=0 per spec) and other illegal-instruction exceptions, causing S-mode `seed` access attempts to be handled as generic illegal-instruction faults rather than being recognized as an access-control delegation issue that M-mode firmware should either enable (by setting SSEED/USEED) or gracefully deny with a well-defined error.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "mseccfg.*SSEED|mseccfg.*USEED|seed.*CSR.*trap|illegal.instruction.*seed|mseccfg.*save|mseccfg.*restore|mseccfg.*suspend|mseccfg.*resume",
+    "affected_entities": [
+      "mseccfg",
+      "seed",
+      "CSRRW",
+      "CSRRS",
+      "CSRRC"
+    ],
+    "summary": "OpenSBI must explicitly configure mseccfg.SSEED/USEED after reset before handing control to S-mode; failing to set these bits leaves S/U-mode seed CSR access permanently denied, and OpenSBI's illegal-instruction trap handler must distinguish seed CSR access violations to avoid silently blocking legitimate S-mode entropy requests."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "mstatus_init",
+        "line_start": 176,
+        "line_end": 180,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "OpenSBI correctly sets SSEED=1 and USEED=0 in mseccfg when the Zkr extension is detected. This grants S-mode read-write access to the seed CSR while denying U-mode access. The configuration runs on all three init paths: cold boot (sbi_hart_init), warm boot, and HSM suspend-resume (sbi_hart_reinit), so SSEED is always enabled before S-mode execution.",
+      "snippet": "/* Enable S-mode access to seed CSR */\nif (sbi_hart_has_extension(scratch, SBI_HART_EXT_ZKR)) {\n    csr_set(CSR_MSECCFG, MSECCFG_SSEED);\n    csr_clear(CSR_MSECCFG, MSECCFG_USEED);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2351,
+          "line_end": 2354,
+          "excerpt": "When SSEED is 0, access to the seed CSR from S-/HS-mode raises an illegal-instruction exception. When SSEED is 1, read-write access to the seed CSR from S-/HS-mode is allowed."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_save",
+        "line_start": 427,
+        "line_end": 432,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mseccfg is intentionally excluded from the HSM non-retentive suspend CSR save list. Instead of save/restore, mseccfg is reconfigured through the warm-boot path: init_warm_resume() calls sbi_hart_reinit() (sbi_init.c:490), which calls mstatus_init() (sbi_hart.c:715) to set SSEED=1/USEED=0, then sbi_hart_protection_configure() (sbi_init.c:494) sets RLB/MML. Since mseccfg is reconfigured before sbi_hart_switch_mode() returns to S-mode in sbi_hsm_hart_resume_finish() (sbi_hsm.c:484), there is no window where S-mode observes stale mseccfg state.",
+      "snippet": "hdata->saved_mie = csr_read(CSR_MIE);\nhdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);\nhdata->saved_medeleg = csr_read(CSR_MEDELEG);\nhdata->saved_mideleg = csr_read(CSR_MIDELEG);\nif (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)\n    hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_illegal_insn.c",
+        "function_name": "sbi_illegal_insn_handler",
+        "line_start": 148,
+        "line_end": 175,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The M-mode illegal-instruction trap handler dispatches ALL illegal-instruction exceptions through a unified path: sbi_illegal_insn_handler() → system_opcode_insn() → sbi_emulate_csr_read(). The seed CSR (0x015) is NOT in the emulation switch table, so unrecognized CSR accesses fall through to the default SBI_ENOTSUPP return, triggering truly_illegal_insn() which redirects the trap back to S-mode with cause=CAUSE_ILLEGAL_INSTRUCTION. The handler cannot distinguish a seed-CSR illegal-instruction (which would occur if SSEED were 0) from any other unrecognized CSR access. Currently a potential risk because OpenSBI always sets SSEED=1 before S-mode execution; but if SSEED were ever 0 (e.g., via a future platform quirk or errata), S-mode seed access would loop with unrecoverable illegal-instruction traps rather than receiving a well-defined error.",
+      "snippet": "if (sbi_emulate_csr_read(csr_num, regs, &csr_val))\n    return truly_illegal_insn(insn, regs);\n...\ndefault:\n    ret = SBI_ENOTSUPP;\n    break;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2351,
+          "line_end": 2355,
+          "excerpt": "When SSEED is 0, access to the seed CSR from S-/HS-mode raises an illegal-instruction exception. When SSEED is 1, read-write access to the seed CSR from S-/HS-mode is allowed."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zk.adoc",
+          "line_start": 3776,
+          "line_end": 3793,
+          "excerpt": "The Zkr extension adds the SSEED and USEED fields to the mseccfg CSR to control access to the seed CSR from U, S, or HS modes."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hart.c",
+        "function_name": "delegate_traps",
+        "line_start": 225,
+        "line_end": 252,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CAUSE_ILLEGAL_INSTRUCTION is correctly NOT delegated to S-mode via medeleg. This ensures M-mode's CSR emulation layer (which handles seed, cycle/time counters, etc.) sees the trap first. Delegating illegal-instruction to S-mode would bypass CSR emulation entirely.",
+      "snippet": "exceptions = (1U << CAUSE_MISALIGNED_FETCH) | (1U << CAUSE_BREAKPOINT) |\n         (1U << CAUSE_USER_ECALL);\n...\ncsr_write(CSR_MEDELEG, exceptions);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_emulate_csr.c",
+        "function_name": "sbi_emulate_csr_read",
+        "line_start": 44,
+        "line_end": 148,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The CSR emulation layer correctly omits seed CSR from its read-emulation switch table. When SSEED=1 (the normal OpenSBI configuration), S-mode accesses seed directly in hardware without trapping, so M-mode emulation is unnecessary. The emulation path only handles CSRs that M-mode must intercept (HTIMEDELTA, cycle/time counters).",
+      "snippet": "switch (csr_num) {\ncase CSR_HTIMEDELTA:\n...\ndefault:\n    ret = SBI_ENOTSUPP;\n    break;\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

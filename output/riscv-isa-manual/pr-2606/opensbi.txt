@@ -1,0 +1,116 @@
+PR #2606  target=opensbi  overall=compliant
+Spec: Unvalidated miselect/siselect in M-mode trap handlers allows S-mode to control what register state M-mode observes through the indirect CSR window, enabling privilege escalation via UNSPECIFIED behavior on unimplemented select values
+Violation:
+  OpenSBI M-mode trap handler reads or writes mireg*/sireg* CSRs without first
+  explicitly setting miselect/siselect to a validated value. Since these CSRs
+  form an indirection window controlled by the select register, and the select
+  value was last written by untrusted S-mode software before the trap, M-mode
+  unwittingly accesses register state gated by an attacker-controlled index.
+  An S-mode attacker sets miselect to an unimplemented or unexpected value,
+  then invokes an SBI call—OpenSBI's handler accesses mireg* and triggers
+  UNSPECIFIED behavior (hardware hang, spurious exception, or register state
+  leak from a different select context).
+Consequence: privilege_escape
+Pattern:
+  csrr.*mireg|csrw.*mireg|csrr.*sireg|csrw.*sireg
+------------------------------------------------------------
+[compliant] lib/utils/irqchip/imsic.c:57-81  imsic_csr_write / imsic_csr_read / imsic_csr_set / imsic_csr_clear (macros)
+  All four IMSIC indirect CSR access macros explicitly write CSR_MISELECT to a
+  compile-time IMSIC constant (e.g., IMSIC_EITHRESHOLD, IMSIC_EIDELIVERY,
+  IMSIC_EIP0..EIP63) before accessing CSR_MIREG. The miselect register is
+  always overwritten with a trusted, validated value before each mireg
+  read/write. Even when invoked from the SBI trap handler path (e.g., IPI
+  processing), miselect is set first. No code path reads or writes mireg*
+  without a preceding miselect write.
+  | #define imsic_csr_write(__c, __v)       \
+  | do { \
+  |         csr_write(CSR_MISELECT, __c); \
+  |         csr_write(CSR_MIREG, __v); \
+  | } while (0)
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:68-70
+      "The value of miselect determines which register is accessed upon
+      read or write of each of the machine indirect alias CSRs (mireg*)."
+    - riscv-isa-manual/src/priv/smcsrind.adoc:98-99
+      "The behavior upon accessing mireg* from M-mode, while miselect
+      holds a value that is not implemented, is UNSPECIFIED."
+
+[not_implemented] include/sbi/riscv_encoding.h:369-375  (CSR definitions only, no runtime code)
+  CSR_SIREG through CSR_SIREG6 are defined as constants but are never
+  referenced in any .c or .S source file in the OpenSBI codebase. OpenSBI
+  M-mode firmware does not access sireg* CSRs in any code path, including the
+  trap handler, HSM suspend/resume, domain context switch, or platform init.
+  No vulnerability exists because the CSRs are simply never accessed.
+  | #define CSR_SIREG                 0x151
+  | #define CSR_SIREG2                0x152
+  | #define CSR_SIREG3                0x153
+  | #define CSR_SIREG4                0x155
+  | #define CSR_SIREG5                0x156
+  | #define CSR_SIREG6                0x157
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:171-173
+      "The behavior upon accessing sireg* from M-mode or S-mode, while
+      siselect holds a value that is not implemented at supervisor level,
+      is UNSPECIFIED."
+
+[not_implemented] include/sbi/riscv_encoding.h:452-457  (CSR definitions only, no runtime code)
+  CSR_VSIREG through CSR_VSIREG6 are defined as constants but are never
+  referenced in any .c or .S source file. OpenSBI does not access virtual
+  supervisor indirect CSR alias registers in any code path.
+  | #define CSR_VSIREG                0x251
+  | #define CSR_VSIREG2               0x252
+  | #define CSR_VSIREG3               0x253
+  | #define CSR_VSIREG4               0x255
+  | #define CSR_VSIREG5               0x256
+  | #define CSR_VSIREG6               0x257
+
+[not_implemented] include/sbi/riscv_encoding.h:760-765  (CSR definitions only, no runtime code)
+  CSR_MIREG2 through CSR_MIREG6 are defined but never accessed by any code.
+  Only CSR_MIREG (the primary alias) is used, exclusively via the IMSIC macros
+  in imsic.c which set miselect first. The multi-register aliases (mireg2-6)
+  for 64-bit indirect access are not needed by the IMSIC driver since all
+  IMSIC registers accessed indirectly are XLEN-wide.
+  | #define CSR_MIREG                 0x351
+  | #define CSR_MIREG2                0x352
+  | #define CSR_MIREG3                0x353
+  | #define CSR_MIREG4                0x355
+  | #define CSR_MIREG5                0x356
+  | #define CSR_MIREG6                0x357
+
+[compliant] lib/sbi/sbi_hart.c:100-104  mstatus_init
+  When Smcsrind is detected, the mstatus_init function correctly sets
+  SMSTATEEN0_SVSLCT (bit 60) in mstateen0. Per the Smcsrind spec, this bit
+  controls S-mode access to siselect/sireg*/vsiselect/vsireg*. Setting this
+  bit before entering S-mode ensures S-mode software can use the indirect CSR
+  access mechanism. When Smcsrind is not present, the bit is correctly
+  cleared. The logic also correctly handles the SMAIA||SMCSRIND disjunction —
+  the bit is needed when either extension (or both) is present.
+  | if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMAIA) ||
+  |     sbi_hart_has_extension(scratch, SBI_HART_EXT_SMCSRIND))
+  |         mstateen_val |= (SMSTATEEN0_SVSLCT);
+  | else
+  |         mstateen_val &= ~(SMSTATEEN0_SVSLCT);
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:306-315
+      "If extension Smstateen is implemented together with Smcsrind, bit
+      60 of state-enable register mstateen0 controls access to siselect,
+      sireg*, vsiselect"
+
+[potential_risk] lib/sbi/sbi_hsm.c:408-446  __sbi_hsm_suspend_non_ret_save / __sbi_hsm_suspend_non_ret_restore
+  The non-retentive suspend save path saves MIE, MIP, MEDELEG, MIDELEG, and
+  MENVCFG but does NOT save miselect (or siselect). On resume, miselect resets
+  to its hardware-default value. While all M-mode mireg accesses go through
+  IMSIC macros that set miselect first, the loss of miselect state across
+  suspend/resume means: (1) if the suspend occurred during a sequence where
+  miselect was temporarily set to a non-default value, the resumed context is
+  inconsistent; (2) siselect is not saved either, so S-mode's indirect CSR
+  context is silently corrupted after non-retentive resume. This is a state-
+  integrity gap, though not the specific trap-handler attack vector described
+  in the vulnerability pattern.
+  | hdata->saved_mie = csr_read(CSR_MIE);
+  | hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+  | hdata->saved_medeleg = csr_read(CSR_MEDELEG);
+  | hdata->saved_mideleg = csr_read(CSR_MIDELEG);
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  |         hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+

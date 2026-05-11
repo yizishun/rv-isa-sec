@@ -1,0 +1,131 @@
+PR #2737  target=opensbi  overall=potential_risk
+Spec: Agent error: exit code 1
+Violation:
+
+Consequence: function_loss
+Pattern:
+
+------------------------------------------------------------
+[compliant] lib/sbi/sbi_hart.c:584-594  hart_detect_features
+  PMP entry count correctly detected at runtime by probing PMPADDR CSRs (0-63)
+  via __check_csr_64 macro. Each CSR is write-then-read-back verified;
+  pmp_count incremented only for CSRs holding the written all-ones pattern.
+  Matches spec norm:pmp_entry_count (machine.adoc:3347-3349) for 0/16/64 entry
+  implementations.
+  | val = hart_pmp_get_allowed_addr();
+  | if (val) {
+  |     hfeatures->pmp_log2gran = sbi_ffs(val) + 2;
+  |     hfeatures->pmp_addr_bits = sbi_fls(val) + 1;
+  |     __check_csr_64(CSR_PMPADDR0, 0, val, pmp_count, __pmp_skip);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3345-3349
+      "Up to 64 PMP entries are supported. Implementations may implement
+      zero, 16, or 64 PMP entries; the lowest-numbered PMP entries must be
+      implemented fir"
+    - riscv-isa-manual/src/priv/machine.adoc:3539-3539
+      "Software may determine the PMP granularity by writing zero to
+      pmp0cfg, then writing all ones to pmpaddr0, then reading back
+      pmpaddr0."
+
+[compliant] lib/sbi/sbi_hart_pmp.c:112-119  is_valid_pmp_idx
+  Runtime bounds check uses probed pmp_count (not PMP_COUNT=64) to validate
+  PMP indices before programming. Both configure functions guard all entry
+  accesses with this check, preventing writes to unimplemented entries.
+  | static bool is_valid_pmp_idx(unsigned int pmp_count, unsigned int pmp_idx)
+  | {
+  |     if (pmp_count > pmp_idx)
+  |         return true;
+  |     sbi_printf("error: insufficient PMP entries\n");
+  |     return false;
+  | }
+
+[compliant] lib/sbi/riscv_asm.c:333-381  pmp_set
+  pmp_set() uses compile-time PMP_COUNT (64) as a defensive bounds check. All
+  callers (sbi_hart_smepmp_configure, sbi_hart_oldpmp_configure) pre-validate
+  indices via is_valid_pmp_idx() against the runtime pmp_count before calling,
+  so the PMP_COUNT check is a safety net only. PMP entry is programmed in
+  correct order: pmpaddr written first, then pmpcfg — avoids transient NAPOT
+  mis-match.
+  | if (n >= PMP_COUNT || log2len > __riscv_xlen || log2len < PMP_SHIFT)
+  |     return SBI_EINVAL;
+  | ...
+  | csr_write_num(pmpaddr_csr, pmpaddr);
+  | csr_write_num(pmpcfg_csr, pmpcfg);
+
+[compliant] lib/sbi/sbi_hart_pmp.c:121-218  sbi_hart_smepmp_configure
+  Two-pass Smepmp configuration: (1) sets RLB to bypass locked-entry
+  enforcement, programs M-only firmware regions; (2) sets MML to enable Smepmp
+  encoding, programs shared/SU-only regions, disables remainder. Issues
+  sfence.vma fence after all PMP writes (line 216) per privileged spec section
+  3.7.2. Firmware entries tracked in bitmap to survive domain switches.
+  | csr_set(CSR_MSECCFG, MSECCFG_RLB);
+  | // ... program M-only regions first ...
+  | csr_set(CSR_MSECCFG, MSECCFG_MML);
+  | // ... program shared and SU-only regions ...
+  | sbi_hart_pmp_fence();
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:39-43
+      "this extension introduces the RLB, MMWP, and MML fields in the
+      mseccfg CSR and their associated rules."
+
+[compliant] lib/sbi/sbi_hart_pmp.c:259-298  sbi_hart_oldpmp_configure
+  Traditional (non-Smepmp) PMP configuration correctly iterates over domain
+  memory regions, translates flags via sbi_domain_get_oldpmp_flags(), programs
+  entries within runtime pmp_count bounds, disables remaining entries, and
+  issues fence.
+  | pmp_idx = 0;
+  | sbi_domain_for_each_memregion(dom, reg) {
+  |     if (!is_valid_pmp_idx(pmp_count, pmp_idx))
+  |         return SBI_EFAIL;
+  |     ...
+  |     pmp_set(pmp_idx++, pmp_flags, reg->base, reg->order);
+  | }
+  | for(; pmp_idx < pmp_count; pmp_idx++)
+  |     pmp_disable(pmp_idx);
+
+[potential_risk] platform/generic/mips/boston.c:69-79  boston_nascent_init
+  Boston platform hardcodes PMP writes to entries 14-15 (PMPADDR14, PMPADDR15,
+  PMPCFG2) before runtime PMP count detection runs. No read-back verification
+  to confirm writes took effect. If hardware implements fewer than 16 entries
+  (e.g., 0), these writes are silently ignored due to WARL behavior, leaving
+  DRAM unprotected. Platform-specific code assumes 16 entries; only safe
+  because the MIPS Boston platform is known to implement 16 PMP entries.
+  | csr_write(CSR_PMPADDR14, DRAM_PMP_ADDR);
+  | csr_write(CSR_PMPADDR15, 0x1fffffffffffffff);
+  | csr_write(CSR_PMPCFG2, ((PMP_A_NAPOT|PMP_R|PMP_W|PMP_X)<<56)|
+  |           ((PMP_A_NAPOT|PMP_R|PMP_W|PMP_X)<<48));
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3347-3349
+      "Up to 64 PMP entries are supported. Implementations may implement
+      zero, 16, or 64 PMP entries; the lowest-numbered PMP entries must be
+      implemented fir"
+
+[potential_risk] platform/generic/eswin/eic770x.c:206-213  eswin_eic7700_final_init
+  ESWIN EIC770X hardcodes PMP slot layout constants assuming exactly 8 PMP
+  entries (PMP_FW_START=0, PMP_RESERVED_B=6, PMP_FREE_B_START=7). No runtime
+  verification that pmp_count >= PMP_FREE_B_START + PMP_FREE_B_COUNT (i.e., >=
+  8). If a variant implements fewer PMP entries, the hardcoded indices could
+  access unimplemented CSRs (WARL ignored) or skip programming entirely.
+  | #define PMP_FW_START 0
+  | #define PMP_FW_COUNT 2
+  | #define PMP_RESERVED_A 2
+  | #define PMP_FREE_A_START 3
+  | #define PMP_FREE_A_COUNT 3
+  | #define PMP_RESERVED_B 6
+  | #define PMP_FREE_B_START 7
+  | #define PMP_FREE_B_COUNT 1
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:3347-3349
+      "Up to 64 PMP entries are supported. Implementations may implement
+      zero, 16, or 64 PMP entries; the lowest-numbered PMP entries must be
+      implemented fir"
+
+[compliant] lib/utils/fdt/fdt_fixup.c:319-320  fdt_reserved_memory_fixup
+  Stack arrays sized to PMP_COUNT (64), the architectural maximum. Actual
+  iteration bound comes from domain memregion count
+  (sbi_domain_for_each_memregion), not from PMP_COUNT. Over-allocation uses
+  ~512 bytes of stack but has no security impact.
+  | unsigned long filtered_base[PMP_COUNT] = { 0 };
+  | unsigned char filtered_order[PMP_COUNT] = { 0 };
+

@@ -1,0 +1,158 @@
+PR #2570  target=opensbi  overall=bug_confirmed
+Spec: Smmpm-enabled M-mode trap handlers must not perform explicit loads/stores using hardware-PM-transformed mtval values without first reversing (or accounting for) the prior PM transform, else double-masking corrupts the target physical address
+Violation:
+  OpenSBI M-mode trap handler reads mtval (already PM-transformed by hardware
+  per pm_csr_hw_apply from the trapping privilege mode's PM settings), then
+  uses this value for explicit memory accesses while Smmpm is enabled —
+  hardware applies M-mode's PM transformation a second time on the already-
+  transformed address (double-masking), yielding a wrong physical address.
+Consequence: data_corruption
+Pattern:
+  csr_read(CSR_MTVAL) followed by explicit load/store (lw/ld/sw/sd) within
+  M-mode trap handler when Smmpm may be enabled; also M-mode misaligned access
+  emulation using mtval without clearing PM transformation before constituent
+  aligned accesses
+------------------------------------------------------------
+[bug_confirmed] lib/sbi/sbi_trap_ldst.c:271-289  sbi_misaligned_ld_emulator
+  Double pointer-masking on misaligned load emulation: orig_trap->tval holds
+  the address already PM-transformed by hardware (per norm:pm_csr_hw_apply,
+  zpm.adoc:161). sbi_load_u8 sets MPRV, causing hardware to apply PM
+  transformation a second time (per norm:pm_mprv_spvp, zpm.adoc:135) when
+  Smmpm is enabled. This yields a wrong physical address → data corruption. No
+  PMLEN check, no address canonicalization, no mseccfg.PMM or menvcfg.PMM
+  inspection anywhere in this path.
+  | sbi_load_u8((void *)(orig_trap->tval + i), &uptrap);
+  | // orig_trap->tval = already-PM-transformed mtval
+  | // sbi_load_u8 sets MPRV → hardware applies PM AGAIN
+
+[bug_confirmed] lib/sbi/sbi_trap_ldst.c:296-314  sbi_misaligned_st_emulator
+  Double pointer-masking on misaligned store emulation: identical pattern to
+  sbi_misaligned_ld_emulator. orig_trap->tval (already PM-transformed mtval)
+  is passed byte-by-byte to sbi_store_u8 which sets MPRV. Hardware applies PM
+  a second time. Same data corruption consequence, same complete absence of PM
+  awareness.
+  | sbi_store_u8((void *)(orig_trap->tval + i), in_val.data_bytes[i], &uptrap);
+  | // orig_trap->tval = PM-transformed; sbi_store_u8 with MPRV → PM AGAIN
+
+[bug_confirmed] lib/sbi/sbi_trap_ldst.c:321-337  sbi_ld_access_emulator
+  Access fault load emulator uses orig_trap->tval (PM-transformed mtval) as
+  the address passed to the platform emulator. If the platform emulator does
+  explicit loads from this address and Smmpm is enabled, double PM
+  transformation applies. No PM awareness anywhere in this path.
+  | if (sbi_platform_emulate_load(sbi_platform_thishart_ptr(), rlen,
+  |                               orig_trap->tval, out_val))
+  |     return sbi_trap_redirect(regs, orig_trap);
+
+[bug_confirmed] lib/sbi/sbi_trap_ldst.c:344-360  sbi_st_access_emulator
+  Access fault store emulator: identical double-PM pattern as
+  sbi_ld_access_emulator. orig_trap->tval (PM-transformed mtval) passed to
+  sbi_platform_emulate_store without clearing the PM transformation. Data
+  corruption if Smmpm is enabled.
+  | if (sbi_platform_emulate_store(sbi_platform_thishart_ptr(), wlen,
+  |                                orig_trap->tval, in_val))
+  |     return sbi_trap_redirect(regs, orig_trap);
+
+[potential_risk] lib/sbi/sbi_unpriv.c:21-46  DEFINE_UNPRIVILEGED_LOAD_FUNCTION
+  All unprivileged load functions (sbi_load_u8/u16/u32/u64/s8/s16/s32/ulong)
+  set MPRV before performing an explicit data load. Per norm:pm_mprv_spvp
+  (zpm.adoc:135), MPRV causes the pointer masking settings of the effective
+  privilege mode to be applied. This is mechanically correct for single-PM
+  application when the input address is untransformed — but these functions
+  have no way to know whether their caller passed a PM-transformed or
+  untransformed address. The vulnerability is in the callers (misaligned
+  emulators, access fault emulators) that pass mtval as the address.
+  | "csrrs %[mstatus], " STR(CSR_MSTATUS) ", %[mprv]\n"  // MPRV set
+  | #insn " %[ret], %[addr]\n"  // explicit load → PM applies
+
+[potential_risk] lib/sbi/sbi_unpriv.c:48-71  DEFINE_UNPRIVILEGED_STORE_FUNCTION
+  All unprivileged store functions (sbi_store_u8/u16/u32/u64) set MPRV before
+  performing an explicit data store. Same MPRV→PM concern as the load
+  functions. Mechanically correct for single-PM application but caller must
+  ensure the address is not already PM-transformed.
+  | "csrrs %[mstatus], " STR(CSR_MSTATUS) ", %[mprv]\n"  // MPRV set
+  | #insn " %[val], %[addr]\n"  // explicit store → PM applies
+
+[potential_risk] lib/sbi/sbi_trap_ldst.c:69-73  sbi_trap_emulate_load
+  Instruction fetch for load emulation uses sbi_get_insn(regs->mepc, &uptrap),
+  which sets MPRV+MXR and performs an explicit lhu data load on mepc. Per
+  norm:pm_not_apply_implicit (zpm.adoc:67), PM does NOT apply to instruction
+  fetches, but this uses an explicit data load (lhu) which IS subject to PM.
+  If mepc happens to have tag bits set in the PM region (unlikely for
+  instruction addresses but possible), the instruction would be read from the
+  wrong physical address. Also note that sbi_get_insn sets MXR (zpm.adoc:135:
+  when MXR is in effect, PM does not apply), which mitigates this in the
+  current code, but sbi_load_u8/sbi_store_u8 do NOT set MXR.
+  | insn = sbi_get_insn(regs->mepc, &uptrap);
+  | // sbi_get_insn uses MPRV|lhu — explicit data load on mepc, PM applies
+  | // But MXR is also set → PM does NOT apply per norm:pm_mxr_exception
+
+[compliant] firmware/fw_base.S:579-606  TRAP_SAVE_INFO
+  Assembly trap entry correctly saves CSR_MTVAL to the trap context. The
+  hardware writes the PM-transformed fault address into mtval (per
+  norm:pm_csr_hw_apply), and the firmware has no choice but to read it. The
+  compliance issue is not here but in downstream C code that re-uses this PM-
+  transformed value for explicit memory accesses.
+  | csrr t0, CSR_MTVAL
+  | REG_S t0, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(tval))(sp)
+
+[compliant] lib/sbi/sbi_expected_trap.S:24-38  __sbi_expected_trap
+  Expected trap handler correctly saves CSR_MTVAL into the trap_info struct.
+  Same reasoning as TRAP_SAVE_INFO — the hardware wrote the PM-transformed
+  value, the firmware must save it. The double-masking risk is downstream when
+  callers re-use the saved tval for explicit memory accesses.
+  | csrr a4, CSR_MTVAL
+  | REG_S a4, SBI_TRAP_INFO_OFFSET(tval)(a3)
+
+[compliant] lib/sbi/sbi_trap.c:103-232  sbi_trap_redirect
+  sbi_trap_redirect writes trap->tval (the PM-transformed mtval) to CSR_STVAL
+  or CSR_VSTVAL. This is correct behavior: it passes through the address the
+  hardware provided without re-interpreting it. The next-lower privilege
+  mode's trap handler receives the same PM-transformed address that the
+  hardware would have written to stval directly if the trap had not been taken
+  via M-mode. No explicit memory access is performed on this address within
+  this function.
+  | csr_write(CSR_STVAL, trap->tval);
+  | // ... or ...
+  | csr_write(CSR_VSTVAL, trap->tval);
+
+[potential_risk] lib/sbi/sbi_fwft.c:237-262  fwft_set_pmlen
+  fwft_set_pmlen configures menvcfg.PMM (for Smnpm — pointer masking for
+  S-mode/next-lower mode). This is the ONLY code path in OpenSBI that touches
+  pointer masking configuration, and it has ZERO integration with the trap
+  handling code. When this is called to enable PM (e.g., PMLEN=7 or 16), the
+  trap handlers in sbi_trap_ldst.c have no awareness that addresses in mtval
+  may now be PM-transformed. The misaligned/access fault emulators will
+  silently double-apply PM. Additionally, this function only controls
+  menvcfg.PMM (Smnpm), not mseccfg.PMM (Smmpm) — so even if OpenSBI disables
+  PM for lower modes, the hardware could have Smmpm enabled independently via
+  mseccfg.
+  | prev = csr_read_clear(CSR_MENVCFG, ENVCFG_PMM);
+  | csr_set(CSR_MENVCFG, pmm);
+  | // No notification to trap handlers; no PM-awareness flag set
+
+[potential_risk] lib/sbi/sbi_trap_v_ldst.c:196-212  sbi_misaligned_v_ld_emulator
+  Vector misaligned load emulator computes the element address from register
+  state (base + vstart*stride) rather than from mtval, which correctly avoids
+  the double-PM problem on the address source. However, it passes the computed
+  address to sbi_load_u8 which sets MPRV, and if the register values contain
+  PM tags, the address will be PM-transformed once (correct). The risk is that
+  if S-mode had PM enabled and the register base has tag bits, the single PM
+  application via MPRV is spec-correct — but the code has no awareness of
+  whether the address is virtual or physical and does not handle the ignore-
+  transform distinction (sign-extend for VA vs zero-extend for PA per
+  zpm.adoc:39,53).
+  | ulong addr = base + vstart * stride;
+  | // ...
+  | sbi_load_u8((void *)(addr + seg * len + i), &uptrap);
+  | // addr from registers, not mtval — single PM via MPRV is correct
+
+[potential_risk] lib/sbi/sbi_trap_v_ldst.c:295-316  sbi_misaligned_v_st_emulator
+  Vector misaligned store emulator: same pattern as the vector load emulator.
+  Computes address from register state (not mtval), passes to sbi_store_u8
+  with MPRV. Single PM application is spec-correct, but code has no PM
+  awareness for the ignore-transform distinction between virtual and physical
+  addresses.
+  | ulong addr = base + vstart * stride;
+  | // ...
+  | sbi_store_u8((void *)(addr + seg * len + i), bytes[seg * len + i], &uptrap);
+

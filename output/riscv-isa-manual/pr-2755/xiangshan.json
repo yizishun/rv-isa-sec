@@ -1,0 +1,131 @@
+{
+  "pr_number": 2755,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2755,
+    "violation_condition": "In the mip CSR hardware module, if STIP read-only behavior is gated on the elaboration-time presence of stimecmp hardware (e.g., a Chisel 'if (hasSstc)' guarding writability) rather than on the runtime menvcfg.STCE bit. Specifically, when menvcfg.STCE=0—meaning the Sstc extension is disabled by M-mode firmware—the hardware must allow M-mode software to write mip.STIP to inject timer interrupts to S-mode. If the implementation instead treats STIP as permanently read-only whenever stimecmp registers exist in the RTL, writes to mip.STIP are silently dropped when STCE=0.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "mip.STIP writability gated on compile-time/elaboration-time stimecmp presence (e.g., conditional 'when' block keyed on HasSstc parameter) rather than on runtime menvcfg.STCE via Mux(menvcfg.STCE.asBool, platformIRP.STIP, reg.STIP)",
+    "affected_entities": [
+      "mip",
+      "menvcfg",
+      "stimecmp"
+    ],
+    "summary": "STIP read-only in mip must depend on runtime menvcfg.STCE=1, not on hardware-implemented stimecmp alone; STCE=0 requires software-writable STIP even with stimecmp present"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "mip CSRModule (STIP bit handling)",
+        "line_start": 247,
+        "line_end": 257,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mip.STIP writability is correctly gated on the runtime menvcfg.STCE bit, not on a compile-time parameter. When menvcfg.STCE=0 (Sstc disabled), M-mode writes to mip.STIP are accepted via the register path; when menvcfg.STCE=1 (Sstc enabled), STIP is read-only and reflects platformIRP.STIP from the SstcInterruptGen hardware. This correctly implements the spec requirement that STIP reverts to writable behavior when STCE=0.",
+      "snippet": "regOut.STIP := Mux(this.menvcfg.STCE.asBool, platformIRP.STIP, reg.STIP.asBool)\nwhen ((wen || fromMvip.STIP.valid) && !this.menvcfg.STCE) {\n  reg.STIP := Mux1H(Seq(\n    wen -> wdata.STIP,\n    fromMvip.STIP.valid -> fromMvip.STIP.bits,\n  ))\n}.otherwise {\n  reg.STIP := reg.STIP\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2228,
+          "line_end": 2239,
+          "excerpt": "When this extension is implemented and STCE in menvcfg is zero, an attempt to access stimecmp in a mode other than M-mode raises an illegal-instruction exception, STCE in henvcfg is read-only zero, and STIP in mip and sip reverts to its defined behavior as if this extension is not implemented."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1468,
+          "line_end": 1475,
+          "excerpt": "If the stimecmp register is not implemented, STIP is writable in mip, and may be written by M-mode software to deliver timer interrupts to S-mode. If the stimecmp (supervisor-mode timer compare) register is implemented, STIP is read-only in mip and reflects the supervisor-level timer interrupt signal resulting from stimecmp."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MEnvCfg class",
+        "line_start": 712,
+        "line_end": 715,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The menvcfg.STCE field RW-ness is correctly controlled by the compile-time CSRConfig.EXT_SSTC parameter: when Sstc is implemented, STCE is RW (reset=1); when Sstc is not implemented, STCE defaults to RO (reset=0) from the EnvCfg base class. The compile-time parameter only controls whether the field itself is writable, not the downstream STIP behavior.",
+      "snippet": "class MEnvCfg extends EnvCfg {\n  if (CSRConfig.EXT_SSTC) {\n    this.STCE.setRW().withReset(1.U)\n  }\n  this.PBMTE.setRW().withReset(0.U)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2231,
+          "line_end": 2232,
+          "excerpt": "The Sstc extension adds the STCE (STimecmp Enable) bit to menvcfg CSR. When the Sstc extension is not implemented, STCE is read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/SstcInterruptGen.scala",
+        "function_name": "SstcInterruptGen",
+        "line_start": 33,
+        "line_end": 35,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The SstcInterruptGen correctly guards the STIP output with runtime menvcfg.STCE: the timer comparison is only registered when menvcfg.STCE is true. When STCE=0, the platformIRP.STIP signal stays false, which is correct since the mip module reads from reg.STIP (the software-writable register) in that case.",
+      "snippet": "o.STIP  := RegEnable(i.stime.bits >= i.stimecmp.rdata && i.menvcfg.STCE, false.B, i.stime.valid || i.stimecmp.wen || i.menvcfg.wen)\no.VSTIP := RegEnable(i.vstime.bits >= i.vstimecmp.rdata && i.henvcfg.STCE, false.B, i.vstime.valid || i.vstimecmp.wen || i.htimedeltaWen || i.menvcfg.wen || i.henvcfg.wen)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 1166,
+          "line_end": 1175,
+          "excerpt": "A supervisor timer interrupt becomes pending, as reflected in the STIP bit in the mip and sip registers whenever time contains a value greater than or equal to stimecmp, treating the values as unsigned integers."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "henvcfg CSRModule",
+        "line_start": 73,
+        "line_end": 76,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "henvcfg.STCE is correctly forced to 0 when menvcfg.STCE=0, implementing the spec requirement that henvcfg.STCE is read-only zero when the parent menvcfg.STCE is zero.",
+      "snippet": "when(!menvcfg.STCE) {\n  regOut.STCE := 0.U\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2234,
+          "line_end": 2236,
+          "excerpt": "When this extension is implemented and STCE in menvcfg is zero, [...] STCE in henvcfg is read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "mvip CSRModule (STIP alias handling)",
+        "line_start": 151,
+        "line_end": 157,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The mvip.STIP alias correctly follows the mip.STIP writability: when menvcfg.STCE=1, mvip.STIP is read-only zero; when menvcfg.STCE=0, mvip.STIP is an alias of mip.STIP and writes are forwarded to mip via toMip.STIP.valid gated on !this.menvcfg.STCE.",
+      "snippet": "// When STIP is not writable in mip (such as when menvcfg.STCE = 1), bit 5 of mvip is read-only zero.\nregOut.STIP := Mux(this.menvcfg.STCE.asBool, 0.U, this.mip.STIP.asBool)\n// Don't update mip.STIP when menvcfg.STCE is 1\ntoMip.STIP.valid := wen && !this.menvcfg.STCE.asBool\ntoMip.STIP.bits := wdata.STIP",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2234,
+          "line_end": 2239,
+          "excerpt": "When this extension is implemented and STCE in menvcfg is zero [...] STIP in mip and sip reverts to its defined behavior as if this extension is not implemented."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

@@ -1,0 +1,111 @@
+{
+  "pr_number": 2755,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2755,
+    "violation_condition": "FreeBSD S-mode kernel probes has_sstc=true (ISA string), unconditionally writes stimecmp CSR directly, but M-mode firmware has not set menvcfg.STCE=1, so stimecmp writes do not generate the STIP timer interrupt signal — the kernel assumes the spec's read-only-STIP-reflects-stimecmp semantic but the hardware still operates in writable-STIP legacy mode.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "has_sstc && csr_write(stimecmp, without menvcfg.STCE verification in S-mode",
+    "affected_entities": [
+      "stimecmp",
+      "menvcfg.STCE",
+      "mip.STIP",
+      "sip.STIP"
+    ],
+    "summary": "FreeBSD gates direct stimecmp access on has_sstc but never verifies menvcfg.STCE; if firmware leaves SSTC disabled, timer interrupts silently fail and the scheduler starves"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/identcpu.c",
+        "function_name": "parse_ext_s",
+        "line_start": 166,
+        "line_end": 176,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "has_sstc is set purely from the ISA string's 'sstc' extension substring, with no verification that M-mode firmware has set menvcfg.STCE=1. The S-mode kernel cannot read menvcfg directly, so it blindly trusts the ISA string. Per the RISC-V spec (machine.adoc:2233-2239), when SSTC is implemented but STCE=0, any S-mode access to stimecmp raises an illegal-instruction exception. On such a platform, the kernel will panic when set_timecmp() or riscv_timer_intr() first writes stimecmp.",
+      "snippet": "CHECK_S_EXT(\"sstc\", SV_SSTC);\n...\nUPDATE_CAP(has_sstc, (desc->smode_extensions & SV_SSTC) != 0);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2231,
+          "line_end": 2239,
+          "excerpt": "The Sstc extension adds the STCE (STimecmp Enable) bit to menvcfg CSR. When this extension is implemented and STCE in menvcfg is zero, an attempt to access stimecmp in a mode other than M-mode raises an illegal-instruction exception, STCE in henvcfg is read-only zero, and STIP in mip and sip reverts to its defined behavior as if this extension is not implemented."
+        },
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/sstc.adoc",
+          "line_start": 179,
+          "line_end": 182,
+          "excerpt": "When this extension is implemented and STCE in menvcfg is zero, an attempt to access stimecmp or vstimecmp in a mode other than M-mode raises an illegal-instruction exception, STCE in henvcfg is read-only zero, and STIP in mip and sip reverts to its defined behavior as if this extension is not implemented."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/timer.c",
+        "function_name": "set_timecmp",
+        "line_start": 88,
+        "line_end": 96,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Unconditionally writes stimecmp CSR when has_sstc is true, without any runtime probe or verification that the CSR access will succeed. If menvcfg.STCE=0 (firmware not configured), the csr_write(stimecmp, timecmp) raises an illegal-instruction exception per the spec, resulting in kernel panic at trap.c:366-369. This is called from riscv_timer_et_start() on every timer event setup, making it a hard boot-time or first-timer-event crash on affected platforms.",
+      "snippet": "if (has_sstc)\n    csr_write(stimecmp, timecmp);\nelse\n    sbi_set_timer(timecmp);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2233,
+          "line_end": 2239,
+          "excerpt": "The STCE bit enables stimecmp for S-mode when set to one. When this extension is implemented and STCE in menvcfg is zero, an attempt to access stimecmp in a mode other than M-mode raises an illegal-instruction exception..."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/timer.c",
+        "function_name": "riscv_timer_intr",
+        "line_start": 139,
+        "line_end": 155,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Same unconditional stimecmp write pattern in the timer interrupt handler: writes stimecmp = -1UL when has_sstc is true with no STCE verification. If the firmware enabled STCE=1 at boot but later cleared it (theoretical), or if the kernel booted on a platform where the ISA string advertises SSTC but menvcfg.STCE remains 0, every timer interrupt would cause a panic on the illegal-instruction exception.",
+      "snippet": "if (has_sstc)\n    csr_write(stimecmp, -1UL);\nelse\n    sbi_set_timer(-1UL);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2233,
+          "line_end": 2239,
+          "excerpt": "When this extension is implemented and STCE in menvcfg is zero, an attempt to access stimecmp in a mode other than M-mode raises an illegal-instruction exception..."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 366,
+        "line_end": 371,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The S-mode illegal-instruction handler unconditionally panics the kernel. There is no recovery path for a failed stimecmp access. If the first stimecmp write from set_timecmp() raises an illegal-instruction exception (due to STCE=0), the kernel crashes with 'Illegal instruction' panic. A robust implementation would probe stimecmp accessibility at boot time and fall back to the SBI timer path if the access fails, rather than crashing the kernel.",
+      "snippet": "case SCAUSE_ILLEGAL_INSTRUCTION:\n    dump_regs(frame);\n    panic(\"Illegal instruction 0x%0*lx at %#lx\",\n        (frame->tf_stval & 0x3) != 0x3 ? 4 : 8,\n        frame->tf_stval, frame->tf_sepc);\n    break;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-cheri",
+          "file_path": "src/sstc.adoc",
+          "line_start": 179,
+          "line_end": 182,
+          "excerpt": "When this extension is implemented and STCE in menvcfg is zero, an attempt to access stimecmp or vstimecmp in a mode other than M-mode raises an illegal-instruction exception..."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

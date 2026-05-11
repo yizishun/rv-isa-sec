@@ -1,0 +1,206 @@
+{
+  "pr_number": 2608,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2608,
+    "violation_condition": "Kernel writes to sstateen CSRs to permit user-mode access to extension state (e.g., JVT, FCSR-under-Zfinx, custom state via C bit), but the kernel's __switch_to context-switch path does not save/restore the actual architectural state controlled by those bits, allowing one user thread to set state and another to observe it",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "csr_write.*sstateen|csr_set.*sstateen|__switch_to.*sstateen|SZSTATEEN|save_stateen|restore_stateen",
+    "affected_entities": [
+      "sstateen0",
+      "sstateen1",
+      "sstateen2",
+      "sstateen3",
+      "mstateen0",
+      "hstateen0"
+    ],
+    "summary": "Kernel enabling sstateen bits without context-switching the corresponding extension registers creates cross-process covert channels through ISA extension state"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "__switch_to",
+        "line_start": 421,
+        "line_end": 471,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The kernel's __switch_to context-switch path does NOT save/restore sstateen0 or any stateen-controlled state. This is currently compliant because the non-KVM kernel never writes to sstateen0 — it does not enable any sstateen-controlled user-mode extension access. The kernel correctly uses sstatus.FS/VS bits for FPU/Vector context switching, which is the spec-preferred mechanism. Per spec norm:mstateen_lower_priv_roz, if M-mode firmware leaves mstateen0 bits zero (the reset default per norm:mstateen_zero_initialization), the corresponding sstateen0 bits appear read-only zero, so user access is blocked at hardware level.",
+      "snippet": "SYM_FUNC_START(__switch_to)\n\tli    a4,  TASK_THREAD_RA\n\tadd   a3, a0, a4\n\tadd   a4, a1, a4\n\tREG_S ra,  TASK_THREAD_RA_RA(a3)\n\t...\n\tret\nSYM_FUNC_END(__switch_to)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 332,
+          "line_end": 335,
+          "excerpt": "Software should ensure that all writable bits of sstateen CSRs are initialized to zeros when an OS at supervisor level is first entered. The OS can then set bits in these registers to enable user-level access to the controlled state, presumably because it knows how to context-swap the state."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 153,
+          "line_end": 156,
+          "excerpt": "On reset, all writable mstateen bits are initialized by the hardware to zeros. If machine-level software changes these values, it is responsible for initializing the corresponding writable bits of the hstateen and sstateen CSRs to zeros too."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 141,
+          "line_end": 143,
+          "excerpt": "For every bit in an mstateen CSR that is zero (whether read-only zero or set to zero), the same bit appears as read-only zero in the matching hstateen and sstateen CSRs."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/switch_to.h",
+        "function_name": "switch_to",
+        "line_start": 113,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The switch_to macro handles FPU (__switch_to_fpu), Vector (__switch_to_vector), and ENVCFG (__switch_to_envcfg) on context switch, but does NOT handle sstateen. This is currently compliant because the kernel never enables sstateen-controlled user-mode state — it relies entirely on sstatus.FS/VS for FPU/V access control. No sstateen CSR is ever written in the bare-metal supervisor path.",
+      "snippet": "#define switch_to(prev, next, last)\ndo {\n\t...\n\tif (has_fpu())\n\t\t__switch_to_fpu(__prev, __next);\n\tif (has_vector() || has_xtheadvector())\n\t\t__switch_to_vector(__prev, __next);\n\t...\n\t__switch_to_envcfg(__next);\n\t((last) = __switch_to(__prev, __next));\n} while (0)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_swap_in_guest_state",
+        "line_start": 749,
+        "line_end": 761,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM correctly saves the host sstateen0 and swaps in the guest sstateen0 via csr_swap(CSR_SSTATEEN0, smcsr->sstateen0) when SMSTATEEN is present and hstateen0.SE0=1 (SMSTATEEN0_SSTATEEN0 bit). The host value is preserved in vcpu->arch.host_sstateen0 for later restore.",
+      "snippet": "static __always_inline void kvm_riscv_vcpu_swap_in_guest_state(struct kvm_vcpu *vcpu)\n{\n\t...\n\tif (riscv_has_extension_unlikely(RISCV_ISA_EXT_SMSTATEEN) &&\n\t    (cfg->hstateen0 & SMSTATEEN0_SSTATEEN0))\n\t\tvcpu->arch.host_sstateen0 = csr_swap(CSR_SSTATEEN0,\n\t\t\t\t\t\t     smcsr->sstateen0);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 337,
+          "line_end": 341,
+          "excerpt": "For the sstateen CSRs whose access by a guest OS is permitted by bit 63 of the corresponding hstateen CSRs, a hypervisor must include the sstateen CSRs in the context it swaps for a guest OS."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_vcpu_swap_in_host_state",
+        "line_start": 763,
+        "line_end": 775,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM correctly restores the host sstateen0 while saving the guest's sstateen0 via csr_swap(CSR_SSTATEEN0, vcpu->arch.host_sstateen0), symmetric with the guest swap-in. Guest sstateen0 is preserved in smcsr->sstateen0 for next VCPU entry.",
+      "snippet": "static __always_inline void kvm_riscv_vcpu_swap_in_host_state(struct kvm_vcpu *vcpu)\n{\n\t...\n\tif (riscv_has_extension_unlikely(RISCV_ISA_EXT_SMSTATEEN) &&\n\t    (cfg->hstateen0 & SMSTATEEN0_SSTATEEN0))\n\t\tsmcsr->sstateen0 = csr_swap(CSR_SSTATEEN0,\n\t\t\t\t\t    vcpu->arch.host_sstateen0);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_load",
+        "line_start": 564,
+        "line_end": 622,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "kvm_arch_vcpu_load correctly configures hstateen0 with SMSTATEEN0_HSENVCFG, AIA-related bits (IMSIC/AIA/ISEL), and SMSTATEEN0_SSTATEEN0 when the SMSTATEEN extension is present. The hstateen0 value is written to the hardware CSR (either via NACL or direct csr_write). This properly enables the guest to access sstateen0 and senvcfg.",
+      "snippet": "if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SMSTATEEN)) {\n\tcfg->hstateen0 |= SMSTATEEN0_HSENVCFG;\n\tif (riscv_isa_extension_available(isa, SSAIA))\n\t\tcfg->hstateen0 |= SMSTATEEN0_AIA_IMSIC |\n\t\t\t\t  SMSTATEEN0_AIA |\n\t\t\t\t  SMSTATEEN0_AIA_ISEL;\n\tif (riscv_isa_extension_available(isa, SMSTATEEN))\n\t\tcfg->hstateen0 |= SMSTATEEN0_SSTATEEN0;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 269,
+          "line_end": 271,
+          "excerpt": "The SE0 bit in mstateen0 controls access to the hstateen0, hstateen0h, and the sstateen0 CSRs. The SE0 bit in hstateen0 controls access to the sstateen0 CSR."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_arch_vcpu_put",
+        "line_start": 643,
+        "line_end": 683,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "kvm_arch_vcpu_put does NOT save/restore hstateen0 or read back sstateen0 from hardware. The function reads back VS CSRs (vsstatus, vsie, vstvec, etc.) but does not capture the current hstateen0 or sstateen0 state at VCPU exit. This relies on the swap_in_host_state having already restored host_sstateen0 before vcpu_put is called. While this ordering is correct in the current VCPU run loop, there is no explicit assertion or comment documenting this dependency, making it fragile to refactoring.",
+      "snippet": "void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)\n{\n\t...\n\tkvm_riscv_vcpu_guest_fp_save(&vcpu->arch.guest_context, vcpu->arch.isa);\n\tkvm_riscv_vcpu_host_fp_restore(&vcpu->arch.host_context);\n\t...\n\tcsr->vsstatus = csr_read(CSR_VSSTATUS);\n\t/* no sstateen/hstateen save here */\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "SMSTATEEN0 bit definitions",
+        "line_start": 233,
+        "line_end": 243,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The kernel only defines hstateen0/mstateen0 bits for supervisor-and-above-level state (bit 58-63: AIA_IMSIC, AIA, AIA_ISEL, HSENVCFG, SSTATEEN0). Missing are the user-facing sstateen0 bit definitions: bit 0 (C — custom state), bit 1 (FCSR — Zfinx fcsr), and bit 2 (JVT — Zcmt jvt). The kernel currently has no Zcmt or Zfinx support (confirmed: no 'jvt', 'zcmt', 'zfinx' references in arch/riscv/), so this is a latent gap. If a future implementation adds Zcmt/Zfinx and M-mode firmware sets corresponding mstateen0 bits, the kernel would lack the symbolic definitions to detect or control this state.",
+      "snippet": "/* Smstateen bits */\n#define SMSTATEEN0_AIA_IMSIC_SHIFT\t58\n#define SMSTATEEN0_AIA_IMSIC\t\t(_ULL(1) << SMSTATEEN0_AIA_IMSIC_SHIFT)\n...\n#define SMSTATEEN0_SSTATEEN0_SHIFT\t63\n#define SMSTATEEN0_SSTATEEN0\t\t(_ULL(1) << SMSTATEEN0_SSTATEEN0_SHIFT)\n/* Missing: bit 0 C, bit 1 FCSR, bit 2 JVT */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 228,
+          "line_end": 264,
+          "excerpt": "Supervisor State Enable 0 Register (sstateen0): bits C (custom state), FCSR (Zfinx fcsr), JVT (Zcmt jvt). The FCSR bit controls access to fcsr for Zfinx. The JVT bit controls access to the jvt CSR provided by the Zcmt extension."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "restore_sigframe",
+        "line_start": 230,
+        "line_end": 278,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The signal frame save/restore path handles FPU state (sc_fpregs), Vector state (RISCV_V_MAGIC), and Zicfiss shadow stack (RISCV_ZICFISS_MAGIC). It does NOT handle JVT or any sstateen-controlled custom state. This is currently compliant because the kernel never enables sstateen bits for user-mode access. The state that IS enabled (FPU via sstatus.FS, Vector via sstatus.VS) IS correctly saved/restored through the signal frame.",
+      "snippet": "switch (magic) {\ncase END_MAGIC: ... return 0;\ncase RISCV_V_MAGIC: ... err = __restore_v_state(regs, sc_ext_ptr); break;\ncase RISCV_ZICFISS_MAGIC: ... err = __restore_cfiss_state(regs, sc_ext_ptr); break;\ndefault: return -EINVAL;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_onereg.c",
+        "function_name": "kvm_riscv_vcpu_smstateen_set_csr",
+        "line_start": 546,
+        "line_end": 558,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM's ONE_REG interface correctly exposes sstateen0 to userspace (e.g., QEMU) via kvm_riscv_vcpu_smstateen_get/set_csr. The smstateen CSR context is included in the register count (num_csr_regs) and copied during register enumeration (copy_csr_reg_indices). This allows VMM userspace to save/restore the full guest sstateen0 state across live migration.",
+      "snippet": "static inline int kvm_riscv_vcpu_smstateen_set_csr(struct kvm_vcpu *vcpu,\n\t\t\t\t\t\t   unsigned long reg_num,\n\t\t\t\t\t\t   unsigned long reg_val)\n{\n\tstruct kvm_vcpu_smstateen_csr *csr = &vcpu->arch.smstateen_csr;\n\tif (reg_num >= sizeof(struct kvm_riscv_smstateen_csr) / sizeof(unsigned long))\n\t\treturn -EINVAL;\n\t((unsigned long *)csr)[reg_num] = reg_val;\n\treturn 0;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu.c",
+        "function_name": "kvm_riscv_reset_vcpu",
+        "line_start": 55,
+        "line_end": 64,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VCPU reset correctly zeros the smstateen_csr context (memset to 0), satisfying the spec requirement at spec line 340: 'When it starts a new guest OS, it must ensure the writable bits of those sstateen CSRs are initialized to zeros.'",
+      "snippet": "memset(&vcpu->arch.smstateen_csr, 0, sizeof(vcpu->arch.smstateen_csr));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 337,
+          "line_end": 341,
+          "excerpt": "When it starts a new guest OS, it must ensure the writable bits of those sstateen CSRs are initialized to zeros, and it must emulate accesses to any other sstateen CSRs."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

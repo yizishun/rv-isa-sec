@@ -1,0 +1,147 @@
+{
+  "pr_number": 2572,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2572,
+    "violation_condition": "In the FreeBSD kernel, vector context-switch save/restore paths (e.g., in cpu_switch(), set_fpcontext(), or get_fpcontext()) that use whole-register load/store instructions (vl1r.v, vs1r.v, etc.) or the vmv<nr>r.v move instructions without first ensuring vstart < evl (where evl = NFIELDS * VLEN / EEW). This can occur when a vector instruction was interrupted mid-execution, leaving vstart non-zero, and the kernel subsequently uses whole-register instructions to save or restore vector state without explicitly clearing vstart. Under the new spec, vstart >= evl makes these instructions reserved (implementation-defined behavior), whereas previously the behavior was well-defined (no elements written).",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "vsetvli.*vstart|csrw.*vstart|csrr.*vstart|vl[1248]r|vs[1248]r|vmv[1248]r\\.v|whole.register.*save|whole.register.*restore|vector.*context.*switch|fpu.*context.*switch",
+    "affected_entities": [
+      "vstart",
+      "vl1re8.v",
+      "vl1re16.v",
+      "vl1re32.v",
+      "vl1re64.v",
+      "vl2re8.v",
+      "vl2re16.v",
+      "vl2re32.v",
+      "vl2re64.v",
+      "vl4re8.v",
+      "vl4re16.v",
+      "vl4re32.v",
+      "vl4re64.v",
+      "vl8re8.v",
+      "vl8re16.v",
+      "vl8re32.v",
+      "vl8re64.v",
+      "vs1r.v",
+      "vs2r.v",
+      "vs4r.v",
+      "vs8r.v",
+      "vmv1r.v",
+      "vmv2r.v",
+      "vmv4r.v",
+      "vmv8r.v"
+    ],
+    "summary": "FreeBSD's vector context-switch code must clear vstart before using whole-register load/store/move instructions, as vstart >= evl is now reserved (implementation-defined) rather than the prior well-defined no-op behavior, risking silent register corruption on implementations that trap or misbehave"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The FreeBSD RISC-V kernel has no vector (V ISA extension) support. cpu_switch() saves/restores only scalar integer registers (ra, sp, s0-s11) and scalar FP registers (via __fpe_state_save/__fpe_state_load). No vector registers (v0-v31), vstart CSR, vtype CSR, vl CSR, or vcsr are saved or restored. No whole-register vector instructions (vl1r.v, vs1r.v, vmv<nr>r.v) are used anywhere in the kernel. The vstart-vs-whole-register vulnerability is not present because the kernel does not implement vector context switching at all.",
+      "snippet": "/* Save the old context */\nmv\ta1, a0\naddi\ta1, a1, PCB_S0\t/* &pcb_s[] */\nREG_S\ts0, (0 * 8)(a1)\n...\n/* FPU context. */\nbeqz\tt0, .Lload_fpe_ctx\nCALL\tswitch_vfp_context",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 2117,
+          "line_end": 2125,
+          "excerpt": "The instructions operate with an effective vector length, evl=NFIELDS*VLEN/EEW, regardless of current settings in vtype and vl. The usual property that no elements are written if vstart >= vl does not apply to these instructions. Instead, the instructions are reserved if vstart >= evl."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 4852,
+          "line_end": 4857,
+          "excerpt": "The usual property that no elements are written if vstart >= vl does not apply to these instructions. Similarly, the property that the instructions are reserved if vstart exceeds the largest element index for the current vtype setting does not apply. Instead, the instructions are reserved if vstart >= evl."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 206,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "cpu_throw() switches to a new thread without saving the old thread's state. For FP, it checks sstatus.FS and calls __fpe_state_load if FP is enabled. No vector state initialization or vstart clearing is performed because vector support is not implemented.",
+      "snippet": "/* Check if new thread has FP enabled */\nld\tt0, TD_PCB(t1)\nld\tt0, PCB_FLAGS(t0)\nandi\tt0, t0, PCB_FP_ENABLED\nbeqz\tt0, .Lthrow_restore\nCALL\t__fpe_state_load",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "savectx() saves callee-saved integer registers plus scalar FP state via __fpe_state_save. No vector state (v0-v31, vstart, vtype, vl, vcsr) is saved because vector support is not implemented.",
+      "snippet": "CALL\t__fpe_state_save\nret",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "get_fpcontext",
+        "line_start": 265,
+        "line_end": 292,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "get_fpcontext() saves only scalar FP state (pcb_x[32][2] and pcb_fcsr) to the mcontext. No vector register state or vstart/vtype/vl CSR values are saved. The mc_spare[8] field in struct __mcontext is unused and could serve as expansion space for future vector context.",
+      "snippet": "if (td == curthread)\n\tfpe_state_save(td);\nbcopy(&pcb->pcb_x, &mcp->mc_fpregs.fp_x, sizeof(pcb->pcb_x));\nmcp->mc_fpregs.fp_fcsr = pcb->pcb_fcsr;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_fpcontext",
+        "line_start": 295,
+        "line_end": 315,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "set_fpcontext() restores only scalar FP state from mcontext to PCB. No vector register state or vstart/vtype/vl CSR values are restored. If vector support is added, clearing vstart before any whole-register save/restore would be mandatory.",
+      "snippet": "bcopy(&mcp->mc_fpregs.fp_x, &pcb->pcb_x, sizeof(pcb->pcb_x));\npcb->pcb_fcsr = mcp->mc_fpregs.fp_fcsr;\nif ((mcp->mc_flags & _MC_FP_VALID) != 0)\n\tpcb->pcb_flags |= PCB_FP_ENABLED;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/identcpu.c",
+        "function_name": "parse_riscv_isa",
+        "line_start": 261,
+        "line_end": 333,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "parse_riscv_isa() parses single-letter ISA extensions but has no case for 'v' (vector). An ISA string containing 'v' would fall through to the default case (line 323-326) and be silently ignored. HWCAP_ISA_V is not defined in sys/riscv/include/elf.h.",
+      "snippet": "switch (c) {\ncase 'a': ...\ncase 'f': ...\ndefault:\n\t/* Unknown extension, ignore silently */\n\tbreak;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "struct pcb has fields for scalar FP state only (pcb_x[32][2], pcb_fcsr). No fields for vector register state (v0-v31, 32*VLEN bits each), vstart, vtype, vl, vcsr, or vlenb CSRs. The structure would need significant expansion for vector support.",
+      "snippet": "struct pcb {\n\tregister_t\tpcb_ra;\n\t...\n\tuint64_t\tpcb_x[32][2];\n\tuint64_t\tpcb_fcsr;\n\tuint32_t\tpcb_flags;\n};",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

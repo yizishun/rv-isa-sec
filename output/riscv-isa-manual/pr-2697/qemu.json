@@ -1,0 +1,94 @@
+{
+  "pr_number": 2697,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2697,
+    "violation_condition": "QEMU's CSR dispatch table does not register tinfo (0x7A4) and tcontrol (0x7A5) as valid Debug/Trace CSRs, causing accesses to these newly-allocated CSR addresses to fall through to the default unimplemented-CSR trap path (illegal instruction), or worse, to alias onto an unrelated CSR or return stale/uninitialized data from an unvalidated read path.",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "riscv_csr_operations.*0x7A[0-9A-F].*|csr_ops\\[.*\\].*t(info|control)|case 0x7a4|case 0x7a5|CSR_TINFO|CSR_TCONTROL",
+    "affected_entities": [
+      "tinfo",
+      "tcontrol"
+    ],
+    "summary": "Newly-allocated Sdtrig CSRs tinfo (0x7A4) and tcontrol (0x7A5) must be registered in QEMU's CSR lookup table; absence causes illegal-instruction traps on valid guest CSR accesses, breaking debug/trace trigger functionality expected by spec-compliant guest software."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "csr_ops table (Debug CSRs block)",
+        "line_start": 6373,
+        "line_end": 6379,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "CSR tcontrol (0x7A5) is missing from the CSR dispatch table. The RISC-V ISA manual (csrs.adoc lines 1001-1030) allocates 0x7A5 as the 'Trigger control register' (tcontrol) in the Debug/Trace Registers block alongside tselect, tdata1-3, tinfo, and mcontext. No CSR_TCONTROL macro is defined in cpu_bits.h, no read/write handler is implemented in csr.c or debug.c, and no entry exists in the csr_ops table. Any machine-mode access to CSR 0x7A5 hits the NULL predicate check in riscv_csrrw_check() (line 5588) and returns RISCV_EXCP_ILLEGAL_INST — the emulated guest sees an illegal instruction exception where a valid CSR read/write should succeed. This causes function_loss: debugging tools and external debuggers that rely on tcontrol for trigger configuration will malfunction.",
+      "snippet": "    /* Debug CSRs */\n    [CSR_TSELECT]   =  { \"tselect\",  debug, read_tselect,  write_tselect  },\n    [CSR_TDATA1]    =  { \"tdata1\",   debug, read_tdata,    write_tdata    },\n    [CSR_TDATA2]    =  { \"tdata2\",   debug, read_tdata,    write_tdata    },\n    [CSR_TDATA3]    =  { \"tdata3\",   debug, read_tdata,    write_tdata    },\n    [CSR_TINFO]     =  { \"tinfo\",    debug, read_tinfo,    write_ignore   },\n    /* CSR_TCONTROL (0x7A5) is MISSING — gap before MCONTEXT */\n    [CSR_MCONTEXT]  =  { \"mcontext\", debug, read_mcontext, write_mcontext },",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 1001,
+          "line_end": 1030,
+          "excerpt": "Debug/Trace Registers (shared with Debug Mode): 0x7A0 tselect, 0x7A1 tdata1, 0x7A2 tdata2, 0x7A3 tdata3, 0x7A4 tinfo, 0x7A5 tcontrol, 0x7A8 mcontext. tcontrol is described as 'Trigger control register.'"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "csr_ops table / read_tinfo / tinfo_csr_read",
+        "line_start": 5418,
+        "line_end": 5423,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR tinfo (0x7A4) is correctly implemented and registered. CSR_TINFO is defined in cpu_bits.h:463, read_tinfo() delegates to tinfo_csr_read() in debug.c:918, and the CSR is registered as read-only (write_ignore) in the dispatch table at line 6378. This matches the spec allocation at csrs.adoc lines 1001-1030.",
+      "snippet": "static RISCVException read_tinfo(CPURISCVState *env, int csrno,\n                                 target_ulong *val)\n{\n    *val = tinfo_csr_read(env);\n    return RISCV_EXCP_NONE;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_bits.h",
+        "function_name": "Debug/Trace CSR macros",
+        "line_start": 458,
+        "line_end": 464,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "CSR_TCONTROL (0x7A5) macro is missing from cpu_bits.h. The Debug/Trace register block defines CSR_TSELECT (0x7A0) through CSR_TINFO (0x7A4), then jumps directly to CSR_MCONTEXT (0x7A8), skipping 0x7A5 (tcontrol) entirely. Without this macro, the CSR dispatch table in csr.c cannot register tcontrol.",
+      "snippet": "/* Debug/Trace Registers (shared with Debug Mode) */\n#define CSR_TSELECT         0x7a0\n#define CSR_TDATA1          0x7a1\n#define CSR_TDATA2          0x7a2\n#define CSR_TDATA3          0x7a3\n#define CSR_TINFO           0x7a4\n/* CSR_TCONTROL (0x7A5) is MISSING */\n#define CSR_MCONTEXT        0x7a8",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 1001,
+          "line_end": 1030,
+          "excerpt": "Debug/Trace Registers (shared with Debug Mode): 0x7A5 tcontrol — Trigger control register."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/debug.c",
+        "function_name": "(no tcontrol implementation)",
+        "line_start": 1,
+        "line_end": 1,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "No tcontrol read/write handler exists in debug.c. The file implements tselect, tdata1-3, and tinfo handling via tinfo_csr_read(), but tcontrol has no CSR read/write functions. Any attempt to access tcontrol will fail at the CSR dispatch layer before reaching debug.c.",
+      "snippet": "(no tcontrol handler — the string 'tcontrol' does not appear anywhere in target/riscv/)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 1001,
+          "line_end": 1030,
+          "excerpt": "0x7A5 MRW tcontrol — Trigger control register."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

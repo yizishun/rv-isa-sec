@@ -1,0 +1,36 @@
+PR #2517  target=qemu  overall=compliant
+Spec: WFI in U-mode with S-mode implemented must unconditionally raise illegal-instruction exception regardless of mstatus.TW; TW must only gate trapping for S-mode and for U-mode when S-mode is NOT present
+Violation:
+  In QEMU helper_wfi(), if the U-mode WFI trap condition depends on mstatus.TW
+  when S-mode (RVS) is implemented — i.e., a control flow where TW=0 short-
+  circuits the illegal-instruction exception before reaching the (rvs &&
+  prv_u) unconditional trap — WFI would incorrectly execute without trapping
+  in U-mode despite S-mode being present, violating the spec's mandate that
+  U-mode WFI must always trap regardless of TW.
+Consequence: denial_of_service
+Pattern:
+  MSTATUS_TW check in WFI handler that gates or precedes the unconditional
+  U-mode+S-mode trap; specifically any code path where get_field(env->mstatus,
+  MSTATUS_TW) appearing without an additional (prv_u && riscv_has_ext(env,
+  RVS)) conjunct results in WFI completing in U-mode when S-mode exists and
+  TW=0
+------------------------------------------------------------
+[compliant] target/riscv/op_helper.c:541-559  helper_wfi
+  The WFI handler correctly implements the spec requirement that U-mode WFI
+  always traps when S-mode is implemented, regardless of mstatus.TW. The TW-
+  dependent U-mode check at line 548 is gated by (!rvs && prv_u), ensuring it
+  only applies when S-mode is absent. When S-mode is present (rvs=true), the
+  unconditional (rvs && prv_u && !env->virt_enabled) check in the second
+  disjunct catches U-mode WFI and raises an illegal-instruction exception
+  independently of TW.
+  | if (((prv_s || (!rvs && prv_u)) && get_field(env->mstatus, MSTATUS_TW)) ||
+  |     (rvs && prv_u && !env->virt_enabled)) {
+  |     riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, GETPC());
+  | } else if (env->virt_enabled &&
+  |            (prv_u || (prv_s && get_field(env->hstatus, HSTATUS_VTW)))) {
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:775-777
+      "When S-mode is implemented, then executing WFI in U-mode causes an
+      illegal-instruction exception, regardless of the value of the TW
+      bit, unless the in"
+

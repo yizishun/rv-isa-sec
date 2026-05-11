@@ -1,0 +1,103 @@
+PR #2755  target=xiangshan  overall=compliant
+Spec: STIP read-only in mip must depend on runtime menvcfg.STCE=1, not on hardware-implemented stimecmp alone; STCE=0 requires software-writable STIP even with stimecmp present
+Violation:
+  In the mip CSR hardware module, if STIP read-only behavior is gated on the
+  elaboration-time presence of stimecmp hardware (e.g., a Chisel 'if
+  (hasSstc)' guarding writability) rather than on the runtime menvcfg.STCE
+  bit. Specifically, when menvcfg.STCE=0—meaning the Sstc extension is
+  disabled by M-mode firmware—the hardware must allow M-mode software to write
+  mip.STIP to inject timer interrupts to S-mode. If the implementation instead
+  treats STIP as permanently read-only whenever stimecmp registers exist in
+  the RTL, writes to mip.STIP are silently dropped when STCE=0.
+Consequence: denial_of_service
+Pattern:
+  mip.STIP writability gated on compile-time/elaboration-time stimecmp
+  presence (e.g., conditional 'when' block keyed on HasSstc parameter) rather
+  than on runtime menvcfg.STCE via Mux(menvcfg.STCE.asBool, platformIRP.STIP,
+  reg.STIP)
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:247-257  mip CSRModule (STIP bit handling)
+  mip.STIP writability is correctly gated on the runtime menvcfg.STCE bit, not
+  on a compile-time parameter. When menvcfg.STCE=0 (Sstc disabled), M-mode
+  writes to mip.STIP are accepted via the register path; when menvcfg.STCE=1
+  (Sstc enabled), STIP is read-only and reflects platformIRP.STIP from the
+  SstcInterruptGen hardware. This correctly implements the spec requirement
+  that STIP reverts to writable behavior when STCE=0.
+  | regOut.STIP := Mux(this.menvcfg.STCE.asBool, platformIRP.STIP, reg.STIP.asBool)
+  | when ((wen || fromMvip.STIP.valid) && !this.menvcfg.STCE) {
+  |   reg.STIP := Mux1H(Seq(
+  |     wen -> wdata.STIP,
+  |     fromMvip.STIP.valid -> fromMvip.STIP.bits,
+  |   ))
+  | }.otherwise {
+  |   reg.STIP := reg.STIP
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2228-2239
+      "When this extension is implemented and STCE in menvcfg is zero, an
+      attempt to access stimecmp in a mode other than M-mode raises an
+      illegal-instructio"
+    - riscv-isa-manual/src/priv/machine.adoc:1468-1475
+      "If the stimecmp register is not implemented, STIP is writable in
+      mip, and may be written by M-mode software to deliver timer
+      interrupts to S-mode. If "
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:712-715  MEnvCfg class
+  The menvcfg.STCE field RW-ness is correctly controlled by the compile-time
+  CSRConfig.EXT_SSTC parameter: when Sstc is implemented, STCE is RW
+  (reset=1); when Sstc is not implemented, STCE defaults to RO (reset=0) from
+  the EnvCfg base class. The compile-time parameter only controls whether the
+  field itself is writable, not the downstream STIP behavior.
+  | class MEnvCfg extends EnvCfg {
+  |   if (CSRConfig.EXT_SSTC) {
+  |     this.STCE.setRW().withReset(1.U)
+  |   }
+  |   this.PBMTE.setRW().withReset(0.U)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2231-2232
+      "The Sstc extension adds the STCE (STimecmp Enable) bit to menvcfg
+      CSR. When the Sstc extension is not implemented, STCE is read-only
+      zero."
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SstcInterruptGen.scala:33-35  SstcInterruptGen
+  The SstcInterruptGen correctly guards the STIP output with runtime
+  menvcfg.STCE: the timer comparison is only registered when menvcfg.STCE is
+  true. When STCE=0, the platformIRP.STIP signal stays false, which is correct
+  since the mip module reads from reg.STIP (the software-writable register) in
+  that case.
+  | o.STIP  := RegEnable(i.stime.bits >= i.stimecmp.rdata && i.menvcfg.STCE, false.B, i.stime.valid || i.stimecmp.wen || i.menvcfg.wen)
+  | o.VSTIP := RegEnable(i.vstime.bits >= i.vstimecmp.rdata && i.henvcfg.STCE, false.B, i.vstime.valid || i.vstimecmp.wen || i.htimedeltaWen || i.menvcfg.wen || i.henvcfg.wen)
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1166-1175
+      "A supervisor timer interrupt becomes pending, as reflected in the
+      STIP bit in the mip and sip registers whenever time contains a value
+      greater than or"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:73-76  henvcfg CSRModule
+  henvcfg.STCE is correctly forced to 0 when menvcfg.STCE=0, implementing the
+  spec requirement that henvcfg.STCE is read-only zero when the parent
+  menvcfg.STCE is zero.
+  | when(!menvcfg.STCE) {
+  |   regOut.STCE := 0.U
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2234-2236
+      "When this extension is implemented and STCE in menvcfg is zero,
+      [...] STCE in henvcfg is read-only zero."
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:151-157  mvip CSRModule (STIP alias handling)
+  The mvip.STIP alias correctly follows the mip.STIP writability: when
+  menvcfg.STCE=1, mvip.STIP is read-only zero; when menvcfg.STCE=0, mvip.STIP
+  is an alias of mip.STIP and writes are forwarded to mip via toMip.STIP.valid
+  gated on !this.menvcfg.STCE.
+  | // When STIP is not writable in mip (such as when menvcfg.STCE = 1), bit 5 of mvip is read-only zero.
+  | regOut.STIP := Mux(this.menvcfg.STCE.asBool, 0.U, this.mip.STIP.asBool)
+  | // Don't update mip.STIP when menvcfg.STCE is 1
+  | toMip.STIP.valid := wen && !this.menvcfg.STCE.asBool
+  | toMip.STIP.bits := wdata.STIP
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2234-2239
+      "When this extension is implemented and STCE in menvcfg is zero
+      [...] STIP in mip and sip reverts to its defined behavior as if this
+      extension is not i"
+

@@ -1,0 +1,119 @@
+PR #2790  target=opensbi  overall=potential_risk
+Spec: mie/mip are WARL — writes may be silently coerced; OpenSBI must read-back verify after mie writes and must not assume save/restore fidelity across HSM suspend/resume
+Violation:
+  OpenSBI writes a value to mie (e.g., to enable/disable specific interrupt
+  classes during init, HSM suspend/resume, or SBI handler prologue/epilogue)
+  and assumes the write took effect exactly as written, without reading back
+  to verify. Hardware WARL behavior may silently drop or alter unsupported
+  interrupt-enable bits, causing a mismatch between OpenSBI's expected and
+  actual mie state.
+Consequence: denial_of_service
+Pattern:
+  csrw mie, <val> without subsequent csrr mie read-back verification; or
+  save/restore of mie across HSM suspend where the restored value is not
+  validated against the written value
+------------------------------------------------------------
+[potential_risk] lib/sbi/sbi_hsm.c:166-186  sbi_hsm_hart_wait
+  MIE save/restore across hart-wait with no read-back verification. saved_mie
+  is read from CSR before enabling MSIE+MEIE via csr_set, then restored via
+  csr_write without confirming the write took effect. Additionally,
+  csr_set(CSR_MIE, MIP_MSIP | MIP_MEIP) at line 169 ORs bitmask constants into
+  MIE without read-back — if MSIE or MEIE were read-only-zero on a non-
+  conforming platform, IPI wake-up would silently fail and the hart could hang
+  in wfi().
+  | saved_mie = csr_read(CSR_MIE);
+  | csr_set(CSR_MIE, MIP_MSIP | MIP_MEIP);
+  | // ... wfi() ...
+  | csr_write(CSR_MIE, saved_mie);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1382-1384
+      "The mie register must always be implemented. A bit in mie must be
+      writable if the corresponding interrupt can ever become pending.
+      Bits of mie that ar"
+
+[compliant] lib/sbi/sbi_hsm.c:427-427  __sbi_hsm_suspend_non_ret_save
+  Suspend non-retentive MIE save reads CSR_MIE directly into hdata->saved_mie,
+  capturing the actual hardware state including ROZ bits. This is correct
+  because the saved value reflects the hardware's view of MIE, not a software-
+  constructed value.
+  | hdata->saved_mie = csr_read(CSR_MIE);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1382-1384
+      "The mie register must always be implemented. Bits of mie that are
+      not writable must be read-only zero."
+
+[potential_risk] lib/sbi/sbi_hsm.c:444-444  __sbi_hsm_suspend_non_ret_restore
+  MIE restoration after non-retentive suspend writes hdata->saved_mie via
+  csr_write without reading back to verify. The warm-boot path (fw_base.S:346)
+  reinitializes MIE to 0. While saved_mie was hardware-derived from the same
+  physical hart, the absence of read-back-after-write means a silent WARL drop
+  during restore would go undetected, potentially leaving interrupts disabled
+  that S-mode software expects to be enabled.
+  | csr_write(CSR_MIE, hdata->saved_mie);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1382-1384
+      "A bit in mie must be writable if the corresponding interrupt can
+      ever become pending. Bits of mie that are not writable must be read-
+      only zero."
+
+[potential_risk] lib/utils/hsm/fdt_hsm_sifive_tmc0.c:269-278  sifive_tmc0_stop
+  SiFive TMC0 HSM stop saves MIE, then uses csr_set(CSR_MIE, MIP_MEIP |
+  MIP_MSIP) to enable wake-up interrupts before power-gating. No read-back
+  verification after csr_set to confirm MEIE/MSIE were actually enabled. On
+  error rollback, csr_write(CSR_MIE, mie) restores the saved value without
+  read-back verification. A silent WARL drop on either path could leave the
+  hart in unexpected interrupt state.
+  | unsigned long mie = csr_read(CSR_MIE);
+  | csr_set(CSR_MIE, MIP_MEIP | MIP_MSIP);  // no read-back
+  | rc = sifive_tmc0_tile_pg();
+  | if (rc) {
+  |     csr_write(CSR_MIE, mie);  // no read-back
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1382-1384
+      "Bits of mie that are not writable must be read-only zero."
+
+[potential_risk] lib/utils/hsm/fdt_hsm_andes_atcsmu.c:153-156  andes_hsm_stop
+  Andes HSM stop writes csr_write(CSR_MIE, 0) then conditionally
+  csr_write(CSR_MIE, MIP_MSIP) for light sleep wake-up. The MIP_MSIP constant
+  is written directly to MIE without reading back to confirm the MSIE bit was
+  actually set. If MSIE is read-only-zero (e.g., on a single-hart system per
+  spec norm:mip_msip_mie_msie_maybe_rdonly0), the core may fail to wake from
+  light sleep.
+  | csr_write(CSR_MIE, 0);
+  | if (sleep_type == SBI_SUSP_AE350_LIGHT_SLEEP) {
+  |     csr_write(CSR_MIE, MIP_MSIP);  // no read-back
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1430-1433
+      "If a system has only one hart, or if a system has multiple harts
+      but software interrupts are not implemented, then mip.MSIP and
+      mie.MSIE may both be r"
+
+[compliant] firmware/fw_base.S:345-346  _start_warm
+  Warm-boot initialization writes csrw CSR_MIE, zero to disable all
+  interrupts. Writing 0 to MIE is always safe since read-only-zero bits are
+  already 0, and clearing writable bits cannot be WARL-dropped.
+  | csrw  CSR_MIE, zero
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1382-1384
+      "Bits of mie that are not writable must be read-only zero."
+
+[compliant] lib/sbi/sbi_hart.c:183-184  sbi_hart_init
+  Cold boot initialization writes csr_write(CSR_MIE, 0) to disable all
+  interrupts before entering S-mode. Writing 0 to MIE is always safe — ROZ
+  bits are already 0 and writable bits are correctly cleared.
+  | /* Disable all interrupts */
+  | csr_write(CSR_MIE, 0);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1382-1384
+      "Bits of mie that are not writable must be read-only zero."
+
+[compliant] lib/utils/suspend/fdt_suspend_andes_atcsmu.c:47-48  ae350_system_suspend
+  Andes system suspend writes csr_write(CSR_MIE, 0) to prevent unexpected WFI
+  exit. Writing 0 to MIE is always safe.
+  | csr_write(CSR_MIE, 0);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1382-1384
+      "Bits of mie that are not writable must be read-only zero."
+

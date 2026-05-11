@@ -1,0 +1,263 @@
+{
+  "pr_number": 2729,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2729,
+    "violation_condition": "When the Linux kernel context-switches vector state without saving/restoring the full vtype CSR including the new lambda[2:0] (vtype[XLEN-2:XLEN-4]), altfmt_A (vtype[9]), altfmt_B (vtype[10]), and bs (vtype[11]) fields introduced by the Zvvm IME extension, a user process may observe or manipulate another process's IME tile configuration",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "__riscv_v_state_save|__riscv_v_state_restore|vstate_save|vstate_restore|vtype_save|vtype_restore",
+    "affected_entities": [
+      "vtype",
+      "lambda[2:0]",
+      "altfmt_A",
+      "altfmt_B",
+      "bs",
+      "vmtl.v",
+      "vmts.v",
+      "vmttl.v",
+      "vmtts.v",
+      "vmmacc.vv",
+      "vfmmacc.vv",
+      "vfwmmacc.vv",
+      "vfqwmmacc.vv",
+      "v0"
+    ],
+    "summary": "New vtype CSR fields (lambda, altfmt_A, altfmt_B, bs) added by Zvvm IME must be context-switched by the kernel; failure to save/restore these WARL fields leaks IME tile geometry and format state across processes"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__vstate_csr_save",
+        "line_start": 129,
+        "line_end": 165,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correctly saves the full XLEN-wide vtype CSR via csrr, which would capture all Zvvm-defined fields (lambda[2:0], altfmt_A, altfmt_B, bs) on Zvvm hardware. The save side of context-switch is architecturally sound.",
+      "snippet": "asm volatile (\n  \"csrr  %0, \" __stringify(CSR_VSTART) \"\\n\\t\"\n  \"csrr  %1, \" __stringify(CSR_VTYPE) \"\\n\\t\"\n  \"csrr  %2, \" __stringify(CSR_VL) \"\\n\\t\"\n  : \"=r\" (dest->vstart), \"=r\" (dest->vtype), \"=r\" (dest->vl),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__vstate_csr_restore",
+        "line_start": 167,
+        "line_end": 194,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Uses vsetvl to restore vtype, but vsetvl architecturally zeroes bits XLEN-2:8 (standard reserved region). On Zvvm hardware, this would silently clobber lambda[2:0] (vtype[XLEN-2:XLEN-4]), altfmt_A (vtype[9]), altfmt_B (vtype[10]), and bs (vtype[11]). The vsetvl instruction is not extensible to preserve non-standard vtype fields, creating a latent architectural gap for any extension that defines those fields.",
+      "snippet": "asm volatile (\n  \".option push\\n\\t\"\n  \".option arch, +zve32x\\n\\t\"\n  \"vsetvl  x0, %2, %1\\n\\t\"\n  \".option pop\\n\\t\"\n  \"csrw \" __stringify(CSR_VSTART) \", %0\\n\\t\"\n  : : \"r\" (src->vstart), \"r\" (src->vtype), \"r\" (src->vl));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/images/wavedrom/vtype-format.edn",
+          "line_start": 1,
+          "line_end": 28,
+          "excerpt": "vtype register layout: vill[XLEN-1] | reserved[XLEN-2:8] | vma[7] | vta[6] | vsew[5:3] | vlmul[2:0]. Bits XLEN-2:8 are 'reserved' — vsetvl writes zero to them. Zvvm would redefine bits 9 (altfmt_A), 10 (altfmt_B), 11 (bs), and XLEN-2:XLEN-4 (lambda[2:0]), but vsetvl does not recognize these fields and would zero them."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__riscv_v_vstate_discard",
+        "line_start": 270,
+        "line_end": 296,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Calls vsetvli (line 281) and vsetvl (line 291) to reset vector state, which zeroes all vtype bits XLEN-2:8. On Zvvm hardware, this would discard any in-flight IME tile configuration (lambda, altfmt_A, altfmt_B, bs) during explicit vstate discard operations.",
+      "snippet": "\"vsetvli %0, x0, e8, m8, ta, ma\\n\\t\"\n...\n\"vsetvl  %0, x0, %1\\n\\t\"\n: \"=&r\" (vl) : \"r\" (vtype_inval));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/images/wavedrom/vtype-format.edn",
+          "line_start": 1,
+          "line_end": 28,
+          "excerpt": "vsetvl/vsetvli write only vlmul[2:0], vsew[2:0], vta, vma, and vill; reserved bits XLEN-2:8 are forced to zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "save_v_state",
+        "line_start": 73,
+        "line_end": 108,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Signal frame save correctly delegates to riscv_v_vstate_save() → __vstate_csr_save() which captures full vtype including any Zvvm fields. The vector state (including vtype) is copied to userspace via copy_to_user, preserving all bits.",
+      "snippet": "riscv_v_vstate_save(&current->thread.vstate, regs);\nerr = __copy_to_user(&state->v_state, &current->thread.vstate,\n                     offsetof(struct __riscv_v_ext_state, datap));",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "__restore_v_state",
+        "line_start": 115,
+        "line_end": 143,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Signal frame restore sets TIF_RISCV_V_DEFER_RESTORE flag, which causes deferred restore via arch_exit_to_user_mode_prepare() → riscv_v_vstate_restore() → __vstate_csr_restore() → vsetvl. The vsetvl-based restore would zero Zvvm-specific vtype fields on return to userspace after signal delivery.",
+      "snippet": "riscv_v_vstate_set_restore(current, regs);\nerr = __copy_from_user(&current->thread.vstate, &state->v_state,\n                       offsetof(struct __riscv_v_ext_state, datap));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/images/wavedrom/vtype-format.edn",
+          "line_start": 1,
+          "line_end": 28,
+          "excerpt": "vsetvl zeroes bits XLEN-2:8 where Zvvm fields live."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/entry-common.h",
+        "function_name": "arch_exit_to_user_mode_prepare",
+        "line_start": 10,
+        "line_end": 21,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Deferred vector restore on return to userspace calls riscv_v_vstate_restore() → __riscv_v_vstate_restore() → __vstate_csr_restore() → vsetvl. Zvvm-specific vtype fields would be zeroed on this path, which is the primary context-switch restore surface.",
+      "snippet": "if (ti_work & _TIF_RISCV_V_DEFER_RESTORE) {\n  clear_thread_flag(TIF_RISCV_V_DEFER_RESTORE);\n  riscv_v_vstate_restore(&current->thread.vstate, regs);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__switch_to_vector",
+        "line_start": 369,
+        "line_end": 400,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Context-switch path for both preemptive (kernel_vstate) and user (vstate) vector contexts. Save uses __riscv_v_vstate_save (compliant), but restore sets TIF_RISCV_V_DEFER_RESTORE which triggers the vsetvl-based restore on return to userspace. The vsetvl-based restore cannot preserve Zvvm vtype fields.",
+      "snippet": "riscv_v_vstate_save(&prev->thread.vstate, regs);\n...\nriscv_v_vstate_set_restore(next, task_pt_regs(next));",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_vector.c",
+        "function_name": "kvm_riscv_vcpu_guest_vector_restore",
+        "line_start": 53,
+        "line_end": 61,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM guest vector restore delegates to __kvm_riscv_vector_restore() → __riscv_v_vstate_restore() → __vstate_csr_restore() → vsetvl. On Zvvm hardware, guest Zvvm vtype fields would be zeroed when the VCPU is loaded, causing guest-visible corruption of IME tile state.",
+      "snippet": "if (riscv_isa_extension_available(isa, v))\n  __kvm_riscv_vector_restore(cntx);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/images/wavedrom/vtype-format.edn",
+          "line_start": 1,
+          "line_end": 28,
+          "excerpt": "vsetvl zeroes bits XLEN-2:8 which would clobber Zvvm-defined vtype fields."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm/vcpu_vector.c",
+        "function_name": "kvm_riscv_vcpu_host_vector_restore",
+        "line_start": 70,
+        "line_end": 74,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "KVM host vector restore uses __kvm_riscv_vector_restore() → vsetvl path. On Zvvm hardware, host Zvvm vtype fields would be zeroed after VM exit, potentially corrupting the host kernel's IME tile configuration.",
+      "snippet": "if (riscv_isa_extension_available(NULL, v))\n  __kvm_riscv_vector_restore(cntx);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/images/wavedrom/vtype-format.edn",
+          "line_start": 1,
+          "line_end": 28,
+          "excerpt": "vsetvl zeroes bits XLEN-2:8 where Zvvm lambda/altfmt/bs fields would live."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/ptrace.c",
+        "function_name": "invalid_ptrace_v_csr",
+        "line_start": 131,
+        "line_end": 215,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "ptrace vr_set validates vtype against only standard V spec bitmask (VTYPE_VSEW | VTYPE_VLMUL | VTYPE_VMA | VTYPE_VTA). Any bits outside this mask — including Zvvm's lambda, altfmt_A, altfmt_B, bs — are rejected as 'reserved'. A debugger cannot read/write Zvvm vtype fields through ptrace, creating a semantic gap.",
+      "snippet": "reserved = ~(VTYPE_VSEW | VTYPE_VLMUL | VTYPE_VMA | VTYPE_VTA);\nif (ptrace->vtype & reserved)\n  return 1;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/images/wavedrom/vtype-format.edn",
+          "line_start": 1,
+          "line_end": 28,
+          "excerpt": "Standard vtype format shows bits XLEN-2:8 as 'Reserved if non-zero'. ptrace validation enforces this reservation, which would reject valid non-zero Zvvm fields."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/vector.h",
+        "function_name": "__riscv_v_vstate_restore",
+        "line_start": 233,
+        "line_end": 268,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Full vector register restore path. Vector registers restored via vle8.v, then CSRs restored via __vstate_csr_restore() → vsetvl. The vsetvl-based vtype restore zeroes vtype bits XLEN-2:8 where Zvvm fields live, even though the in-memory vtype value (restore_from->vtype) correctly retains those bits from the save path.",
+      "snippet": "\"vle8.v  v0, (%1)\\n\\t\"\n...\n__vstate_csr_restore(restore_from);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/images/wavedrom/vtype-format.edn",
+          "line_start": 1,
+          "line_end": 28,
+          "excerpt": "vsetvl writes only vlmul, vsew, vta, vma; XLEN-2:8 (where Zvvm lambda/altfmt/bs live) are set to zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/kernel_mode_vector.c",
+        "function_name": "riscv_v_start_kernel_context",
+        "line_start": 124,
+        "line_end": 152,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "In-kernel vector use starts by saving either kernel preempt state or user vstate. Both paths use __riscv_v_vstate_save() → __vstate_csr_save() → csrr, which correctly captures full vtype. Save side is compliant.",
+      "snippet": "__riscv_v_vstate_save(kvstate, kvstate->datap);\n...\n__riscv_v_vstate_save(uvstate, uvstate->datap);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/kernel_mode_vector.c",
+        "function_name": "riscv_v_context_nesting_end",
+        "line_start": 169,
+        "line_end": 188,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When kernel V nesting unwinds to depth 0, restore via __riscv_v_vstate_restore() → __vstate_csr_restore() → vsetvl. Zvvm vtype fields would be zeroed when kernel mode vector operations complete.",
+      "snippet": "if (riscv_preempt_v_restore(current)) {\n  __riscv_v_vstate_restore(vstate, vstate->datap);\n  __riscv_v_vstate_clean(regs);\n  riscv_preempt_v_reset_flags();\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/images/wavedrom/vtype-format.edn",
+          "line_start": 1,
+          "line_end": 28,
+          "excerpt": "vsetvl zeroes bits XLEN-2:8."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

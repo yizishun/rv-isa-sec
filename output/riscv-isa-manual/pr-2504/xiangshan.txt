@@ -1,0 +1,242 @@
+PR #2504  target=xiangshan  overall=compliant
+Spec: Sstc changes mip.STIP from M-mode-writable to hardware-driven read-only based on menvcfg.STCE; incorrect RTL STIP writability gating breaks privilege separation, allowing M-mode to inject/suppress S-mode timer interrupts or denying M-mode its legacy timer interrupt delivery mechanism when Sstc is disabled
+Violation:
+  When Sstc is implemented and menvcfg.STCE=1, XiangShan RTL still allows
+  M-mode CSR writes to mip.STIP as writable (legacy behavior), instead of
+  making mip.STIP read-only and driven exclusively by the hardware comparator
+  (time >= stimecmp unsigned comparison). Conversely, when menvcfg.STCE
+  transitions 1→0, the RTL fails to revert mip.STIP to its writable-by-M-mode
+  legacy behavior and fails to cascade henvcfg.STCE to read-only zero, leaving
+  stimecmp/vstimecmp accessible from S/VS-mode in violation of the spec.
+Consequence: privilege_escape
+Pattern:
+  mip.STIP.*writable|STIP.*readOnly|menvcfg.STCE.*mip|stimecmp.*comparator.*ST
+  IP|CSR write.*0x144.*STIP|WARL.*STIP.*Sstc
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:247-257  Mip
+  mip.STIP writability correctly gated by menvcfg.STCE. When STCE=1,
+  regOut.STIP is sourced from platformIRP.STIP (hardware comparator) and
+  writes via wen/fromMvip are blocked. When STCE=0, reg.STIP is software-
+  writable and regOut reflects it. Correctly implements the spec-mandated
+  read-only behavior when stimecmp is enabled.
+  | regOut.STIP := Mux(this.menvcfg.STCE.asBool, platformIRP.STIP, reg.STIP.asBool)
+  | when ((wen || fromMvip.STIP.valid) && !this.menvcfg.STCE) {
+  |   reg.STIP := Mux1H(Seq(
+  |     wen -> wdata.STIP,
+  |     fromMvip.STIP.valid -> fromMvip.STIP.bits,
+  |   ))
+  | }.otherwise {
+  |   reg.STIP := reg.STIP
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1472-1475
+      "If the stimecmp (supervisor-mode timer compare) register is
+      implemented, STIP is read-only in mip and reflects the supervisor-
+      level timer interrupt si"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SstcInterruptGen.scala:33-35  SstcInterruptGen
+  Hardware comparator correctly implements unsigned time >= stimecmp
+  comparison. STIP is AND-gated with menvcfg.STCE to avoid spurious assertion
+  when STCE=0. Re-evaluation trigger set includes time valid, stimecmp write,
+  and menvcfg write — covering all spec-mandated update conditions.
+  | o.STIP  := RegEnable(i.stime.bits >= i.stimecmp.rdata && i.menvcfg.STCE, false.B, i.stime.valid || i.stimecmp.wen || i.menvcfg.wen)
+  | o.VSTIP := RegEnable(i.vstime.bits >= i.vstimecmp.rdata && i.henvcfg.STCE, false.B, i.vstime.valid || i.vstimecmp.wen || i.htimedeltaWen || i.menvcfg.wen || i.henvcfg.wen)
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1166-1170
+      "A supervisor timer interrupt becomes pending... whenever time
+      contains a value greater than or equal to stimecmp, treating the
+      values as unsigned inte"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:73-83  henvcfg
+  henvcfg.STCE regOut correctly cascaded from menvcfg.STCE. When
+  menvcfg.STCE=0, henvcfg.regOut.STCE is forced to 0, satisfying the spec
+  requirement that 'STCE in henvcfg is read-only zero'. This gate propagates
+  to the sstcIRGen (via henvcfg.regOut.STCE.asBool at NewCSR.scala:530) and to
+  CSR access control (via henvcfg.rdata at NewCSR.scala:506), correctly
+  disabling vstimecmp access and VSTIP generation.
+  | val henvcfg = Module(new CSRModule("Henvcfg", new HEnvCfg) with HasHypervisorEnvBundle {
+  |   when(!menvcfg.STCE) {
+  |     regOut.STCE := 0.U
+  |   }
+  |   ...
+  | }).setAddr(CSRs.henvcfg)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2233-2239
+      "When this extension is implemented and STCE in menvcfg is zero...
+      STCE in henvcfg is read-only zero, and STIP in mip and sip reverts
+      to its defined be"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:151-157  Mvip
+  mvip.STIP correctly implemented: when menvcfg.STCE=1, regOut reads 0 and
+  writes to mip.STIP are blocked (toMip.STIP.valid = wen && !menvcfg.STCE).
+  When STCE=0, mvip.STIP is an alias of mip.STIP. Matches AIA spec bit 5 mvip
+  behavior.
+  | regOut.STIP := Mux(this.menvcfg.STCE.asBool, 0.U, this.mip.STIP.asBool)
+  | toMip.STIP.valid := wen && !this.menvcfg.STCE.asBool
+  | toMip.STIP.bits := wdata.STIP
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:225-225  MLevelPermitModule
+  Non-M-mode access to stimecmp/vstimecmp correctly traps with EX_II when
+  mcounteren.TM=0 or menvcfg.STCE=0. The menvcfgSTCE is extracted from menvcfg
+  rdata (bit 63), which reflects the regOut value including the HEnvCfg
+  cascaded gate.
+  | private val rwStimecmp_EX_II = !privState.isModeM && (!mcounterenTM || !menvcfgSTCE) && (addr === CSRs.vstimecmp.U || addr === CSRs.stimecmp.U)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1597-1603
+      "when the TM bit in the mcounteren register is clear, attempts to
+      access the stimecmp or vstimecmp register while executing in a mode
+      less privileged t"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:441-442  VirtualLevelPermitModule
+  VS-mode access to stimecmp correctly traps with EX_VI when hcounteren.TM=0
+  or henvcfg.STCE=0. The henvcfgSTCE is extracted from henvcfg rdata (bit 63),
+  which is gated by menvcfg.STCE. VTI (virtual timer intercept) blocks writes
+  when set. Correctly implements the spec requirement.
+  | private val rwStimecmp_EX_VI = privState.isModeVS && (addr === CSRs.stimecmp.U) &&
+  |   (!hcounterenTM || !henvcfgSTCE || wen && hvictlVTI)
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:745-751
+      "When STCE bit is henvcfg is zero, an attempt to access stimecmp
+      (really vstimecmp) when V=1 raises a virtual-instruction exception,
+      and VSTIP in hip r"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:505-506  NewCSR
+  CSR access control permit module receives menvcfg.rdata and henvcfg.rdata
+  for STCE bit extraction. Both rdata values correctly reflect the regOut
+  (including the henvcfg.STCE gate from menvcfg.STCE). The permit module uses
+  these for EX_II/EX_VI trap decisions, which are correct.
+  | permitMod.io.in.xenvcfg.menvcfg := menvcfg.rdata
+  | permitMod.io.in.xenvcfg.henvcfg := henvcfg.rdata
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:259-260  Mip
+  mip.VSTIP correctly implemented as logical-OR of hvip.VSTIP (software-
+  writable virtual interrupt) and platformIRP.VSTIP (hardware comparator
+  output). When menvcfg.STCE=0, henvcfg.STCE cascades to 0, which gates
+  platformIRP.VSTIP to 0 in the comparator, so mip.VSTIP = hvip.VSTIP || 0 =
+  hvip.VSTIP — correct behavior when Sstc is disabled.
+  | regOut.VSTIP := hvip.VSTIP || platformIRP.VSTIP
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:96-98  hip
+  hip.VSTIP correctly aliased to mip.VSTIP. When henvcfg.STCE=0,
+  platformIRP.VSTIP=0 (gated by comparator) so hip.VSTIP = mip.VSTIP =
+  hvip.VSTIP, reverting to the pre-Sstc behavior as the spec requires.
+  | regOut.VSTIP := mip.VSTIP
+  | regOut.VSEIP := mip.VSEIP
+  | regOut.SGEIP := mip.SGEIP
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:576-581
+      "VSTIP is read-only in hip, and is the logical-OR of hvip.VSTIP and,
+      when the Sstc extension is implemented, the timer interrupt signal
+      resulting from "
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala:131-134  stimecmp
+  stimecmp CSR correctly defined at address 0x14D as a 64-bit RW register
+  resetting to all-ones (maximum value). sMapVS maps stimecmp (0x14D) →
+  vstimecmp (0x24D) for VS-mode access redirection. Reset value ensures no
+  premature timer interrupt at boot.
+  | val stimecmp = Module(new CSRModule("Stimecmp", new CSRBundle {
+  |   val stimecmp = RW(63, 0).withReset(bitPatToUInt(BitPat.Y(64))).withDescription("Supervisor timer compare value.")
+  | }))
+  |   .setAddr(CSRs.stimecmp)
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:1161-1164
+      "The stimecmp CSR is a 64-bit register and has 64-bit precision on
+      all RV32 and RV64 systems."
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala:73-76  henvcfg
+  henvcfg.STCE WARL subtlety: when menvcfg.STCE=0, the regOut.STCE is forced
+  to 0 but writes to reg.STCE are still accepted (CSRModule framework allows
+  writes to RW fields). If software writes 1 to henvcfg.STCE while
+  menvcfg.STCE=0, the reg.STCE latches 1 internally even though regOut reads
+  0. When menvcfg.STCE later transitions 0→1, the regOut override is removed
+  and henvcfg.STCE unexpectedly reads as 1 (the latched write). This deviates
+  from strict 'read-only zero' semantics where writes should be silently
+  ignored.
+  | when(!menvcfg.STCE) {
+  |   regOut.STCE := 0.U
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2234-2236
+      "When this extension is implemented and STCE in menvcfg is zero...
+      STCE in henvcfg is read-only zero"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SstcInterruptGen.scala:34-34  SstcInterruptGen
+  STIP comparator re-evaluation triggers correctly include only the relevant
+  events: time update, stimecmp write, and menvcfg write. No unnecessary re-
+  evaluation on henvcfg or htimedelta writes, which is correct since STIP
+  depends only on stime (not vstime) and menvcfg.STCE (not henvcfg.STCE).
+  | o.STIP  := RegEnable(i.stime.bits >= i.stimecmp.rdata && i.menvcfg.STCE, false.B, i.stime.valid || i.stimecmp.wen || i.menvcfg.wen)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/SstcInterruptGen.scala:35-35  SstcInterruptGen
+  VSTIP comparator correctly uses vstime (time + htimedelta) >= vstimecmp with
+  henvcfg.STCE guard. Re-evaluation triggers cover all relevant events: vstime
+  update, vstimecmp write, htimedelta write, menvcfg write (for cascaded
+  STCE), and henvcfg write (for direct STCE change). The 64-bit addition
+  implicitly implements the spec-required truncation.
+  | o.VSTIP := RegEnable(i.vstime.bits >= i.vstimecmp.rdata && i.henvcfg.STCE, false.B, i.vstime.valid || i.vstimecmp.wen || i.htimedeltaWen || i.menvcfg.wen || i.henvcfg.wen)
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:1434-1437
+      "A virtual supervisor timer interrupt becomes pending... whenever
+      (time + htimedelta), truncated to 64 bits, contains a value greater
+      than or equal to "
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:712-715  MEnvCfg
+  menvcfg.STCE correctly defined as RW bit 63 with reset=1 when Sstc is
+  implemented. The spec does not mandate a specific reset value for STCE.
+  Reset=1 is a reasonable design choice: stimecmp/vstimecmp are enabled by
+  default. The STCE bit in the EnvCfg base class (CSRBundles.scala:69) is RO
+  with reset=0, correctly representing the case when Sstc is not implemented.
+  | class MEnvCfg extends EnvCfg {
+  |   if (CSRConfig.EXT_SSTC) {
+  |     this.STCE.setRW().withReset(1.U)
+  |   }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2231-2233
+      "The Sstc extension adds the STCE (STimecmp Enable) bit to menvcfg
+      CSR. When the Sstc extension is not implemented, STCE is read-only
+      zero."
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:519-531  NewCSR
+  SstcInterruptGen correctly wired with all necessary inputs: stime/vstime
+  from time CSR module, stimecmp/vstimecmp current rdata values,
+  menvcfg/henvcfg STCE bits from regOut, and write-enable signals via
+  GatedValidRegNext. The use of regOut (not reg) for STCE ensures henvcfg.STCE
+  cascading from menvcfg.STCE is reflected.
+  | sstcIRGen.i.menvcfg.STCE  := menvcfg.regOut.STCE.asBool
+  | sstcIRGen.i.henvcfg.STCE  := henvcfg.regOut.STCE.asBool
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:594-598  NewCSR
+  Platform IRP STIP/VSTIP correctly replaced with sstcIRGen outputs for all
+  modules with HasExternalInterruptBundle. This ensures the hardware
+  comparator output (not software-writable values) is used when STCE=1 across
+  all interrupt-pending consumers (mip, sip, etc.).
+  | m.platformIRP := this.platformIRP
+  | m.platformIRP.STIP  := sstcIRGen.o.STIP
+  | m.platformIRP.VSTIP := sstcIRGen.o.VSTIP
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/VirtualSupervisorLevel.scala:191-194  vstimecmp
+  vstimecmp CSR correctly defined at address 0x24D as a 64-bit RW register
+  resetting to all-ones. sMapVS mapping (stimecmp→vstimecmp) ensures VS-mode
+  accesses to stimecmp (0x14D) redirect to vstimecmp (0x24D). Reset to maximum
+  value prevents premature VS timer interrupt at boot.
+  | val vstimecmp = Module(new CSRModule("VStimecmp", new CSRBundle {
+  |   val vstimecmp = RW(63, 0).withReset(bitPatToUInt(BitPat.Y(64))).withDescription("Virtual supervisor timer compare value.")
+  | }))
+  |   .setAddr(CSRs.vstimecmp)
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:1429-1432
+      "The vstimecmp CSR is a 64-bit register and has 64-bit precision on
+      all RV32 and RV64 systems."
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/Unprivileged.scala:148-167  time
+  time CSR module correctly computes stime (= raw clintTime) and vstime (=
+  clintTime + htimedelta). Both are 64-bit unsigned additions, naturally
+  implementing the spec-required truncation. The 'updated' signal marks valid
+  time ticks for the SstcInterruptGen comparator re-evaluation.
+  | val stimeTmp  = mHPM.time.bits
+  | val vstimeTmp = mHPM.time.bits + htimedelta
+  | ...
+  | updated := GatedValidRegNext(mHPM.time.valid && !debugModeStopTime)
+  | stime  := stimeTmp
+  | vstime := vstimeTmp
+

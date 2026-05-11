@@ -1,0 +1,172 @@
+PR #2606  target=linux  overall=potential_risk
+Spec: siselect/sireg* are not saved/restored on context switch: any extension using Sscsrind leaks register state across task boundaries via residual siselect window selection
+Violation:
+  Linux kernel context-switches between tasks while Sscsrind is active (any
+  extension using siselect/sireg* indirect CSR access is present), without
+  saving and restoring siselect or sireg* in __switch_to or the entry.S trap
+  context-save path. Task A sets siselect to select a specific indirect
+  register window; preemption occurs; task B reads sireg* and observes the
+  register state selected by task A's residual siselect value. Currently
+  arch/riscv/kernel/entry.S and arch/riscv/kernel/process.c __switch_to save
+  sstatus/sepc/stvec/sscratch but never touch siselect (CSR 0x150) or sireg*
+  (CSR 0x151-0x157).
+Consequence: info_leak
+Pattern:
+  context switch save/restore list missing siselect or sireg; switch_to
+  without siselect save; grep for CSR_SISELECT or CSR_SIREG in
+  arch/riscv/kernel/entry.S and arch/riscv/kernel/process.c returning no hits
+  versus their definitions in arch/riscv/include/asm/csr.h at 0x150-0x157;
+  indirect CSR window selector not in thread_struct
+------------------------------------------------------------
+[potential_risk] arch/riscv/kernel/entry.S:421-471  __switch_to
+  __switch_to saves/restores callee-saved GPRs (ra, sp, s0-s11) and the SUM
+  bit from sstatus, but never saves or restores siselect (CSR 0x150) or any
+  sireg* CSR (0x151-0x157). If the hart implements Sscsrind, these CSRs exist
+  as architectural supervisor state. Any siselect value set before a context
+  switch persists into the next task, allowing task B to observe indirect
+  register state through the window selected by task A's residual siselect
+  value. Similarly, sireg2-sireg6 (0x152-0x153, 0x155-0x157) are entirely
+  absent from the kernel's CSR definitions in csr.h, which only defines
+  CSR_SIREG (0x151) but not CSR_SIREG2 through CSR_SIREG6.
+  | SYM_FUNC_START(__switch_to)
+  | 	li    a4,  TASK_THREAD_RA
+  | 	add   a3, a0, a4
+  | 	add   a4, a1, a4
+  | 	REG_S ra,  TASK_THREAD_RA_RA(a3)
+  | 	[... no siselect/sireg save/restore ...]
+  | 	REG_L s11, TASK_THREAD_S11_RA(a4)
+  | 	move tp, a1
+  | 	scs_load_current
+  | 	ret
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:134-144
+      "Supervisor-level CSRs: siselect 0x150 (SRW), sireg 0x151 (SRW),
+      sireg2 0x152 (SRW), sireg3 0x153 (SRW), sireg4 0x155 (SRW), sireg5
+      0x156 (SRW), sireg6"
+
+[potential_risk] arch/riscv/kernel/entry.S:160-200  handle_exception
+  The trap entry path (handle_exception) saves sstatus, sepc, stval, scause,
+  sscratch to the pt_regs frame but does not save siselect (0x150) or any
+  sireg* (0x151-0x157). If a trap occurs while siselect holds a non-default
+  value (set by kernel code or by an extension-dependent store), that value is
+  not preserved across the trap handler. The ret_from_exception path (line
+  247-317) restores sstatus and sepc from pt_regs but never touches
+  siselect/sireg*.
+  | .Lsave_context:
+  | 	REG_S sp, TASK_TI_USER_SP(tp)
+  | 	REG_L sp, TASK_TI_KERNEL_SP(tp)
+  | 	addi sp, sp, -(PT_SIZE_ON_STACK)
+  | 	[... saves x1,x3,x5-x31, sstatus,sepc,stval,scause,sscratch ...]
+  | 	csrw CSR_SCRATCH, x0
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:134-144
+      "siselect (0x150) and sireg* (0x151-0x157) are supervisor-level CSRs
+      required if S-mode is implemented under Sscsrind."
+
+[potential_risk] arch/riscv/include/asm/processor.h:106-127  thread_struct
+  thread_struct has no fields for siselect or any sireg* register. Without
+  storage in the per-task thread struct, context-switch save/restore of these
+  CSRs is impossible. Compare with envcfg (line 113) and sum (line 114) which
+  are properly stored per-task. A siselect field would be needed to save the
+  indirect register window selector across context switches.
+  | struct thread_struct {
+  | 	unsigned long ra;
+  | 	unsigned long sp;
+  | 	unsigned long s[12];
+  | 	struct __riscv_d_ext_state fstate;
+  | 	unsigned long bad_cause;
+  | 	unsigned long envcfg;
+  | 	unsigned long sum;
+  | 	/* ... no siselect or sireg fields ... */
+  | };
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:192-196
+      "Attempts to access sireg* from M-mode or S-mode while siselect
+      holds a number in a standard-defined and implemented range result in
+      specific behavior "
+
+[potential_risk] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The switch_to macro handles FPU save/restore, vector save/restore, icache
+  flush, and envcfg restore, but has no call to save/restore siselect or
+  sireg*. The pattern for envcfg (__switch_to_envcfg on line 124) shows how
+  per-task CSR state should be handled during context switch; siselect, being
+  analogous supervisor architectural state that controls which indirect
+  register window is active, needs equivalent treatment.
+  | #define switch_to(prev, next, last)			\
+  | 	__switch_to_fpu(__prev, __next);		\
+  | 	__switch_to_vector(__prev, __next);	\
+  | 	if (switch_to_should_flush_icache(__next))	\
+  | 		local_flush_icache_all();		\
+  | 	__switch_to_envcfg(__next);			\
+  | 	((last) = __switch_to(__prev, __next));
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:148-151
+      "The siselect register will support the value range 0..0xFFF at a
+      minimum. [...] Values of siselect with the most-significant bit set
+      (bit XLEN - 1 = 1"
+
+[potential_risk] arch/riscv/include/asm/csr.h:347-349  (CSR definitions)
+  Only CSR_SISELECT (0x150) and CSR_SIREG (0x151) are defined. The spec
+  defines seven supervisor-level CSRs for Sscsrind: siselect (0x150), sireg
+  (0x151), sireg2 (0x152), sireg3 (0x153), sireg4 (0x155), sireg5 (0x156),
+  sireg6 (0x157). CSR_SIREG2, CSR_SIREG3, CSR_SIREG4, CSR_SIREG5, CSR_SIREG6
+  are missing. Note that 0x154 is already used for CSR_SIPH (AIA), and
+  sireg4-sireg6 (0x155-0x157) similarly have no definitions. Any future kernel
+  code that needs to access these registers will need the definitions added.
+  | /* Supervisor-Level Window to Indirectly Accessed Registers (AIA) */
+  | #define CSR_SISELECT		0x150
+  | #define CSR_SIREG		0x151
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:134-144
+      "Supervisor-level CSRs: siselect 0x150, sireg 0x151, sireg2 0x152,
+      sireg3 0x153, sireg4 0x155, sireg5 0x156, sireg6 0x157."
+
+[not_implemented] arch/riscv/kernel/cpufeature.c:580-584  (ISA extension table)
+  The kernel's ISA extension table does not include Sscsrind, Ssccfg,
+  Smcdeleg, Smctr, or Ssctr. None of the extensions that depend on the
+  Sscsrind indirect CSR access mechanism are detected or advertised. This
+  means the kernel is unaware of whether the hardware implements Sscsrind and
+  treats siselect/sireg* CSRs as non-existent. This is the root cause of the
+  missing context-switch handling: the kernel cannot conditionally
+  save/restore CSRs for an extension it doesn't know exists.
+  | __RISCV_ISA_EXT_SUPERSET(smnpm, RISCV_ISA_EXT_SMNPM, riscv_xlinuxenvcfg_exts),
+  | __RISCV_ISA_EXT_SUPERSET(ssnpm, RISCV_ISA_EXT_SSNPM, riscv_xlinuxenvcfg_exts),
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:39-43
+      "The machine-level extension Smcsrind encompasses all added CSRs and
+      all behavior modifications for a hart, over all privilege levels.
+      For a supervisor"
+    - riscv-isa-manual/src/priv/smctr.adoc:19-19
+      "Smctr and Ssctr depend on both the implementation of S-mode and the
+      Sscsrind extension."
+
+[compliant] arch/riscv/kvm/aia_imsic.c:378-419  imsic_rmw_ireg
+  KVM's AIA IMSIC code correctly saves and restores vsiselect around IMSIC
+  indirect register accesses (e.g., lines 380/419). The pattern `old_vsiselect
+  = csr_read(CSR_VSISELECT); ... csr_write(CSR_VSISELECT, old_vsiselect);`
+  demonstrates the correct save/restore discipline needed for indirect CSR
+  selectors. This same pattern is missing from the non-KVM context-switch
+  paths (__switch_to, handle_exception).
+  | old_vsiselect = csr_read(CSR_VSISELECT);
+  | /* ... IMSIC operations ... */
+  | csr_write(CSR_VSISELECT, old_vsiselect);
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:134-144
+      "vsiselect (0x250) and vsireg* (0x251-0x257) are the virtual
+      supervisor-level indirect CSR access CSRs."
+
+[compliant] arch/riscv/kvm/aia.c:120-130  kvm_riscv_vcpu_aia_swap_vsiselect
+  KVM's AIA VCPU code properly saves vsiselect to per-VCPU storage
+  (csr->vsiselect) during VCPU load/put. This is the correct pattern for
+  virtualizing the indirect CSR selector across VCPU switches. The absence of
+  equivalent siselect handling in the non-virtualized context-switch path
+  (__switch_to, switch_to macro) is the gap.
+  | nacl_csr_write(nsh, CSR_VSISELECT, csr->vsiselect);
+  | /* ... */
+  | csr_write(CSR_VSISELECT, csr->vsiselect);
+  References:
+    - riscv-isa-manual/src/priv/smcsrind.adoc:213-237
+      "Virtual Supervisor-level CSRs: vsiselect (0x250), vsireg (0x251),
+      vsireg2-6. These CSRs are required if the hypervisor extension is
+      implemented."
+

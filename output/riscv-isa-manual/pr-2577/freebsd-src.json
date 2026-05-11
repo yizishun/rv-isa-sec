@@ -1,0 +1,167 @@
+{
+  "pr_number": 2577,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 2577,
+    "violation_condition": "In the FreeBSD kernel's bhyve hypervisor or trap handler, if instruction-address-misaligned exceptions are raised for untaken conditional branches (when IALIGN=32), violating the spec rule that only taken branches to misaligned targets generate exceptions. This occurs when the hypervisor pre-validates branch targets without evaluating the branch condition, or when the kernel's illegal-instruction emulation layer does not distinguish between JAL/JALR (always fault on misaligned) and conditional branches (fault only on taken).",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "bhyve.*misalign|IALIGN|inst_addr_misaligned|EXCP_MISALIGNED|illegal_instruction.*branch|decode_compressed.*align",
+    "affected_entities": [
+      "JAL",
+      "JALR",
+      "BEQ",
+      "BNE",
+      "BLT",
+      "BLTU",
+      "BGE",
+      "BGEU",
+      "mcountinhibit",
+      "misa.C"
+    ],
+    "summary": "Branch misaligned-exception behavior depends on whether the branch is taken—untaken branches to misaligned targets must NOT fault; bhyve or the kernel trap emulation layer incorrectly signaling misaligned exceptions on untaken branches would leak hypervisor-internal state to a guest VM"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_delegate",
+        "line_start": 141,
+        "line_end": 159,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The hypervisor correctly delegates SCAUSE_INST_MISALIGNED (line 146) to the guest VS-mode via hedeleg. This means the hypervisor does NOT intercept, pre-validate, or emulate branch instructions. The guest OS receives the raw hardware exception, which per the RISC-V spec is only raised for taken conditional branches and unconditional jumps (JAL/JALR), never for untaken branches. No privilege-escalation path exists here because bhyve does not intervene in branch-misaligned exception handling.",
+      "snippet": "hedeleg  = (1UL << SCAUSE_INST_MISALIGNED);\nhedeleg |= (1UL << SCAUSE_ILLEGAL_INSTRUCTION);\nhedeleg |= (1UL << SCAUSE_BREAKPOINT);\nhedeleg |= (1UL << SCAUSE_ECALL_USER);\nhedeleg |= (1UL << SCAUSE_INST_PAGE_FAULT);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32.adoc",
+          "line_start": 658,
+          "line_end": 662,
+          "excerpt": "The conditional branch instructions will generate an instruction-address-misaligned exception if the target address is not aligned to a four-byte boundary and the branch condition evaluates to true. If the branch condition evaluates to false, the instruction-address-misaligned exception will not be raised."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_supervisor",
+        "line_start": 341,
+        "line_end": 347,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Kernel-mode SCAUSE_INST_MISALIGNED triggers a panic. This is correct: the kernel is compiled with proper instruction alignment, so a kernel-mode instruction-misaligned exception indicates either a hardware fault or a corrupted code path, justifying a panic. The panic handler does not attempt to distinguish branch types because it doesn't need to — the hardware will only deliver this exception for taken branches or JAL/JALR per the spec.",
+      "snippet": "case SCAUSE_INST_MISALIGNED:\n    dump_regs(frame);\n    panic(\"Misaligned address exception at %#lx: %#lx\",\n        frame->tf_sepc, frame->tf_stval);\n    break;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 418,
+        "line_end": 424,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "User-mode SCAUSE_INST_MISALIGNED delivers SIGBUS/BUS_ADRALN to the user process. The kernel does NOT attempt instruction emulation, branch-condition evaluation, or target fix-up for misaligned branches. This is correct: the hardware already enforces the spec rule (only taken branches fault), so the kernel simply reports the fault. No artificial IALIGN violations are injected by software.",
+      "snippet": "case SCAUSE_INST_MISALIGNED:\n    call_trapsignal(td, SIGBUS, BUS_ADRALN, (void *)frame->tf_sepc,\n        exception);\n    userret(td, frame);\n    break;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/rv32.adoc",
+          "line_start": 139,
+          "line_end": 143,
+          "excerpt": "An instruction-address-misaligned exception is generated on a taken branch or unconditional jump if the target address is not IALIGN-bit aligned. This exception is reported on the branch or jump instruction, not on the target instruction. No instruction-address-misaligned exception is generated for a conditional branch that is not taken."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "riscv_handle_world_switch",
+        "line_start": 447,
+        "line_end": 524,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The VMM world-switch handler's trap dispatch (switch on scause) does NOT include a case for SCAUSE_INST_MISALIGNED. Since this exception was delegated to VS-mode in vmmops_delegate(), the hypervisor never sees it. Instead, the guest's trap handler receives it directly. This prevents the hypervisor from mis-handling instruction-address-misaligned exceptions by pre-validating branch targets. The fallthrough default case (line 515) logs 'unknown scause' — this would only catch non-delegated, unexpected causes.",
+      "snippet": "switch (vme->scause) {\ncase SCAUSE_FETCH_GUEST_PAGE_FAULT:\ncase SCAUSE_LOAD_GUEST_PAGE_FAULT:\ncase SCAUSE_STORE_GUEST_PAGE_FAULT:\n    // ... MMIO/page-fault handling, no branch emulation",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "riscv_gen_inst_emul_data",
+        "line_start": 326,
+        "line_end": 445,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The VMM instruction emulation function handles only load/store instructions (LB, LH, LW, LD, LBU, LHU, LWU, SB, SH, SW, SD and compressed C.LW, C.LD, C.SW, C.SD) for guest MMIO access. It does NOT decode or emulate any branch (BEQ/BNE/BLT/etc.) or jump (JAL/JALR) instructions. The function is gated by SCAUSE_FETCH/LOAD/STORE_GUEST_PAGE_FAULT (line 341-344), not by SCAUSE_INST_MISALIGNED. No branch misalignment pre-validation occurs here.",
+      "snippet": "KASSERT(vme_ret->scause == SCAUSE_FETCH_GUEST_PAGE_FAULT ||\n    vme_ret->scause == SCAUSE_LOAD_GUEST_PAGE_FAULT ||\n    vme_ret->scause == SCAUSE_STORE_GUEST_PAGE_FAULT,\n    (\"Invalid scause\"));",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_instruction_emul.c",
+        "function_name": "vmm_emulate_instruction",
+        "line_start": 59,
+        "line_end": 86,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The cross-layer instruction emulation function makes a generic load/store MMIO access based on a pre-decoded vie (virtual instruction emulation) structure. It performs only memory read/write for data access instructions. No branch or jump instruction handling exists here. This function cannot be reached via an instruction-address-misaligned path because SCAUSE_INST_MISALIGNED is delegated to the guest (not intercepted by the hypervisor).",
+      "snippet": "if (vie->dir == VM_DIR_READ) {\n    error = memread(vcpu, gpa, &val, vie->access_size, memarg);\n    // ...\n} else {\n    error = vm_get_register(vcpu, vie->reg, &val);\n    // ...\n    error = memwrite(vcpu, gpa, val, vie->access_size, memarg);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "page_fault_handler",
+        "line_start": 203,
+        "line_end": 304,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The page-fault handler distinguishes INST_PAGE_FAULT, STORE_PAGE_FAULT, and LOAD_PAGE_FAULT to set the correct VM_PROT flag (VM_PROT_EXECUTE/VM_PROT_WRITE/VM_PROT_READ) before calling pmap_fault() and vm_fault_trap(). This is correct for page-level faults but is not the path for instruction-address-misaligned exceptions (SCAUSE_INST_MISALIGNED), which are handled separately in do_trap_supervisor/do_trap_user.",
+      "snippet": "if (frame->tf_scause == SCAUSE_STORE_PAGE_FAULT) {\n    ftype = VM_PROT_WRITE;\n} else if (frame->tf_scause == SCAUSE_INST_PAGE_FAULT) {\n    ftype = VM_PROT_EXECUTE;\n} else {\n    ftype = VM_PROT_READ;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "(boot sequence)",
+        "line_start": 1,
+        "line_end": 396,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The locore.S boot code sets up stvec to cpu_exception_handler and builds bootstrap page tables with PTE_X for kernel text. No IALIGN-specific CSR configuration exists, which is expected: IALIGN is a hardware property derived from ISA extensions (IALIGN=16 when C extension is present, IALIGN=32 otherwise) and is not software-configurable. The kernel does not need to program IALIGN at boot.",
+      "snippet": "la      t0, cpu_exception_handler\ncsrw    stvec, t0",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/intro.adoc",
+          "line_start": 458,
+          "line_end": 462,
+          "excerpt": "We use the term IALIGN (measured in bits) to refer to the instruction-address alignment constraint the implementation enforces. IALIGN is 32 bits in the base ISA, but some ISA extensions, including the compressed ISA extension, relax IALIGN to 16 bits."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/machdep.c",
+        "function_name": "initriscv",
+        "line_start": 558,
+        "line_end": 669,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "initriscv() initializes the RISC-V machine-dependent layer without any IALIGN-specific configuration. The identify_cpu() call probes ISA extensions (including 'C' for compressed), but IALIGN is a derived hardware property, not a configurable CSR. No security-relevant IALIGN misconfiguration is possible here.",
+      "snippet": "identify_cpu(0);",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

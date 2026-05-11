@@ -1,0 +1,119 @@
+PR #2504  target=opensbi  overall=bug_confirmed
+Spec: When Sstc is enabled, STIP in mip is read-only and reflects stimecmp; OpenSBI must use stimecmp to clear timer interrupts instead of writing to mip.STIP, or writes are silently dropped causing unacknowledgeable timer interrupts.
+Violation:
+  OpenSBI M-mode code writes to mip.STIP to set or clear the supervisor timer
+  interrupt, but the Sstc extension is enabled (menvcfg.STCE=1), making STIP
+  read-only in mip. The CSR write is silently ignored per spec, so the timer
+  interrupt state is not updated as the firmware expects. The only way to
+  clear the timer interrupt condition when Sstc is active is to write stimecmp
+  with a value greater than the current time value.
+Consequence: denial_of_service
+Pattern:
+  csr_write.*CSR_MIP.*STIP|csr_set.*CSR_MIP.*STIP|csr_clear.*CSR_MIP.*STIP
+------------------------------------------------------------
+[bug_confirmed] lib/sbi/sbi_timer.c:211-218  sbi_timer_exit
+  sbi_timer_exit unconditionally writes csr_clear(CSR_MIP, MIP_STIP) without
+  checking whether Sstc is enabled. When menvcfg.STCE=1 (Sstc active, stimecmp
+  delegated to S-mode), STIP is read-only in mip per RISC-V privileged spec.
+  The CSR write is silently ignored — the firmware believes it has cleared the
+  pending timer interrupt, but the bit was never actually cleared. The only
+  valid way to clear the timer interrupt condition when Sstc is enabled is to
+  write stimecmp with a value greater than the current time value.
+  | void sbi_timer_exit(struct sbi_scratch *scratch)
+  | {
+  | 	if (timer_dev && timer_dev->timer_event_stop)
+  | 		timer_dev->timer_event_stop();
+  | 
+  | 	csr_clear(CSR_MIP, MIP_STIP);
+  | 	csr_clear(CSR_MIE, MIP_MTIP);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1472-1475
+      "If the stimecmp (supervisor-mode timer compare) register is
+      implemented, STIP is read-only in mip and reflects the supervisor-
+      level timer interrupt si"
+    - riscv-isa-manual/src/priv/supervisor.adoc:433-440
+      "Bits sip.STIP and sie.STIE are the interrupt-pending and interrupt-
+      enable bits for supervisor-level timer interrupts. If implemented,
+      STIP is read-onl"
+
+[bug_confirmed] lib/sbi/sbi_hsm.c:435-446  __sbi_hsm_suspend_non_ret_restore
+  MENVCFG is restored at line 441 BEFORE MIP_STIP is re-injected via
+  csr_set(CSR_MIP, ...) at line 445. When saved_menvcfg has STCE=1 in the STCE
+  bit, the subsequent csr_set writing MIP_STIP is silently ignored because
+  STCE makes STIP read-only in mip. If a timer interrupt was pending
+  (hardware-set STIP from stimecmp comparison) before non-retentive suspend,
+  it was captured in saved_mip, but the re-injection on resume is a no-op —
+  the timer interrupt is permanently lost. S-mode resumes execution and never
+  receives the timer IRQ, causing missed deadlines and denial of service.
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	csr_write64(CSR_MENVCFG, hdata->saved_menvcfg);
+  | csr_write(CSR_MIDELEG, hdata->saved_mideleg);
+  | csr_write(CSR_MEDELEG, hdata->saved_medeleg);
+  | csr_write(CSR_MIE, hdata->saved_mie);
+  | csr_set(CSR_MIP, (hdata->saved_mip & (MIP_SSIP | MIP_STIP)));
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1472-1475
+      "If the stimecmp (supervisor-mode timer compare) register is
+      implemented, STIP is read-only in mip and reflects the supervisor-
+      level timer interrupt si"
+
+[compliant] lib/sbi/sbi_hsm.c:408-433  __sbi_hsm_suspend_non_ret_save
+  Save side correctly captures MIP_STIP (which may be hardware-set via SSTC
+  stimecmp) along with MENVCFG (containing STCE). The save logic is sound —
+  the bug is in the restore ordering where MENVCFG is written before MIP_STIP,
+  not in the save itself.
+  | hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+  | // ...
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+
+[compliant] lib/sbi/sbi_timer.c:150-160  sbi_timer_process
+  M-mode timer IRQ handler correctly guards MIP_STIP injection with a !SSTC
+  check. When SSTC is available, S-mode receives timer interrupts directly
+  from hardware stimecmp comparison; M-mode should not inject STIP. When SSTC
+  is not available, M-mode software injects STIP on behalf of the legacy timer
+  hardware.
+  | csr_clear(CSR_MIE, MIP_MTIP);
+  | if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC))
+  | 	csr_set(CSR_MIP, MIP_STIP);
+
+[compliant] lib/sbi/sbi_timer.c:133-148  sbi_timer_event_start
+  SBI_SET_TIMER implementation correctly checks SSTC. When SSTC is available,
+  writes CSR_STIMECMP directly and does not touch MIP_STIP. When SSTC is not
+  available, falls back to the platform timer device and clears MIP_STIP
+  explicitly in the legacy path.
+  | if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
+  | 	csr_write64(CSR_STIMECMP, next_event);
+  | } else if (timer_dev && timer_dev->timer_event_start) {
+  | 	timer_dev->timer_event_start(next_event);
+  | 	csr_clear(CSR_MIP, MIP_STIP);
+  | }
+
+[potential_risk] lib/sbi/sbi_init.c:483-499  init_warm_resume
+  Warm resume path calls sbi_hart_reinit (which via mstatus_init sets
+  MENVCFG.STCE at lib/sbi/sbi_hart.c:159) BEFORE sbi_hsm_hart_resume_finish
+  (which calls __sbi_hsm_suspend_non_ret_restore to restore saved MENVCFG and
+  re-inject MIP_STIP). This creates a transient window where STCE is already
+  enabled from mstatus_init when the subsequent restore attempts to csr_set
+  MIP_STIP, ensuring the STIP write is silently dropped.
+  | sbi_hsm_hart_resume_start(scratch);
+  | rc = sbi_hart_reinit(scratch);
+  | // ...
+  | rc = sbi_hart_protection_configure(scratch);
+  | // ...
+  | sbi_hsm_hart_resume_finish(scratch, hartid);
+
+[potential_risk] lib/sbi/sbi_hart.c:137-174  mstatus_init
+  mstatus_init sets ENVCFG_STCE in MENVCFG (line 159) during both cold boot
+  and warm resume (via sbi_hart_reinit). On warm resume from non-retentive
+  suspend, this sets STCE=1 before __sbi_hsm_suspend_non_ret_restore
+  overwrites MENVCFG with the saved value and attempts the MIP_STIP re-
+  injection. The double-write of MENVCFG creates a window where STCE state
+  differs from both the initial and final values, and the early STCE=1 setting
+  from mstatus_init makes the subsequent MIP_STIP write at hsm.c:445 a no-op
+  if the saved_menvcfg also has STCE=1.
+  | __set_menvcfg_ext(SBI_HART_EXT_SSTC, ENVCFG_STCE)
+  | // ...
+  | csr_write64(CSR_MENVCFG, menvcfg_val);
+

@@ -1,0 +1,273 @@
+{
+  "pr_number": 2707,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2707,
+    "violation_condition": "In XiangShan RTL, when a CSR write to sip/sie (or their virtualized counterparts vsip/vsie, hip/hie) does not enforce WARL semantics on unimplemented interrupt bits — specifically, writing 1 to a bit position corresponding to an unimplemented interrupt type (SEI/STI/SSI/LCOFI) that should be read-only zero instead retains the written value or propagates to internal interrupt-pending/enable logic",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "CSR read/write logic for interrupt-pending and interrupt-enable registers (sip, sie, vsip, vsie, hip, hie) that lacks per-bit WARL masking based on implemented interrupt types; look for CSR wiring in Chisel that passes raw write data to register state without masking against a configuration-defined legal bitmask, or CSR read paths that return raw register state without zeroing unimplemented bit positions",
+    "affected_entities": [
+      "sip",
+      "sie",
+      "vsip",
+      "vsie",
+      "hip",
+      "hie",
+      "hedeleg",
+      "hideleg",
+      "stvec",
+      "vstvec",
+      "hgeie",
+      "hvip",
+      "mnepc",
+      "mncause",
+      "mnstatus"
+    ],
+    "summary": "Missing WARL bit-masking on interrupt and delegation CSRs allows software to enable or pend non-existent interrupt sources, potentially triggering spurious trap handlers at higher privilege levels or masking real interrupts via aliased bit positions"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala",
+        "function_name": "SieBundle",
+        "line_start": 229,
+        "line_end": 236,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SieBundle correctly implements WARL semantics: M-level bits (MSIE/MTIE/MEIE), VS-level bits (VSSIE/VSTIE/VSEIE), and SGEIE are hardwired to 0. HS-level bits (SSIE/SEIE) and local interrupt bits are RW. STIE is set RO with reset 0, but this is functionally correct because when Sstc is implemented (EXT_SSTC=true), STIE writes are routed through the mie alias path (mideleg(5)=1) rather than the internal register path. When mideleg(5)=0, the interrupt is not delegated to S-mode and STIE correctly reads 0.",
+      "snippet": "class SieBundle extends InterruptEnableBundle {\n  this.getHS.foreach(_.setRW().withReset(0.U))\n  this.STIE.setRO().withReset(0.U)\n  this.getLocal.foreach(_.setRW().withReset(0.U))\n  this.getM .foreach(_.setHardWired(0.U))\n  this.getVS.foreach(_.setHardWired(0.U))\n  this.SGEIE.setHardWired(0.U)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 465,
+          "line_end": 470,
+          "excerpt": "Each standard interrupt type (SEI, STI, SSI, or LCOFI) may not be implemented, in which case the corresponding interrupt-pending and interrupt-enable bits are read-only zeros. All bits in sip and sie are WARL fields."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala",
+        "function_name": "sip",
+        "line_start": 85,
+        "line_end": 129,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sip correctly implements WARL via delegation-based aliasing: regOut := mipIsAlias & mip | (mvipIsAlias & mvip). Writes are gated by mideleg delegation bits AND destination writability (wtMip.bits.isRW.B). When an interrupt is not delegated to S-mode (mideleg(num)=0 and mvipIsAlias(num)=0), the bit reads as 0 and writes are suppressed. M-level, VS-level, and SGEI bits are hardwired to 0. Hardwired fields are enforced at regOut via getHardWireValue override.",
+      "snippet": "val mipIsAlias  = mideleg\nval mvipIsAlias = ~mideleg & mvien\nregOut := mipIsAlias & mip | (mvipIsAlias & mvip)\n...\nwtMip.specifyField(\n  _.valid := wen && mipIsAlias(num) && wtMip.bits.isRW.B,\n  _.bits  := wen && mipIsAlias(num) && wtMip.bits.isRW.B &< wdata(num),\n)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 465,
+          "line_end": 470,
+          "excerpt": "All bits in sip and sie are WARL fields. The implemented interrupts may be found by writing one to every bit location in sie, then reading back to see which bit positions hold a one."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala",
+        "function_name": "SieBundle",
+        "line_start": 230,
+        "line_end": 231,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "SieBundle sets STIE to RO with reset 0 unconditionally (line 231), regardless of whether the Sstc extension is implemented (CSRConfig.EXT_SSTC=true at NewCSR.scala:65). The code sets getHS (SSIE,STIE,SEIE) to RW on line 230, then immediately overrides STIE to RO on line 231. While functionally correct because STIE writes flow through the mie alias path when mideleg(5)=1 (bypassing the RO restriction on the internal register), this pattern is misleading and fragile. If the alias logic were ever refactored, STIE could become permanently non-writable despite Sstc being implemented, breaking timer interrupt masking.",
+      "snippet": "this.getHS.foreach(_.setRW().withReset(0.U))\nthis.STIE.setRO().withReset(0.U)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 432,
+          "line_end": 440,
+          "excerpt": "Bits sip.STIP and sie.STIE are the interrupt-pending and interrupt-enable bits for supervisor-level timer interrupts. When the Sstc extension is implemented, STIP reflects the timer interrupt signal resulting from stimecmp."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "HieBundle",
+        "line_start": 260,
+        "line_end": 262,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HieBundle correctly sets all bits as RO (default from InterruptEnableBundle parent), since all hie bits are aliases of mie with no independent register state. The hie module (lines 38-56) implements WARL by gating reads through mieIsAlias (mideleg) AND destination writability (wtMie.bits.isRW.B). HieToMie only marks getVS (VSSIE/VSTIE/VSEIE) and SGEIE as writable. HS-level bits (SSIE/STIE/SEIE) are correctly RO-zero, satisfying the sie_hip_hie_mutex requirement that hie bits must be RO-zero where corresponding sie bits are writable.",
+      "snippet": "class HieBundle extends InterruptEnableBundle {\n  // All bits in hie are RO, since all registers implemented in mie.\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 512,
+          "line_end": 515,
+          "excerpt": "For each writable bit in sie, the corresponding bit shall be read-only zero in both hip and hie. Hence, the nonzero bits in sie and hie are always mutually exclusive."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 542,
+          "line_end": 545,
+          "excerpt": "A bit in hie shall be writable if the corresponding interrupt can ever become pending in hip. Bits of hie that are not writable shall be read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "hip",
+        "line_start": 88,
+        "line_end": 108,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hip correctly implements WARL with explicit per-bit semantics: VSSIP is RW (alias of hvip.VSSIP, write routed to hvip via toHvip), VSTIP/VSEIP/SGEIP are RO (aliases of mip.VSTIP/mip.VSEIP/mip.SGEIP respectively). All remaining bits (from InterruptPendingBundle parent) are RO. This satisfies the sie_hip_hie_mutex requirement, and the gate condition wen (without isRW check on the bundle) is safe because only VSSIP is writable and the toHvip path provides the actual write control.",
+      "snippet": "regOut.VSTIP := mip.VSTIP\nregOut.VSEIP := mip.VSEIP\nregOut.SGEIP := mip.SGEIP\ntoHvip.VSSIP.valid := wen\ntoHvip.VSSIP.bits  := wdata.VSSIP\nregOut.VSSIP := this.hvip.VSSIP",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 532,
+          "line_end": 540,
+          "excerpt": "If bit i of sie is read-only zero, the same bit in register hip may be writable or may be read-only."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 499,
+          "line_end": 499,
+          "excerpt": "Registers hip and hie are HSXLEN-bit read/write registers that supplement sip and sie for HS-mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/VirtualSupervisorLevel.scala",
+        "function_name": "vsip",
+        "line_start": 153,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vsip implements correct WARL with proper VS-to-host interrupt number remapping via shiftedIP: Cat(originIP(63,COI), 0.U(1.W), originIP(SGEI,SSI)). This shift correctly maps host VSSIP(bit 2)→VS SSIP(bit 1), host VSTIP(bit 6)→VS STIP(bit 5), host VSEIP(bit 10)→VS SEIP(bit 9). M-level, VS-level, and SGEI bits are then hardwired to 0. Delegation chain correctly routes writes to mip/mvip/hvip based on mideleg/hideleg/mvien/hvien. Local interrupt writes are gated by destination port writability via connectZeroNonRW.",
+      "snippet": "val originIP = mideleg & hideleg & mip | (~mideleg & hideleg & mvien & mvip) | (~hideleg & hvien & hvip)\nval shiftedIP = Cat(originIP(63, InterruptNO.COI), 0.U(1.W), originIP(InterruptNO.SGEI, InterruptNO.SSI))\nregOut := shiftedIP\nregOut.getM.foreach(_ := 0.U)\nregOut.getVS.foreach(_ := 0.U)\nregOut.SGEIP := 0.U",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 1244,
+          "line_end": 1295,
+          "excerpt": "When V=1, vsip and vsie substitute for the usual sip and sie. When hideleg bit is zero, corresponding vsip/vsie bits are read-only zero; otherwise they are aliases of hip/hie bits."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/VirtualSupervisorLevel.scala",
+        "function_name": "vsie",
+        "line_start": 55,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vsie correctly implements WARL with proper VS-to-host interrupt number remapping (same shiftedIE pattern as vsip). Internal register is only used when ~hideleg & hvien; otherwise values are aliased from mie or sie. VS-level bits (SSIE/STIE/SEIE) in guest numbering are correctly mapped from host VSSIE/VSTIE/VSEIE through the shift operation. The write path correctly routes VS bit writes to host positions (vsNum=2→sNum=1 for mie.VSSIE, etc.). Delegation chain and .connectZeroNonRW on output ports provide comprehensive write protection.",
+      "snippet": "val mieIsAlias =  hideleg &  mideleg\nval sieIsAlias =  hideleg & ~mideleg & mvien\nval usingReg   = ~hideleg &            hvien\nval originAliasIE = (mieIsAlias & mie) | (sieIsAlias & sie)\nval shiftedIE = Cat(originAliasIE(63, InterruptNO.COI), 0.U(1.W), originAliasIE(InterruptNO.SGEI, InterruptNO.SSI))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 1244,
+          "line_end": 1295,
+          "excerpt": "When V=1, vsip and vsie substitute for the usual sip and sie. When hideleg bit is zero, corresponding vsip/vsie bits are read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "hvip",
+        "line_start": 111,
+        "line_end": 131,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hvip implements correct write arbitration for VSSIP from multiple sources (fromMip, fromHip, fromVSip) using Mux1H priority. VS-level bits (VSSIP/VSTIP/VSEIP) and local bits are RW. LCOFIP is RO with reset 0. This is the backing store for guest interrupt pending state, and writes are correctly gated through the valid signals from source modules, providing implicit WARL protection.",
+      "snippet": "when (fromMip.VSSIP.valid || fromHip.VSSIP.valid || fromVSip.VSSIP.valid) {\n  reg.VSSIP := Mux1H(Seq(\n    fromMip.VSSIP.valid -> fromMip.VSSIP.bits,\n    fromHip.VSSIP.valid -> fromHip.VSSIP.bits,\n    fromVSip.VSSIP.valid -> fromVSip.VSSIP.bits,\n  ))\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MidelegBundle",
+        "line_start": 645,
+        "line_end": 658,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "MidelegBundle correctly implements spec-mandated delegation defaults: M-level interrupts (MSI/MTI/MEI) are RO 0 (cannot be delegated from M-mode), VS-level interrupts (VSSI/VSTI/VSEI) and SGEI are RO 1 (always delegated past M-mode to HS-mode per hypervisor spec section 13.4.2). All other bits default to RW 0. LCOFI is separately RW. This establishes the correct foundation for the entire interrupt delegation chain used by sip/sie/vsip/vsie/hip/hie.",
+      "snippet": "class MidelegBundle extends InterruptBundle {\n  this.getALL.foreach(_.setRW().withReset(0.U))\n  this.getM.foreach(_.setRO().withReset(0.U))\n  this.getVS.foreach(_.setRO().withReset(1.U))\n  this.SGEI.setRO().withReset(1.U)\n  this.getLocal.foreach(_.setRO().withReset(0.U))\n  this.LCOFI.setRW().withReset(0.U)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 1,
+          "line_end": 20,
+          "excerpt": "When the hypervisor extension is implemented, bits 10, 6, and 2 of mideleg (corresponding to the standard VS-level interrupts) are each read-only one. Bit 12 of mideleg (corresponding to supervisor-level guest external interrupts) is also read-only one."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/VirtualSupervisorLevel.scala",
+        "function_name": "vsip",
+        "line_start": 169,
+        "line_end": 182,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The vsip local interrupt write path (lines 172-182) routes writes to toMip/toMvip/toHvip based ONLY on delegation bits (mideleg, hideleg, mvien, hvien) without checking whether the destination port's bit is actually writable (isRW). This contrasts with sip (SupervisorLevel.scala:112-115) which gates on wtMip.bits.isRW.B. While currently safe because toMip/toMvip/toHvip are constructed with .connectZeroNonRW that hardwires valid=false for non-RW bits, if the port definition or the .connectZeroNonRW call were ever changed, this path would blindly route writes to any local interrupt bit regardless of writability.",
+      "snippet": "toMipLCIP .valid := wen &&  hidelegBit &&  midelegBit\ntoMvipLCIP.valid := wen &&  hidelegBit && !midelegBit &&  mvienBit\ntoHvipLCIP.valid := wen && !hidelegBit &&                 hvienBit\ntoMipLCIP .bits := wLCIP\ntoMvipLCIP.bits := wLCIP\ntoHvipLCIP.bits := wLCIP",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 1276,
+          "line_end": 1276,
+          "excerpt": "When bit 13 of hideleg is zero, vsip.LCOFIP and vsie.LCOFIE are read-only zeros."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "mip",
+        "line_start": 275,
+        "line_end": 283,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mip SEIP read path correctly implements the AIA-specified behavior: when mvien.SEIE=0, mip.SEIP is alias of mvip.SEIP; when mvien.SEIE=1, mip.SEIP is read-only 0 (and SEIP is independently visible through mvip). The rdataFields.SEIP additionally ORs in platformIRP.SEIP and aiaToCSR.seip per AIA spec. This correctly supports the spec requirement that mip.SEIP's readable value includes external interrupt controller signals.",
+      "snippet": "regOut.SEIP := Mux(!this.mvien.SEIE, this.mvip.SEIP.asUInt, 0.U)\nrdataFields.SEIP := regOut.SEIP || platformIRP.SEIP || aiaToCSR.seip",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "HidelegBundle",
+        "line_start": 303,
+        "line_end": 315,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "HidelegBundle correctly implements interrupt delegation defaults for HS-to-VS delegation: SSI, MSI, STI, MTI, SEI, MEI, SGEI, and all local interrupts are RO 0 (cannot be delegated from HS-mode to VS-mode by default). Only VSSI, VSTI, VSEI (the VS-level virtual interrupts) and LCOFI are RW. This matches the spec requirement that VS-level interrupts are delegated in a way that maps to the guest's view of sip/sie.",
+      "snippet": "class HidelegBundle extends InterruptBundle {\n  this.getALL.foreach(_.setRW().withReset(0.U))\n  this.SSI .setRO().withReset(0.U)\n  ...\n  this.SGEI.setRO().withReset(0.U)\n  this.getLocal.foreach(_.setRO().withReset(0.U))\n  this.LCOFI.setRW().withReset(0.U)\n}",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

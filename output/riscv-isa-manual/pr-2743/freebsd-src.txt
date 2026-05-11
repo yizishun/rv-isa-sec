@@ -1,0 +1,128 @@
+PR #2743  target=freebsd-src  overall=not_implemented
+Spec: Zvfbfa adds altfmt bit (bit 8) to vtype CSR; FreeBSD currently has no V-extension support at all (no vtype in PCB/mcontext/context-switch), so any future V support addition must preserve the full vtype register including altfmt to prevent BF16/FP16 format corruption across context switches
+Violation:
+  FreeBSD RISC-V kernel has zero V-extension support: no vtype CSR
+  save/restore in context switch, no SSTATUS_VS bit tracking, no vector fields
+  in PCB. If rudimentary V support is added without preserving the full vtype
+  register (including the new altfmt bit at position 8), a context switch
+  between a process using altfmt=1 (BF16 mode) and one expecting altfmt=0
+  (FP16 mode) would corrupt floating-point vector computation semantics for
+  the victim process. Additionally, any kernel code that read-modify-writes
+  vtype field-by-field (vsew, vlmul, vta, vma) without preserving bit 8 would
+  silently clear altfmt.
+Consequence: data_corruption
+Pattern:
+  vtype.*&=|vtype.*\|=|vtype.*mask|write_csr.*vtype|SSTATUS_VS|csr_write.*0xc2
+  1|VTYPE_|pcb.*vtype|save.*vstate|restore.*vstate|altfmt
+------------------------------------------------------------
+[not_implemented] sys/riscv/include/riscvreg.h:60-80  N/A (header definitions)
+  SSTATUS_VS (bits 9-10, vector context state tracking) is not defined. Only
+  SSTATUS_FS (bits 13-14 for float) and SSTATUS_XS (bits 15-16 for user
+  extensions) exist. Without SSTATUS_VS, the kernel cannot track whether a
+  process has dirty vector state, making lazy/on-demand vector context
+  switching impossible.
+  | #define SSTATUS_FS_SHIFT  13
+  | #define SSTATUS_FS_MASK   (0x3 << SSTATUS_FS_SHIFT)
+  | #define SSTATUS_XS_SHIFT  15
+  | #define SSTATUS_XS_MASK   (0x3 << SSTATUS_XS_SHIFT)
+  | /* SSTATUS_VS (bits 9-10) NOT DEFINED */
+  References:
+    - riscv-isa-manual/src/unpriv/images/wavedrom/vtype-format.edn:1-28
+      "vtype register layout: bits 2:0=vlmul, 5:3=vsew, 6=vta, 7=vma, 8+
+      reserved, XLEN-1=vill. Currently no altfmt bit defined in the base
+      V-extension spec "
+
+[not_implemented] sys/riscv/include/encoding.h:532-679  N/A (CSR address definitions)
+  No vector CSR addresses are defined. Missing: CSR_VSTART (0x008), CSR_VXSAT
+  (0x009), CSR_VXRM (0x00A), CSR_VCSR (0x00F), CSR_VL (0xC20), CSR_VTYPE
+  (0xC21), CSR_VLENB (0xC22). The kernel has no ability to read or write vtype
+  or any vector control/status registers.
+  | #define CSR_FFLAGS 0x1
+  | #define CSR_FRM 0x2
+  | #define CSR_FCSR 0x3
+  | /* CSR_VSTART 0x008, CSR_VTYPE 0xC21, etc. NOT DEFINED */
+  | #define CSR_CYCLE 0xc00
+
+[not_implemented] sys/riscv/include/pcb.h:42-54  N/A (struct pcb)
+  struct pcb has no vector state fields. Only floating-point state is stored:
+  pcb_x[32][2] (32×128-bit F registers) and pcb_fcsr. Missing: vector register
+  storage (v0-v31, each VLEN bits wide), vtype, vl, vstart, vcsr, vlenb. A
+  process's vector execution context cannot be saved or restored across
+  context switches.
+  | struct pcb {
+  |   uint64_t pcb_x[32][2];   /* Floating point registers */
+  |   uint64_t pcb_fcsr;        /* Floating point control reg */
+  |   uint64_t pcb_fpflags;     /* Floating point flags */
+  |   /* No vector state fields (vtype, vl, vregs, etc.) */
+  | };
+  References:
+    - riscv-isa-manual/src/unpriv/images/wavedrom/vtype-format.edn:16-28
+      "vtype register layout table: vill (XLEN-1), reserved (XLEN-2:8),
+      vma (7), vta (6), vsew[2:0] (5:3), vlmul[2:0] (2:0). Full vtype must
+      be saved/restore"
+
+[not_implemented] sys/riscv/riscv/swtch.S:41-137  cpu_switch / __fpe_state_save / __fpe_state_load
+  Context switch path (cpu_switch, cpu_throw, savectx) only saves/restores
+  floating-point state via __fpe_state_save and __fpe_state_load macros. No
+  vector save/restore macros exist. If V-extension support were added, context
+  switching between processes using altfmt=1 (BF16) and altfmt=0 (FP16) would
+  corrupt vector computation semantics because vtype is not preserved.
+  | /* __fpe_state_save: saves f0-f31, fcsr to PCB */
+  | /* __fpe_state_load: restores f0-f31, fcsr from PCB */
+  | /* __v_state_save / __v_state_load: NOT IMPLEMENTED */
+
+[not_implemented] sys/riscv/riscv/exec_machdep.c:150-155  set_fpregs / set_fpcontext
+  set_fpregs() and set_fpcontext() manipulate SSTATUS_FS via &=
+  ~SSTATUS_FS_MASK / |= SSTATUS_FS_CLEAN field-by-field mask-and-set pattern.
+  If vector support were added mimicking this pattern for vtype (e.g., vtype
+  &= ~mask; vtype |= new_fields), the altfmt bit (in the reserved range bits
+  8+) would be silently cleared whenever only vsew/vlmul/vta/vma fields are
+  updated, corrupting BF16 mode for the process.
+  | frame->tf_sstatus &= ~SSTATUS_FS_MASK;
+  | frame->tf_sstatus |= SSTATUS_FS_CLEAN;
+  | /* Analogous vtype manipulation would clear reserved/altfmt bits */
+  References:
+    - riscv-isa-manual/src/unpriv/images/wavedrom/vtype-format.edn:16-28
+      "vtype bits XLEN-2:8 are reserved. If Zvfbfa repurposes a reserved
+      bit as altfmt, field-by-field mask-and-set operations that only
+      preserve bits 0-7 wo"
+
+[not_implemented] sys/riscv/riscv/identcpu.c:274-333  isa_parse (or equivalent)
+  ISA string parser does not recognize 'v' (vector) extension. Handles single-
+  letter extensions 'a','b','c','d','f','h','i','m','s','x','z' and multi-
+  letter 'z*' extensions, but no 'v'. HWCAP_ISA_V is also not defined in
+  sys/riscv/include/elf.h. The kernel cannot detect or advertise V-extension
+  capability to userspace.
+  | /* ISA parser handles: a, b, c, d, f, h, i, m, s, x, z */
+  | /* 'v' (vector extension): NOT RECOGNIZED */
+  | /* HWCAP_ISA_V: NOT DEFINED */
+
+[not_implemented] sys/riscv/riscv/trap.c:435-444  do_trap_user / illegal_instruction_handler
+  Illegal instruction trap handler only checks for FPU lazy-enable
+  (PCB_FP_STARTED flag, fpe_state_clear(), SSTATUS_FS_CLEAN). No vector lazy-
+  enable path exists. A userspace process executing a vector instruction on
+  hardware with V-extension would take an illegal-instruction trap with no
+  kernel handler to enable VS state, preventing any V-extension use.
+  | frame->tf_sstatus &= ~SSTATUS_FS_MASK;
+  | frame->tf_sstatus |= SSTATUS_FS_CLEAN;
+  | /* No SSTATUS_VS enable for vector lazy-context-switch */
+
+[not_implemented] sys/riscv/riscv/fpe.c:44-152  fpe_enable / fpe_disable / fpe_store / fpe_restore
+  Only floating-point state management functions exist (fpe_enable,
+  fpe_disable, fpe_store, fpe_restore, fpe_state_save, fpe_state_clear). No
+  corresponding vector state management API (v_enable, v_disable, v_store,
+  v_restore, v_state_save, v_state_clear). The save area alloc/free/reset
+  infrastructure (fpu_save_area_alloc/free/reset) has no vector equivalent.
+  | void fpe_enable(void)  { csr_set(sstatus, SSTATUS_FS_INITIAL); }
+  | void fpe_disable(void) { csr_clear(sstatus, SSTATUS_FS_MASK); }
+  | /* v_enable() / v_disable() with SSTATUS_VS: NOT IMPLEMENTED */
+
+[not_implemented] sys/riscv/vmm/vmm.c:395-417  vm_vcpu_restore / vm_vcpu_save
+  bhyve VMM (virtual machine monitor) only saves/restores floating-point
+  context (fpe_state_save, fpe_restore, fpe_store) for guest VCPUs. No vector
+  state save/restore for guests. A guest OS using V-extension (including
+  Zvfbfa BF16) would have its vector state corrupted across VM exits, as vtype
+  (including altfmt) is not preserved.
+  | /* fpe_state_save / fpe_restore / fpe_store for guest FPE context */
+  | /* No vector state save/restore for guest VCPUs */
+

@@ -1,0 +1,202 @@
+{
+  "pr_number": 2601,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 2601,
+    "violation_condition": "When QEMU allows S-mode access to scountinhibit or other Ssccfg/Smcdeleg CSRs without first checking that menvcfg.CDE=1, or when menvcfg.CDE is writable to 1 despite Smcdeleg not being implemented (CDE must be read-only zero when Smcdeleg is absent), or when clearing CDE from 1 to 0 does not immediately make scountinhibit and other delegated counter CSRs raise illegal-instruction exceptions in S-mode.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "menvcfg.*[Cc][Dd][Ee].*(?:read.only|writ|check|deleg)|scountinhibit.*(?:priv|access|check|mode|S_)|scof.*(?:priv|access|check)|cde.*(?:readonly|ro.?zero|check)",
+    "affected_entities": [
+      "menvcfg",
+      "scountinhibit",
+      "mhpmevent",
+      "scof",
+      "Ssccfg extension CSRs"
+    ],
+    "summary": "menvcfg.CDE gate bypass: QEMU must enforce that S-mode scountinhibit/performance-counter delegation is gated on menvcfg.CDE=1, and CDE must be read-only zero when Smcdeleg is not implemented; failing this lets S-mode software control counters it should not access, enabling timing side-channels or counter-manipulation attacks against M-mode."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_menvcfg",
+        "line_start": 3180,
+        "line_end": 3215,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "MENVCFG_CDE is unconditionally included in the initial mask on line 3182, before the RV64 conditional block. On RV64, when ext_smcdeleg is false, the conditional `mask |= (cfg->ext_smcdeleg ? MENVCFG_CDE : 0)` OR's in 0, which does NOT unset the CDE bit already in the mask. Result: CDE is always writable on RV64 regardless of Smcdeleg presence, violating norm:menvcfg_cde_rdonly0. On MXL_RV32 (TARGET_RISCV64 with MXL_RV32), writing CSR_MENVCFG (low 32-bit half) additionally clobbers CDE (bit 60) via `env->menvcfg & ~mask`, since CDE in mask clears bit 60 on a write that shouldn't touch high-half bits.",
+      "snippet": "    uint64_t mask = MENVCFG_FIOM | MENVCFG_CBIE | MENVCFG_CBCFE |\n                    MENVCFG_CBZE | MENVCFG_CDE;  /* CDE unconditionally set! */\n    bool stce_changed = false;\n\n    if (riscv_cpu_mxl(env) == MXL_RV64) {\n        mask |= (cfg->ext_svpbmt ? MENVCFG_PBMTE : 0) |\n                (cfg->ext_sstc ? MENVCFG_STCE : 0) |\n                (cfg->ext_smcdeleg ? MENVCFG_CDE : 0) |  /* OR's 0, doesn't unset CDE */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2226,
+          "line_end": 2229,
+          "excerpt": "If the Smcdeleg extension is implemented, the CDE (Counter Delegation Enable) bit controls whether Zicntr and Zihpm counters can be delegated to S-mode. When CDE=1, the Smcdeleg extension is enabled, see <<smcdeleg>>. When CDE=0, the Smcdeleg and Ssccfg extensions appear to be not implemented. If Smcdeleg is not implemented, CDE is read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "scountinhibit_pred",
+        "line_start": 393,
+        "line_end": 410,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The scountinhibit predicate correctly checks: (1) both ext_ssccfg and ext_smcdeleg must be present, (2) menvcfg.CDE must be set, (3) virt_enabled raises VIRT_INSTRUCTION_FAULT, (4) smode privilege check. This matches the spec requirement norm:ssccfg_illegal_scountinhibit_cde0 that scountinhibit must raise illegal-instruction when CDE=0. The CDE check on line 401 was added by the fix commit (9add702cd57f) and correctly gates S-mode access.",
+      "snippet": "    if (!cpu->cfg.ext_ssccfg || !cpu->cfg.ext_smcdeleg) {\n        return RISCV_EXCP_ILLEGAL_INST;\n    }\n\n    if (!get_field(env->menvcfg, MENVCFG_CDE)) {\n        return RISCV_EXCP_ILLEGAL_INST;\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcdeleg.adoc",
+          "line_start": 108,
+          "line_end": 115,
+          "excerpt": "When menvcfg.CDE=0, attempts to access scountinhibit raise an illegal-instruction exception."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xireg_cd",
+        "line_start": 2729,
+        "line_end": 2799,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The indirect counter delegation access path correctly checks: (1) ext_smcdeleg and ext_ssccfg presence (line 2737), (2) mcounteren per-counter delegation bit AND menvcfg.CDE (lines 2767-2768) before allowing any CD-region indirect register access. Full coverage of all CD functions: rmw_cd_mhpmcounter, rmw_cd_mhpmcounterh, rmw_cd_mhpmevent, rmw_cd_mhpmeventh, rmw_cd_ctr_cfg, rmw_cd_ctr_cfgh.",
+      "snippet": "    if (!get_field(env->mcounteren, BIT(ctr_index)) ||\n        !get_field(env->menvcfg, MENVCFG_CDE)) {\n        goto done;\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcdeleg.adoc",
+          "line_start": 36,
+          "line_end": 44,
+          "excerpt": "When the Smcdeleg/Ssccfg extensions are enabled (menvcfg.CDE=1), it further allows M-mode to delegate select counters to S-mode. When a counter i is delegated (mcounteren[i]=1 and menvcfg.CDE=1), the register state associated with counter i can be read or written via sireg*."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_menvcfgh",
+        "line_start": 3231,
+        "line_end": 3258,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The menvcfgh write (RV32 upper half) correctly includes MENVCFG_CDE in mask only when ext_smcdeleg is true (line 3240). This properly handles the RV32 high-half path per norm:menvcfg_cde_rdonly0.",
+      "snippet": "    uint64_t mask = (cfg->ext_svpbmt ? MENVCFG_PBMTE : 0) |\n                    (cfg->ext_sstc ? MENVCFG_STCE : 0) |\n                    (cfg->ext_svadu ? MENVCFG_ADUE : 0) |\n                    (cfg->ext_smcdeleg ? MENVCFG_CDE : 0) |\n                    (cfg->ext_ssdbltrp ? MENVCFG_DTE : 0);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2226,
+          "line_end": 2229,
+          "excerpt": "If Smcdeleg is not implemented, CDE is read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_henvcfg",
+        "line_start": 3334,
+        "line_end": 3391,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "write_henvcfg correctly does NOT include CDE in the menvcfg-inherited bits for henvcfg (line 3348). Only PBMTE, STCE, ADUE, DTE are inherited from menvcfg. This is correct per spec since CDE is an M-mode-only control that does not get delegated to HS-mode.",
+      "snippet": "        mask |= env->menvcfg & (HENVCFG_PBMTE | HENVCFG_STCE | HENVCFG_ADUE |\n                                HENVCFG_DTE);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_scountovf",
+        "line_start": 1613,
+        "line_end": 1648,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "scountovf read correctly virtualizes access when menvcfg.CDE=1, sscofpmf and ssccfg are enabled, and virt_enabled is set. Returns VIRT_INSTRUCTION_FAULT to trap to hypervisor, matching norm:ssccfg_virtual_scountovf_vs_vu.",
+      "snippet": "    if (riscv_cpu_cfg(env)->ext_sscofpmf &&\n        riscv_cpu_cfg(env)->ext_ssccfg &&\n        get_field(env->menvcfg, MENVCFG_CDE) &&\n        env->virt_enabled) {\n        return RISCV_EXCP_VIRT_INSTRUCTION_FAULT;\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcdeleg.adoc",
+          "line_start": 119,
+          "line_end": 122,
+          "excerpt": "For implementations that support Smcdeleg/Ssccfg, Sscofpmf, and the H extension, when menvcfg.CDE=1, attempts to read scountovf from VS-mode or VU-mode raise a virtual-instruction exception."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "read_scountinhibit",
+        "line_start": 3063,
+        "line_end": 3069,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "read_scountinhibit correctly masks env->mcountinhibit with env->mcounteren, so S-mode only sees inhibit bits for delegated counters. Non-delegated counter inhibit bits read as zero.",
+      "snippet": "    /* S-mode can only access the bits delegated by M-mode */\n    *val = env->mcountinhibit & env->mcounteren;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcdeleg.adoc",
+          "line_start": 111,
+          "line_end": 112,
+          "excerpt": "For counters not delegated to S-mode, the associated bits in scountinhibit are read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_scountinhibit",
+        "line_start": 3071,
+        "line_end": 3075,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "write_scountinhibit correctly masks the write value with env->mcounteren before delegating to write_mcountinhibit, ensuring S-mode can only modify inhibit bits for counters delegated via mcounteren.",
+      "snippet": "    return write_mcountinhibit(env, csrno, val & env->mcounteren, ra);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcdeleg.adoc",
+          "line_start": 111,
+          "line_end": 112,
+          "excerpt": "For counters delegated to S-mode, the associated mcountinhibit bits can be accessed via scountinhibit."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "rmw_xireg_csrind",
+        "line_start": 2833,
+        "line_end": 2833,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The virt flag only checks for CSR_VSIREG, not CSR_VSIREG2 through CSR_VSIREG6. When a VS-mode guest accesses sireg2-sireg6 (aliased to vsireg2-vsireg6) and the access is denied (e.g., CDE=0), the error returned at line 2849 produces RISCV_EXCP_ILLEGAL_INST instead of RISCV_EXCP_VIRT_INSTRUCTION_FAULT. A hypervisor expecting VIRT_INSTRUCTION_FAULT to emulate the access would receive ILLEGAL_INST instead. This is a general CSRIND issue, not CDE-specific.",
+      "snippet": "    bool virt = csrno == CSR_VSIREG ? true : false;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smcdeleg.adoc",
+          "line_start": 105,
+          "line_end": 106,
+          "excerpt": "An attempt from VS-mode to access any sireg* (really vsireg*) raises an illegal-instruction exception if menvcfg.CDE = 0, or a virtual-instruction exception if menvcfg.CDE = 1."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

@@ -1,0 +1,274 @@
+PR #2568  target=opensbi  overall=potential_risk
+Spec: Critical-error state leaves counter/timer updates UNSPECIFIED; OpenSBI cannot depend on mtime or performance counters advancing for watchdog timeout, deadlock detection, or post-critical-error recovery
+Violation:
+  OpenSBI M-mode trap handler enters critical-error state (unexpected trap
+  with no RNMI or mnstatus.NMIE=0) and firmware logic assumes mtime continues
+  incrementing or performance counters remain active during this state
+Consequence: denial_of_service
+Pattern:
+  mtime|mtimecmp|time|counter|timer|mcycle|minstret|critical.error|unexpected.
+  trap|double.trap
+------------------------------------------------------------
+[potential_risk] lib/sbi/sbi_trap.c:332-339  sbi_trap_handler
+  FW PMU counters (SBI_PMU_FW_MISALIGNED_LOAD, SBI_PMU_FW_MISALIGNED_STORE)
+  are incremented at lines 333 and 338 BEFORE the handler return code is
+  checked at line 369. If the handler subsequently fails (rc != 0),
+  sbi_trap_error() → sbi_hart_hang() is called. The spec states that in the
+  critical-error state, whether performance counters are updated is
+  UNSPECIFIED (machine.adoc:506-507). While the C handler runs with MDT=0 (not
+  in critical-error), the FW PMU counter increment assumes these events are
+  valid and non-transient.
+  | case CAUSE_MISALIGNED_LOAD:
+  | 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_MISALIGNED_LOAD);
+  | 	rc  = sbi_misaligned_load_handler(tcntx);
+  | 	msg = "misaligned load handler failed";
+  | 	break;
+  | case CAUSE_MISALIGNED_STORE:
+  | 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_MISALIGNED_STORE);
+  | 	rc  = sbi_misaligned_store_handler(tcntx);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:506-507
+      "Whether performance counters and timers are updated in the
+      critical-error state is UNSPECIFIED."
+
+[potential_risk] lib/sbi/sbi_trap.c:347-355  sbi_trap_handler
+  FW PMU counters (SBI_PMU_FW_ACCESS_LOAD, SBI_PMU_FW_ACCESS_STORE) are
+  incremented at lines 348 and 353 BEFORE the handler return code is checked
+  at line 369. Same pattern as above: these counters record load/store access
+  fault events before confirming the handler succeeded. If the handler later
+  fails, the counters have already been incremented for an event that
+  ultimately leads to critical-error.
+  | case CAUSE_LOAD_ACCESS:
+  | 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_ACCESS_LOAD);
+  | 	rc  = sbi_load_access_handler(tcntx);
+  | 	msg = "load fault handler failed";
+  | 	break;
+  | case CAUSE_STORE_ACCESS:
+  | 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_ACCESS_STORE);
+  | 	rc  = sbi_store_access_handler(tcntx);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:506-507
+      "Whether performance counters and timers are updated in the
+      critical-error state is UNSPECIFIED."
+
+[potential_risk] lib/sbi/sbi_illegal_insn.c:165-165  sbi_illegal_insn_handler
+  FW PMU counter SBI_PMU_FW_ILLEGAL_INSN is incremented at line 165 before the
+  illegal instruction is decoded and dispatched. If the instruction decode
+  fails or the dispatched handler (e.g., system_opcode_insn →
+  sbi_emulate_csr_read) returns an error, the FW counter has already been
+  incremented. The sbi_emulate_csr_read function reads hardware counters
+  (MCYCLE at line 62, TIME at line 71, MINSTRET at line 77, MHPMCOUNTERs at
+  line 110) whose values are UNSPECIFIED during critical-error states per the
+  spec.
+  | sbi_pmu_ctr_incr_fw(SBI_PMU_FW_ILLEGAL_INSN);
+  | if (unlikely((insn & 3) != 3)) {
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:506-507
+      "Whether performance counters and timers are updated in the
+      critical-error state is UNSPECIFIED."
+
+[potential_risk] lib/sbi/sbi_emulate_csr.c:59-78  sbi_emulate_csr_read
+  sbi_emulate_csr_read reads hardware counter CSRs (MCYCLE at line 62 via
+  csr_read, TIME at line 71 via sbi_timer_value()→get_ticks()→rdtime, MINSTRET
+  at line 77 via csr_read) during illegal instruction emulation for S/U-mode
+  CSR accesses. These reads occur as part of the trap handler dispatch chain,
+  before the handler's return value is checked at sbi_trap.c:369. The spec
+  (machine.adoc:506-507) states counter/timer updates in critical-error state
+  are UNSPECIFIED. While the reads themselves occur with MDT=0 (not in
+  critical-error), the values feed into the S/U-mode trap redirection
+  decision, which may assume valid counter state.
+  | case CSR_CYCLE:
+  | 	if (!hpm_allowed(csr_num - CSR_CYCLE, prev_mode, virt))
+  | 		return SBI_ENOTSUPP;
+  | 	*csr_val = csr_read(CSR_MCYCLE);
+  | 	break;
+  | case CSR_TIME:
+  | 	if (!hpm_allowed(csr_num - CSR_CYCLE, prev_mode, virt))
+  | 		return SBI_ENOTSUPP;
+  | 	*csr_val = (virt) ? sbi_timer_virt_value():
+  | 			    sbi_timer_value();
+  | 	break;
+  | case CSR_INSTRET:
+  | 	if (!hpm_allowed(csr_num - CSR_CYCLE, prev_mode, virt))
+  | 		return SBI_ENOTSUPP;
+  | 	*csr_val = csr_read(CSR_MINSTRET);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:506-507
+      "Whether performance counters and timers are updated in the
+      critical-error state is UNSPECIFIED."
+
+[potential_risk] lib/sbi/sbi_trap.c:317-324  sbi_trap_handler
+  M-mode timer interrupts are dispatched to sbi_timer_process() at line 238
+  (via sbi_trap_nonaia_irq) or line 265 (via sbi_trap_aia_irq) before checking
+  whether the trap is expected. sbi_timer_process() unconditionally clears
+  MIP.MTIP (line 152) and may set MIP.STIP (line 159). In a scenario where an
+  unexpected trap occurs and the handler enters critical-error, timer state
+  (mtimecmp programmed by sbi_timer_event_start at line 142/144) may become
+  stale. The spec states timer updates in critical-error state are
+  UNSPECIFIED.
+  | if (mcause & MCAUSE_IRQ_MASK) {
+  | 	if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+  | 				   SBI_HART_EXT_SMAIA))
+  | 		rc = sbi_trap_aia_irq();
+  | 	else
+  | 		rc = sbi_trap_nonaia_irq(mcause & ~MCAUSE_IRQ_MASK);
+  | 	msg = "unhandled local interrupt";
+  | 	goto trap_done;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:506-507
+      "Whether performance counters and timers are updated in the
+      critical-error state is UNSPECIFIED."
+
+[potential_risk] lib/sbi/sbi_timer.c:133-148  sbi_timer_event_start
+  sbi_timer_event_start() unconditionally sets MIE.MTIP at line 147
+  (csr_set(CSR_MIE, MIP_MTIP)) after programming the next timer event. It also
+  increments the FW PMU counter at line 135. If the hart enters critical-error
+  state after this function returns but before the timer interrupt fires, the
+  programmed mtimecmp value and pending MTIP state may not be honored, as the
+  spec leaves timer behavior in critical-error UNSPECIFIED. The firmware has
+  no mechanism to detect or recover from this staleness.
+  | void sbi_timer_event_start(u64 next_event)
+  | {
+  | 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_SET_TIMER);
+  | 	if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
+  | 		csr_write64(CSR_STIMECMP, next_event);
+  | 	} else if (timer_dev && timer_dev->timer_event_start) {
+  | 		timer_dev->timer_event_start(next_event);
+  | 		csr_clear(CSR_MIP, MIP_STIP);
+  | 	}
+  | 	csr_set(CSR_MIE, MIP_MTIP);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:506-507
+      "Whether performance counters and timers are updated in the
+      critical-error state is UNSPECIFIED."
+
+[compliant] lib/sbi/sbi_double_trap.c:23-24  sbi_double_trap_handler
+  sbi_double_trap_handler correctly returns SBI_ERR_INVALID_PARAM when the
+  double trap originates from a non-S-mode source (e.g., M-mode). This causes
+  sbi_trap_handler to call sbi_trap_error() → sbi_hart_hang(), which is the
+  correct critical-error escalation path per the spec (machine.adoc:502-507).
+  The handler does not attempt to read counters or timers.
+  | if (sbi_mstatus_prev_mode(regs->mstatus) != PRV_S)
+  | 	return SBI_ERR_INVALID_PARAM;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:502-507
+      "When the Smrnmi extension is not implemented, or if the Smrnmi
+      extension is implemented and mnstatus.NMIE is 0, the hart enters a
+      critical-error state"
+
+[compliant] lib/sbi/sbi_hart.c:761-765  sbi_hart_hang
+  sbi_hart_hang() enters an infinite WFI loop without reading any counter or
+  timer CSRs. This is the correct behavior for a critical-error termination:
+  the hart ceases meaningful execution and does not rely on counter/timer
+  state that may be UNSPECIFIED per the spec.
+  | void __attribute__((noreturn)) sbi_hart_hang(void)
+  | {
+  | 	while (1)
+  | 		wfi();
+  | 	__builtin_unreachable();
+  | }
+
+[compliant] firmware/fw_base.S:138-144  _start (early boot path)
+  During early cold boot at _start (fw_base.S:144), CLEAR_MDT is called after
+  setting up the temporary trap handler (_start_hang). The comment explicitly
+  states: 'Clear MDT to avoid generating a double trap and thus entering a
+  critical-error state.' This is correct defensive programming: no counters or
+  timers are accessed before MDT is cleared, preventing an unexpected trap
+  during the vulnerable early-init window from triggering critical-error.
+  | /*
+  |  * While at this point, trap handling is rudimentary, if a trap happens,
+  |  * it will end up in _start_hang which is enough to hook up a GDB. Clear
+  |  * MDT to avoid generating a double trap and thus entering a
+  |  * critical-error state.
+  |  */
+  | CLEAR_MDT t0
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:475-476
+      "When a trap is to be taken into M-mode, if the MDT bit is currently
+      0, it is then set to 1, and the trap is delivered as expected.
+      However, if MDT is "
+
+[compliant] firmware/fw_base.S:403-404  _start_warm (warm boot path)
+  During warm boot at _start_warm (fw_base.S:404), CLEAR_MDT is called again
+  after setting up the real trap handler (_trap_handler). This ensures MDT is
+  cleared on all harts before entering sbi_init(), consistent with the cold
+  boot path. No counters/timers are read in the vulnerable window between MDT
+  clear and trap handler setup.
+  | /* Clear MDT here again for all harts */
+  | CLEAR_MDT t0
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:475-476
+      "When a trap is to be taken into M-mode, if the MDT bit is currently
+      0, it is then set to 1, and the trap is delivered as expected.
+      However, if MDT is "
+
+[compliant] firmware/fw_base.S:604-605  TRAP_SAVE_INFO
+  CLEAR_MDT at the end of TRAP_SAVE_INFO (fw_base.S:605) re-enables nested
+  trap delivery before calling the C handler (sbi_trap_handler). This is
+  intentional: it allows the C handler to execute with MDT=0 so that nested
+  traps are delivered as new, normal traps rather than triggering critical-
+  error. Counter/timer reads in the C handler occur with MDT=0, so the
+  hardware is not in critical-error state during those reads.
+  | /* We are ready to take another trap, clear MDT */
+  | CLEAR_MDT t0
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:475-476
+      "When a trap is to be taken into M-mode, if the MDT bit is currently
+      0, it is then set to 1, and the trap is delivered as expected."
+
+[compliant] lib/sbi/sbi_hart.c:137-141  mstatus_init
+  menvcfg.DTE is explicitly cleared during mstatus_init (sbi_hart.c:141),
+  disabling the Ssdbltrp double-trap-enable feature by default. This is the
+  correct cold-boot default: without DTE, the hardware behaves as though
+  Ssdbltrp is not implemented (per machine.adoc:2316-2317). The MDT bit
+  management in fw_base.S can then operate independently. Platforms that want
+  double-trap enable can set DTE via FWFT or platform init.
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12) {
+  | 	menvcfg_val = csr_read64(CSR_MENVCFG);
+  | 	/* Disable double trap by default */
+  | 	menvcfg_val &= ~ENVCFG_DTE;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2315-2317
+      "The Ssdbltrp extension adds the double-trap-enable (DTE) field in
+      menvcfg. When menvcfg.DTE is zero, the implementation behaves as
+      though Ssdbltrp is "
+
+[potential_risk] lib/sbi/sbi_timer.c:150-159  sbi_timer_process
+  sbi_timer_process() is called from the trap handler's interrupt dispatch
+  path (sbi_trap_nonaia_irq at sbi_trap.c:238 or sbi_trap_aia_irq at
+  sbi_trap.c:265). It unconditionally clears MIE.MTIP (line 152) and may set
+  MIP.STIP (line 159). If a nested unexpected trap occurs while the timer
+  interrupt is being processed, and MDT is already set (between trap entry and
+  CLEAR_MDT), the hart enters critical-error. The spec (machine.adoc:506-507)
+  leaves timer updates UNSPECIFIED in critical-error. An STIP that was set but
+  whose corresponding mtimecmp may not fire (since timer updates are
+  unspecified) creates a denial-of-service risk for S-mode timer interrupt
+  delivery.
+  | void sbi_timer_process(void)
+  | {
+  | 	csr_clear(CSR_MIE, MIP_MTIP);
+  | 	if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC))
+  | 		csr_set(CSR_MIP, MIP_STIP);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:502-507
+      "When the Smrnmi extension is not implemented, or if the Smrnmi
+      extension is implemented and mnstatus.NMIE is 0, the hart enters a
+      critical-error state"
+
+[compliant] lib/sbi/sbi_trap.c:77-93  sbi_trap_error
+  sbi_trap_error() prints the trap context (register state, mcause, mtval,
+  mepc, mstatus) and then calls sbi_hart_hang(). It does NOT read any counter
+  CSRs (mcycle, minstret, time) or timer CSRs (mtimecmp) during the error
+  reporting path. The register dump includes only architectural state saved at
+  trap entry, not live counter values. This is correct: it does not assume
+  counters are incrementing during the error state.
+  | static void __noreturn sbi_trap_error(const char *msg, int rc,
+  | 			      const struct sbi_trap_context *tcntx)
+  | {
+  | 	u32 depth = 0, hartid = current_hartid();
+  | 	...
+  | 	sbi_hart_hang();
+  | }
+

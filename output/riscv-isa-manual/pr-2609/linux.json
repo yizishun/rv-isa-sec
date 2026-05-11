@@ -1,0 +1,386 @@
+{
+  "pr_number": 2609,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 2609,
+    "violation_condition": "Linux kernel performs a regular (non-shadow-stack) store instruction to a virtual address covered by an SPMP entry configured as a shadow stack region (spmpcfg.XWR=010, SHARED=0), which raises a store/AMO access fault. This can happen in code paths that write to user memory without checking whether the target is SPMP-protected as shadow stack, e.g., put_user()/copy_to_user() during signal frame delivery, ptrace POKEDATA, or /proc/pid/mem writes.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "put_user|copy_to_user|__put_user|__copy_to_user.*ssp|spmp.*shadow",
+    "affected_entities": [
+      "spmpcfg",
+      "ssp",
+      "menvcfg.SSE",
+      "satp.MODE"
+    ],
+    "summary": "Kernel user-memory store paths (ptrace, signals, /proc/pid/mem) may fault on SPMP shadow stack regions configured with XWR=010, since only Zicfiss shadow-stack instructions (sspush/sspopchk) may store to them"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "get_sigframe",
+        "line_start": 390,
+        "line_end": 411,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Computes signal frame address as pure arithmetic (sp - framesize) without VMA lookup or VM_SHADOW_STACK check. If the alternate signal stack (set via sigaltstack) overlaps shadow-stack memory, the computed frame address lands on R=0,W=1 PTEs. All subsequent __put_user/__copy_to_user in setup_rt_frame use regular store instructions, which the hardware rejects with EXC_STORE_ACCESS (cause=7). The kernel dispatches cause=7 to do_trap_store_fault → SIGSEGV without checking uaccess fixup tables, causing signal delivery failure (DoS). For the Sspmpss SPMP spec, the same semantic applies: regular stores to XWR=010 SPMP entries raise store/AMO access faults.",
+      "snippet": "sp = sigsp(sp, ksig) - framesize;\nsp &= ~0xfUL;\nreturn (void __user *)sp;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 220,
+          "line_end": 222,
+          "excerpt": "Memory mapped as an SS page cannot be written to by instructions other than ssamoswap.w[], ssamoswap.d[], sspush[], and c.sspush[]. Attempts will raise a store/AMO access-fault exception."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 209,
+          "line_end": 211,
+          "excerpt": "The encoding R=0, W=1, and X=0, is defined to represent an SS page."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "setup_rt_frame",
+        "line_start": 421,
+        "line_end": 432,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Uses access_ok(frame, frame_size) as sole guard, which only checks (addr+size) <= TASK_SIZE — a bounds check, not a PTE-permission check. If frame lands on shadow-stack memory, the subsequent __put_user/__copy_to_user calls (lines 425-432) use regular sd/sw instructions that raise EXC_STORE_ACCESS (cause=7). The kernel dispatches cause=7 to do_trap_store_fault, which sends SIGSEGV without consulting uaccess fixup tables. This is a DoS: signal delivery reliably fails when the target address is shadow-stack memory. Equivalent SPMP behavior: regular store to XWR=010 entry → store/AMO access fault.",
+      "snippet": "frame = get_sigframe(ksig, regs, frame_size);\nif (!access_ok(frame, frame_size))\n\treturn -EFAULT;\nerr |= copy_siginfo_to_user(&frame->info, &ksig->info);\nerr |= __put_user(0, &frame->uc.uc_flags);\nerr |= __put_user(NULL, &frame->uc.uc_link);\nerr |= __save_altstack(&frame->uc.uc_stack, regs->sp);\nerr |= setup_sigcontext(frame, regs);\nerr |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 220,
+          "line_end": 222,
+          "excerpt": "Memory mapped as an SS page cannot be written to by instructions other than ssamoswap.w[], ssamoswap.d[], sspush[], and c.sspush[]. Attempts will raise a store/AMO access-fault exception."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 229,
+          "line_end": 234,
+          "excerpt": "Stores to shadow stack pages by instructions other than ssamoswap[], sspush[], and c.sspush[] will trigger a store/AMO access-fault exception, not a store/AMO page-fault exception, signaling a fatal error."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "save_cfiss_state",
+        "line_start": 166,
+        "line_end": 167,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "save_user_shstk() correctly uses ssamoswap.d (Zicfiss-authorized write to shadow stack). The subsequent __put_user(ss_ptr, &state->ss_ptr) writes the saved token pointer to the signal frame — not to the shadow stack itself. The signal frame location is the vulnerability (see get_sigframe/setup_rt_frame), not this individual __put_user. The save/restore logic for the shadow stack token is architecturally correct.",
+      "snippet": "err |= save_user_shstk(current, &ss_ptr);\nerr |= __put_user(ss_ptr, &state->ss_ptr);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "setup_sigcontext",
+        "line_start": 362,
+        "line_end": 385,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Copies GP registers (line 362 __copy_to_user), extension headers (lines 376-377 __put_user), and END marker (lines 384-385 __put_user) to the signal frame using regular store instructions. All expand to sd/sw with SR_SUM=1. These will raise EXC_STORE_ACCESS (cause=7) if the signal frame is on shadow-stack memory. No PTE-level or VMA-level check for shadow-stack encoding before writing.",
+      "snippet": "err = __copy_to_user(&sc->sc_regs, regs, sizeof(sc->sc_regs));\n...\nerr |= __put_user(arch_ext->magic, &sc_ext_ptr->magic);\nerr |= __put_user(ext_size, &sc_ext_ptr->size);\n...\nerr |= __put_user(END_MAGIC, &sc_ext_ptr->magic);\nerr |= __put_user(END_HDR_SIZE, &sc_ext_ptr->size);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 220,
+          "line_end": 222,
+          "excerpt": "Memory mapped as an SS page cannot be written to by instructions other than ssamoswap.w[], ssamoswap.d[], sspush[], and c.sspush[]."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "save_fp_state",
+        "line_start": 65,
+        "line_end": 65,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Copies FPU state to signal frame via regular __copy_to_user. Same vulnerability as other signal frame writes: if frame is on shadow-stack memory, the store raises EXC_STORE_ACCESS → SIGSEGV.",
+      "snippet": "err = __copy_to_user(state, &current->thread.fstate, sizeof(*state));",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "save_v_state",
+        "line_start": 97,
+        "line_end": 102,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Three regular store operations to signal frame for vector extension state (__copy_to_user + __put_user). Same vulnerability pattern: if signal frame lands on shadow-stack memory, these fault.",
+      "snippet": "err = __copy_to_user(&state->v_state, &current->thread.vstate,\n\t\t     offsetof(struct __riscv_v_ext_state, datap));\nerr |= __put_user((__force void *)datap, &state->v_state.datap);\nerr |= __copy_to_user(datap, current->thread.vstate.datap, riscv_v_vsize);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "kernel/signal.c",
+        "function_name": "do_sigaltstack",
+        "line_start": 4401,
+        "line_end": 4437,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The sigaltstack syscall accepts any user-provided ss_sp without checking whether the underlying VMA is VM_SHADOW_STACK. A process can register shadow-stack memory as its alternate signal stack. When a signal is later delivered, get_sigframe() computes sp from this shadow-stack address, setup_rt_frame() regular stores fault with EXC_STORE_ACCESS → SIGSEGV. This is a user-triggerable DoS on signal delivery. The equivalent SPMP scenario: ss_sp points to memory covered by an SPMP entry with XWR=010.",
+      "snippet": "void __user *ss_sp = ss->ss_sp;\nsize_t ss_size = ss->ss_size;\n...\nt->sas_ss_sp = (unsigned long) ss_sp;\nt->sas_ss_size = ss_size;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 220,
+          "line_end": 222,
+          "excerpt": "Memory mapped as an SS page cannot be written to by instructions other than ssamoswap.w[], ssamoswap.d[], sspush[], and c.sspush[]."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/mm/fault.c",
+        "function_name": "access_error",
+        "line_start": 249,
+        "line_end": 272,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "For EXC_STORE_PAGE_FAULT, access_error() checks VM_WRITE and returns false for shadow-stack VMAs (which have VM_WRITE set). This is actually correct for the Zicfiss fault model: when a shadow-stack instruction (ssamoswap/sspush) faults on a non-resident SS page, it raises EXC_STORE_PAGE_FAULT (cause=15), not EXC_STORE_ACCESS (cause=7). The kernel must allow handle_mm_fault() to proceed, where pte_mkwrite() detects VM_SHADOW_STACK and calls pte_mkwrite_shstk() to create the R=0,W=1 PTE. The original concern about infinite loops is not valid because a regular store to a present SS page raises EXC_STORE_ACCESS (cause=7), not EXC_STORE_PAGE_FAULT (cause=15). The hardware distinguishes: access fault for regular stores to present SS pages; page fault for SS instructions to non-resident pages.",
+      "snippet": "case EXC_STORE_PAGE_FAULT:\n\tif (!(vma->vm_flags & VM_WRITE)) {\n\t\treturn true;\n\t}\n\tbreak;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 229,
+          "line_end": 241,
+          "excerpt": "Stores to shadow stack pages by instructions other than ssamoswap[], sspush[], and c.sspush[] will trigger a store/AMO access-fault exception, not a store/AMO page-fault exception... allowing for a straightforward distinction between fatal conditions and recoverable faults."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/traps.c",
+        "function_name": "do_trap_store_fault",
+        "line_start": 252,
+        "line_end": 253,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "EXC_STORE_ACCESS (cause=7) is dispatched to do_trap_store_fault which is DO_ERROR_INFO → force_sig(SIGSEGV, SEGV_ACCERR). This handler never checks uaccess fixup tables. When the kernel performs __copy_to_user/__put_user with SR_SUM=1 and the target is a shadow-stack page, the hardware raises EXC_STORE_ACCESS (cause=7). do_trap_store_fault sends SIGSEGV to current without attempting fixup_exception(). This is correct for user-mode accesses (shadow stack is protected) but is incorrect for in-kernel uaccess: the __copy_to_user fixup entry is never consulted. In the signal delivery path (setup_rt_frame calling __put_user via handle_signal), this means the signal frame write failure is unrecoverable — the kernel cannot gracefully return -EFAULT from the uaccess, and instead the process receives SIGSEGV during signal delivery. The Zicfiss spec correctly mandates access faults (not page faults) for this scenario, so this is a kernel design flaw: the kernel's uaccess fixup mechanism is incompatible with the access-fault exception type used by shadow-stack PTE enforcement.",
+      "snippet": "DO_ERROR_INFO(do_trap_store_fault,\n\tSIGSEGV, SEGV_ACCERR, \"store (or AMO) access fault\");",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 220,
+          "line_end": 222,
+          "excerpt": "Memory mapped as an SS page cannot be written to by instructions other than ssamoswap.w[], ssamoswap.d[], sspush[], and c.sspush[]. Attempts will raise a store/AMO access-fault exception."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 229,
+          "line_end": 234,
+          "excerpt": "Stores to shadow stack pages by instructions other than ssamoswap[], sspush[], and c.sspush[] will trigger a store/AMO access-fault exception, not a store/AMO page-fault exception, signaling a fatal error."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "mm/gup.c",
+        "function_name": "check_vma_flags",
+        "line_start": 1227,
+        "line_end": 1241,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "VM_SHADOW_STACK is checked at line 1227 but bypassed by FOLL_FORCE at line 1228-1229. The is_cow_mapping() guard at line 1239 returns true for shadow-stack VMAs (MAP_PRIVATE | VM_MAYWRITE), so FOLL_FORCE+FOLL_WRITE passes. This allows ptrace (PTRACE_POKEDATA via generic_ptrace_pokedata at kernel/ptrace.c:1441-1442) and /proc/pid/mem writes (fs/proc/base.c:931 via access_remote_vm) to obtain writable access to shadow-stack pages. Data is then written via copy_to_user_page (kmap+memcpy at mm/memory.c:7006-7007), bypassing the PTE R=0,W=1 hardware enforcement entirely. This corrupts shadow-stack contents with non-shadow-stack data, violating the fundamental property that only shadow-stack instructions may write to shadow-stack pages.",
+      "snippet": "if (!(vm_flags & VM_WRITE) || (vm_flags & VM_SHADOW_STACK)) {\n\tif (!(gup_flags & FOLL_FORCE))\n\t\treturn -EFAULT;\n\t...\n\tif (!is_cow_mapping(vm_flags))\n\t\treturn -EFAULT;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 243,
+          "line_end": 244,
+          "excerpt": "Operating systems must ensure that no writable, non-shadow-stack alias virtual address mappings exist for the physical memory backing the shadow stack."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "mm/gup.c",
+        "function_name": "can_follow_write_pte",
+        "line_start": 785,
+        "line_end": 800,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "can_follow_write_pte() only checks pte_write(pte) at line 790, which returns true for R=0,W=1 shadow-stack PTEs. There is no shadow-stack-specific PTE check. The VMA-level VM_SHADOW_STACK guard in check_vma_flags() should prevent reaching this code for shadow-stack pages without FOLL_FORCE, but with FOLL_FORCE the VMA guard is bypassed. This function provides no defense-in-depth for the case where check_vma_flags() incorrectly allows FOLL_WRITE on shadow-stack VMAs.",
+      "snippet": "if (pte_write(pte))\n\treturn true;\n\nif (!can_follow_write_common(page, vma, flags))\n\treturn false;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "kernel/ptrace.c",
+        "function_name": "generic_ptrace_pokedata",
+        "line_start": 1436,
+        "line_end": 1444,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "PTRACE_POKEDATA writes to target process memory via ptrace_access_vm() with FOLL_FORCE|FOLL_WRITE. Due to the FOLL_FORCE bypass in check_vma_flags(), this succeeds on shadow-stack pages. The data is written via copy_to_user_page() (kmap+memcpy) which bypasses the hardware PTE R=0,W=1 enforcement. This allows a ptracer to corrupt shadow-stack contents with arbitrary data, breaking the integrity guarantees of Zicfiss shadow stacks. The equivalent SPMP scenario: regular store to memory covered by XWR=010 SPMP entry succeeds via kmap bypass.",
+      "snippet": "copied = ptrace_access_vm(tsk, addr, &data, sizeof(data),\n\t\tFOLL_FORCE | FOLL_WRITE);\nreturn (copied == sizeof(data)) ? 0 : -EIO;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 220,
+          "line_end": 222,
+          "excerpt": "Memory mapped as an SS page cannot be written to by instructions other than ssamoswap.w[], ssamoswap.d[], sspush[], and c.sspush[]."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 243,
+          "line_end": 244,
+          "excerpt": "Operating systems must ensure that no writable, non-shadow-stack alias virtual address mappings exist for the physical memory backing the shadow stack."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "fs/proc/base.c",
+        "function_name": "mem_rw",
+        "line_start": 919,
+        "line_end": 931,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "/proc/pid/mem write uses access_remote_vm() with flags = FOLL_WRITE (and FOLL_FORCE if ptrace-active). Without ptrace permissions, VM_SHADOW_STACK is correctly rejected by check_vma_flags(). With ptrace permissions (FOLL_FORCE), writes to shadow-stack pages succeed via GUP+kmap bypass, corrupting shadow-stack contents. No independent VM_SHADOW_STACK check in the proc mem_rw path itself.",
+      "snippet": "flags = write ? FOLL_WRITE : 0;\nif (proc_mem_foll_force(file, mm))\n\tflags |= FOLL_FORCE;\n...\nthis_len = access_remote_vm(mm, addr, page, this_len, flags);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 220,
+          "line_end": 222,
+          "excerpt": "Memory mapped as an SS page cannot be written to by instructions other than ssamoswap.w[], ssamoswap.d[], sspush[], and c.sspush[]."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/usercfi.c",
+        "function_name": "amo_user_shstk",
+        "line_start": 129,
+        "line_end": 152,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "REFERENCE: The only correct kernel-side write path to user shadow-stack pages. Uses ssamoswap.d instruction (Zicfiss-authorized) with proper __enable_user_access/__disable_user_access and exception table fixup. This is the model for safe shadow-stack writes. Used correctly by save_user_shstk(), restore_user_shstk(), and create_rstor_token(). Contrast with all other paths (signal frame, ptrace, /proc/pid/mem) that use regular store instructions.",
+      "snippet": "asm goto(\".option push\\n\"\n\t\".option arch, +zicfiss\\n\"\n\t\"1: ssamoswap.d %[swap], %[val], %[addr]\\n\"\n\t_ASM_EXTABLE(1b, %l[fault])\n\t\".option pop\\n\"\n\t : [swap] \"=r\" (swap), [addr] \"+A\" (*(__force unsigned long *)addr)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 220,
+          "line_end": 222,
+          "excerpt": "Memory mapped as an SS page cannot be written to by instructions other than ssamoswap.w[], ssamoswap.d[], sspush[], and c.sspush[]."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/pgtable.h",
+        "function_name": "PAGE_SHADOWSTACK",
+        "line_start": 181,
+        "line_end": 181,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "REFERENCE: Defines shadow-stack PTE encoding as _PAGE_BASE|_PAGE_WRITE, producing R=0,W=1,X=0 (+A,D,U). This is the Zicfiss encoding matching spec norm:ss_page_enc. Semantically identical to SPMP XWR=010 encoding. Hardware correctly enforces that regular stores fault on these PTEs. The kernel uses this encoding correctly for user shadow-stack pages.",
+      "snippet": "#define PAGE_SHADOWSTACK       __pgprot(_PAGE_BASE | _PAGE_WRITE)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 209,
+          "line_end": 211,
+          "excerpt": "The encoding R=0, W=1, and X=0, is defined to represent an SS page."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/pgtable.h",
+        "function_name": "pte_mkwrite_shstk",
+        "line_start": 463,
+        "line_end": 466,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "REFERENCE: Creates shadow-stack PTE by clearing _PAGE_LEAF (R/W/X bits) then setting only W. Produces correct R=0,W=1 encoding. Called from pte_mkwrite() when vma->vm_flags & VM_SHADOW_STACK. Correctly used by handle_mm_fault() to create SS PTEs for shadow-stack page faults.",
+      "snippet": "static inline pte_t pte_mkwrite_shstk(pte_t pte)\n{\n\treturn __pte((pte_val(pte) & ~(_PAGE_LEAF)) | _PAGE_WRITE);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 209,
+          "line_end": 211,
+          "excerpt": "The encoding R=0, W=1, and X=0, is defined to represent an SS page."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "ENVCFG_SSE",
+        "line_start": 225,
+        "line_end": 225,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "REFERENCE: Shadow Stack Enable bit (bit 3) in menvcfg/senvcfg. When set, the Zicfiss SS page encoding is active. The kernel sets this via set_shstk_status() when enabling user-mode shadow stacks. This is a prerequisite for hardware enforcement of the R=0,W=1 PTE semantics.",
+      "snippet": "#define ENVCFG_SSE\t\t\t(_AC(1, UL) << 3)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/cfi.adoc",
+          "line_start": 211,
+          "line_end": 213,
+          "excerpt": "When menvcfg[sse]=0, this encoding remains reserved. Similarly, when V=1 and henvcfg[sse]=0, this encoding remains reserved at VS and VU levels."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "CSR_SSP",
+        "line_start": 335,
+        "line_end": 336,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "REFERENCE: CSR_SSP (0x011) definition for the Shadow Stack Pointer. Saved/restored on kernel entry/exit via save_userssp/restore_userssp in entry.S. The kernel correctly manages this CSR in context-switch and exception paths.",
+      "snippet": "/* zicfiss user mode csr.  CSR_SSP holds current shadow stack pointer */\n#define CSR_SSP\t\t\t0x011",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

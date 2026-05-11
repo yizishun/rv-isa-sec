@@ -1,0 +1,53 @@
+PR #2577  target=opensbi  overall=bug_confirmed
+Spec: mcountinhibit.CY is shared between harts sharing mcycle; OpenSBI must save/restore mcountinhibit per-hart during HSM suspend/resume to avoid cross-hart counter inhibit corruption.
+Violation:
+  In OpenSBI HSM suspend/resume, failing to save and restore mcountinhibit on
+  a per-hart basis when mcycle is shared between harts on the same core,
+  causing writes to mcountinhibit.CY from one hart's resume path to corrupt
+  another hart's counter inhibit state.
+Consequence: data_corruption
+Pattern:
+  mcountinhibit save/restore missing or not per-hart in HSM suspend/resume
+  flow; CSR write to mcountinhibit without checking hart-sharing of mcycle.CY
+------------------------------------------------------------
+[bug_confirmed] lib/sbi/sbi_hsm.c:408-433  __sbi_hsm_suspend_non_ret_save
+  mcountinhibit CSR is not saved in the HSM non-retentive suspend save path.
+  On resume, sbi_hart_reinit() -> mstatus_init() unconditionally writes
+  0xFFFFFFF8 to CSR_MCOUNTINHIBIT at lib/sbi/sbi_hart.c:65. Per the RISC-V
+  spec (norm:mcountinhibit_cy_shared), mcountinhibit.CY is shared between
+  harts on the same core when mcycle is shared. Writing 0xFFFFFFF8 (which sets
+  CY=0, enabling mcycle) during one hart's resume corrupts the
+  mcountinhibit.CY state of sibling harts that may have had CY=1 (inhibited)
+  for profiling or power optimization. The saved CSR set (mie, mip, medeleg,
+  mideleg, menvcfg) should also include mcountinhibit.
+  | hdata->saved_mie = csr_read(CSR_MIE);
+  | hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+  | hdata->saved_medeleg = csr_read(CSR_MEDELEG);
+  | hdata->saved_mideleg = csr_read(CSR_MIDELEG);
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+  | /* BUG: mcountinhibit is NOT saved here */
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1644-1646
+      "The mcycle CSR may be shared between harts on the same core, in
+      which case the mcountinhibit.CY field is also shared between those
+      harts, and so write"
+
+[bug_confirmed] lib/sbi/sbi_hart.c:64-65  mstatus_init
+  mstatus_init() unconditionally writes 0xFFFFFFF8 (CY=0, IR=0, HPMn=1) to
+  CSR_MCOUNTINHIBIT on both cold and warm boot (including resume from non-
+  retentive suspend). This is the write that triggers the cross-hart
+  corruption when mcycle is shared: a hart resuming from suspend overwrites
+  mcountinhibit.CY to 0 (enabled) on the shared register, corrupting the
+  inhibit state of any sibling hart that had explicitly set CY=1. The warm-
+  boot resume path should restore mcountinhibit to a saved per-hart value
+  rather than writing a hardcoded default.
+  | /* All programmable counters will start running at runtime after S-mode request */
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_11)
+  | 	csr_write(CSR_MCOUNTINHIBIT, 0xFFFFFFF8);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1644-1646
+      "The mcycle CSR may be shared between harts on the same core, in
+      which case the mcountinhibit.CY field is also shared between those
+      harts, and so write"
+

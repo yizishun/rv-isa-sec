@@ -1,0 +1,219 @@
+PR #2568  target=xiangshan  overall=potential_risk
+Spec: Performance counters and timer (mtime) may continue updating after critical-error entry because their freeze logic is not gated by the critical-error signal, creating a timing side channel observable post-reset and violating the architectural expectation that no architectural state changes in critical-error state
+Violation:
+  In XiangShan RTL, when the hart enters critical-error state (unexpected trap
+  with !Smrnmi or mnstatus.NMIE==0), the CSR module asserts critical-error and
+  ceases execution, but performance counters (mcycle/minstret/mhpmevent*) and
+  the mtime timer in the CLINT/ACLINT module do NOT receive the critical-error
+  stall signal. Specifically, mcycle and minstret in the CSR file may continue
+  incrementing because their clock-gating condition only checks for CSR-
+  counter-enable writes and COUNTINHIBIT bits, not the critical-error signal.
+  The mtime register in the platform timer module is independently clocked and
+  has no critical-error input at all, so it unconditionally continues
+  counting. This means the counter/timer freeze behavior is inconsistent: some
+  counters may stop due to pipeline stall propagation while others continue,
+  and this inconsistency is determined by the microarchitectural signal
+  routing topology rather than any architectural intent.
+Consequence: function_loss
+Pattern:
+  critical_error.*counter|counter.*critical_error|mcycle.*inhibit.*critical|mi
+  nstret.*critical|mtime.*critical_error|COUNTINHIBIT.*critical|csr_write.*MIP
+  .*STIP.*critical|timer.*update.*critical_error
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:329-337  mcycle
+  mcycle unconditionally increments (gated only by !mcountinhibit.CY &&
+  countingEn) and has no criticalErrorState input. During critical-error
+  state, mcycle continues counting because the only gating conditions are
+  COUNTINHIBIT.CY and Smcntrpmf mode filtering (countingEn). This means the
+  cycle counter keeps advancing even though the hart has ceased execution.
+  | val mcycle = Module(new CSRModule("Mcycle", new CounterValueBundle(...)) with HasMachineCounterControlBundle with SmcntrpmfBundle {
+  |   when(w.wen) {
+  |     reg := w.wdata
+  |   }.elsewhen(!this.mcountinhibit.CY.asUInt.asBool && countingEn) {
+  |     reg := reg.ALL.asUInt + 1.U
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:502-507
+      "When the Smrnmi extension is not implemented, or if the Smrnmi
+      extension is implemented and mnstatus.NMIE is 0, the hart enters a
+      critical-error state"
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:340-348  minstret
+  minstret gating includes `robCommit.instNum.valid` which depends on ROB
+  commit. Since criticalErrorState blocks ROB commit (Rob.scala:800-801),
+  minstret implicitly stops during critical-error. However, this is a
+  microarchitectural side effect, not an intentional freeze. The inconsistency
+  (mcycle continues, minstret stops) means the IPC observable via these CSRs
+  drops to zero during critical-error, leaking the critical-error state to
+  software that can read the counters.
+  | val minstret = Module(new CSRModule("Minstret", new CounterValueBundle(...)) with HasMachineCounterControlBundle with HasRobCommitBundle with SmcntrpmfBundle {
+  |   when(w.wen) {
+  |     reg := w.wdata
+  |   }.elsewhen(!this.mcountinhibit.IR && robCommit.instNum.valid && countingEn) {
+  |     reg := reg.ALL.asUInt + robCommit.instNum.bits
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:502-507
+      "When the Smrnmi extension is not implemented... the hart enters a
+      critical-error state... Whether performance counters and timers are
+      updated in the c"
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:350-365  mhpmcounters
+  mhpmcounter3-31 gating uses `perf.value =/= 0.U && !countingInhibit`, where
+  countingInhibit = mcountinhibit.asUInt(num) | !countingEn. There is no
+  criticalErrorState input to freeze these counters. Behavior during critical-
+  error depends on whether each counter's event source (backend events,
+  frontend events, L2 events, LSU events) still fires while the pipeline is
+  stalled. This creates per-event-source inconsistency: some HPM counters may
+  continue counting while others stop, all determined by microarchitectural
+  signal topology.
+  | val mhpmcounters: Seq[CSRModule[_]] = (3 to 0x1F).map(num =>
+  |   Module(new CSRModule(s"Mhpmcounter$num", new MhpmcounterBundle) with ... HasPerfCounterBundle {
+  |     val countingInhibit = this.mcountinhibit.asUInt(num) | !countingEn
+  |     ...
+  |     }.elsewhen (perf.value =/= 0.U && !countingInhibit) {
+  |       reg := counterAdd.tail(1)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:502-507
+      "hart enters a critical-error state... Whether performance counters
+      and timers are updated in the critical-error state is UNSPECIFIED."
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:285-286  criticalErrorState
+  criticalErrorState is a sticky register set when
+  io.fromTop.criticalErrorState (backend/ROB critical errors) OR
+  criticalErrorStateInCSR (CSR-detected double trap) fires. Correctly
+  implements one-shot latch semantics: once set, remains set until reset.
+  Propagation path is correct: CSR detects double trap → criticalErrorState
+  latched → filtered by CETRIG → output via io.status.criticalErrorState.
+  | val criticalErrorStateInCSR = Wire(Bool())
+  | val criticalErrorState = RegEnable(true.B, false.B, io.fromTop.criticalErrorState || criticalErrorStateInCSR)
+  References:
+    - riscv-isa-manual/src/priv/smdbltrp.adoc:4-11
+      "The Smdbltrp extension addresses a double trap in M-mode... enables
+      invocation of the RNMI handler on a double trap in M-mode to handle
+      the critical e"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1531-1534  criticalErrorStateInCSR
+  CSR critical-error detection correctly implements the spec-defined
+  condition: !mnstatus.NMIE (NMIE already cleared from prior NMI) AND hasTrap
+  (new trap occurring) AND !entryDebugMode. This matches the RISC-V Smrnmi
+  spec: a double-trap during NMI handler (NMIE=0) when not entering debug
+  mode. The single trigger condition is correct per spec.
+  | val criticalErrors = Seq(
+  |   ("csr_dbltrp_inMN", !mnstatus.regOut.NMIE && hasTrap && !entryDebugMode),
+  | )
+  | criticalErrorStateInCSR := criticalErrors.map(criticalError => criticalError._2).reduce(_ || _).asBool
+  References:
+    - riscv-isa-manual/src/priv/smrnmi.adoc:161-161
+      "If the hart encounters an exception while executing in M-mode with
+      the mnstatus.NMIE bit clear, the actions taken are the same as if
+      the exception had"
+    - riscv-isa-manual/src/priv/machine.adoc:502-507
+      "When the Smrnmi extension is not implemented, or if the Smrnmi
+      extension is implemented and mnstatus.NMIE is 0, the hart enters a
+      critical-error state"
+
+[potential_risk] src/main/scala/xiangshan/backend/rob/Rob.scala:788-804  blockCommit
+  criticalErrorState blocks ROB commit (line 800-801), which causes the
+  pipeline to stall indirectly. This blocks minstret increment (via
+  instNum.valid=0) but does NOT block mcycle or mtime. The critical-error
+  execution-cease mechanism operates entirely through the ROB commit path —
+  there is no explicit fetch-stage or decode-stage stall signal. This means
+  while instructions stop retiring, the frontend may continue fetching and the
+  issue queue may continue issuing (until backpressure propagates).
+  Performance counters linked to frontend events could continue counting
+  during the window between critical-error assertion and full pipeline
+  backpressure.
+  | val criticalErrorState = io.csr.criticalErrorState
+  | ...
+  | val blockCommit = misPredBlock || lastCycleFlush || hasWFI || io.redirect.valid ||
+  |   (deqNeedFlush && !deqHasFlushed) || deqFlushBlock || criticalErrorState || traceBlock
+  | ...
+  | io.commits.isCommit := state === s_idle && !blockCommit
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:502-507
+      "the hart enters a critical-error state without updating any
+      architectural state, including the pc. This state involves ceasing
+      execution... Whether pe"
+
+[potential_risk] src/main/scala/device/SYSCNT.scala:86-151  mtime increment
+  mtime operates in an independent rtc_clock domain and has no critical_error
+  input. The stop_en input, which could freeze mtime, is hardwired to false.B
+  in Top.scala:333. The timer unconditionally advances in the critical-error
+  state. This is architecturally allowed (mtime is shared across harts), but
+  the inconsistency with minstret (which does stop) creates an observable side
+  channel: software reading both mtime and minstret can detect the critical-
+  error condition via diverging counter behavior.
+  | val time = withClockAndReset(rtc_clock, rtc_reset)(RegInit(0.U(timeWidth.W)))
+  | ...
+  | }.elsewhen(stop_sync) {
+  |   time := time
+  | }.otherwise {
+  |   time := time + (1.U << incwidth_mux)
+  | }
+  | io.time.bits  := time
+  | io.time.valid := time_en
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1658-1659
+      "Because the mtime counter can be shared between multiple cores, it
+      cannot be inhibited with the mcountinhibit mechanism."
+
+[potential_risk] src/main/scala/device/TIMER.scala:86-105  mtip generation
+  The TIMER module's mtip generation (`time >= timecmp`) continues computing
+  during critical-error because mtime (fed from SYSCNT) never stops. During
+  critical-error, all interrupts including NMIs are disabled per spec, so the
+  mtip signal should not cause a trap. However, the mtip bit in mip may
+  continue toggling. A platform-level monitor or a second hart reading the
+  first hart's interrupt state via MMIO could observe this toggling and infer
+  the first hart's critical-error state, which is a cross-hart information
+  leak.
+  | val time = RegInit(0.U(timeWidth.W))
+  | when(io.time.valid)(time := io.time.bits)
+  | ...
+  | int(1) := ShiftRegister(time.asUInt >= timecmp(io.hartId).asUInt, params.intStages) // mtip
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:502-507
+      "This state involves ceasing execution, disabling all interrupts
+      (including NMIs), and asserting a critical-error signal to the
+      platform. Whether perfo"
+
+[compliant] src/main/scala/top/Top.scala:330-333  stop_en hardwiring
+  SYSCNT stop_en is hardwired to false.B, meaning mtime is intentionally never
+  stopped. This is a deliberate platform-level design choice and is consistent
+  with the RISC-V spec note that mtime is shared across harts and cannot be
+  inhibited per-hart. There is no critical_error signal routed to the SYSCNT
+  stop_en port.
+  | misc.module.scntIO.update_en := false.B
+  | misc.module.scntIO.update_value := 0.U
+  | misc.module.scntIO.stop_en := false.B
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1658-1659
+      "Because the mtime counter can be shared between multiple cores, it
+      cannot be inhibited with the mcountinhibit mechanism."
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:279-283  debugModeStopCount/Time
+  debugModeStopCount and debugModeStopTime correctly implement the
+  dcsr.STOPCOUNT and dcsr.STOPTIME debug mode counter-stop mechanism. These
+  gates are applied only to the unprivileged shadow CSRs (cycle, instret,
+  time) in Unprivileged.scala, not to the machine-level counters themselves.
+  This separation is correct per spec: debug-mode stop affects only the read-
+  only shadows, while mcycle/minstret continue counting. However, there is no
+  equivalent freeze mechanism for the critical-error state.
+  | val debugModeStopCountNext = debugMode && dcsr.regOut.STOPCOUNT
+  | val debugModeStopTimeNext  = debugMode && dcsr.regOut.STOPTIME
+  | val debugModeStopCount = RegNext(debugModeStopCountNext)
+  | val unprivCountUpdate  = !debugModeStopCount && debugModeStopCountNext
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:302-302  sstcInterruptGen
+  The SstcInterruptGen module (sstcIRGen) generates STIP/VSTIP interrupts
+  based on stimecmp/vstimecmp comparison with mtime. During critical-error,
+  mtime continues advancing, so STIP can transition. Although interrupts are
+  disabled in critical-error, the mip.STIP bit itself may change. If a second
+  hart or an external debugger reads this hart's mip CSR via MMIO (SBA), it
+  can observe STIP changes and infer the critical-error timing, constituting a
+  cross-observer timing leak.
+  | val sstcIRGen = Module(new SstcInterruptGen)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:502-507
+      "This state involves ceasing execution, disabling all interrupts
+      (including NMIs)... Whether performance counters and timers are
+      updated in the critica"
+

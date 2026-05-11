@@ -1,0 +1,110 @@
+PR #2572  target=freebsd-src  overall=not_implemented
+Spec: FreeBSD's vector context-switch code must clear vstart before using whole-register load/store/move instructions, as vstart >= evl is now reserved (implementation-defined) rather than the prior well-defined no-op behavior, risking silent register corruption on implementations that trap or misbehave
+Violation:
+  In the FreeBSD kernel, vector context-switch save/restore paths (e.g., in
+  cpu_switch(), set_fpcontext(), or get_fpcontext()) that use whole-register
+  load/store instructions (vl1r.v, vs1r.v, etc.) or the vmv<nr>r.v move
+  instructions without first ensuring vstart < evl (where evl = NFIELDS * VLEN
+  / EEW). This can occur when a vector instruction was interrupted mid-
+  execution, leaving vstart non-zero, and the kernel subsequently uses whole-
+  register instructions to save or restore vector state without explicitly
+  clearing vstart. Under the new spec, vstart >= evl makes these instructions
+  reserved (implementation-defined behavior), whereas previously the behavior
+  was well-defined (no elements written).
+Consequence: data_corruption
+Pattern:
+  vsetvli.*vstart|csrw.*vstart|csrr.*vstart|vl[1248]r|vs[1248]r|vmv[1248]r\.v|
+  whole.register.*save|whole.register.*restore|vector.*context.*switch|fpu.*co
+  ntext.*switch
+------------------------------------------------------------
+[not_implemented] sys/riscv/riscv/swtch.S:258-358  cpu_switch
+  The FreeBSD RISC-V kernel has no vector (V ISA extension) support.
+  cpu_switch() saves/restores only scalar integer registers (ra, sp, s0-s11)
+  and scalar FP registers (via __fpe_state_save/__fpe_state_load). No vector
+  registers (v0-v31), vstart CSR, vtype CSR, vl CSR, or vcsr are saved or
+  restored. No whole-register vector instructions (vl1r.v, vs1r.v, vmv<nr>r.v)
+  are used anywhere in the kernel. The vstart-vs-whole-register vulnerability
+  is not present because the kernel does not implement vector context
+  switching at all.
+  | /* Save the old context */
+  | mv	a1, a0
+  | addi	a1, a1, PCB_S0	/* &pcb_s[] */
+  | REG_S	s0, (0 * 8)(a1)
+  | ...
+  | /* FPU context. */
+  | beqz	t0, .Lload_fpe_ctx
+  | CALL	switch_vfp_context
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:2117-2125
+      "The instructions operate with an effective vector length,
+      evl=NFIELDS*VLEN/EEW, regardless of current settings in vtype and
+      vl. The usual property tha"
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:4852-4857
+      "The usual property that no elements are written if vstart >= vl
+      does not apply to these instructions. Similarly, the property that
+      the instructions ar"
+
+[not_implemented] sys/riscv/riscv/swtch.S:206-248  cpu_throw
+  cpu_throw() switches to a new thread without saving the old thread's state.
+  For FP, it checks sstatus.FS and calls __fpe_state_load if FP is enabled. No
+  vector state initialization or vstart clearing is performed because vector
+  support is not implemented.
+  | /* Check if new thread has FP enabled */
+  | ld	t0, TD_PCB(t1)
+  | ld	t0, PCB_FLAGS(t0)
+  | andi	t0, t0, PCB_FP_ENABLED
+  | beqz	t0, .Lthrow_restore
+  | CALL	__fpe_state_load
+
+[not_implemented] sys/riscv/riscv/swtch.S:434-457  savectx
+  savectx() saves callee-saved integer registers plus scalar FP state via
+  __fpe_state_save. No vector state (v0-v31, vstart, vtype, vl, vcsr) is saved
+  because vector support is not implemented.
+  | CALL	__fpe_state_save
+  | ret
+
+[not_implemented] sys/riscv/riscv/exec_machdep.c:265-292  get_fpcontext
+  get_fpcontext() saves only scalar FP state (pcb_x[32][2] and pcb_fcsr) to
+  the mcontext. No vector register state or vstart/vtype/vl CSR values are
+  saved. The mc_spare[8] field in struct __mcontext is unused and could serve
+  as expansion space for future vector context.
+  | if (td == curthread)
+  | 	fpe_state_save(td);
+  | bcopy(&pcb->pcb_x, &mcp->mc_fpregs.fp_x, sizeof(pcb->pcb_x));
+  | mcp->mc_fpregs.fp_fcsr = pcb->pcb_fcsr;
+
+[not_implemented] sys/riscv/riscv/exec_machdep.c:295-315  set_fpcontext
+  set_fpcontext() restores only scalar FP state from mcontext to PCB. No
+  vector register state or vstart/vtype/vl CSR values are restored. If vector
+  support is added, clearing vstart before any whole-register save/restore
+  would be mandatory.
+  | bcopy(&mcp->mc_fpregs.fp_x, &pcb->pcb_x, sizeof(pcb->pcb_x));
+  | pcb->pcb_fcsr = mcp->mc_fpregs.fp_fcsr;
+  | if ((mcp->mc_flags & _MC_FP_VALID) != 0)
+  | 	pcb->pcb_flags |= PCB_FP_ENABLED;
+
+[not_implemented] sys/riscv/riscv/identcpu.c:261-333  parse_riscv_isa
+  parse_riscv_isa() parses single-letter ISA extensions but has no case for
+  'v' (vector). An ISA string containing 'v' would fall through to the default
+  case (line 323-326) and be silently ignored. HWCAP_ISA_V is not defined in
+  sys/riscv/include/elf.h.
+  | switch (c) {
+  | case 'a': ...
+  | case 'f': ...
+  | default:
+  | 	/* Unknown extension, ignore silently */
+  | 	break;
+
+[not_implemented] sys/riscv/include/pcb.h:42-54  struct pcb
+  struct pcb has fields for scalar FP state only (pcb_x[32][2], pcb_fcsr). No
+  fields for vector register state (v0-v31, 32*VLEN bits each), vstart, vtype,
+  vl, vcsr, or vlenb CSRs. The structure would need significant expansion for
+  vector support.
+  | struct pcb {
+  | 	register_t	pcb_ra;
+  | 	...
+  | 	uint64_t	pcb_x[32][2];
+  | 	uint64_t	pcb_fcsr;
+  | 	uint32_t	pcb_flags;
+  | };
+

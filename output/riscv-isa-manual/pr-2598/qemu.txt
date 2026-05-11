@@ -1,0 +1,111 @@
+PR #2598  target=qemu  overall=compliant
+Spec: QEMU TCG TranslationBlock cache may serve stale host code indefinitely after cross-hart guest code modification when Ziccid is advertised, violating Ziccid's store-to-instruction-fetch eventual-visibility guarantee
+Violation:
+  QEMU TCG advertises Ziccid in ISA string but does not flush/invalidate stale
+  TranslationBlocks for cacheable+coherent memory regions when another hart
+  modifies instruction memory without an explicit FENCE.I. Ziccid requires
+  that stores eventually become visible to all harts' instruction fetches; in
+  QEMU TCG this translates to eventually invalidating cached TBs for modified
+  guest code pages. If QEMU relies solely on FENCE.I-triggered TB flushes and
+  lacks a mechanism (e.g., periodic or write-triggered TB invalidation on
+  cross-hart stores to executable pages) to ensure eventual visibility, a
+  guest JIT compiler thread storing new code will have its stores indefinitely
+  invisible to other harts' instruction fetches, causing those harts to
+  execute stale (pre-modification) translated host code.
+Consequence: data_corruption
+Pattern:
+  tb_flush|tb_invalidate_phys_page|FENCE_I|fence_i|helper_fence_i|Ziccid|zicci
+  d|tb_jmp_cache|CODE_GEN_PHYS_HASH
+------------------------------------------------------------
+[compliant] target/riscv/cpu.c:124-149  isa_edata_arr
+  Ziccid is NOT present in isa_edata_arr. QEMU correctly does not advertise
+  'ziccid' in the ISA string since Ziccid is not a ratified RISC-V extension —
+  it only appears in RVA23/RVB23 profile notes as a possible future option.
+  Adding ziccid to the ISA string without implementing Ziccid-specific
+  coherence semantics would be a bug, but no such addition is present.
+  | ISA_EXT_DATA_ENTRY(ziccamoa, PRIV_VERSION_1_11_0, has_priv_1_11),
+  | ISA_EXT_DATA_ENTRY(ziccif, PRIV_VERSION_1_11_0, has_priv_1_11),
+  | ISA_EXT_DATA_ENTRY(zicclsm, PRIV_VERSION_1_11_0, has_priv_1_11),
+  | ISA_EXT_DATA_ENTRY(ziccrse, PRIV_VERSION_1_11_0, ext_ziccrse),
+  References:
+    - riscv-isa-manual/src/profiles/rva23.adoc:184-187
+      "NOTE: ext:zifencei[] is mandated as it is the only standard way to
+      support instruction-cache coherence in RVA23 application processors.
+      A new instruct"
+
+[compliant] target/riscv/cpu_cfg_fields.h.inc:1-200  RISCVCPUConfig
+  No ext_ziccid field exists in RISCVCPUConfig. There is no config knob to
+  enable Ziccid, consistent with the extension not being ratified. The closest
+  cache-related fields are ext_ziccrse and the Zicbom/Zicboz/Zicbop extensions
+  (ext_zicbom, ext_zicboz, ext_zicbop).
+  | (no ext_ziccid field in cpu_cfg_fields.h.inc)
+
+[compliant] accel/tcg/cputlb.c:1336-1358  notdirty_write
+  The generic TCG notdirty_write mechanism provides eventual cross-hart
+  instruction-fetch visibility: on the first write to any RAM page marked
+  clean for code tracking, tb_invalidate_phys_range_fast() is called, which
+  globally invalidates all TBs on all vCPUs for the affected physical range
+  via do_tb_phys_invalidate() — removing from the global htable, all CPU jmp
+  caches, and all jmp lists. This functionally achieves what Ziccid would
+  require (eventual instruction-fetch coherence without explicit FENCE.I),
+  though it is a general QEMU mechanism rather than RISC-V-specific Ziccid
+  implementation.
+  | if (!physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
+  |     tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);
+  | }
+  | physical_memory_set_dirty_range(ram_addr, size, DIRTY_CLIENTS_NOCODE);
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-75
+      "FENCE.I does not ensure that other RISC-V harts' instruction
+      fetches will observe the local hart's stores in a multiprocessor
+      system. To make a store "
+
+[compliant] accel/tcg/tb-maint.c:921-960  do_tb_phys_invalidate
+  do_tb_phys_invalidate() performs complete global TB invalidation: removes
+  from tb_ctx.htable (global hash), removes from all CPU jmp caches via
+  CPU_FOREACH in tb_jmp_cache_inval_tb(), removes from page list, and unlinks
+  from all jump chains. This ensures that after a write to a code page, no
+  hart can execute the stale TB through any fast-path lookup. The mechanism
+  provides the eventual-visibility guarantee Ziccid would require.
+  | if (!qht_remove(&tb_ctx.htable, tb, h)) {
+  |     return;
+  | }
+  | tb_jmp_cache_inval_tb(tb);
+  | tb_remove_from_jmp_list(tb, 0);
+  | tb_remove_from_jmp_list(tb, 1);
+  | tb_jmp_unlink(tb);
+
+[compliant] target/riscv/insn_trans/trans_rvi.c.inc:970-984  trans_fence_i
+  FENCE.I is correctly implemented as a TB-ending no-op in QEMU TCG. The
+  comment explains: 'FENCE_I is a no-op in QEMU, however we need to end the
+  translation block.' This is correct because QEMU has no emulated I-cache —
+  TB invalidation is handled by the generic notdirty_write mechanism on actual
+  writes to code pages. FENCE.I does NOT flush TBs globally (it only ends the
+  current TB), but this is correct per spec: FENCE.I only synchronizes a
+  single hart's instruction fetches with its own prior stores. Cross-hart
+  coherence requires additional FENCE + IPI + remote FENCE.I, which is a guest
+  software responsibility.
+  | /*
+  |  * FENCE_I is a no-op in QEMU,
+  |  * however we need to end the translation block
+  |  */
+  | gen_update_pc(ctx, ctx->cur_insn_len);
+  | exit_tb(ctx);
+  References:
+    - riscv-isa-manual/src/unpriv/zifencei.adoc:66-80
+      "RISC-V does not guarantee that stores to instruction memory will be
+      made visible to instruction fetches on a RISC-V hart until that hart
+      executes a FE"
+
+[compliant] target/riscv/cpu.c:2874-2893  riscv_isa_string
+  ISA string construction correctly excludes ziccid since no entry exists in
+  isa_edata_arr. The ISA string will contain zifencei (if enabled) but not
+  ziccid. This is correct behavior for an unratified extension.
+  | for (edata = isa_edata_arr; edata && edata->name; edata++) {
+  |     if (isa_ext_is_enabled(cpu, edata->ext_enable_offset)) {
+  |         new = g_strconcat(old, "_", edata->name, NULL);
+  |         g_free(old);
+  |         old = new;
+  |     }
+  | }
+

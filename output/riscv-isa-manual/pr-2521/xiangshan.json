@@ -1,0 +1,85 @@
+{
+  "pr_number": 2521,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 2521,
+    "violation_condition": "When the XiangShan SPMP checker's permission-decision hardware (a combinational decoder mapping {spmpcfg[i].SHARED, spmpcfg[i].U, spmpcfg[i].RWX, sstatus.SUM, effective_priv_mode, access_type} to {Deny, Enforce, EnforceNoX, Reserved}) incorrectly encodes any row of the SPMP Encoding Table, e.g., treating a Reserved encoding (RWX=010 or RWX=011, or SHARED=1 with U=0) as Enforce instead of raising a fault, or incorrectly evaluating the sstatus.SUM-dependent S-mode access path such that an S-mode access to a U-mode rule with SUM=0 is Enforced instead of Denied. This is a pure combinational-logic correctness hazard: the decoder is a new hardware block with 4 input variables (SHARED, U, RWX[2:0], SUM) producing per-access-type decisions; a single bit error in the Chisel `switch`/`Mux` tree or an incorrect default case silently inverts the access-control outcome.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "MuxLookup|switch|is.|=== .U|=== .SHARED|VecInit|MuxCase.*spmpcfg|Mux.*sstatus.*SUM.*spmp",
+    "affected_entities": [
+      "spmpcfg",
+      "sstatus.SUM",
+      "SPMPChecker",
+      "spmpaddr"
+    ],
+    "summary": "SPMP permission decoder must bit-exactly match the 6-row×4-column encoding table in the spec; any Chisel Mux/switch mis-encoding in the {SHARED, U, RWX, SUM}→{Deny,Enforce,EnforceNoX} logic creates a hardware privilege escape where S/U-mode accesses bypass physical memory restrictions"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/PMP.scala",
+        "function_name": "PMPChecker",
+        "line_start": 556,
+        "line_end": 617,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "SPMP (Sspmp) is not implemented in XiangShan RTL. The existing PMPChecker module performs only M-mode PMP+PMA+KeyID checks (resp = resp_pmp | resp_pma | resp_keyid at line 610) with no SPMP path. SPMP would require a new combinational decoder mapping {SHARED, U, RWX[2:0], sstatus.SUM} to {Deny, Enforce, EnforceNoX} per the SPMP Encoding Table, but no such logic exists. The PMPConfig bundle (lines 41-61) uses the M-mode bit layout (L, A[1:0], X, W, R) which is incompatible with SPMP's bit layout (SHARED, U, RWX[2:0]).",
+      "snippet": "resp := resp_pmp | resp_pma | resp_keyid\n// ...\n// No SPMP path exists in the checker\n// PMPConfig uses M-mode layout: L, A, X, W, R, not SPMP's SHARED, U, RWX",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRPMP.scala",
+        "function_name": "CSRPMP",
+        "line_start": 15,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "No SPMP CSR registers (spmpcfg0-3 at 0x1CC-0x1CF, spmpaddr0-63 at 0x1D0+) are defined. Only M-mode pmpcfg (0x3A0) and pmpaddr (0x3B0) CSRs exist. An SPMP implementation would require analogous CSRSPMP trait with S-mode-accessible addresses, and an SPMPCfgBundle with the SPMP-specific bit fields (SHARED, U, RWX[2:0]) at their correct positions.",
+      "snippet": "// Only PMP CSR addresses defined:\n// pmpcfg0-3 at 0x3A0-0x3A3\n// pmpaddr0-63 at 0x3B0-0x3EF\n// No spmpcfg (0x1CC) or spmpaddr (0x1D0) CSRs exist",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRIND.scala",
+        "function_name": "mireg2-mireg6 CSRIND",
+        "line_start": 17,
+        "line_end": 40,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The Smpmpind indirect-access CSR registers (mireg2-mireg6) are hardwired to zero (regOut := 0.U). For SPMP support, these would need to be replaced with real indirect-access routing logic to provide S-mode access to pmpcfg/pmpaddr CSRs through mseccfg.MMWP-mediated remapping. This is a prerequisite for the Sspmp extension's S-mode PMP access mechanism.",
+      "snippet": "regOut := 0.U  // hardwired to zero, no SPMP indirect-access routing",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "mseccfg CSR",
+        "line_start": 319,
+        "line_end": 327,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The mseccfg CSR fields MMWP (bit 1), MML (bit 0), and RLB (bit 2) are all defined as RO (Read-Only) with reset=0, hardwired to zero. For Sspmp, MMWP must be writable to enable the Smpmpind indirect CSR access window (SPMP relies on MMWP=1 to remap mseccfg.SPMPC to activate the SPMP encoding table). The current RO hardwiring prevents any SPMP enablement.",
+      "snippet": "// MMWP at line 325: RO(1), hardwired to 0\n// MML  at line 326: RO(0), hardwired to 0\n// RLB  at line 324: RO(2), hardwired to 0",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "CSR address constants",
+        "line_start": 171,
+        "line_end": 250,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "No SPMP-related CSR address constants (spmpcfg, spmpaddr) are defined in the CSR address decoding table. Only M-mode pmpcfg and pmpaddr addresses exist. The instruction decoder cannot route S-mode SPMP CSR accesses.",
+      "snippet": "// Only pmpcfg0-15 (0x3A0-0x3AF) and pmpaddr0-63 (0x3B0-0x3EF) defined\n// No spmpcfg (0x1CC-0x1CF) or spmpaddr (0x1D0+) CSR address constants",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

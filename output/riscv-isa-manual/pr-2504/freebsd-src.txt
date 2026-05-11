@@ -1,0 +1,75 @@
+PR #2504  target=freebsd-src  overall=potential_risk
+Spec: S-mode direct stimecmp access traps fatally when menvcfg.STCE=0; FreeBSD must gate stimecmp usage on STCE probe before touching the CSR
+Violation:
+  FreeBSD kernel (S-mode) executes a CSR read or write to stimecmp when
+  menvcfg.STCE=0 — either because OpenSBI/boot firmware never set the STCE
+  bit, or because M-mode software dynamically cleared it. The resulting
+  illegal-instruction exception is fatal in kernel mode.
+Consequence: denial_of_service
+Pattern:
+  csr_read\(.*stimecmp.*\)|csr_write\(.*stimecmp.*\)|CSR_STIMECMP|csrr.*stimec
+  mp|csrw.*stimecmp
+------------------------------------------------------------
+[potential_risk] sys/riscv/riscv/timer.c:88-96  set_timecmp
+  FreeBSD S-mode kernel writes to stimecmp CSR guarded only by has_sstc
+  (derived from ISA string parsing), without verifying menvcfg.STCE is set by
+  M-mode firmware. Per spec (machine.adoc:2233-2235), when menvcfg.STCE=0, any
+  non-M-mode access to stimecmp raises an illegal-instruction exception, which
+  is fatal in kernel mode. If M-mode firmware advertises Sstc in ISA string
+  but fails to set or later clears menvcfg.STCE, the kernel panics.
+  | if (has_sstc)
+  | 	csr_write(stimecmp, timecmp);
+  | else
+  | 	sbi_set_timer(timecmp);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2231-2239
+      "The Sstc extension adds the STCE (STimecmp Enable) bit to menvcfg
+      CSR. The STCE bit enables stimecmp for S-mode when set to one. When
+      this extension i"
+    - riscv-isa-manual/src/priv/sstc.adoc:13-24
+      "This extension serves to provide supervisor mode with its own CSR-
+      based timer interrupt facility that it can directly manage to
+      provide its own timer "
+
+[potential_risk] sys/riscv/riscv/timer.c:140-155  riscv_timer_intr
+  Timer interrupt handler writes to stimecmp CSR (writing -1UL to disable the
+  timer interrupt) guarded by the same has_sstc flag. Same vulnerability as
+  set_timecmp: if menvcfg.STCE is not actually set by M-mode, the
+  csr_write(stimecmp, -1UL) will cause a fatal illegal-instruction exception
+  in the interrupt handler context.
+  | if (has_sstc)
+  | 	csr_write(stimecmp, -1UL);
+  | else
+  | 	sbi_set_timer(-1UL);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2231-2239
+      "When this extension is implemented and STCE in menvcfg is zero, an
+      attempt to access stimecmp in a mode other than M-mode raises an
+      illegal-instructio"
+
+[potential_risk] sys/riscv/riscv/identcpu.c:464-467  identify_cpu_smode_extensions
+  has_sstc is derived from ISA string parsing (SV_SSTC bit in
+  smode_extensions), not from reading menvcfg.STCE. FreeBSD runs in S-mode and
+  cannot read menvcfg directly. The ISA string advertising 'sstc' does not
+  guarantee menvcfg.STCE is currently set. This creates the dependency chain:
+  ISA string → has_sstc → direct stimecmp access, with no M-mode state
+  verification.
+  | UPDATE_CAP(has_sstc, (desc->smode_extensions & SV_SSTC) != 0);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2233-2236
+      "The STCE bit enables stimecmp for S-mode when set to one. When this
+      extension is implemented and STCE in menvcfg is zero, an attempt to
+      access stimecm"
+
+[compliant] sys/riscv/vmm/vmm_riscv.c:631-632  vmx_run_vcpu
+  bhyye hypervisor correctly sets henvcfg.STCE=1 when Sstc is available,
+  enabling vstimecmp for VS-mode guests. This follows the spec requirement
+  that HS-mode must set henvcfg.STCE to enable VS-mode stimecmp access. The
+  code explicitly writes csr_write(henvcfg, HENVCFG_STCE) after checking
+  has_sstc.
+  | if (has_sstc)
+  | 	csr_write(henvcfg, HENVCFG_STCE);
+  References:
+    - riscv-isa-manual/src/priv/sstc.adoc:21-24
+      "This extension adds the STCE bit to the menvcfg and henvcfg CSRs."
+
