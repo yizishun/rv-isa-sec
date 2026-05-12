@@ -1,0 +1,170 @@
+PR #1302  target=xiangshan  overall=potential_risk
+Spec: mseccfg CSR unconditionally present in hardware CSR map despite spec requiring it exist only when at least one of Zkr/Smmpm/Zicfilp/Smepmp is implemented; software probing for extension support via CSR trap behavior will incorrectly detect mseccfg capability
+Violation:
+  In XiangShan RTL, mseccfg (0x747) and mseccfgh (0x757) are unconditionally
+  instantiated as CSRModules and always present in the csrRwMap, regardless of
+  which extensions are configured. Per the updated spec, mseccfg must exist if
+  and only if Sm >= 1.12 AND at least one of {Zkr, Smmpm, Zicfilp, Smepmp} is
+  implemented. When XiangShan is synthesized with none of these extensions
+  enabled, any M-mode CSR access to 0x747/0x757 will succeed (reading back
+  zero-filled RO fields) instead of raising an illegal instruction exception
+  as required. The noCSRIllegal check at NewCSR.scala:1021 will never flag
+  this address as invalid because mseccfg is an unconditional key in csrRwMap.
+Consequence: info_leak
+Pattern:
+  mseccfg.*CSRModule|CSRModule\("Mseccfg"|csrRwMap.*mseccfg|machineLevelCSRMod
+  s.*mseccfg|noCSRIllegal.*mseccfg|setAddr\(CSRs\.mseccfg\)
+------------------------------------------------------------
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:319-327  mseccfg (CSRModule instantiation)
+  mseccfg CSRModule is unconditionally instantiated in the MachineLevel scope
+  (line 319) and unconditionally added to machineLevelCSRMods (line 462). Per
+  spec norm:mseccfg_presence (machine.adoc:2335), mseccfg 'exists if any
+  extension that adds a field to mseccfg is implemented. Otherwise, it is
+  reserved.' The current default XiangShan config includes 'smmpm' in
+  ISAExtensions (Parameters.scala:297), so mseccfg correctly exists for that
+  config. However, the RTL has NO conditional gating mechanism — if a
+  configuration removes smmpm (and doesn't add zkr/smepmp/zicfilp), mseccfg
+  would still be present and accessible, violating the 'otherwise reserved'
+  rule. This is a parameterization robustness gap.
+  | val mseccfg = Module(new CSRModule("Mseccfg", new CSRBundle {
+  |     val PMM   = EnvPMM(33, 32, wNoEffect).withReset(EnvPMM.Disable)...
+  |     val MLPE  = RO(10)...
+  |     val SSEED = RO( 9)...
+  |     val USEED = RO( 8)...
+  |     val RLB   = RO( 2)...
+  |     val MMWP  = RO( 1)...
+  |     val MML   = RO( 0)...
+  |   })).setAddr(CSRs.mseccfg)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2335-2335
+      "[#norm:mseccfg_presence]#It exists if any extension that adds a
+      field to `mseccfg` is implemented. Otherwise, it is reserved.#"
+    - riscv-isa-manual/src/priv/csrs.adoc:46-48
+      "Instructions that access a non-existent CSR are reserved.
+      [#norm:Zicsr_illegal_mode]#Attempts to access a CSR without
+      appropriate privilege level rais"
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:462-462  machineLevelCSRMods (mseccfg in module list)
+  mseccfg is unconditionally listed in machineLevelCSRMods: Seq[CSRModule[_]]
+  at line 462, which feeds directly into machineLevelCSRMap (line 484) and
+  then into csrRwMap (NewCSR.scala:320-321). There is no if-guard or
+  conditional expression around this entry. The noCSRIllegal check
+  (NewCSR.scala:1021) iterates csrRwMap.keys, so 0x747 will always be
+  considered a legal CSR address regardless of which extensions are actually
+  configured.
+  | mseccfg,
+  |     mcycle,
+  |     minstret,
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2335-2335
+      "[#norm:mseccfg_presence]#It exists if any extension that adds a
+      field to `mseccfg` is implemented. Otherwise, it is reserved.#"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1021-1021  noCSRIllegal (CSR address legality check)
+  The noCSRIllegal check is generic and correct: it tests whether the
+  requested CSR address matches any key in csrRwMap. Since mseccfg (0x747) is
+  in csrRwMap, accesses will succeed. This mechanism itself is correctly
+  implemented — the issue is upstream (the unconditional presence of mseccfg
+  in the map), not in this check.
+  | private val noCSRIllegal = (ren || wen) && Cat(csrRwMap.keys.toSeq.sorted.map(csrAddr => !(addr === csrAddr.U))).andR
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:324-326  mseccfg fields (Smepmp: RLB, MMWP, MML as RO)
+  The Smepmp fields (RLB, MMWP, MML) are declared as RO (read-only zero by
+  default). Per spec norm:mseccfg_rlb_mmwp_mml_presence
+  (machine.adoc:2387-2389), these fields are added by Smepmp. Since XiangShan
+  does NOT list 'smepmp' in its ISAExtensions, these fields correctly return
+  read-only zero. This complies with the spec rule that non-implemented
+  extension fields return zero on read and ignore writes.
+  | val RLB   = RO( 2).withDescription("Rule-locking bypass control from the Smepmp extension.")
+  |     val MMWP  = RO( 1).withDescription("Machine-mode whitelist policy control from the Smepmp extension.")
+  |     val MML   = RO( 0).withDescription("Machine-mode lock-down control from the Smepmp extension.")
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2387-2389
+      "[[norm:mseccfg_rlb_mmwp_mml_presence]] The Smepmp extension adds
+      the `RLB`, `MMWP`, and the `MML` fields in `mseccfg`."
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:322-323  mseccfg fields (Zkr: SSEED, USEED as RO)
+  The Zkr fields (SSEED, USEED) are declared as RO (read-only zero by
+  default). Per spec norm:mseccfg_sseed_useed_presence
+  (machine.adoc:2341-2343), these fields are added by Zkr. XiangShan does NOT
+  list 'zkr' in its ISAExtensions, so these fields correctly return read-only
+  zero. Compliant.
+  | val SSEED = RO( 9).withDescription("Seed CSR enable from the Zkr extension.")
+  |     val USEED = RO( 8).withDescription("User seed CSR enable from the Zkr extension.")
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2341-2343
+      "[[norm:mseccfg_sseed_useed_presence]] The Zkr extension adds the
+      `SSEED` and `USEED` fields to the `mseccfg` CSR to control access to
+      the `seed` CSR f"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:320-320  mseccfg field PMM (Smmpm: EnvPMM WARL)
+  The PMM field is declared as EnvPMM(33, 32, wNoEffect) with reset value
+  Disable (b00). Per spec norm:mseccfg_pmm_rdonly0 (machine.adoc:2478), 'If
+  Smmpm is not implemented, PMM is read-only zero.' However, XiangShan DOES
+  list 'smmpm' in ISAExtensions (Parameters.scala:297), so the EnvPMM WARL
+  field is correct for this configuration. The WARL legal values (b00=Disable,
+  b10=PMLEN7, b11=PMLEN16) match spec norm:mseccfg_pmm_enc
+  (machine.adoc:2483-2489). Bit positions 33:32 are correct for the 64-bit PMM
+  field.
+  | val PMM   = EnvPMM(33, 32, wNoEffect).withReset(EnvPMM.Disable).withDescription("Machine security memory protection mode from the Smmpm extension.")
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2475-2478
+      "[#norm:mseccfg_pmm_presence_op]#If the Smmpm extension is
+      implemented, the `PMM` field enables or disables pointer masking
+      (see <<Zpm>>) for M-mode ac"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:321-321  mseccfg field MLPE (Zicfilp as RO)
+  The MLPE field is declared as RO(10). Per spec norm:mseccfg_mlpe_presence
+  (machine.adoc:2499), Zicfilp adds the MLPE field. XiangShan does NOT list
+  'zicfilp' in ISAExtensions, so MLPE correctly returns read-only zero. The
+  bit position (10) matches spec.
+  | val MLPE  = RO(10).withDescription("Machine landing-pad enable from the Zicfilp extension.")
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2499-2499
+      "[#norm:mseccfg_mlpe_presence]#The Zicfilp extension adds the `MLPE`
+      field in `mseccfg`.#"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:319-327  mseccfg (mseccfgh 0x757 — high-half CSR)
+  There is NO CSRModule for mseccfgh (address 0x757) anywhere in the NewCSR
+  directory. Per spec (csrs.adoc:1277-1281), for RV64 (XLEN=64), the addresses
+  of all standard high-half CSRs are reserved and accessing them raises an
+  illegal-instruction exception. Since XiangShan is RV64 and mseccfgh is not
+  in csrRwMap, the noCSRIllegal check will correctly flag accesses to 0x757 as
+  illegal. Compliant.
+  | (No CSRModule exists for mseccfgh; 0x757 is absent from csrRwMap)
+  References:
+    - riscv-isa-manual/src/priv/csrs.adoc:1277-1281
+      "Standard high-half CSRs are accessible only when the base RISC-V
+      instruction set is RV32 (XLEN=32). For RV64 (when XLEN=64), the
+      addresses of all stan"
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:320-321  csrRwMap construction (includes mseccfg unconditionally)
+  csrRwMap is built by concatenating machineLevelCSRMap with all other CSR
+  maps. Since machineLevelCSRMap derives from machineLevelCSRMods (which
+  unconditionally includes mseccfg), address 0x747 is always present in
+  csrRwMap. The noCSRIllegal check on line 1021 iterates csrRwMap.keys, so
+  mseccfg accesses will never trigger an illegal instruction exception, even
+  in configurations lacking all qualifying extensions. This is the same
+  underlying issue as finding #1.
+  | var csrRwMap: SeqMap[Int, (CSRAddrWriteBundle[_], UInt)] =
+  |     machineLevelCSRMap ++
+  |     supervisorLevelCSRMap ++
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2335-2335
+      "[#norm:mseccfg_presence]#It exists if any extension that adds a
+      field to `mseccfg` is implemented. Otherwise, it is reserved.#"
+
+[compliant] src/main/scala/xiangshan/Parameters.scala:297-297  ISAExtensions (smmpm present)
+  The default XiangShan configuration includes 'smmpm' in ISAExtensions. Since
+  Smmpm is one of the extensions that adds a field (PMM) to mseccfg, mseccfg
+  must exist per spec norm:mseccfg_presence. The presence of smmpm in the
+  default config means the unconditional mseccfg instantiation is currently
+  correct for this configuration. The risk is architectural (no
+  parameterization), not a current bug.
+  | "shvstvecd", "smaia", "smcntrpmf", "smcsrind", "smdbltrp", "smmpm", "smnpm", "smrnmi", "smstateen",
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2475-2476
+      "[#norm:mseccfg_pmm_presence_op]#If the Smmpm extension is
+      implemented, the `PMM` field enables or disables pointer masking
+      (see <<Zpm>>) for M-mode..."
+

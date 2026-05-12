@@ -1,0 +1,50 @@
+PR #1172  target=xiangshan  overall=not_implemented
+Spec: sctrctl/vsctrctl alias mctrctl in hardware but have narrower read masks (missing M, MTE bits); returning raw mctrctl state without per-CSR masking leaks M-mode-only configuration fields to S/VS-mode via CSR read instructions
+Violation:
+  sctrctl/vsctrctl read path in RTL directly returns mctrctl hardware register
+  state without applying the correct per-CSR read mask. The sctrctl read mask
+  (0x787F9F80000DC3) excludes bit 2 (M field) and bit 9 (MTE field) present in
+  the mctrctl mask (0x787F9F80000FC7). If the Chisel CSR module implements
+  sctrctl as a simple alias that reads the raw mctrctl wire without masking,
+  S-mode and VS-mode can observe M-mode CTR enable and M-mode trap enable
+  bits, leaking M-mode configuration state to lower privilege levels.
+Consequence: info_leak
+Pattern:
+  sctrctl.*alias.*mctrctl|vsctrctl.*mask.*0xDC3|CSR.*0x14E.*read.*mask|sctrctl
+  .*Bits.*63.*0|CSRMap.*sctrctl.*mctrctl
+------------------------------------------------------------
+[not_implemented] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:66-67  CSRs object (CSR address constants)
+  sctrctl (0x14E) and vsctrctl (0x24E) CSR address constants are defined and
+  added to the all-CSRs lookup list (lines 523, 546, 619), but no CSRModule is
+  instantiated for them in SupervisorLevel.scala,
+  VirtualSupervisorLevel.scala, or MachineLevel.scala. The NewCSR framework
+  (NewCSR.scala:1021) treats unregistered addresses as illegal-instruction.
+  The vulnerability described in the security spec — sctrctl read path
+  returning raw mctrctl state without masking bits 2 (M) and 9 (MTE) — cannot
+  be assessed because no read path exists.
+  | val sctrctl = 0x14e
+  | val sctrstatus = 0x14f
+  | // ...
+  | val vsctrctl = 0x24e
+  | // ...
+  | val mctrctl = 0x34e
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:119-121
+      "The sctrctl register provides supervisor mode access to a subset of
+      mctrctl. Bits 2 and 9 in sctrctl are read-only 0. As a result, the M
+      and MTE field"
+    - riscv-isa-manual/src/priv/smctr.adoc:109-109
+      "All fields are optional except for M, S, U, and BPFRZ. All
+      unimplemented fields are read-only 0, while all implemented fields
+      are writable."
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1021-1023  NewCSR CSR access dispatch
+  The CSR read/write dispatch map (csrRwMap at line 320) contains no entry for
+  sctrctl (0x14E), vsctrctl (0x24E), mctrctl (0x34E), sctrstatus (0x14F), or
+  sctrdepth (0x15F). The noCSRIllegal logic catches unregistered CSR
+  addresses, so accesses to these CSRs raise an illegal-instruction exception.
+  No information leak is possible because the registers cannot be read at all.
+  | private val noCSRIllegal = (ren || wen) && Cat(csrRwMap.keys.toSeq.sorted.map(csrAddr => !(addr === csrAddr.U))).andR
+  | 
+  | private val noCSRIllegalReg = RegEnable(noCSRIllegal, ren || wen)
+

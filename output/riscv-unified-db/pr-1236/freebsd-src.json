@@ -1,0 +1,159 @@
+{
+  "pr_number": 1236,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 1236,
+    "violation_condition": "FreeBSD writes to sie (CSR 0x104) in mp_machdep.c, intc.c, and timer.c assuming sie bits independently control interrupt enable state. The spec now clarifies that sie.SSIE/STIE/SEIE/LCOFIE are aliases of the corresponding mie bits, not independent state. If M-mode firmware (OpenSBI/BBL) has not delegated the corresponding interrupt via mideleg, the write to sie is silently ignored (bit remains read-only 0), and FreeBSD incorrectly assumes the interrupt is enabled/disabled. Conversely, if mideleg IS set, writing to sie actually writes through to mie, which means the interrupt-enable is truly controlled at M-level — a malicious or buggy M-mode firmware can observe or override sie state at any time via mie reads/writes.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csr_write\\(sie|csr_set\\(sie|csr_clear\\(sie",
+    "affected_entities": [
+      "sie",
+      "mie",
+      "mideleg"
+    ],
+    "summary": "sie bits are aliases of mie bits, not independent state — FreeBSD writes to sie for IPI/timer/external interrupt control silently fail if mideleg is not configured, and M-mode can always observe/override sie state via mie"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/mp_machdep.c",
+        "function_name": "init_secondary",
+        "line_start": 166,
+        "line_end": 168,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "AP boot path writes csr_set(sie, SIE_SSIE) to ensure WFI doesn't halt the hart, but never verifies that SSI is delegated via mideleg[1]. If M-mode firmware has not set mideleg[1], the write is silently ignored (sie.SSIE is read-only zero per norm:sie_acc), and the WFI may hang the AP indefinitely. Conversely, if delegation IS active, the write actually targets mie.MSIE at M-level, meaning M-mode firmware can observe/override the interrupt-enable state that FreeBSD treats as S-mode-private.",
+      "snippet": "/* Workaround: make sure wfi doesn't halt the hart */\ncsr_set(sie, SIE_SSIE);\ncsr_set(sip, SIE_SSIE);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 472,
+          "line_end": 484,
+          "excerpt": "The sip and sie registers are subsets of the mip and mie registers. Reading any implemented field, or writing any writable field, of sip/sie effects a read or write of the homonymous field of mip/mie."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 408,
+          "line_end": 409,
+          "excerpt": "A bit in sie must be writable if the corresponding interrupt can ever become pending. Bits of sie that are not writable are read-only zero."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1520,
+          "line_end": 1524,
+          "excerpt": "If an interrupt is delegated to S-mode by setting a bit in the mideleg register, it becomes visible in the sip register and is maskable using the sie register. Otherwise, the corresponding bits in sip and sie are read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_disable_intr",
+        "line_start": 193,
+        "line_end": 197,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "intc_disable_intr() writes csr_clear(sie, 1ul << irq) for any IRQ 0-15 without checking mideleg. For interrupts not delegated to S-mode (e.g., if firmware doesn't set mideleg[9] for external interrupts, or mideleg[5] for timer), the sie bit is read-only zero and the clear is silently ignored — FreeBSD believes it disabled the interrupt but it remains enabled at M-level. For delegated interrupts, csr_clear(sie, ...) actually clears the mie bit, so M-mode firmware can observe the disable state change and can re-enable it via mie writes, breaking the S-mode security invariant.",
+      "snippet": "irq = ((struct intc_irqsrc *)isrc)->irq;\nif (irq >= INTC_NIRQS)\n  panic(\"%s: Unsupported IRQ %u\", __func__, irq);\n\ncsr_clear(sie, 1ul << irq);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 472,
+          "line_end": 484,
+          "excerpt": "The sip and sie registers are subsets of the mip and mie registers. Reading any implemented field, or writing any writable field, of sip/sie effects a read or write of the homonymous field of mip/mie."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1520,
+          "line_end": 1524,
+          "excerpt": "If an interrupt is delegated to S-mode by setting a bit in the mideleg register, it becomes visible in the sip register and is maskable using the sie register. Otherwise, the corresponding bits in sip and sie are read-only zero."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 408,
+          "line_end": 409,
+          "excerpt": "A bit in sie must be writable if the corresponding interrupt can ever become pending. Bits of sie that are not writable are read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/intc.c",
+        "function_name": "intc_enable_intr",
+        "line_start": 204,
+        "line_end": 209,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "intc_enable_intr() writes csr_set(sie, 1ul << irq) for any IRQ 0-15 without checking mideleg. For interrupts not delegated to S-mode, the set is silently ignored (sie bit stays read-only zero), so FreeBSD thinks it enabled the interrupt but delivery remains blocked. For delegated interrupts, the write targets mie at M-level, granting M-mode firmware both observability and control over what FreeBSD considers S-mode-private interrupt-enable state.",
+      "snippet": "irq = ((struct intc_irqsrc *)isrc)->irq;\nif (irq >= INTC_NIRQS)\n  panic(\"%s: Unsupported IRQ %u\", __func__, irq);\n\ncsr_set(sie, 1ul << irq);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 472,
+          "line_end": 484,
+          "excerpt": "The sip and sie registers are subsets of the mip and mie registers. Reading any implemented field, or writing any writable field, of sip/sie effects a read or write of the homonymous field of mip/mie."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1520,
+          "line_end": 1524,
+          "excerpt": "If an interrupt is delegated to S-mode by setting a bit in the mideleg register, it becomes visible in the sip register and is maskable using the sie register. Otherwise, the corresponding bits in sip and sie are read-only zero."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 408,
+          "line_end": 409,
+          "excerpt": "A bit in sie must be writable if the corresponding interrupt can ever become pending. Bits of sie that are not writable are read-only zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/timer.c",
+        "function_name": "riscv_timer_et_stop",
+        "line_start": 130,
+        "line_end": 137,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "riscv_timer_et_stop() writes csr_clear(sie, SIE_STIE) to disable timer interrupts without checking mideleg[5]. If the timer interrupt is not delegated to S-mode (mideleg[5]=0, typical when Sstc is absent and M-mode firmware handles timer via SBI), this clear is silently ignored — sie.STIE is read-only zero per norm:sie_acc. The kernel believes timer interrupts are masked, but they remain enabled at M-level. For delegated setups (mideleg[5]=1), the write targets mie.MTIE, making the timer enable state visible and modifiable by M-mode firmware.",
+      "snippet": "riscv_timer_et_stop(struct eventtimer *et)\n{\n\n  /* Disable timer interrupts. */\n  csr_clear(sie, SIE_STIE);\n\n  return (0);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 472,
+          "line_end": 484,
+          "excerpt": "The sip and sie registers are subsets of the mip and mie registers. Reading any implemented field, or writing any writable field, of sip/sie effects a read or write of the homonymous field of mip/mie."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 1520,
+          "line_end": 1524,
+          "excerpt": "If an interrupt is delegated to S-mode by setting a bit in the mideleg register, it becomes visible in the sip register and is maskable using the sie register. Otherwise, the corresponding bits in sip and sie are read-only zero."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 408,
+          "line_end": 409,
+          "excerpt": "A bit in sie must be writable if the corresponding interrupt can ever become pending. Bits of sie that are not writable are read-only zero."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

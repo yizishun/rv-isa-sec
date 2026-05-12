@@ -1,0 +1,21 @@
+PR #1245  target=freebsd-src  overall=compliant
+Spec: Context switch checks only FS dirty bit (SSTATUS_FS_MASK), missing vector state tracked through XS summary, and struct pcb lacks vector register storage, causing silent vector state corruption on thread switch
+Violation:
+  When FreeBSD runs on V-extension-capable hardware with writable misa.V (or
+  VSSTATUS_VS_EXISTS where vsstatus.VS is present even when misa.V is clear),
+  the context switch path in swtch.S:cpu_switch (lines 287-304) and cpu_throw
+  (lines 237-246) only tests SSTATUS_FS_MASK (bits 13:14) to decide whether
+  extended state is dirty. The spec's sstatus.XS field (bits 15:14) summarizes
+  both FS and VS status; if vector state is dirty but FPU state is clean, the
+  XS summary reports dirty while FS reads clean. FreeBSD's mask check sees
+  clean FS, skips save/restore entirely, and silently drops or leaks the full
+  vector register file (v0-v31, each VLEN bits wide, potentially 65536 bits)
+  plus CSRs (vtype, vl, vstart, vcsr, vxrm, vxsat) across a thread switch. The
+  static struct pcb (pcb.h:42-54) has no fields for vector state and is stack-
+  allocated at compile time with sizeof(struct pcb), so even if the dirty-
+  check were fixed, there is no storage to hold vector context.
+Consequence: data_corruption
+Pattern:
+  SSTATUS_FS_MASK|SSTATUS_XS_MASK|__fpe_state_save|__fpe_state_load|cpu_switch
+  |cpu_throw|struct pcb|PCB_SIZE
+------------------------------------------------------------

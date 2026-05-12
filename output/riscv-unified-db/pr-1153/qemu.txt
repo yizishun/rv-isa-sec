@@ -1,0 +1,311 @@
+PR #1153  target=qemu  overall=potential_risk
+Spec: QEMU must re-validate all cached PMP access decisions (TLB flush) on any mseccfg sticky-bit change (MML/MMWP/RLB) and must correctly implement the 32-entry Smepmp truth table in pmp_hart_has_privs, including the MML-mode-specific redefinition of pmpcfg.L semantics and RLB-gated lock bypass
+Violation:
+  When QEMU TCG emulates mseccfg.MML bit 0→1 transition but does not re-
+  evaluate all TLB-cached PMP access decisions (e.g., cached code-translation
+  blocks or cached page protections), guest M-mode code could execute from
+  regions previously allowed but now denied under the Smepmp MML truth table
+  (case c of MML spec: M-mode execution requires explicit M-mode-only or
+  locked-shared-region rule). Similarly, if mseccfg.MMWP transitions 0→1
+  without flushing cached PMP bypass for M-mode, cached TLB entries could
+  grant M-mode access to regions that should now be denied. Conversely, RLB
+  transitions that unlock locked PMP entries without TLB flush could leave
+  stale denial caches.
+Consequence: privilege_escape
+Pattern:
+  mseccfg write handler does not tlb_flush on every sticky-bit change that
+  alters PMP access semantics; OR pmp_hart_has_privs truth table incorrectly
+  maps smepmp_operation codes to allowed_privs for M-mode vs S/U-mode; OR
+  mseccfg_csr_write fails to enforce RLB lock-out when any pmpcfg.L is set in
+  disabled (OFF) entries; OR pmpcfg_csr_write allows executable M-mode-only or
+  locked-shared-region configurations when MML=1 and RLB=0 (spec clause 4b);
+  OR mseccfg.MML/MMWP re-enabled after migration resume without TLB
+  invalidation
+------------------------------------------------------------
+[potential_risk] /home/yzs/riscv/qemu/target/riscv/cpu.c:757-764  riscv_cpu_reset_hold
+  mseccfg is only cleared on reset when ext_smepmp is true, but Zkr
+  (USEED/SSEED bits [9:8]), Smmpm (PMM bits [33:32]), and Zicfilp (MLPE bit
+  [10]) also store security-critical state in mseccfg. If any of these
+  extensions are enabled without Smepmp, a warm reset leaves those fields at
+  their previous values, violating norm:mseccfg_useed_sseed_rst ('must have
+  defined reset values') and norm:mseccfg_mlpe_rst ('MLPE field is reset to
+  0').
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         env->mseccfg = 0;
+  |     }
+  | 
+  |     pmp_unlock_entries(env);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2797-2808
+      "The MML, MMWP, and RLB fields of the mseccfg register are set to 0,
+      unless the platform mandates a different reset value. [...] The
+      USEED and SSEED fi"
+
+[potential_risk] /home/yzs/riscv/qemu/target/riscv/pmp.c:697-700  mseccfg_csr_write
+  The MLPE bit handling `val |= (val & MSECCFG_MLPE)` is a no-op — OR'ing val
+  with a masked subset of itself produces no change. This looks like a copy-
+  paste error from the sticky-bit pattern on line 688 (`val |= (env->mseccfg &
+  mask)`). If MLPE was intended to be a sticky (forward-only) bit per
+  Zicfilp's 'forward CFI' semantics, this implementation fails to make it
+  sticky — guest can clear MLPE at will. If MLPE is intentionally not sticky,
+  this is dead code that confuses future maintainers.
+  | if (env_archcpu(env)->cfg.ext_zicfilp) {
+  |         val |= (val & MSECCFG_MLPE);
+  |     }
+  | 
+  |     env->mseccfg = val;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2499-2508
+      "The Zicfilp extension adds the MLPE field in mseccfg. When MLPE
+      field is 1, Zicfilp extension is enabled in M-mode. When the MLPE
+      field is 0, the Zicf"
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/pmp.c:662-703  mseccfg_csr_write
+  Sticky-bit enforcement for MML, MMWP, and PMM is correctly implemented: `val
+  |= (env->mseccfg & mask)` prevents clearing once set (line 688). TLB flush
+  is correctly triggered when any sticky bit changes state (lines 689-690),
+  re-evaluating all cached PMP access decisions per norm:mseccfg_mml_sticky
+  and norm:mseccfg_mmwp_op_warl. RLB lock-out is correctly enforced when any
+  PMP entry has L=1 and current RLB=0 (lines 676-684), matching
+  norm:mseccfg_rlb_op_warl ('when mseccfg.RLB is 0 and pmpcfg.L is 1 in any
+  rule or entry, including disabled entries').
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         /* Sticky bits */
+  |         val |= (env->mseccfg & mask);
+  |         if ((val ^ env->mseccfg) & mask) {
+  |             tlb_flush(env_cpu(env));
+  |         }
+  |     }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2391-2423
+      "When mseccfg.RLB is 0 and pmpcfg.L is 1 in any rule or entry
+      (including disabled entries), then mseccfg.RLB remains 0. [...] This
+      is a sticky bit, mea"
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/pmp.c:438-509  pmp_hart_has_privs
+  The Smepmp enhanced PMP truth table implementation correctly maps all 16
+  smepmp_operation codes to allowed_privs for both M-mode and S/U-mode. M-mode
+  checks (lines 445-475) correctly deny access for S/U-mode-only rules (ops
+  0-8 except shared regions 2,3), allow execute from locked M-mode-only and
+  locked shared-code regions (ops 9-11,13), and enforce read/write/execute per
+  spec. S/U-mode checks (lines 476-509) correctly deny access for M-mode-only
+  rules (ops 8-9,12-14), allow execute from S/U-mode-only regions (ops
+  1,10,11), and enforce shared-region semantics. All 16 encodings match the
+  normative truth table in norm:mml_truth_table.
+  | if (mode == PRV_M) {
+  |                     switch (smepmp_operation) {
+  |                     case 0:
+  |                     case 1:
+  |                     case 4:
+  |                     case 5:
+  |                     case 6:
+  |                     case 7:
+  |                     case 8:
+  |                         *allowed_privs = 0;
+  |                         break;
+  |                     case 2:
+  |                     case 3:
+  |                     case 14:
+  |                         *allowed_privs = PMP_READ | PMP_WRITE;
+  |                         break;
+  |                     case 9:
+  |                     case 10:
+  |                         *allowed_privs = PMP_EXEC;
+  |                         break;
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:44-66
+      "The physical memory protection rules when mseccfg.MML is set to 1
+      are summarized in the truth table below. [16-row table mapping
+      L,R,W,X to M Mode and"
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/pmp.c:77-110  pmp_is_invalid_smepmp_cfg
+  The X-restrict enforcement correctly rejects pmpcfg writes that would create
+  executable M-mode-only or locked shared-region rules when MML=1 and RLB=0.
+  Invalid operations (9,10,11,13) correspond to: op9=locked-execute-only,
+  op10=locked-shared-code-exec-only, op11=locked-shared-code-RX, op13=locked-
+  read-execute. When MML=0 or RLB=1, the restriction is correctly bypassed,
+  allowing boot firmware to configure PMP entries before locking them. Matches
+  norm:mseccfg_mml_X_restrict.
+  | if (!MSECCFG_MML_ISSET(env) || MSECCFG_RLB_ISSET(env)) {
+  |         return 0;
+  |     }
+  |     switch (pmp_get_smepmp_operation(val)) {
+  |     ...
+  |     case 9:
+  |     case 10:
+  |     case 11:
+  |     case 13:
+  |         return 1;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2462-2465
+      "Adding a rule with executable privileges that either is M-mode-only
+      or a locked Shared-Region is not possible and such pmpcfg writes are
+      ignored, leav"
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/pmp.c:311-359  pmp_hart_has_privs_default
+  Default PMP policy correctly implements: (1) MMWP=1 denies all modes
+  including M-mode (norm:mseccfg_mmwp_op_warl — 'changes the default PMP
+  policy for M-mode to denied instead of ignored'), (2) MML=1 allows M-mode
+  R/W only when not executing, denies all other modes
+  (norm:mseccfg_mml_exec_code — 'Executing code with Machine mode privileges
+  is only possible from memory regions with a matching M-mode-only rule or a
+  locked Shared-Region rule'), (3) defaults to M-mode full access when no
+  special flags.
+  | if (MSECCFG_MMWP_ISSET(env)) {
+  |         *allowed_privs = 0;
+  |         return false;
+  |     } else if (MSECCFG_MML_ISSET(env)) {
+  |         if (mode == PRV_M && !(privs & PMP_EXEC)) {
+  |             ret = true;
+  |             *allowed_privs = PMP_READ | PMP_WRITE;
+  |         } else {
+  |             ret = false;
+  |             *allowed_privs = 0;
+  |         }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2412-2418
+      "The mseccfg.MMWP (Machine-Mode Allowlist Policy) [...] changes the
+      default PMP policy for Machine mode when accessing memory regions
+      that don't have a"
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/pmp.c:69-72  pmp_is_readonly
+  PMP entry read-only enforcement correctly depends on both the LOCK bit being
+  set AND mseccfg.RLB being clear. When RLB=1, locked entries become writable
+  (Rule Locking Bypass), matching norm:mseccfg_rlb_op_warl: 'When mseccfg.RLB
+  is 1, locked PMP rules may be removed or modified.'
+  | static int pmp_is_readonly(CPURISCVState *env, uint32_t pmp_index)
+  | {
+  |     return pmp_is_locked(env, pmp_index) && !MSECCFG_RLB_ISSET(env);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2391-2397
+      "When mseccfg.RLB is 1, locked PMP rules may be removed or modified
+      and locked PMP rules may be edited. When mseccfg.RLB is 0 and
+      pmpcfg.L is 1 in any "
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/machine.c:426-443  vmstate_mseccfg
+  mseccfg migration is correctly implemented as a conditional subsection,
+  gated by mseccfg_needed() which returns true when any extension that uses
+  mseccfg fields is enabled (ext_smepmp, ext_zkr, ext_smmpm, ext_zicfilp). The
+  subsection correctly saves/restores env.mseccfg as a target_ulong.
+  Registered under vmstate_riscv_cpu subsections array (line 521).
+  | static bool mseccfg_needed(void *opaque)
+  | {
+  |     RISCVCPU *cpu = opaque;
+  |     return cpu->cfg.ext_smepmp || cpu->cfg.ext_zkr
+  |         || cpu->cfg.ext_smmpm || cpu->cfg.ext_zicfilp;
+  | }
+  | 
+  | static const VMStateDescription vmstate_mseccfg = {
+  |     .name = "cpu/mseccfg",
+  |     .version_id = 1,
+  |     .minimum_version_id = 1,
+  |     .needed = mseccfg_needed,
+  |     .fields = (const VMStateField[]) {
+  |         VMSTATE_UINTTL(env.mseccfg, RISCVCPU),
+  |         VMSTATE_END_OF_LIST()
+  |     }
+  | };
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/csr.c:775-788  have_mseccfg
+  CSR existence predicate correctly gates mseccfg CSR on any of the three
+  extensions that define fields in it: ext_smepmp (MML/MMWP/RLB), ext_zkr
+  (USEED/SSEED), ext_smmpm (PMM). Matches norm:mseccfg_presence: 'It exists if
+  any extension that adds a field to mseccfg is implemented.' Note: Zicfilp
+  (MLPE field) is not listed in have_mseccfg, but Zicfilp CSR validation
+  requires ext_zicsr which implies CSR infrastructure, and mseccfg would exist
+  through another extension or be unavailable — this is a design gap per PR
+  review feedback but not a security vulnerability.
+  | static RISCVException have_mseccfg(CPURISCVState *env, int csrno)
+  | {
+  |     if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     if (riscv_cpu_cfg(env)->ext_zkr) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     if (riscv_cpu_cfg(env)->ext_smmpm) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2335-2335
+      "It exists if any extension that adds a field to mseccfg is
+      implemented. Otherwise, it is reserved."
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/pmp.c:528-548  pmpcfg_csr_write
+  pmpcfg_csr_write correctly iterates over all pmpcfg entries in the register,
+  delegates to pmp_write_cfg for per-entry validation (read-only check, Smepmp
+  invalid-cfg check, MTMATCH handling), and flushes TLB + updates rule count
+  when any entry was modified. This ensures cached TLB entries are invalidated
+  when PMP configuration changes, preventing stale permission caching.
+  | for (i = 0; i < pmpcfg_nums; i++) {
+  |         cfg_val = (val >> 8 * i)  & 0xff;
+  |         modified |= pmp_write_cfg(env, (reg_index * 4) + i, cfg_val);
+  |     }
+  |     /* If PMP permission of any addr has been changed, flush TLB pages. */
+  |     if (modified) {
+  |         pmp_update_rule_nums(env);
+  |         tlb_flush(env_cpu(env));
+  |     }
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/pmp.c:574-608  pmpaddr_csr_write
+  pmpaddr_csr_write correctly enforces TOR lock propagation: when writing
+  pmpaddr[i] and pmpaddr[i+1] uses TOR matching and is locked+RLB=0, the write
+  is rejected. When not read-only, the address register is updated,
+  pmp_update_rule_addr recalculates the cached SA/EA range, and tlb_flush
+  invalidates cached TLB entries. The TOR lock check prevents bypassing locked
+  PMP entries by shrinking the address range of a preceding TOR entry.
+  | if (pmp_is_readonly(env, addr_index + 1) && is_next_cfg_tor) {
+  |                 qemu_log_mask(LOG_GUEST_ERROR,
+  |                               "ignoring pmpaddr write - pmpcfg+1 read only\n");
+  |                 return;
+  |             }
+  |         }
+  |         if (!pmp_is_readonly(env, addr_index)) {
+  |             env->pmp_state.pmp[addr_index].addr_reg = val;
+  |             pmp_update_rule_addr(env, addr_index);
+  |             if (is_next_cfg_tor) {
+  |                 pmp_update_rule_addr(env, addr_index + 1);
+  |             }
+  |             tlb_flush(env_cpu(env));
+
+[compliant] /home/yzs/riscv/qemu/target/riscv/csr.c:5333-5338  write_mseccfg
+  CSR dispatch wrapper correctly delegates to mseccfg_csr_write() in pmp.c,
+  following the standard pattern for CSR handlers. The CSR table entry at line
+  6226-6227 correctly uses have_mseccfg predicate and min_priv_ver
+  PRIV_VERSION_1_11_0.
+  | static RISCVException write_mseccfg(CPURISCVState *env, int csrno,
+  |                                     target_ulong val, uintptr_t ra)
+  | {
+  |     mseccfg_csr_write(env, val);
+  |     return RISCV_EXCP_NONE;
+  | }
+
+[potential_risk] /home/yzs/riscv/qemu/target/riscv/machine.c:255-262  riscv_cpu_post_load
+  riscv_cpu_post_load only recomputes env->xl after migration resume and does
+  not perform TLB flush. While the current implementation reads mseccfg and
+  pmp_state directly during address translation (no intermediate cached
+  representation), if future optimizations add a cached 'effective PMP policy'
+  derived from mseccfg bits, the lack of post-load TLB invalidation could
+  cause the destination VM to use stale permissions computed from the source's
+  pre-migration mseccfg state. Adding an explicit tlb_flush in post_load when
+  mseccfg is non-zero would be a defense-in-depth measure.
+  | static int riscv_cpu_post_load(void *opaque, int version_id)
+  | {
+  |     RISCVCPU *cpu = opaque;
+  |     CPURISCVState *env = &cpu->env;
+  | 
+  |     env->xl = cpu_recompute_xl(env);
+  |     return 0;
+  | }
+
+[not_implemented] /home/yzs/riscv/qemu/target/riscv/kvm/kvm-cpu.c:0-0  (none)
+  KVM mseccfg synchronization is not implemented. The KVM CSR synchronization
+  table (kvm_csr_cfgs) and reset function (kvm_riscv_reset_regs_csr) contain
+  no references to mseccfg. This is consistent with KVM for RISC-V not yet
+  implementing the Smepmp extension (kvm_multi_ext_cfgs does not include
+  smepmp). When KVM adds Smepmp support, mseccfg synchronization must be added
+  to kvm_cpu_riscv.c.
+

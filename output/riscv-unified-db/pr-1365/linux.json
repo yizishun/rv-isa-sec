@@ -1,0 +1,218 @@
+{
+  "pr_number": 1365,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 1365,
+    "violation_condition": "Kernel accesses user-space memory (via copy_from_user/copy_to_user/put_user/get_user or signal frame setup) expecting little-endian byte order, while the user process runs with sstatus.UBE=1 and interprets that same memory as big-endian. Since S-mode data accesses are unaffected by UBE, the kernel and user process disagree on byte order of shared data structures.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "copy_(from|to)_user|put_user|get_user|setup_sigframe|ptrace_(getregs|setregs)|__access_remote_vm",
+    "affected_entities": [
+      "sstatus.UBE"
+    ],
+    "summary": "Ssube allows U-mode big-endian via sstatus.UBE but S-mode kernel accesses to user memory always use little-endian, creating an inherent endianness mismatch that the kernel is not architected to handle."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "(CSR bit definitions)",
+        "line_start": 12,
+        "line_end": 19,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The SR_UBE (bit 6, value 0x00000040) macro is absent from the status register bit definitions. Every other standard sstatus bit (SIE, MIE, SPIE, MPIE, SPP, MPP, SUM, SPELP, FS, VS, XS, UXL) is defined, but the UBE bit controlling user-mode endianness is missing. This means no code in the kernel can reference or manipulate the UBE bit.",
+      "snippet": "#define SR_SIE     _AC(0x00000002, UL)\n#define SR_MIE     _AC(0x00000008, UL)\n#define SR_SPIE    _AC(0x00000020, UL)\n#define SR_MPIE    _AC(0x00000080, UL)\n/* bit 6 (0x40) = UBE — NOT DEFINED */\n#define SR_SPP     _AC(0x00000100, UL)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 224,
+          "line_end": 231,
+          "excerpt": "The UBE bit is a WARL field that controls the endianness of explicit memory accesses made from U-mode, which may differ from the endianness of memory accesses in S-mode. [...] UBE controls whether explicit load and store memory accesses made from U-mode are little-endian (UBE=0) or big-endian (UBE=1)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/uaccess.h",
+        "function_name": "__enable_user_access / __disable_user_access",
+        "line_start": 59,
+        "line_end": 62,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The user memory access enable/disable macros only manipulate SR_SUM (Supervisor User Memory access). When SR_SUM is set, S-mode load/store instructions can access user pages, but these accesses follow S-mode endianness (SBE), NOT U-mode endianness (UBE). If a user process runs with sstatus.UBE=1 (big-endian), the kernel's loads/stores via these paths will produce byte-swapped data because the kernel sees little-endian while user-space sees big-endian. There is no byte-swap logic in any user-access path.",
+      "snippet": "#define __enable_user_access()           \\\n    __asm__ __volatile__ (\"csrs sstatus, %0\" : : \"r\" (SR_SUM) : \"memory\")\n#define __disable_user_access()          \\\n    __asm__ __volatile__ (\"csrc sstatus, %0\" : : \"r\" (SR_SUM) : \"memory\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 656,
+          "line_end": 659,
+          "excerpt": "If U-mode is not supported, UBE is read-only 0. Otherwise, UBE controls whether explicit load and store memory accesses made from U-mode are little-endian (UBE=0) or big-endian (UBE=1)."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 651,
+          "line_end": 654,
+          "excerpt": "SBE controls whether explicit load and store memory accesses made from S-mode are little-endian (SBE=0) or big-endian (SBE=1)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/lib/uaccess.S",
+        "function_name": "fallback_scalar_usercopy",
+        "line_start": 28,
+        "line_end": 30,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The scalar user-copy fallback path enables user access via SR_SUM only and uses native-endian lb/sb/REG_L/REG_S instructions for the bulk copy. On a CPU implementing Ssube with writable UBE=1, these loads/stores (executed in S-mode with SUM=1) follow S-mode endianness, not U-mode endianness, causing byte-swapped data transfer between kernel and big-endian user processes. No byte-swap logic exists anywhere in this 215-line assembly function.",
+      "snippet": "SYM_FUNC_START(fallback_scalar_usercopy)\n    /* Enable access to user memory */\n    li  t6, SR_SUM",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 224,
+          "line_end": 231,
+          "excerpt": "The UBE bit is a WARL field that controls the endianness of explicit memory accesses made from U-mode, which may differ from the endianness of memory accesses in S-mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "setup_sigcontext",
+        "line_start": 361,
+        "line_end": 385,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "setup_sigcontext writes the entire pt_regs structure (all GP registers) to the user-space signal frame via __copy_to_user and __put_user, using native-endian stores. If the user process has UBE=1 (big-endian), the signal frame's sc_regs will contain byte-swapped register values relative to what the user process expects. Similarly, restore_sigcontext (line 226) reads sc_regs back via __copy_from_user, which would misread big-endian data. This corrupts all register state on signal delivery and sigreturn.",
+      "snippet": "/* sc_regs is structured the same as the start of pt_regs */\nerr = __copy_to_user(&sc->sc_regs, regs, sizeof(sc->sc_regs));\n...\nerr |= __put_user(arch_ext->magic, &sc_ext_ptr->magic);\nerr |= __put_user(ext_size, &sc_ext_ptr->size);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 224,
+          "line_end": 231,
+          "excerpt": "The UBE bit is a WARL field that controls the endianness of explicit memory accesses made from U-mode, which may differ from the endianness of memory accesses in S-mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/signal.c",
+        "function_name": "restore_sigcontext",
+        "line_start": 226,
+        "line_end": 249,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "restore_sigcontext reads the entire pt_regs structure (all GP registers) from the user-space signal frame via __copy_from_user, then reads extension header magic/size via __get_user — all with native-endian loads. If the user process set UBE=1 before the signal was delivered, the kernel wrote the frame as little-endian but user code may have modified the frame as big-endian. On sigreturn, the kernel misreads the frame, corrupting all restored register state.",
+      "snippet": "err = __copy_from_user(regs, &sc->sc_regs, sizeof(sc->sc_regs));\n...\nerr |= __get_user(magic, &head->magic);\nerr |= __get_user(size, &head->size);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 224,
+          "line_end": 231,
+          "excerpt": "The UBE bit is a WARL field that controls the endianness of explicit memory accesses made from U-mode, which may differ from the endianness of memory accesses in S-mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/ptrace.c",
+        "function_name": "riscv_gpr_get / riscv_gpr_set",
+        "line_start": 40,
+        "line_end": 57,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "riscv_gpr_get copies the kernel struct pt_regs to user space via membuf_write (which uses copy_to_user). riscv_gpr_set copies user data into pt_regs via user_regset_copyin (which uses copy_from_user). Both use native-endian loads/stores. If the debugger or debuggee runs with UBE=1, register values transferred via PTRACE_GETREGS/PTRACE_SETREGS will be byte-swapped, corrupting the debugger's view. Same applies to riscv_fpr_get/set (lines 60-91), riscv_vr_get/set (lines 95-251), and compat variants (lines 559-584).",
+      "snippet": "static int riscv_gpr_get(struct task_struct *target,\n             const struct user_regset *regset,\n             struct membuf to)\n{\n    return membuf_write(&to, task_pt_regs(target),\n                sizeof(struct user_regs_struct));\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 224,
+          "line_end": 231,
+          "excerpt": "The UBE bit is a WARL field that controls the endianness of explicit memory accesses made from U-mode, which may differ from the endianness of memory accesses in S-mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/process.c",
+        "function_name": "start_thread",
+        "line_start": 144,
+        "line_end": 157,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "start_thread initializes sstatus to SR_PIE (bit 5, value 0x20), which implicitly zeroes the UBE bit (bit 6). All new threads start in little-endian mode. There is no mechanism (prctl, ELF flag, AT_FLAGS) to request big-endian execution. If Ssube were implemented, this function would need to consult a per-task endianness state and set/clear UBE accordingly.",
+      "snippet": "void start_thread(struct pt_regs *regs, unsigned long pc,\n    unsigned long sp)\n{\n    regs->status = SR_PIE;\n    if (has_fpu()) {\n        regs->status |= SR_FS_INITIAL;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 224,
+          "line_end": 231,
+          "excerpt": "The UBE bit is a WARL field that controls the endianness of explicit memory accesses made from U-mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/entry.S",
+        "function_name": "handle_exception / ret_from_exception",
+        "line_start": 183,
+        "line_end": 301,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The trap entry path saves all of sstatus into pt_regs->status (line 190) and restores it on return (line 301). Since sstatus is fully round-tripped through pt_regs, any UBE bit set by hardware or previously configured would survive traps and context switches. However, the trap entry also clears SR_SUM | SR_FS_VS | SR_ELP from sstatus (line 183) but does NOT clear or mask the UBE bit. If a hardware implementation makes UBE writable from U-mode (via some mechanism), the UBE value set by user-space would persist into the kernel's view of sstatus. While this does not affect S-mode accesses, it means the kernel has no sanitization of the UBE bit on trap entry.",
+      "snippet": "csrrc s1, CSR_STATUS, t0    // clears SUM|FS|VS|ELP, but NOT UBE\n...\nREG_S s1, PT_STATUS(sp)     // save to pt_regs\n...\ncsrw CSR_STATUS, a0         // restore full sstatus including UBE",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 224,
+          "line_end": 231,
+          "excerpt": "The UBE bit is a WARL field that controls the endianness of explicit memory accesses made from U-mode."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/processor.h",
+        "function_name": "struct thread_struct",
+        "line_start": 106,
+        "line_end": 126,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "thread_struct has no field to track per-task endianness state (e.g., no 'ube' or 'endian' field). Even if SR_UBE were defined, there is no place in the task structure to store whether a thread should run as big-endian. The switch_to macro in switch_to.h manages FPU, vector, envcfg, and icache state during context switch, but has no endianness management.",
+      "snippet": "struct thread_struct {\n    unsigned long ra;\n    unsigned long sp;\n    unsigned long s[12];\n    struct __riscv_d_ext_state fstate;\n    unsigned long bad_cause;\n    unsigned long envcfg;\n    unsigned long sum;\n    /* no ube/endian field */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/uapi/asm/byteorder.h",
+        "function_name": "(byteorder selection)",
+        "line_start": 1,
+        "line_end": 10,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The byteorder header unconditionally selects little-endian via '#include <linux/byteorder/little_endian.h>'. There is no conditional logic to support runtime or compile-time big-endian user-space. All __swab functions, le_to_cpu, be_to_cpu macros are resolved at compile time for a little-endian kernel, with no awareness that user-space might be big-endian.",
+      "snippet": "#include <linux/byteorder/little_endian.h>",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

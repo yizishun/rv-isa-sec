@@ -1,0 +1,70 @@
+PR #1302  target=qemu  overall=bug_confirmed
+Spec: have_mseccfg() CSR access guard missing ext_zicfilp check causes divergence from mseccfg_needed() migration guard; mseccfg state is migrated but guest cannot access it, violating spec rule that mseccfg exists when any field-defining extension (including Zicfilp) is implemented
+Violation:
+  In QEMU, mseccfg CSR access guard (have_mseccfg) and migration subsection
+  guard (mseccfg_needed) use diverging extension checks: have_mseccfg checks
+  ext_smepmp, ext_zkr, ext_smmpm but omits ext_zicfilp, while mseccfg_needed
+  includes ext_zicfilp. When a VM is configured with only Zicfilp (no
+  Smepmp/Zkr/Smmpm), the CSR traps as illegal but its state is still included
+  in the migration stream, creating a guest-observable inconsistency where
+  migrated-in mseccfg state exists but cannot be accessed or modified.
+Consequence: info_leak
+Pattern:
+  have_mseccfg\(|mseccfg_needed\(|ext_zicfilp.*mseccfg|CSR_MSECCFG.*ILLEGAL
+------------------------------------------------------------
+[bug_confirmed] target/riscv/csr.c:775-788  have_mseccfg
+  have_mseccfg() omits ext_zicfilp in its extension check, while
+  mseccfg_needed() (machine.c:430-431) includes it. When a VM is configured
+  with only Zicfilp (no Smepmp/Zkr/Smmpm), CSR_MSECCFG traps as illegal-
+  instruction, making the MLPE bit (bit 10 of mseccfg) inaccessible to the
+  guest. However, the mseccfg state is still included in the migration stream
+  via mseccfg_needed(), creating a guest-observable inconsistency: migrated-in
+  mseccfg state exists (and MLPE controls M-mode forward-edge CFI per the
+  priv-cfi spec) but cannot be read or written by the guest. Additionally,
+  cpu.c:762-764 only clears mseccfg on reset when ext_smepmp is set, so with
+  only Zicfilp, env->mseccfg is not reset either. The fix is to add
+  ext_zicfilp to the have_mseccfg() checks and to the reset condition.
+  | static RISCVException have_mseccfg(CPURISCVState *env, int csrno)
+  | {
+  |     if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     if (riscv_cpu_cfg(env)->ext_zkr) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  |     if (riscv_cpu_cfg(env)->ext_smmpm) {
+  |         return RISCV_EXCP_NONE;
+  |     }
+  | 
+  |     return RISCV_EXCP_ILLEGAL_INST;
+  | }
+  References:
+    - riscv-isa-manual/src/priv/cfi.adoc:27-31
+      "|=== |Privilege Mode| xLPE |  M           | csr:mseccfg[mlpe] |  S
+      or HS     | csr:menvcfg[lpe] |  VS          | csr:henvcfg[lpe] |  U
+      or VU     | csr"
+
+[potential_risk] target/riscv/cpu.c:762-764  riscv_cpu_reset_hold
+  Reset code only clears env->mseccfg when ext_smepmp is set. When only
+  ext_zicfilp is enabled, env->mseccfg is not explicitly reset. While env is
+  zero-initialized on creation, this means mseccfg is not cleared on warm
+  reset when only Zicfilp is configured. After fixing have_mseccfg, this reset
+  condition should also include ext_zicfilp (and ext_zkr, ext_smmpm) for
+  correctness.
+  | if (riscv_cpu_cfg(env)->ext_smepmp) {
+  |         env->mseccfg = 0;
+  |     }
+
+[compliant] target/riscv/machine.c:426-432  mseccfg_needed
+  mseccfg_needed() correctly checks all four extensions (ext_smepmp, ext_zkr,
+  ext_smmpm, ext_zicfilp) that use the mseccfg CSR. This is the correct
+  superset — migration should include the state whenever any of these
+  extensions is present.
+  | static bool mseccfg_needed(void *opaque)
+  | {
+  |     RISCVCPU *cpu = opaque;
+  | 
+  |     return cpu->cfg.ext_smepmp || cpu->cfg.ext_zkr
+  |         || cpu->cfg.ext_smmpm || cpu->cfg.ext_zicfilp;
+  | }
+

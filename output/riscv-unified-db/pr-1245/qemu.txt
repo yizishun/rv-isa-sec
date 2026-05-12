@@ -1,0 +1,204 @@
+PR #1245  target=qemu  overall=compliant
+Spec: QEMU TCG vector load emulation may leak data through destination vector register elements written past the faulting index before a memory exception is delivered, violating guest kernel expectations about observable architectural state after page faults
+Violation:
+  In QEMU TCG, vector load instructions (vle*.v, vlse*.v, vluxei*.v,
+  vloxei*.v) are translated into host code that iterates over vector elements.
+  When a guest page fault or access fault occurs at element index N during
+  this iteration, QEMU's generated host code may have already written loaded
+  data to destination vector register elements at indices > N before the
+  exception is delivered. If QEMU does not precisely match the hardware's
+  policy for VECTOR_LOAD_PAST_TRAP (whether elements past the trap index are
+  clobbered or preserved), the guest exception handler will observe vector
+  register state that differs from real silicon. Conversely, if QEMU preserves
+  elements past the trap (the safe default for TCG) but the guest kernel was
+  tested on hardware that clobbers them, guest software may incorrectly rely
+  on QEMU's 'cleaner' state and leak sensitive kernel data across privilege
+  boundaries after an mmap'd page fault on vector loads.
+Consequence: info_leak
+Pattern:
+  TCG vector load helper that writes to vreg before or without checking for
+  memory access faults per element; gen_helper_vle_v or similar helpers that
+  batch-write destination vector registers independently of trap delivery
+  order; missing post-trap vector register element restoration in
+  HELPER(vle*_v) implementations in target/riscv/vector_helper.c
+------------------------------------------------------------
+[compliant] target/riscv/vector_helper.c:207-221  GEN_VEXT_LD_ELEM macro (lde_b_tlb, lde_h_tlb, lde_w_tlb, lde_d_tlb)
+  Each vector element load writes immediately and directly to the destination
+  vector register array via '*cur = cpu_##LDSUF##_data_ra(env, addr,
+  retaddr)'. The RISC-V spec norm:vector_ls_overwrite_past_trap explicitly
+  permits load instructions to overwrite active destination elements past the
+  trap index. This is the correct implementation-defined behavior that matches
+  real hardware implementations that pipeline or speculatively execute vector
+  element loads.
+  | ETYPE *cur = ((ETYPE *)vd + H(idx));
+  | *cur = cpu_##LDSUF##_data_ra(env, addr, retaddr);
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:1773-1775
+      "Load instructions may overwrite active destination vector register
+      group elements past the element index at which the trap is
+      reported."
+
+[compliant] target/riscv/vector_helper.c:309-340  vext_ldst_stride
+  Strided vector load writes each element to vd immediately and incrementally
+  updates env->vstart (line 322: 'env->vstart = ++i'). On a page fault at
+  element N, env->vstart is correctly positioned at N for restart. Per spec
+  norm:vstart_op, re-execution begins from vstart, leaving earlier elements
+  undisturbed and correctly overwriting any clobbered elements at or past
+  vstart. The design satisfies the precise trap requirement: elements
+  preceding vstart have committed results, and elements at or following vstart
+  may have been updated but re-execution correctly overwrites them
+  (norm:V_precise_traps relaxation at lines 4983-4986).
+  | for (i = env->vstart; i < env->vl; env->vstart = ++i) {
+  |     ...
+  |     ldst_elem(env, adjust_addr(env, addr), i + k * max_elems, vd, ra);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:536-539
+      "All vector instructions are defined to begin execution with the
+      element number given in the vstart CSR, leaving earlier elements in
+      the destination ve"
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:4983-4986
+      "We relax the last requirement to allow elements following vstart to
+      have been updated at the time the trap is reported, provided that
+      re-executing the"
+
+[compliant] target/riscv/vector_helper.c:588-622  vext_ldst_index
+  Indexed vector load (used by both vluxei and vloxei) follows the same vstart
+  tracking and immediate-write pattern as strided loads. Elements are written
+  directly to vd one at a time (line 615). On fault, vstart captures the
+  faulting element index, and restart re-executes from that point. Compliant
+  with the spec's precise trap model.
+  | for (i = env->vstart; i < env->vl; env->vstart = ++i) {
+  |     ...
+  |     abi_ptr addr = get_index_addr(base, i, vs2) + (k << log2_esz);
+  |     ldst_elem(env, adjust_addr(env, addr), i + k * max_elems, vd, ra);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/v-st-ext.adoc:10-10
+      "The V vector extension has precise traps."
+
+[potential_risk] target/riscv/vector_helper.c:378-427  vext_page_ldst_us
+  Two distinct code paths with different overwrite-past-trap behaviors. The
+  fast host path (flags==0) uses vext_continuous_ldst_host which, for esz==1,
+  performs a single memcpy writing ALL elements atomically (lines 271-276).
+  The slow TLB path writes elements sequentially with per-element fault
+  detection (lines 411-424). On fast path, if a fault were to occur (TOCTOU
+  race or cosmic ray), elements past the fault are already written to vreg. On
+  slow path, elements past the fault are NOT written (the loop stops at the
+  fault point). While both behaviors are spec-compliant
+  (VECTOR_LS_OVERWRITE_PAST_TRAP permits overwriting), the inconsistency
+  between paths could mask guest kernel bugs that depend on specific post-trap
+  register state. In single-threaded TCG the race is not practically
+  exploitable, but the divergence should be documented.
+  | if (flags == 0) {
+  |     if (nf == 1) {
+  |         vext_continuous_ldst_host(env, ldst_host, vd, evl, env->vstart,
+  |                                   host, esz, is_load);
+  |     }
+  | } else {
+  |     ...
+  |     vext_continuous_ldst_tlb(env, ldst_tlb, vd, evl, addr, env->vstart,
+  |                            ra, esz, is_load);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:1773-1775
+      "Load instructions may overwrite active destination vector register
+      group elements past the element index at which the trap is
+      reported."
+
+[compliant] target/riscv/vector_helper.c:679-805  vext_ldff
+  Fault-only-first vector load (vle8ff-vle64ff) correctly pre-probes all
+  element addresses before loading any data (lines 709-747). On the first
+  element (i==0), probe_pages is called with nonfault=false to allow
+  synchronous exceptions. On subsequent elements, nonfault probes detect
+  inaccessible pages and trim vl (lines 726-737). Only after vl is trimmed
+  does the actual data loading begin (lines 754-801). This correctly
+  implements norm:vector_ff_op — if element 0 faults, vl is unchanged and trap
+  is taken; if element > 0 would fault, vl is reduced and no trap is taken.
+  Elements past the new vl are set by vext_set_tail_elems_1s. No data is
+  loaded past the trimmed vl.
+  | probe_pages(env, addr, (env->vl - env->vstart) * msize, ra, MMU_DATA_LOAD,
+  |             mmu_index, &host, &flags, true);
+  | if (flags & ~TLB_WATCHPOINT) {
+  |     for (i = env->vstart; i < env->vl; i++) {
+  |         ...
+  |         if (i == 0) {
+  |             probe_pages(env, addr_i, nf << log2_esz, ra, MMU_DATA_LOAD,
+  |                         mmu_index, &host, NULL, false);
+  |         } else {
+  |             probe_pages(env, addr_i, offset, 0, MMU_DATA_LOAD,
+  |                         mmu_index, &host, &flags, true);
+  |             if (flags & ~TLB_WATCHPOINT) {
+  |                 vl = i;
+  |                 goto ProbeSuccess;
+  |             }
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:1770-1772
+      "If element 0 raises an exception, vl is not modified, and the trap
+      is taken. If an element > 0 raises an exception, the corresponding
+      trap is not take"
+
+[potential_risk] target/riscv/insn32.decode:399-402  decode (vlxei8_v through vlxei64_v)
+  Ordered (vloxei*) and unordered (vluxei*) indexed loads are decoded
+  identically to the same vlxei*_v helpers. The funct3 bit pattern '0-1'
+  accepts both variants (line 399). The spec distinguishes these: unordered
+  loads allow arbitrary element access order, while ordered loads must access
+  elements in element order. QEMU translates both to the same
+  vext_ldst_index() helper which accesses elements in sequential order. While
+  this is functionally correct (sequential order satisfies both ordered and
+  unordered semantics), it means QEMU does not model the relaxed memory
+  ordering that real hardware may exploit for vluxei. This could mask guest
+  software bugs that depend on specific memory ordering behavior of unordered
+  indexed loads.
+  | vlxei8_v      ... 0-1 . ..... ..... 000 ..... 0000111 @r_nfvm
+  | vlxei16_v     ... 0-1 . ..... ..... 101 ..... 0000111 @r_nfvm
+  | vlxei32_v     ... 0-1 . ..... ..... 110 ..... 0000111 @r_nfvm
+  | vlxei64_v     ... 0-1 . ..... ..... 111 ..... 0000111 @r_nfvm
+
+[compliant] target/riscv/machine.c:138-153  vmstate_vector
+  Vector register state is fully included in migration:
+  VMSTATE_UINT64_ARRAY(env.vreg, ...) covers all 32 vector registers at
+  RV_VLEN_MAX/64 = 1024/64 = 16 uint64_t per register, for 512 total uint64_t
+  entries. All control state (vxrm, vxsat, vl, vstart, vtype, vill) is also
+  migrated. The vector_needed() gate correctly checks for RVV extension (KVM)
+  or ext_zve32x (TCG). No vector state is missing from migration.
+  | VMSTATE_UINT64_ARRAY(env.vreg, RISCVCPU, 32 * RV_VLEN_MAX / 64),
+  | VMSTATE_UINTTL(env.vxrm, RISCVCPU),
+  | VMSTATE_UINTTL(env.vxsat, RISCVCPU),
+  | VMSTATE_UINTTL(env.vl, RISCVCPU),
+  | VMSTATE_UINTTL(env.vstart, RISCVCPU),
+  | VMSTATE_UINTTL(env.vtype, RISCVCPU),
+  | VMSTATE_BOOL(env.vill, RISCVCPU),
+
+[compliant] target/riscv/insn_trans/trans_rvv.c.inc:1120-1145  ldff_trans
+  The fault-only-first load translation correctly handles that vl may be
+  modified by the helper. After the helper call, gen_update_pc advances the PC
+  and lookup_and_goto_ptr exits the TB to re-translate with the updated vl
+  value (lines 1141-1143). s->base.is_jmp is set to DISAS_NORETURN to prevent
+  further translation in the current TB. This is the correct pattern for
+  instructions that modify vl during execution.
+  | fn(dest, mask, base, tcg_env, desc);
+  | finalize_rvv_inst(s);
+  | /* vector unit-stride fault-only-first load may modify vl CSR */
+  | gen_update_pc(s, s->cur_insn_len);
+  | lookup_and_goto_ptr(s);
+  | s->base.is_jmp = DISAS_NORETURN;
+
+[compliant] target/riscv/vector_internals.h:28-33  VSTART_CHECK_EARLY_EXIT macro
+  The VSTART_CHECK_EARLY_EXIT macro correctly handles the case where vstart >=
+  vl (all elements already processed on restart). It resets vstart to 0 and
+  returns immediately. This implements the spec requirement that an
+  instruction that has completed all elements (vstart == vl) does nothing and
+  resets vstart to 0. No destination registers are modified in this case.
+  | #define VSTART_CHECK_EARLY_EXIT(env, vl) do { \
+  |     if (env->vstart >= vl) {                  \
+  |         env->vstart = 0;                      \
+  |         return;                               \
+  |     }                                         \
+  | } while (0)
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:536-539
+      "All vector instructions are defined to begin execution with the
+      element number given in the vstart CSR... and to reset the vstart
+      CSR to zero at the e"
+

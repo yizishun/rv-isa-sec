@@ -1,0 +1,113 @@
+PR #1309  target=qemu  overall=compliant
+Spec: Vector instruction emulation must iterate exactly CSR[vl] elements (not vlmax) and apply CSR[vstart] offset to source/dest bit positions, otherwise QEMU corrupts tail elements the guest kernel's undisturbed policy protects, breaking vector register isolation between guest processes
+Violation:
+  QEMU TCG or helper iterates vector element operations (vadd.vv, vle8.v,
+  vse8.v) up to vlmax (VLEN/SEW/LMUL) instead of CSR vl actual value, causing
+  writes to destination vector register elements beyond the configured vector
+  length that the guest expects to remain undisturbed per tail-agnostic/tail-
+  undisturbed policy
+Consequence: data_corruption
+Pattern:
+  vector loop bound uses vlmax or VLEN/SEW-derived maximum instead of env->vl
+  or CSR vl; missing vl-based early termination in vext_ldst_us,
+  vext_ldst_stride, or vector arith helpers; vstart not added to element index
+  in memory address calculation for unit-stride loads/stores
+------------------------------------------------------------
+[compliant] target/riscv/vector_internals.c:58-82  do_vext_vv
+  Vector VV operation loop bound uses vl=env->vl (line 71: for i=env->vstart;
+  i<vl; i++). total_elems used only for tail element initialization (line 81).
+  No vlmax-derived maximum is used as loop bound.
+  | uint32_t vl = env->vl;
+  |     for (i = env->vstart; i < vl; i++) {
+  |         if (!vm && !vext_elem_mask(v0, i)) { ... continue; }
+  |         fn(vd, vs1, vs2, i);
+  |     }
+  |     vext_set_elems_1s(vd, vta, vl * esz, total_elems * esz);
+
+[compliant] target/riscv/vector_internals.c:84-108  do_vext_vx
+  Vector VX operation loop bound uses vl=env->vl (line 97: for i=env->vstart;
+  i<vl; i++). total_elems only used for tail initialization.
+  | uint32_t vl = env->vl;
+  |     for (i = env->vstart; i < vl; i++) {
+  |         if (!vm && !vext_elem_mask(v0, i)) { ... continue; }
+  |         fn(vd, s1, vs2, i);
+  |     }
+  |     vext_set_elems_1s(vd, vta, vl * esz, total_elems * esz);
+
+[compliant] target/riscv/vector_helper.c:308-340  vext_ldst_stride
+  Strided load/store loop bound correctly uses env->vl (line 322). max_elems
+  (VLEN/SEW-derived) used only for multi-field element indexing within
+  register groups, not as loop bound. Memory address calculation (line 332)
+  correctly uses stride * i with i starting from vstart.
+  | for (i = env->vstart; i < env->vl; env->vstart = ++i) {
+  |         ...
+  |         target_ulong addr = base + stride * i + (k << log2_esz);
+  |         ldst_elem(env, adjust_addr(env, addr), i + k * max_elems, vd, ra);
+
+[compliant] target/riscv/vector_helper.c:429-499  vext_ldst_us
+  Unit-stride load/store takes evl parameter (passed env->vl from
+  GEN_VEXT_LD_US at line 518-519), not vlmax. Address calculation at line 462:
+  addr = base + ((env->vstart * nf) << log2_esz) correctly includes vstart in
+  the address offset.
+  | VSTART_CHECK_EARLY_EXIT(env, evl);
+  |     addr = base + ((env->vstart * nf) << log2_esz);
+  |     ...
+  |     vext_set_tail_elems_1s(evl, vd, desc, nf, esz, max_elems);
+
+[compliant] target/riscv/vector_helper.c:587-622  vext_ldst_index
+  Indexed load/store loop bound uses env->vl (line 604). get_index_addr reads
+  index value from vs2 at position i (starting from vstart), correctly using
+  element index to compute memory address.
+  | for (i = env->vstart; i < env->vl; env->vstart = ++i) {
+  |         ...
+  |         abi_ptr addr = get_index_addr(base, i, vs2) + (k << log2_esz);
+  |         ldst_elem(env, adjust_addr(env, addr), i + k * max_elems, vd, ra);
+
+[compliant] target/riscv/vector_helper.c:678-800  vext_ldff
+  Fault-only-first load correctly uses env->vl as loop bound throughout (lines
+  697, 701, 706, 711, 754, 777, 785). First element fault allowed, subsequent
+  elements probed non-fault. Address calculation at line 697: addr = base +
+  ((env->vstart * nf) << log2_esz) correctly includes vstart.
+  | VSTART_CHECK_EARLY_EXIT(env, env->vl);
+  |     addr = base + ((env->vstart * nf) << log2_esz);
+  |     if (unlikely(env->vstart + elems >= env->vl))
+  |         elems = env->vl - env->vstart;
+
+[compliant] target/riscv/vector_helper.c:834-882  vext_ldst_whole
+  Whole-register load/store correctly uses vlenb for element count (evl = nf *
+  vlenb >> log2_esz), which is spec-correct: whole-register instructions
+  always operate on the entire register group regardless of vl.
+  | uint32_t vlenb = riscv_cpu_cfg(env)->vlenb;
+  |     uint32_t max_elems = vlenb >> log2_esz;
+  |     uint32_t evl = nf * max_elems;
+
+[compliant] target/riscv/vector_helper.c:3140-3168  GEN_VEXT_VV_ENV
+  Floating-point VV helper loop bound uses ecrp->vl=env->vl (line 3155).
+  total_elems from vext_get_total_elems() correctly accounts for EEW/SEW/LMUL
+  differences and is used only for tail element initialization.
+  | uint32_t vl = env->vl;
+  |     for (i = env->vstart; i < vl; i++) {
+  |         if (!vm && !vext_elem_mask(v0, i)) { ... }
+  |         do_##NAME(vd, vs1, vs2, i, env);
+  |     }
+  |     vext_set_elems_1s(vd, vta, vl * ESZ, total_elems * ESZ);
+
+[compliant] target/riscv/insn_trans/trans_rvv.c.inc:1305-1327  do_opivv_gvec
+  gvec fast-path only activates when vl_eq_vlmax is true (vl == vlmax), so
+  using MAXSZ(s) as gvec size is safe. When vl != vlmax, falls through to the
+  helper path where loop uses env->vl.
+  | if (a->vm && s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {
+  |         gvec_fn(s->sew, vreg_ofs(s, a->rd), ..., MAXSZ(s), MAXSZ(s));
+  |     } else {
+  |         ... tcg_gen_gvec_4_ptr(..., s->cfg_ptr->vlenb, s->cfg_ptr->vlenb, data, fn);
+
+[compliant] target/riscv/vector_helper.c:1476-5421  GEN_VEXT_CMP_VV / GEN_VEXT_VMADC_VVM / vmsetm / GEN_VEXT_VIOTA_M / GEN_VEXT_VID_V
+  All remaining vector operations (compare, mask-adc, mask-set, iota, vid,
+  vcpop, mask logical) use env->vl as the primary loop bound and total_elems
+  only for tail element initialization. No instance found where
+  vlmax/vext_max_elems is used as element iteration bound.
+  | uint32_t vl = env->vl;
+  |     for (i = env->vstart; i < vl; i++) { ... }
+  |     env->vstart = 0;
+  |     /* tail initialization uses total_elems not as loop bound */
+

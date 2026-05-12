@@ -1,0 +1,77 @@
+PR #1297  target=xiangshan  overall=bug_confirmed
+Spec: mseccfg/mseccfgh must only exist when Zkr, Smmpm, or Zicfilp is implemented; unconditional CSR presence when only Sm is enabled causes illegal access to succeed where spec mandates trap
+Violation:
+  XiangShan RTL implements the mseccfg CSR (CSR address 0x747) and allows
+  read/write access when the hart only supports Sm extension but none of Zkr,
+  Smmpm, or Zicfilp are enabled. The CSR decoder or CSR access module fails to
+  gate mseccfg existence on the disjunction of {Zkr, Smmpm, Zicfilp}, exposing
+  a CSR that the spec now requires to be absent—reads return zero instead of
+  trapping with illegal instruction, and writes do not trap as required.
+Consequence: privilege_escape
+Pattern:
+  CSR_EXISTENCE_GATE_mseccfg_Sm_WITHOUT_Zkr_Smmpm_Zicfilp
+------------------------------------------------------------
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:319-327  Mseccfg CSR module instantiation (anonymous)
+  The mseccfg CSR module is unconditionally instantiated without any extension
+  gating. Per norm:mseccfg_presence, mseccfg 'exists if any extension that
+  adds a field to mseccfg is implemented. Otherwise, it is reserved.' When
+  none of {Smepmp, Zkr, Smmpm, Zicfilp} are configured, accesses to 0x747
+  should trap with illegal instruction. Instead, reads return zero (and writes
+  are silently ignored as RO), exposing a CSR that the spec requires to be
+  absent. No HasZkr/HasSmepmp/HasSmmpm/HasZicfilp configuration parameters
+  exist anywhere in the codebase to gate this.
+  | val mseccfg = Module(new CSRModule("Mseccfg", new CSRBundle {
+  |     val PMM   = EnvPMM(33, 32, wNoEffect).withReset(EnvPMM.Disable)
+  |     val MLPE  = RO(10)
+  |     val SSEED = RO( 9)
+  |     val USEED = RO( 8)
+  |     val RLB   = RO( 2)
+  |     val MMWP  = RO( 1)
+  |     val MML   = RO( 0)
+  |   })).setAddr(CSRs.mseccfg)
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2333-2335
+      "[#norm:mseccfg_presence]#It exists if any extension that adds a
+      field to `mseccfg` is implemented. Otherwise, it is reserved.#"
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:462-462  machineLevelCSRMods collection
+  mseccfg is unconditionally added to machineLevelCSRMods, which feeds into
+  machineLevelCSRMap and subsequently csrRwMap. Since csrRwMap is the source
+  of truth for CSR existence in the noCSRIllegal check (NewCSR.scala:1021),
+  mseccfg always passes the existence test and never triggers an illegal-
+  instruction exception, even when the qualifying extensions (Smepmp, Zkr,
+  Smmpm, Zicfilp) are absent.
+  | mseccfg,
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2333-2335
+      "[#norm:mseccfg_presence]#It exists if any extension that adds a
+      field to `mseccfg` is implemented. Otherwise, it is reserved.#"
+
+[potential_risk] src/main/scala/xiangshan/backend/decode/isa/CSRs.scala:708-708  CSRs companion object (all array)
+  The mseccfg CSR address (0x747) is unconditionally included in the 'all' CSR
+  array, which is used by the decoder stage for CSR address validation. If the
+  decoder uses this array to check for CSR existence, it would incorrectly
+  indicate that mseccfg is a valid CSR even when none of the qualifying
+  extensions are implemented. Note: XiangShan's decoder may use a separate
+  mechanism — the primary existence gate is the csrRwMap in NewCSR.scala.
+  | res += mseccfg
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2333-2335
+      "[#norm:mseccfg_presence]#It exists if any extension that adds a
+      field to `mseccfg` is implemented. Otherwise, it is reserved.#"
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:320-326  Mseccfg CSR field definitions
+  All mseccfg fields correctly use RO (read-only) type when the corresponding
+  extension features are not dynamically configurable as writable. The PMM
+  field correctly uses the EnvPMM WARL enum (Disable/PMLEN7/PMLEN16). The bit
+  positions match spec: MML=0, MMWP=1, RLB=2, USEED=8, SSEED=9, MLPE=10,
+  PMM=[33:32]. If the qualifying extensions were separately gated, per-field
+  writability could be further refined, but the RO default is safe.
+  | val PMM   = EnvPMM(33, 32, wNoEffect).withReset(EnvPMM.Disable)
+  |     val MLPE  = RO(10)
+  |     val SSEED = RO( 9)
+  |     val USEED = RO( 8)
+  |     val RLB   = RO( 2)
+  |     val MMWP  = RO( 1)
+  |     val MML   = RO( 0)
+

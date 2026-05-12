@@ -1,0 +1,221 @@
+{
+  "pr_number": 1190,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1190,
+    "violation_condition": "Any VLMAX computation path in QEMU that uses the SEW byte-count value (e.g. 8, 16, 32, or 64 bits) where the VSEW field encoding (0-3) is expected in the shift expression `(vlen >> (sew + 3 - lmul))` produces a wildly incorrect element count — for fractional LMUL the error is multiplicative (e.g. SEW=8 yields `3+8=11` instead of `3+0=3`, shifting VLEN by 11 bits instead of 3), and every subsequent vector instruction then iterates past the architectural register-group boundary, reading or corrupting adjacent vector register state.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "VLMAX or max_elems computed with `sew_value_in_bits` (derived as `8 << vsew`) instead of the raw `vsew` encoding, or any expression matching `>> (3 + sew_value)` or `>> (sew_value + 3 - lmul)` where the first operand of `+` is a byte-count or bit-count rather than the 3-bit VSEW field",
+    "affected_entities": [
+      "vsetvl",
+      "vsetvli",
+      "vsetivli",
+      "vext_get_vlmax",
+      "vext_max_elems",
+      "vtype",
+      "vl"
+    ],
+    "summary": "ISA-spec VLMAX formula used SEW bit-value (8/16/32/64) where the VSEW field (0-3) was intended; QEMU must ensure every VLMAX path uses the 3-bit VSEW encoding — not the decoded SEW bit-count — in the shift arithmetic, or vector operations will overrun register groups"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.h",
+        "function_name": "vext_get_vlmax",
+        "line_start": 876,
+        "line_end": 887,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VLMAX = vlen >> (vsew + 3 - lmul). Comment at line 870-875 explicitly documents that vsew is the VSEW field encoding (0/1/2/3), with a worked example showing SEW=16 → vsew=1. The '+ 3' converts log2(SEW_bytes) to log2(SEW_bits). Correct.",
+      "snippet": "static inline uint32_t vext_get_vlmax(uint32_t vlenb, uint32_t vsew,\n                                      int8_t lmul)\n{\n    uint32_t vlen = vlenb << 3;\n    return vlen >> (vsew + 3 - lmul);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 322,
+          "line_end": 325,
+          "excerpt": "The derived value VLMAX = LMUL*VLEN/SEW represents the maximum number of elements that can be operated on with a single vector instruction given the current SEW and LMUL settings."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "HELPER(vsetvl)",
+        "line_start": 61,
+        "line_end": 117,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Correctly extracts vsew as raw VSEW field encoding (line 67: FIELD_EX64(s2, VTYPE, VSEW)), derives sew=8<<vsew (line 68) for ELEN validity checks only, then passes the field encoding vsew (not sew) to vext_get_vlmax (line 110). The two representations are never confused.",
+      "snippet": "uint8_t vsew = FIELD_EX64(s2, VTYPE, VSEW);\nuint16_t sew = 8 << vsew;\n...\nvlmax = vext_get_vlmax(cpu->cfg.vlenb, vsew, lmul);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/tcg/tcg-cpu.c",
+        "function_name": "cpu_get_tb_cpu_state",
+        "line_start": 120,
+        "line_end": 129,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vsew extracted from env->vtype VSEW field (line 123: FIELD_EX64(env->vtype, VTYPE, VSEW)) and passed to vext_get_vlmax (line 124) — pure field encoding. TB_FLAGS.SEW stores this field encoding, which is later loaded into DisasContext::sew. Consistent pipeline.",
+      "snippet": "uint32_t vsew = FIELD_EX64(env->vtype, VTYPE, VSEW);\nuint32_t vlmax = vext_get_vlmax(cpu->cfg.vlenb, vsew, lmul);\nuint32_t maxsz = vlmax << vsew;\n...\nflags = FIELD_DP32(flags, TB_FLAGS, SEW, vsew);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vrgather_vx",
+        "line_start": 3888,
+        "line_end": 3915,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vext_get_vlmax called with s->sew (line 3895), which originates from TB_FLAGS.SEW = VSEW field encoding. Correct field-encoding semantics preserved throughout the translation pipeline.",
+      "snippet": "int vlmax = vext_get_vlmax(s->cfg_ptr->vlenb, s->sew, s->lmul);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vrgather_vi",
+        "line_start": 3918,
+        "line_end": 3939,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Same pattern as vrgather_vx — vext_get_vlmax called with s->sew (line 3925) which is the VSEW field encoding. Correct.",
+      "snippet": "int vlmax = vext_get_vlmax(s->cfg_ptr->vlenb, s->sew, s->lmul);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_max_elems",
+        "line_start": 136,
+        "line_end": 147,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Alternative VLMAX computation: scale = vext_lmul(desc) - log2_esz, then vlenb >> -scale or vlenb << scale. All callers pass ctzl(sizeof(ETYPE)) as log2_esz (e.g., sizeof(uint32_t)=4, ctzl(4)=2). This computes VLENB * LMUL / SEW_bytes correctly. Independent of the field-encoding path, no confusion.",
+      "snippet": "int scale = vext_lmul(desc) - log2_esz;\nreturn scale < 0 ? vlenb >> -scale : vlenb << scale;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_ldst_whole",
+        "line_start": 835,
+        "line_end": 844,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Whole-register load/store VLMAX: max_elems = vlenb >> log2_esz where log2_esz = ctzl(sizeof(ETYPE)). Since whole-register ops have implicit LMUL=1, this is correct: VLENB/SEW_bytes = VLMAX.",
+      "snippet": "uint32_t vlenb = riscv_cpu_cfg(env)->vlenb;\nuint32_t max_elems = vlenb >> log2_esz;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_internals.h",
+        "function_name": "vext_get_total_elems",
+        "line_start": 114,
+        "line_end": 122,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Uses sew = 1 << VSEW_field (line 118) to get SEW in bytes, then computes EMUL in log2 space with ctzl() on byte values. Correctly handles the field→byte conversion before arithmetic.",
+      "snippet": "uint32_t sew = 1 << FIELD_EX64(env->vtype, VTYPE, VSEW);\nint8_t emul = ctzl(esz) - ctzl(sew) + vext_lmul(desc) < 0 ? 0 :\n              ctzl(esz) - ctzl(sew) + vext_lmul(desc);\nreturn (vlenb << emul) / esz;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_vector",
+        "line_start": 138,
+        "line_end": 153,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Vector VMState includes env.vreg (32*RV_VLEN_MAX/64), env.vxrm, env.vxsat, env.vl, env.vstart, env.vtype, env.vill. All architectural vector state is captured for migration. No missing fields.",
+      "snippet": "VMSTATE_UINT64_ARRAY(env.vreg, RISCVCPU, 32 * RV_VLEN_MAX / 64),\nVMSTATE_UINTTL(env.vxrm, RISCVCPU),\nVMSTATE_UINTTL(env.vxsat, RISCVCPU),\nVMSTATE_UINTTL(env.vl, RISCVCPU),\nVMSTATE_UINTTL(env.vstart, RISCVCPU),\nVMSTATE_UINTTL(env.vtype, RISCVCPU),\nVMSTATE_BOOL(env.vill, RISCVCPU),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_vstart",
+        "line_start": 1001,
+        "line_end": 1011,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "CSR vstart write correctly masks to only writable bits: val & ~(~0ULL << ctzl(vlenb << 3)). This reserves bits beyond lg2(VLEN) as read-as-zero/write-ignored. Per spec section norm:vstart_sz_writable.",
+      "snippet": "env->vstart = val & ~(~0ULL << ctzl(riscv_cpu_cfg(env)->vlenb << 3));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 548,
+          "line_end": 554,
+          "excerpt": "The vstart CSR is defined to have only enough writable bits to hold the largest element index (one less than the maximum VLMAX)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/kvm/kvm-cpu.c",
+        "function_name": "kvm_riscv_get_regs_vector",
+        "line_start": 839,
+        "line_end": 888,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM vector register sync correctly reads vstart, vl, vtype, vlenb, and all 32 vreg[] entries from kernel. Vector CSRs and register state are fully synchronized in both get (line 839) and put paths.",
+      "snippet": "ret = kvm_get_one_reg(cs, RISCV_VECTOR_CSR_REG(vstart), &reg);\n...\nret = kvm_get_one_reg(cs, RISCV_VECTOR_CSR_REG(vl), &reg);\n...\nret = kvm_get_one_reg(cs, RISCV_VECTOR_CSR_REG(vtype), &reg);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "endian_ofs",
+        "line_start": 3549,
+        "line_end": 3556,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Big-endian byte-swap uses (idx ^ (7 >> s->sew)) << s->sew. s->sew is the VSEW field encoding (0..3). 7>>0=7, 7>>1=3, 7>>2=1, 7>>3=0 — these produce the correct XOR pattern for byte-swapping within each SEW-width element. Correct usage of field encoding as a log2 shift.",
+      "snippet": "return vreg_ofs(s, r) + ((idx ^ (7 >> s->sew)) << s->sew);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "extract_imm",
+        "line_start": 1497,
+        "line_end": 1500,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "IMM_TRUNC_SEW uses extract64(imm, 0, s->sew + 3) — this is log2(SEW_bits), so for SEW=8 (sew=0): 3 bits, SEW=16 (sew=1): 4 bits, etc. Correct use of the field encoding with '+ 3' to get bit-width log2.",
+      "snippet": "case IMM_TRUNC_SEW:\n    return extract64(imm, 0, s->sew + 3);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vfmv_f_s",
+        "line_start": 3703,
+        "line_end": 3704,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ofs = (8 << s->sew) correctly converts VSEW field encoding to SEW bit-width (8<<0=8, 8<<1=16, 8<<2=32, 8<<3=64). Used for NaN-boxing mask calculation — not a VLMAX computation.",
+      "snippet": "unsigned int ofs = (8 << s->sew);\nunsigned int len = 64 - ofs;",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

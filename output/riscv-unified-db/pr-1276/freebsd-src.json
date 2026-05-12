@@ -1,0 +1,282 @@
+{
+  "pr_number": 1276,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 1276,
+    "violation_condition": "FreeBSD kernel FPU save/restore in swtch.S (__fpe_state_save/__fpe_state_load macros) and fpe.c (fpe_enable/fpe_store/fpe_restore) sets sstatus.FS to enable F-register access, but on a Zfinx+Smstateen system the state-enable CSRs (mstateen0.FCSR, sstateen0.FCSR) are the actual gate for FP instruction legality — not mstatus.FS. Since FreeBSD has zero awareness of the state-enable CSR chain (no mention of mstateen0/sstateen0 anywhere in sys/riscv), if these CSRs power up with FCSR=0 on such hardware, every kernel-side FPU access (frcsr, fscsr, fsd, fld) would raise an illegal-instruction exception, panicking the kernel during context switch or fpe_init at boot.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csrs sstatus, SSTATUS_FS_INITIAL without preceding csr-set of mstateen0.FCSR or sstateen0.FCSR; direct f-register access (frcsr/fscsr/fsd/fld) without stateen CSR audit",
+    "affected_entities": [
+      "mstateen0",
+      "sstateen0",
+      "hstateen0",
+      "sstatus",
+      "mstatus",
+      "frcsr",
+      "fscsr"
+    ],
+    "summary": "FreeBSD's FPU management relies solely on mstatus.FS for FP access gating, ignoring the state-enable CSR chain (mstateen0/sstateen0/hstateen0) that Zfinx+Smstateen systems require per the updated check_f_ok — kernel FPU save/restore would trap with illegal-instruction on such hardware"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "__fpe_state_save",
+        "line_start": 41,
+        "line_end": 88,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Macro sets sstatus.FS=Initial via csrs sstatus, SSTATUS_FS_INITIAL before executing frcsr/fsd instructions. On a Zfinx+Smstateen system, mstatus.FS is hardwired to 0 and misa.F=0, so the csrs is a no-op. The actual gate for FP instruction legality is sstateen0.FCSR (bit 1) — which FreeBSD never configures. If mstateen0.FCSR powers up as 0 (the secure default), every frcsr/fsd instruction in this macro raises an illegal-instruction exception, panicking the kernel during context switch. No reference to mstateen0 or sstateen0 exists anywhere in sys/riscv/.",
+      "snippet": "        li      t0, SSTATUS_FS_INITIAL\n        csrs    sstatus, t0\n\n        /* Store registers */\n        frcsr   t0\n        sd      t0, (PCB_FCSR)(\\p)\n        fsd     f0, (PCB_X + 0 * 16)(\\p)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zfinx.adoc",
+          "line_start": 155,
+          "line_end": 159,
+          "excerpt": "mstatus field FS is hardwired to 0 if the Zfinx extension is implemented, and FS no longer affects the trapping behavior of floating-point instructions or fcsr accesses."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 253,
+          "line_end": 261,
+          "excerpt": "The FCSR bit controls access to fcsr for the case when floating-point instructions operate on x registers instead of f registers as specified by the Zfinx and related extensions (Zdinx, etc.). Whenever misa.F = 1, FCSR bit of mstateen0 is read-only zero (and hence read-only zero in hstateen0 and sstateen0 too). For convenience, when the stateen CSRs are implemented and misa.F = 0, then if the FCSR bit of a controlling stateen0 CSR is zero, all floating-point instructions cause an illegal-instruction exception (or virtual-instruction exception, if relevant), as though they all access fcsr, regardless of whether they really do."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "__fpe_state_load",
+        "line_start": 90,
+        "line_end": 137,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Identical vulnerability to __fpe_state_save. Sets sstatus.FS=Initial then executes fscsr/fld instructions. On Zfinx+Smstateen hardware with stateen0.FCSR=0, every fscsr/fld raises illegal-instruction → kernel panic during context-switch restore path. The sstatus.FS write is architecturally meaningless on Zfinx (field hardwired to 0).",
+      "snippet": "        li      t0, SSTATUS_FS_INITIAL\n        csrs    sstatus, t0\n\n        /* Restore registers */\n        ld      t0, (PCB_FCSR)(\\p)\n        fscsr   t0\n        fld     f0, (PCB_X + 0 * 16)(\\p)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zfinx.adoc",
+          "line_start": 155,
+          "line_end": 159,
+          "excerpt": "mstatus field FS is hardwired to 0 if the Zfinx extension is implemented, and FS no longer affects the trapping behavior of floating-point instructions or fcsr accesses."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 253,
+          "line_end": 261,
+          "excerpt": "The FCSR bit controls access to fcsr for the case when floating-point instructions operate on x registers instead of f registers... if the FCSR bit of a controlling stateen0 CSR is zero, all floating-point instructions cause an illegal-instruction exception..."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 290,
+        "line_end": 304,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "cpu_switch FPU save path checks sstatus.FS==Dirty (via SSTATUS_FS_MASK/SSTATUS_FS_DIRTY) to decide whether to save F-registers. On Zfinx, sstatus.FS is hardwired to 0, so the Dirty check always fails. This means (a) the branch never triggers the save path, leaking FP state across context switches; and (b) if it did trigger, __fpe_state_save would crash. The stateen0.FCSR-controlled gate is entirely unaddressed.",
+      "snippet": "        li      t2, SSTATUS_FS_MASK\n        and     t3, t1, t2\n        li      t2, SSTATUS_FS_DIRTY\n        bne     t3, t2, 1f              /* No, skip. */\n        /* Yes, mark FPE state clean and save registers. */\n        __fpe_state_save x13",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zfinx.adoc",
+          "line_start": 155,
+          "line_end": 163,
+          "excerpt": "mstatus field FS is hardwired to 0 if the Zfinx extension is implemented... misa bits F, D, and Q are hardwired to 0 when the Zfinx extension is implemented."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 347,
+        "line_end": 356,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "cpu_switch FPU restore path checks sstatus.FS!=0 (via SSTATUS_FS_MASK) to decide whether to load F-registers. On Zfinx, FS is hardwired to 0, so the branch never triggers — FP state is never restored on context switch. If it did trigger, __fpe_state_load would crash as described above.",
+      "snippet": "        li      t2, SSTATUS_FS_MASK\n        and     t3, t1, t2\n        beqz    t3, 1f                  /* No, skip. */\n        /* Restore registers. */\n        __fpe_state_load x13",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zfinx.adoc",
+          "line_start": 155,
+          "line_end": 159,
+          "excerpt": "mstatus field FS is hardwired to 0 if the Zfinx extension is implemented, and FS no longer affects the trapping behavior of floating-point instructions or fcsr accesses."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/fpe.c",
+        "function_name": "fpe_enable",
+        "line_start": 44,
+        "line_end": 51,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fpe_enable() only sets sstatus.FS=Initial via csr_set(sstatus, SSTATUS_FS_INITIAL). On Zfinx+Smstateen hardware this is a no-op (FS hardwired to 0). The actual enable gate would be setting sstateen0.FCSR (bit 1), which is never done. Callers (fpe_init at boot, vmm guest FPU restore) would proceed to execute FP instructions that raise illegal-instruction exceptions.",
+      "snippet": "void\nfpe_enable(void)\n{\n        uint64_t reg;\n        reg = SSTATUS_FS_INITIAL;\n        csr_set(sstatus, reg);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zfinx.adoc",
+          "line_start": 155,
+          "line_end": 159,
+          "excerpt": "mstatus field FS is hardwired to 0 if the Zfinx extension is implemented, and FS no longer affects the trapping behavior of floating-point instructions or fcsr accesses."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 86,
+          "line_end": 95,
+          "excerpt": "The stateen registers at each level control access to state at all less-privileged levels, but not at its own level. When a stateen CSR prevents access to state by less-privileged levels, an attempt in one of those privilege modes to execute an instruction that would read or write the protected state raises an illegal-instruction exception."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/fpe.c",
+        "function_name": "fpe_store",
+        "line_start": 64,
+        "line_end": 107,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fpe_store() executes frcsr and 32× fsd instructions to save F-register state. On Zfinx+Smstateen with stateen0.FCSR=0, every one of these instructions raises an illegal-instruction exception. The function provides no sstateen0.FCSR configuration — it relies entirely on the caller having called fpe_enable() (which is itself broken on Zfinx as it only touches sstatus.FS).",
+      "snippet": "        __asm __volatile(\n            \"frcsr        %0              \\n\"\n            \"fsd  f0, (16 * 0)(%2)\\n\"\n            \"fsd  f1, (16 * 1)(%2)\\n\"\n            ...\n            \"fsd  f31, (16 * 31)(%2)\\n\"\n            : \"=&r\"(fcsr), \"=m\"(*fp_x) : \"r\"(fp_x));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 253,
+          "line_end": 261,
+          "excerpt": "For convenience, when the stateen CSRs are implemented and misa.F = 0, then if the FCSR bit of a controlling stateen0 CSR is zero, all floating-point instructions cause an illegal-instruction exception... regardless of whether they really do."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/fpe.c",
+        "function_name": "fpe_restore",
+        "line_start": 110,
+        "line_end": 152,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fpe_restore() executes fscsr and 32× fld instructions to restore F-register state. Same vulnerability as fpe_store: on Zfinx+Smstateen with stateen0.FCSR=0, fscsr/fld raise illegal-instruction exceptions. No stateen0 CSR awareness anywhere in the call chain.",
+      "snippet": "        __asm __volatile(\n            \"fscsr       %0              \\n\"\n            \"fld  f0, (16 * 0)(%1)\\n\"\n            \"fld  f1, (16 * 1)(%1)\\n\"\n            ...\n            \"fld  f31, (16 * 31)(%1)\\n\"\n            :: \"r\"(fcsr), \"r\"(fp_x), \"m\"(*fp_x));",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 253,
+          "line_end": 261,
+          "excerpt": "For convenience, when the stateen CSRs are implemented and misa.F = 0, then if the FCSR bit of a controlling stateen0 CSR is zero, all floating-point instructions cause an illegal-instruction exception... regardless of whether they really do."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/fpe.c",
+        "function_name": "fpe_init",
+        "line_start": 176,
+        "line_end": 190,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Boot-time SYSINIT fpe_init() calls fpe_enable() → fpe_store() → fpe_disable() to capture the initial FPU state. On Zfinx+Smstateen hardware with stateen0.FCSR=0, fpe_enable() is a no-op (sstatus.FS hardwired to 0) and fpe_store() immediately raises illegal-instruction on the first frcsr instruction, causing a kernel panic at SI_SUB_CPU init time — before userland even starts. This is the earliest and most guaranteed crash path.",
+      "snippet": "        fpe_enable();\n        fpe_store(fpu_initialstate);\n        fpe_disable();\n\n        bzero(fpu_initialstate->fp_x, sizeof(fpu_initialstate->fp_x));\n}\nSYSINIT(fpe, SI_SUB_CPU, SI_ORDER_ANY, fpe_init, NULL);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 253,
+          "line_end": 261,
+          "excerpt": "The FCSR bit controls access to fcsr... if the FCSR bit of a controlling stateen0 CSR is zero, all floating-point instructions cause an illegal-instruction exception..."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/zfinx.adoc",
+          "line_start": 155,
+          "line_end": 159,
+          "excerpt": "mstatus field FS is hardwired to 0 if the Zfinx extension is implemented, and FS no longer affects the trapping behavior of floating-point instructions or fcsr accesses."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fpe_state_clear",
+        "line_start": 154,
+        "line_end": 197,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "fpe_state_clear uses the same csrs sstatus, SSTATUS_FS_INITIAL pattern followed by frcsr/fsd instructions to zero out FPU state. Same vulnerability: on Zfinx+Smstateen, the sstatus write is a no-op and the FP instructions raise illegal-instruction exceptions.",
+      "snippet": "        li      t0, SSTATUS_FS_INITIAL\n        csrs    sstatus, t0\n        /* Store registers */\n        frcsr   t0",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 253,
+          "line_end": 261,
+          "excerpt": "if the FCSR bit of a controlling stateen0 CSR is zero, all floating-point instructions cause an illegal-instruction exception..."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "",
+        "line_start": 67,
+        "line_end": 72,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The RISC-V register definitions header defines SSTATUS_FS_* constants but has zero definitions for mstateen0, sstateen0, hstateen0 CSRs or their bit fields (FCSR, C, JVT, CTR, etc.). This absence means no kernel code can reference the stateen CSR chain — the entire Smstateen/Ssstateen extension is unknown to FreeBSD's RISC-V port.",
+      "snippet": "#define SSTATUS_FS_SHIFT        13\n#define SSTATUS_FS_OFF          (0x0 << SSTATUS_FS_SHIFT)\n#define SSTATUS_FS_INITIAL      (0x1 << SSTATUS_FS_SHIFT)\n#define SSTATUS_FS_CLEAN        (0x2 << SSTATUS_FS_SHIFT)\n#define SSTATUS_FS_DIRTY        (0x3 << SSTATUS_FS_SHIFT)\n#define SSTATUS_FS_MASK         (0x3 << SSTATUS_FS_SHIFT)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 46,
+          "line_end": 49,
+          "excerpt": "Smstateen comprises the mstateen*, sstateen*, and hstateen* CSRs."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "__vm_handle_fp",
+        "line_start": 0,
+        "line_end": 0,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The VMM layer (vmm_riscv.c) calls fpe_enable/fpe_restore and fpe_enable/fpe_store for guest FPU context switching but has no awareness of hstateen0.FCSR or sstateen0.FCSR. On Zfinx+Smstateen hardware, virtual-machine FPU state save/restore would raise illegal-instruction exceptions since hstateen0.FCSR (bit 1) is the gate for VS/VU-mode FP access — and FreeBSD never configures it.",
+      "snippet": "(VMM calls fpe_enable + fpe_restore/store for guest FPU — no hstateen0 awareness)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smstateen.adoc",
+          "line_start": 129,
+          "line_end": 132,
+          "excerpt": "With the hypervisor extension, the hstateen CSRs have identical encodings to the mstateen CSRs, except controlling accesses for a virtual machine (from VS and VU modes)."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

@@ -1,0 +1,180 @@
+PR #1153  target=opensbi  overall=potential_risk
+Spec: MSECCFG is not saved/restored across HSM non-retentive suspend/resume; USEED/SSEED bits are lost and platform-specific resume paths may leave Smepmp disabled
+Violation:
+  In OpenSBI's HSM non-retentive suspend flow,
+  __sbi_hsm_suspend_non_ret_save() saves MIE, MIP, MEDELEG, MIDELEG, and
+  MENVCFG but omits MSECCFG. On resume, __sbi_hsm_suspend_non_ret_restore()
+  restores those CSRs but does not restore MSECCFG. After the hart loses power
+  during non-retentive suspend, MSECCFG resets to its hardware default (MML=0,
+  MMWP=0, RLB=0, USEED/SSEED=0). While the standard warm-boot resume path
+  (init_warm_resume → sbi_hart_protection_configure →
+  sbi_hart_smepmp_configure) re-programs MML and RLB as a side effect, non-
+  MSECCFG bits (USEED, SSEED for Zkr) are never re-established since
+  sbi_hart_reinit() does not touch MSECCFG and the Zkr seed CSR configuration
+  is only done during cold boot (sbi_hart.c:177-179). Additionally, any
+  platform-specific resume path that bypasses sbi_hart_protection_configure()
+  would leave MSECCFG at hardware reset value, defeating Smepmp MML/MMWP
+  enforcement entirely.
+Consequence: function_loss
+Pattern:
+  saved_menvcfg without corresponding saved_mseccfg in suspend save/restore;
+  sbi_hart_reinit omitting MSECCFG reconfiguration; warm-boot resume not
+  restoring USEED/SSEED bits
+------------------------------------------------------------
+[potential_risk] lib/sbi/sbi_hsm.c:44-53  struct sbi_hsm_data
+  struct sbi_hsm_data stores saved_mie, saved_mip, saved_medeleg,
+  saved_mideleg, and saved_menvcfg for non-retentive suspend, but has no
+  saved_mseccfg field. MSECCFG is the only security-critical M-mode CSR
+  missing from the save/restore data structure.
+  | struct sbi_hsm_data {
+  | 	atomic_t state;
+  | 	unsigned long suspend_type;
+  | 	unsigned long saved_mie;
+  | 	unsigned long saved_mip;
+  | 	unsigned long saved_medeleg;
+  | 	unsigned long saved_mideleg;
+  | 	u64 saved_menvcfg;
+  | 	atomic_t start_ticket;
+  | };
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2797-2798
+      "The MML, MMWP, and RLB fields of the mseccfg register are set to 0,
+      unless the platform mandates a different reset value."
+    - riscv-isa-manual/src/priv/machine.adoc:2806-2808
+      "The USEED and SSEED fields of the mseccfg CSR must have defined
+      reset values. The system must not allow them to be in an undefined
+      state after reset."
+
+[potential_risk] lib/sbi/sbi_hsm.c:427-432  __sbi_hsm_suspend_non_ret_save
+  Saves MIE, MIP (S-mode bits only), MEDELEG, MIDELEG, and MENVCFG before non-
+  retentive suspend, but does NOT save MSECCFG. After power loss during non-
+  retentive suspend, MSECCFG resets to hardware default (MML=0, MMWP=0, RLB=0,
+  USEED=0, SSEED=0 per spec). The save mechanism is incomplete — MENVCFG is
+  saved but MSECCFG is not.
+  | hdata->saved_mie = csr_read(CSR_MIE);
+  | hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+  | hdata->saved_medeleg = csr_read(CSR_MEDELEG);
+  | hdata->saved_mideleg = csr_read(CSR_MIDELEG);
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2797-2798
+      "The MML, MMWP, and RLB fields of the mseccfg register are set to 0,
+      unless the platform mandates a different reset value."
+
+[potential_risk] lib/sbi/sbi_hsm.c:440-445  __sbi_hsm_suspend_non_ret_restore
+  Restores MENVCFG, MIDELEG, MEDELEG, MIE, and MIP on warm resume, but does
+  NOT restore MSECCFG. This function is the explicit restore counterpart to
+  __sbi_hsm_suspend_non_ret_save and is called from
+  sbi_hsm_hart_resume_finish() (line 479), which runs after sbi_hart_reinit()
+  and sbi_hart_protection_configure(). The missing MSECCFG restore makes the
+  save/restore pair asymmetric (MENVCFG is saved+restored, MSECCFG is
+  neither).
+  | if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)
+  | 	csr_write64(CSR_MENVCFG, hdata->saved_menvcfg);
+  | csr_write(CSR_MIDELEG, hdata->saved_mideleg);
+  | csr_write(CSR_MEDELEG, hdata->saved_medeleg);
+  | csr_write(CSR_MIE, hdata->saved_mie);
+  | csr_set(CSR_MIP, (hdata->saved_mip & (MIP_SSIP | MIP_STIP)));
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2797-2798
+      "The MML, MMWP, and RLB fields of the mseccfg register are set to 0,
+      unless the platform mandates a different reset value."
+
+[compliant] lib/sbi/sbi_hart.c:176-179  mstatus_init
+  mstatus_init() re-establishes MSECCFG SSEED/USEED bits on every warm resume:
+  sets SSEED=1 (S-mode seed access) and clears USEED=0 (no U-mode seed access)
+  when Zkr is present. This runs unconditionally during sbi_hart_reinit()
+  (called at sbi_init.c:490 in init_warm_resume). However, this is re-
+  initialization rather than explicit save/restore — the pre-suspend MSECCFG
+  value is not preserved, the bits are reconstructed from extension detection.
+  Works correctly for current extensions but does not generalize to future
+  MSECCFG fields.
+  | /* Enable S-mode access to seed CSR */
+  | if (sbi_hart_has_extension(scratch, SBI_HART_EXT_ZKR)) {
+  | 	csr_set(CSR_MSECCFG, MSECCFG_SSEED);
+  | 	csr_clear(CSR_MSECCFG, MSECCFG_USEED);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2351-2354
+      "When SSEED is 0, access to the seed CSR from S-/HS-mode raises an
+      illegal-instruction exception. When SSEED is 1, read-write access to
+      the seed CSR fr"
+
+[compliant] lib/sbi/sbi_hart_pmp.c:139-139  sbi_hart_smepmp_configure
+  Sets MSECCFG.RLB=1 on warm resume (via init_warm_resume →
+  sbi_hart_protection_configure → sbi_hart_smepmp_configure at sbi_init.c:494)
+  to allow PMP entry programming. This re-establishes the RLB bit that was
+  lost during non-retentive power loss.
+  | csr_set(CSR_MSECCFG, MSECCFG_RLB);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2392-2395
+      "When mseccfg.RLB is 1, locked PMP rules may be removed or modified
+      and locked PMP rules may be edited."
+
+[compliant] lib/sbi/sbi_hart_pmp.c:184-185  sbi_hart_smepmp_configure
+  Sets MSECCFG.MML=1 on warm resume after programming M-only PMP regions. This
+  re-establishes the MML bit that was lost during non-retentive power loss,
+  enforcing Smepmp encoding.
+  | /* Set the MML to enforce new encoding */
+  | csr_set(CSR_MSECCFG, MSECCFG_MML);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2420-2424
+      "The mseccfg.MML (Machine Mode Lockdown) is a WARL field. This is a
+      sticky bit, meaning that once set it cannot be unset without a PMP
+      reset."
+
+[potential_risk] lib/sbi/sbi_hart_pmp.c:211-214  sbi_hart_smepmp_configure
+  RLB is intentionally left set (1) after Smepmp configuration completes on
+  both cold boot and warm resume. RLB=1 bypasses PMP lock enforcement,
+  allowing any M-mode code to modify locked PMP entries. This is a deliberate
+  design choice for dynamic PMP mapping (sbi_hart_smepmp_map_range), but it
+  means locked entries are never truly locked against M-mode modification at
+  runtime.
+  | /*
+  |  * All entries are programmed.
+  |  * Keep the RLB bit so that dynamic mappings can be done.
+  |  */
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2392-2395
+      "When mseccfg.RLB is 1, locked PMP rules may be removed or modified
+      and locked PMP rules may be edited."
+
+[compliant] lib/sbi/sbi_init.c:490-494  init_warm_resume
+  Warm resume correctly calls sbi_hart_reinit() then
+  sbi_hart_protection_configure() before sbi_hsm_hart_resume_finish(). This
+  ordering ensures mstatus_init() re-establishes MSECCFG.SSEED/USEED before
+  sbi_hart_smepmp_configure() sets MML/RLB. However, the MSECCFG
+  reconfiguration relies on this exact call sequence being maintained; there
+  is no architectural guarantee that MSECCFG state is preserved if the
+  sequence is modified.
+  | rc = sbi_hart_reinit(scratch);
+  | if (rc)
+  | 	sbi_hart_hang();
+  | 
+  | rc = sbi_hart_protection_configure(scratch);
+  | if (rc)
+  | 	sbi_hart_hang();
+
+[potential_risk] lib/sbi/sbi_hsm.c:536-537  sbi_hsm_hart_suspend
+  __sbi_hsm_suspend_non_ret_save() is called unconditionally for any suspend
+  with SBI_HSM_SUSP_NON_RET_BIT set, before platform-specific suspend. If a
+  platform implements non-retentive suspend that preserves MSECCFG (e.g., via
+  dedicated hardware save/restore), the generic save still runs and saves
+  everything EXCEPT MSECCFG. The missing MSECCFG save means even platforms
+  that could preserve it have no mechanism to do so through the HSM framework.
+  | if (suspend_type & SBI_HSM_SUSP_NON_RET_BIT)
+  | 	__sbi_hsm_suspend_non_ret_save(scratch);
+
+[potential_risk] lib/sbi/sbi_hsm.c:479-479  sbi_hsm_hart_resume_finish
+  __sbi_hsm_suspend_non_ret_restore() runs AFTER sbi_hart_reinit() and
+  sbi_hart_protection_configure() have already re-initialized MSECCFG from
+  scratch. This means any MSECCFG bits set by those functions (SSEED/USEED
+  from mstatus_init, MML/RLB from smepmp_configure) are correctly applied.
+  However, the MENVCFG write in __sbi_hsm_suspend_non_ret_restore() (line 441)
+  OVERWRITES the MENVCFG value that mstatus_init() computed at line 174. This
+  is by design — the saved pre-suspend MENVCFG is restored instead of the
+  reconstructed one — but the inconsistency between how MENVCFG and MSECCFG
+  are handled (saved/restored vs re-initialized) is architecturally fragile.
+  | __sbi_hsm_suspend_non_ret_restore(scratch);
+

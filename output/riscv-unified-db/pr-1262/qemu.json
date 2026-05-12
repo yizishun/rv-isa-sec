@@ -1,0 +1,222 @@
+{
+  "pr_number": 1262,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1262,
+    "violation_condition": "When QEMU TCG translates vsetvli/vsetvl with rs1==x0 by reading the architectural zero from GPR x0 (value 0) and passing it as AVL to the vsetvl helper, instead of treating rs1==x0 as the special architectural encoding for 'vl=VLMAX'. This causes helper_vsetvl() to compute vl=0 (since 0 <= vlmax), silently disabling all subsequent vector instructions.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "do_vsetvl.*rs1.*==.*0.*(?!tcg_constant_tl|RV_VLEN_MAX)|helper_vsetvl.*\\bs1\\b.*\\bvlmax\\b|vsetvl.*rs1.*x0.*!vlmax",
+    "affected_entities": [
+      "vsetvli",
+      "vsetvl",
+      "vl"
+    ],
+    "summary": "vsetvli/vsetvl with rs1==x0 architecturally encodes 'set vl=VLMAX' (not 'read GPR[0]==0 as AVL'); incorrect TCG translation would set vl=0, silently disabling all subsequent vector ops and violating guest kernel/supervisor vector ISA assumptions"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "do_vsetvl",
+        "line_start": 204,
+        "line_end": 212,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "rs1==x0 is correctly intercepted before get_gpr() would read architectural zero. When rd!=x0, AVL is set to RV_VLEN_MAX (1024) which is >= max possible VLMAX, causing helper_vsetvl() to clamp vl=VLMAX via the else branch. When rd==0, current cpu_vl is used preserving existing vl. This matches the spec's AVL encoding table: rd!=x0,rs1=x0 → ~0 → VLMAX; rd=x0,rs1=x0 → current vl.",
+      "snippet": "    if (rd == 0 && rs1 == 0) {\n        s1 = tcg_temp_new();\n        tcg_gen_mov_tl(s1, cpu_vl);\n    } else if (rs1 == 0) {\n        /* As the mask is at least one bit, RV_VLEN_MAX is >= VLMAX */\n        s1 = tcg_constant_tl(RV_VLEN_MAX);\n    } else {\n        s1 = get_gpr(s, rs1, EXT_ZERO);\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 1278,
+          "line_end": 1286,
+          "excerpt": "AVL used in vsetvli and vsetvl instructions: rd=-, rs1=!x0 → Value in x[rs1]; rd=!x0, rs1=x0 → ~0, Set vl to VLMAX; rd=x0, rs1=x0 → Value in vl register, Keep existing vl"
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 1293,
+          "line_end": 1296,
+          "excerpt": "[[norm:vsetvl_op_rs1_x0_rd_nx0]] When rs1=x0 but rd≠x0, the maximum unsigned integer value (~0) is used as the AVL, and the resulting VLMAX is written to vl and also to the x register specified by rd."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "HELPER(vsetvl)",
+        "line_start": 111,
+        "line_end": 117,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The vl computation logic correctly implements the three-tier AVL-to-vl mapping per spec: s1 <= vlmax → vl=s1; s1 < 2*vlmax (half_avl) → vl=(s1+1)>>1; else → vl=vlmax. When do_vsetvl passes RV_VLEN_MAX=1024 for rs1==x0, this always hits the else branch (since 1024 >= 2*vlmax for all practical vlmax values when rvv_vl_half_avl=false, the default), correctly producing vl=VLMAX.",
+      "snippet": "    if (s1 <= vlmax) {\n        vl = s1;\n    } else if (s1 < 2 * vlmax && cpu->cfg.rvv_vl_half_avl) {\n        vl = (s1 + 1) >> 1;\n    } else {\n        vl = vlmax;\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 1324,
+          "line_end": 1339,
+          "excerpt": "The vset{i}vl{i} instructions first set VLMAX according to their vtype argument, then set vl obeying: 1. vl = AVL if AVL ≤ VLMAX; 2. ceil(AVL/2) ≤ vl ≤ VLMAX if AVL < 2*VLMAX; 3. vl = VLMAX if AVL ≥ 2*VLMAX"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "HELPER(vsetvl)",
+        "line_start": 111,
+        "line_end": 117,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When rvv_vl_half_avl=true and rs1==x0, the TCG translator passes s1=RV_VLEN_MAX (1024) instead of ~0 (max uint). For VLMAX values in range (512, 1024), s1=1024 falls into the 's1 < 2*vlmax' half_avl branch, producing vl=512 instead of vl=VLMAX (spec requires vl=VLMAX when rs1==x0). Example: vlen=1024, sew=8, lmul=4 gives VLMAX=512 (OK); vlen=1024, sew=8, lmul=8 gives VLMAX=1024 → vl=1024 (OK border case). But vlen=800, sew=8, lmul=4 gives VLMAX=400 — wait, 400 < 512 so 2*VLMAX=800 < 1024, hitting else → vl=400. The half_avl misbehavior requires VLMAX in (512, 1024) which needs vlen>512. With default vlen=128 or 256 this cannot trigger. Mitigated by rvv_vl_half_avl defaulting to false.",
+      "snippet": "    if (s1 <= vlmax) {\n        vl = s1;\n    } else if (s1 < 2 * vlmax && cpu->cfg.rvv_vl_half_avl) {\n        vl = (s1 + 1) >> 1;\n    } else {\n        vl = vlmax;\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 1293,
+          "line_end": 1296,
+          "excerpt": "[[norm:vsetvl_op_rs1_x0_rd_nx0]] When rs1=x0 but rd≠x0, the maximum unsigned integer value (~0) is used as the AVL, and the resulting VLMAX is written to vl"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "HELPER(vsetvl)",
+        "line_start": 103,
+        "line_end": 106,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Invalid vtype configurations (sew > elen, vill already set, reserved bits non-zero) correctly trigger reset_ill_vtype() which sets vill=1, vtype=0, vl=0, vstart=0 and returns 0. This prevents execution of vector instructions with illegal vtype state.",
+      "snippet": "    if ((sew > cpu->cfg.elen) || vill || (vtype_reserved(env, s2) != 0)) {\n        reset_ill_vtype(env);\n        return 0;\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 1298,
+          "line_end": 1298,
+          "excerpt": "Implementations may set vill in either case."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "HELPER(vsetvl)",
+        "line_start": 119,
+        "line_end": 122,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The rvv_vsetvl_x0_vill check correctly implements the reserved-behavior handling for rd=x0,rs1=x0 case (x0 flag set by do_vsetvl when both rd and rs1 are 0). When enabled and vl would change, sets vill instead. Matches spec note that implementations may set vill when rd=x0,rs1=x0 form would change VLMAX. Defaults to false, configurable via QEMU property.",
+      "snippet": "    if (cpu->cfg.rvv_vsetvl_x0_vill && x0 && (env->vl != vl)) {\n        reset_ill_vtype(env);\n        return 0;\n    }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 1298,
+          "line_end": 1298,
+          "excerpt": "Use of the instructions with a new SEW/LMUL ratio that would result in a change of VLMAX is reserved. Implementations may set vill in either case."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "HELPER(vsetvl)",
+        "line_start": 124,
+        "line_end": 128,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "On successful vsetvl, vstart is correctly reset to 0, vill is cleared, and the new vl and vtype are stored. This matches the spec requirement that vsetvl instructions reset vstart to zero on success.",
+      "snippet": "    env->vl = vl;\n    env->vtype = s2;\n    env->vstart = 0;\n    env->vill = 0;\n    return vl;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vector_vmstate",
+        "line_start": 140,
+        "line_end": 153,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All vector CSR state (vl, vstart, vtype, vill) is included in the VMStateDescription for live migration. No fields are missing. Vector register file (vreg), vxrm, and vxsat are also included.",
+      "snippet": "        VMSTATE_UINTTL(env.vl, RISCVCPU),\n        VMSTATE_UINTTL(env.vstart, RISCVCPU),\n        VMSTATE_UINTTL(env.vtype, RISCVCPU),\n        VMSTATE_BOOL(env.vill, RISCVCPU),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vsetvl",
+        "line_start": 244,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "trans_vsetvl correctly passes rs2 (vtype) from GPR and delegates to do_vsetvl which handles rs1==x0 correctly. The rs2 source is zero-extended for XLEN consistency.",
+      "snippet": "static bool trans_vsetvl(DisasContext *s, arg_vsetvl *a)\n{\n    TCGv s2 = get_gpr(s, a->rs2, EXT_ZERO);\n    return do_vsetvl(s, a->rd, a->rs1, s2);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vsetvli",
+        "line_start": 250,
+        "line_end": 254,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "trans_vsetvli correctly uses the immediate field (zimm) as vtype and delegates to do_vsetvl which handles rs1==x0 correctly.",
+      "snippet": "static bool trans_vsetvli(DisasContext *s, arg_vsetvli *a)\n{\n    TCGv s2 = tcg_constant_tl(a->zimm);\n    return do_vsetvl(s, a->rd, a->rs1, s2);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "do_vsetvl",
+        "line_start": 214,
+        "line_end": 221,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "After vsetvl helper execution, the TB is correctly terminated with gen_update_pc + lookup_and_goto_ptr + DISAS_NORETURN. This is necessary because vl/vtype have changed, invalidating any cached translation state. finalize_rvv_inst() marks vector state as dirty.",
+      "snippet": "    gen_helper_vsetvl(dst, tcg_env, s1, s2, tcg_constant_tl((int)(rd == 0 && rs1 == 0)));\n    gen_set_gpr(s, rd, dst);\n    finalize_rvv_inst(s);\n\n    gen_update_pc(s, s->cur_insn_len);\n    lookup_and_goto_ptr(s);\n    s->base.is_jmp = DISAS_NORETURN;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_properties",
+        "line_start": 2693,
+        "line_end": 2696,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "rvv_vl_half_avl and rvv_vsetvl_x0_vill are both defaulting to false, matching the conservative (spec-compliant) behavior. rvv_vl_half_avl=false ensures the half_avl heuristic never activates, preventing the potential misbehavior when rs1==x0 with certain VLMAX values.",
+      "snippet": "    DEFINE_PROP_BOOL(\"rvv_ta_all_1s\", RISCVCPU, cfg.rvv_ta_all_1s, false),\n    DEFINE_PROP_BOOL(\"rvv_ma_all_1s\", RISCVCPU, cfg.rvv_ma_all_1s, false),\n    DEFINE_PROP_BOOL(\"rvv_vl_half_avl\", RISCVCPU, cfg.rvv_vl_half_avl, false),\n    DEFINE_PROP_BOOL(\"rvv_vsetvl_x0_vill\", RISCVCPU, cfg.rvv_vsetvl_x0_vill, false),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/kvm",
+        "function_name": "N/A",
+        "line_start": 0,
+        "line_end": 0,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "No KVM-specific vsetvl/vsetvli handling found in target/riscv/kvm/ or target/riscv/kvm_cpu_riscv.c. The KVM path does not implement vsetvl CSR synchronization, which is expected since KVM RISC-V vector support may not expose this level of state management to userspace.",
+      "snippet": "",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

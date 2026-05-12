@@ -1,0 +1,74 @@
+PR #1364  target=xiangshan  overall=not_implemented
+Spec: Ztso mandates TSO memory ordering (loads = acquire, stores = release); if XiangShan advertises Ztso but the LSU/store-buffer permits younger loads to bypass older stores without forwarding checks, software relying on x86-style TSO semantics will experience data races and silent data corruption across harts.
+Violation:
+  XiangShan RTL advertises Ztso support (e.g., misa.T bit or ISA string
+  reports 'ztso') but the load/store unit (LSU), store buffer, or memory
+  subsystem does not enforce TSO ordering: specifically, a younger load can
+  bypass an older store to a different address without checking the store
+  buffer for forwarding, or store-to-load ordering is not maintained in the
+  pipeline. This occurs when the store buffer allows loads to issue before
+  older stores have drained, violating the 'all loads have implicit acquire
+  semantics' guarantee that Ztso requires.
+Consequence: race_condition
+Pattern:
+  Ztso|tso|total.store.order|store.buffer.bypass|load.speculation.*store|mem.o
+  rdering.TSO|FENCE.TSO|acquire.*implicit|store_to_load.*order
+------------------------------------------------------------
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:627-627  MisaBundle
+  misa.T (bit 19) is hardcoded to read-only 0, indicating Ztso is NOT
+  advertised. This is correct behavior for a design that does not implement
+  TSO ordering. The description 'Reserved extension bit T.' is accurate per
+  the RISC-V spec which assigns bit T for the Tentatively Reserved / Ztso
+  indicator.
+  | val T = RO(19).withReset(0.U).withDescription("Reserved extension bit T.")
+
+[not_implemented] src/main/scala/xiangshan/package.scala:254-261  FenceOpType
+  FENCE.TSO instruction is not defined in FenceOpType. Only fence, sfence,
+  fencei, hfence_v, hfence_g, and nofence are defined. The Ztso spec requires
+  FENCE.TSO to order RW,RW (predecessor R|W, successor R|W), but since Ztso is
+  not advertised, this omission is consistent.
+  | object FenceOpType {
+  |     def fence  = "b10000".U
+  |     def sfence = "b10001".U
+  |     def fencei = "b10010".U
+  |     def hfence_v = "b10011".U
+  |     def hfence_g = "b10100".U
+  |     def nofence= "b00000".U
+  |   }
+
+[compliant] src/main/scala/xiangshan/Parameters.scala:291-305  ISAExtensions
+  "ztso" is absent from ISAExtensions. The ISA string and device tree
+  correctly do not advertise Ztso support. This is consistent with the lack of
+  TSO ordering enforcement in the memory subsystem.
+  | def ISAExtensions = Seq(
+  |     "i", "m", "a", "f", "d", "c", "v", "h",
+  |     "sdtrig", "sha", ..., "zvl128b", "zvl32b", "zvl64b"
+  |   )
+
+[not_implemented] src/main/scala/xiangshan/mem/sbuffer/Sbuffer.scala:778-778  Sbuffer (load forwarding logic)
+  The store buffer implements only RVWMO load forwarding semantics (store-to-
+  load forwarding based on address match/mask). It does not enforce TSO
+  ordering constraints: under Ztso, all loads must have implicit acquire-RCpc
+  semantics, meaning a younger load must not bypass an older store to a
+  different address without checking the store buffer for potential
+  forwarding. The current design allows loads to issue before older stores
+  have drained from the store buffer, which is legal under RVWMO but would
+  violate Ztso if Ztso were advertised.
+  | // ---------------------- Load Data Forward ---------------------
+
+[not_implemented] src/main/scala/xiangshan/backend/fu/Fence.scala:47-57  Fence (FSM states)
+  Fence FSM states (s_idle, s_wait, s_tlb, s_icache, s_fence, s_nofence) do
+  not include any FENCE.TSO handling. Under Ztso, FENCE.TSO (fm=1000,
+  pred=R|W, succ=R|W) must order all prior loads and stores before all
+  subsequent loads and stores. This logic is entirely absent.
+  | val s_idle :: s_wait :: s_tlb :: s_icache :: s_fence :: s_nofence :: Nil = Enum(6)
+  | val state = RegInit(s_idle)
+  | /* fsm
+  |  * s_idle    : init state, send sbflush
+  |  * s_wait  : send sbflush, wait for sbEmpty
+  |  * s_tlb   : flush tlb, just hold one cycle
+  |  * s_icache: flush icache, just hold one cycle
+  |  * s_fence : do nothing, for timing optimiaztion
+  |  * s_nofence: do nothing , for Svinval extension
+  |  */
+

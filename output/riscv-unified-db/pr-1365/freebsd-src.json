@@ -1,0 +1,168 @@
+{
+  "pr_number": 1365,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 1365,
+    "violation_condition": "FreeBSD kernel accesses user memory (copyin/copyout, signal frame setup, ptrace, core dump) without byte-swapping when the current process has sstatus.UBE=1, OR the context-switch path fails to save/restore sstatus.UBE, leaking endianness state between processes.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "sstatus.*UBE|copyin|copyout|siginfo|sigframe|ptrace.*user|proc.*read|proc.*write|set_mcontext|get_mcontext|exec_setregs|cpu_switch|cpu_fork",
+    "affected_entities": [
+      "sstatus.UBE"
+    ],
+    "summary": "FreeBSD is little-endian; if a process enables big-endian U-mode via sstatus.UBE (Ssube), all kernel-user data boundaries—copyin/copyout, signal frames, ptrace, coredumps, and context switches—become endianness-mismatch surfaces that the kernel has no code to handle, silently corrupting process data."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/include/riscvreg.h",
+        "function_name": "N/A (sstatus bit definitions)",
+        "line_start": 60,
+        "line_end": 80,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "No SSTATUS_UBE macro defined. Bits skip from SPIE(5) to SPP(8). UBE(bit 6) is completely absent from the kernel's register-definition layer.",
+      "snippet": "#define SSTATUS_SPIE\t\t(1 << 5)\n#define SSTATUS_SPP\t\t(1 << 8)\n/* UBE at bit 6 is missing */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 224,
+          "line_end": 231,
+          "excerpt": "UBE controls whether explicit load and store memory accesses made from U-mode are little-endian (UBE=0) or big-endian (UBE=1)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/copyinout.S",
+        "function_name": "copycommon, copyin, copyout, copyinstr",
+        "line_start": 60,
+        "line_end": 108,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "All copyin/copyout paths use native S-mode loads/stores (lb/sb/ld/sd) without byte-swapping. No defense-in-depth against a future code path that might allow UBE=1.",
+      "snippet": "2:\tld\ta4, 0(a0)\t/* LE load from user memory */\n\tsd\ta4, 0(a1)\t/* LE store */\n/* No UBE-aware byte-swapping */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "exec_setregs",
+        "line_start": 172,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "memset(tf,0,sizeof(*tf)) implicitly clears UBE=0 on exec. Every new binary starts in LE mode.",
+      "snippet": "memset(tf, 0, sizeof(struct trapframe));",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_mcontext",
+        "line_start": 237,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "UBE (bit 6) is NOT in the ignore-mask for sstatus validation. Any sigreturn/setcontext attempt to change UBE is rejected with EINVAL.",
+      "snippet": "if (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &\n    ~(SD|XS_MASK|FS_MASK|UPIE|UIE)) != 0)\n    return (EINVAL);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "save_registers/load_registers",
+        "line_start": 101,
+        "line_end": 131,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Full sstatus saved/restored round-trip through traps (csrr→sd→...→ld→csrw). UBE preserved intact.",
+      "snippet": "csrr\tt0, sstatus\nsd\tt0, (TF_SSTATUS)(sp)\n/* ... */\ncsrw\tsstatus, t0",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sstatus managed through trapframe (TD_FRAME), not directly in cpu_switch. Per-thread sstatus correctly persists across context switches.",
+      "snippet": "/* cpu_switch saves ra, sp, s0-s11 only */\n/* sstatus lives in trapframe, managed at trap boundaries */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/vm_machdep.c",
+        "function_name": "cpu_fork",
+        "line_start": 106,
+        "line_end": 118,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Child inherits parent's trapframe (UBE=0 since kernel never allows UBE=1). SPIE set and SPP cleared for user-mode entry.",
+      "snippet": "bcopy(td1->td_frame, tf, sizeof(*tf));\ntf->tf_sstatus |= (SSTATUS_SPIE);\ntf->tf_sstatus &= ~(SSTATUS_SPP);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "hypctx_alloc",
+        "line_start": 222,
+        "line_end": 225,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Guest sstatus initialized with UBE=0. Full sstatus virtualized through csrrw save/restore in vmm_switch.S.",
+      "snippet": "hypctx->guest_regs.hyp_sstatus = SSTATUS_SPP | SSTATUS_SPIE | SSTATUS_FS_INITIAL;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "get_mcontext, sendsig, sys_sigreturn",
+        "line_start": 205,
+        "line_end": 413,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Signal delivery captures full sstatus via get_mcontext, copyout's in LE format (matching UBE=0). Sigreturn validated by set_mcontext which rejects UBE changes.",
+      "snippet": "get_mcontext(td, &frame.sf_uc.uc_mcontext, 0);\nif (copyout(&frame, fp, sizeof(*fp)) != 0)\n    sigexit(td, SIGILL);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "fill_regs, set_regs",
+        "line_start": 78,
+        "line_end": 115,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ptrace fill_regs reads sstatus; set_regs does NOT write sstatus back. Debugger can read but not modify UBE through ptrace.",
+      "snippet": "/* fill_regs: */ regs->sstatus = frame->tf_sstatus;\n/* set_regs: sstatus NOT written back */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fork_trampoline",
+        "line_start": 365,
+        "line_end": 432,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Forked process restores full sstatus from trapframe (UBE=0 given exec_setregs or fork_inherit). Only SIE masked before sret.",
+      "snippet": "ld\tt0, (TF_SSTATUS)(sp)\nli\tt1, ~SSTATUS_SIE\nand\tt0, t0, t1\ncsrw\tsstatus, t0",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

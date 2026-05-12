@@ -1,0 +1,129 @@
+PR #1281  target=qemu  overall=compliant
+Spec: vsetvli must zero vl when setting vtype.VILL on illegal vtype encoding — failure leaks stale vl from prior valid vector context across privilege domains or VM exits
+Violation:
+  QEMU's vsetvli/vsetivli/vsetvl implementation sets CSR vtype.VILL=1 for an
+  illegal vtype encoding but fails to also zero CSR vl.VALUE in the same
+  operation, leaving the architectural vl register holding a stale value from
+  a prior valid vector configuration
+Consequence: info_leak
+Pattern:
+  vsetvli.*VILL|vtype.*vill.*vl|set_vill|helper_vsetvl.*vl|vsetvl.*invalid.*vt
+  ype
+------------------------------------------------------------
+[compliant] target/riscv/vector_helper.c:52-59  reset_ill_vtype
+  reset_ill_vtype() correctly zeroes env->vl and env->vstart alongside setting
+  env->vill=1 and env->vtype=0. All vsetvl error paths (line 103 illegal-vtype
+  detection, line 119 x0-vill detection) call this helper, so the
+  vsetvl/vsetvli/vsetivli implementation properly zeroes vl when VILL is set.
+  | static inline void reset_ill_vtype(CPURISCVState *env)
+  | {
+  |     /* only set vill bit. */
+  |     env->vill = 1;
+  |     env->vtype = 0;
+  |     env->vl = 0;
+  |     env->vstart = 0;
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:1244-1246
+      "[#norm:vtype_vill_val]#If the `vtype` value is not supported by the
+      implementation, then the `vill` bit is set in `vtype`, the remaining
+      bits in `vtyp"
+
+[compliant] target/riscv/vector_helper.c:103-106  HELPER(vsetvl)
+  Illegal vtype detection at line 103 (sew>elen, vill bit in s2, or reserved
+  bits non-zero) correctly calls reset_ill_vtype() which zeroes vl and sets
+  vill=1, then returns 0.
+  | if ((sew > cpu->cfg.elen) || vill || (vtype_reserved(env, s2) != 0)) {
+  |     reset_ill_vtype(env);
+  |     return 0;
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:1244-1246
+      "If the `vtype` value is not supported by the implementation, then
+      the `vill` bit is set in `vtype`, the remaining bits in `vtype` are
+      set to zero, and"
+
+[compliant] target/riscv/vector_helper.c:119-122  HELPER(vsetvl)
+  The optional rvv_vsetvl_x0_vill path (vsetvl with rd=0, rs1=0 that would
+  change vl) also correctly calls reset_ill_vtype() which zeroes vl and sets
+  vill. This is a QEMU-specific hardening option, not a spec violation.
+  | if (cpu->cfg.rvv_vsetvl_x0_vill && x0 && (env->vl != vl)) {
+  |     reset_ill_vtype(env);
+  |     return 0;
+  | }
+
+[potential_risk] target/riscv/cpu.c:784-784  riscv_cpu_reset_hold
+  CPU reset sets env->vill = true without explicitly zeroing env->vl. On cold
+  boot, env->vl is zero due to g_malloc0 initialization of the CPU object.
+  However, on warm reset, env->vl retains its prior value, creating a
+  potential info leak: a guest reading the vl CSR before executing any vsetvl
+  instruction can observe a stale vector length from before reset. The spec
+  (vector-common.adoc:670) recommends vl be set to zero at reset. env->vtype
+  is also not zeroed, creating a similar issue for non-VILL vtype bits.
+  | env->vill = true;
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:670-671
+      "NOTE: It is recommended that at reset, `vtype.vill` is set, the
+      remaining bits in `vtype` are zero, and `vl` is set to zero."
+
+[compliant] target/riscv/machine.c:143-153  vmstate_vector
+  The vmstate_vector migration structure includes all vector CSR state: vreg
+  array, vxrm, vxsat, vl, vstart, vtype, and vill. Both env->vl (line 147) and
+  env->vill (line 150) are properly serialized for live migration, ensuring
+  consistent state transfer.
+  | .fields = (const VMStateField[]) {
+  |     VMSTATE_UINT64_ARRAY(env.vreg, RISCVCPU, 32 * RV_VLEN_MAX / 64),
+  |     VMSTATE_UINTTL(env.vxrm, RISCVCPU),
+  |     VMSTATE_UINTTL(env.vxsat, RISCVCPU),
+  |     VMSTATE_UINTTL(env.vl, RISCVCPU),
+  |     VMSTATE_UINTTL(env.vstart, RISCVCPU),
+  |     VMSTATE_UINTTL(env.vtype, RISCVCPU),
+  |     VMSTATE_BOOL(env.vill, RISCVCPU),
+  |     VMSTATE_END_OF_LIST()
+  | }
+
+[compliant] target/riscv/csr.c:946-951  read_vl
+  read_vl() returns env->vl directly. No vtype.vill check is performed before
+  returning vl. Per the spec (norm:vtype_vill_op), when vill=1 any vector
+  instruction depending on vtype raises illegal-instruction. However, vl CSR
+  read is not a 'vector instruction that depends on vtype' — it is a CSR read,
+  so directly exposing env->vl is architecturally correct even when vill=1.
+  The vl register value is defined even when vill=1 (it should be zero per
+  norm:vtype_vill_val).
+  | static RISCVException read_vl(CPURISCVState *env, int csrno,
+  |                               target_ulong *val)
+  | {
+  |     *val = env->vl;
+  |     return RISCV_EXCP_NONE;
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/vector-common.adoc:483-485
+      "[[norm:vtype_vill_op]] If the `vill` bit is set, then any attempt
+      to execute a vector instruction that depends upon `vtype` will raise
+      an illegal-inst"
+
+[compliant] target/riscv/insn_trans/trans_rvv.c.inc:194-222  do_vsetvl
+  do_vsetvl() correctly translates vsetvl/vsetvli instructions by calling
+  gen_helper_vsetvl(), which internally handles all error paths via
+  reset_ill_vtype(). The translation passes the x0 flag at line 214 to enable
+  the optional rvv_vsetvl_x0_vill hardening. The block ends with
+  DISAS_NORETURN to properly end the TB after a state-changing instruction.
+  | gen_helper_vsetvl(dst, tcg_env, s1, s2, tcg_constant_tl((int)(rd == 0 && rs1 == 0)));
+  | gen_set_gpr(s, rd, dst);
+  | finalize_rvv_inst(s);
+  | gen_update_pc(s, s->cur_insn_len);
+  | lookup_and_goto_ptr(s);
+  | s->base.is_jmp = DISAS_NORETURN;
+
+[compliant] target/riscv/tcg/tcg-cpu.c:128-140  riscv_get_tb_cpu_state
+  TB flags VILL bit is correctly derived from env->vill when V extension is
+  present (line 128), and forced to 1 when V is absent (line 140). This
+  ensures translated blocks correctly respect the current VILL state — when
+  env->vill is set (and reset_ill_vtype zeroed vl), subsequent translations
+  will guard vector instructions via vext_check_isa_ill().
+  | flags = FIELD_DP32(flags, TB_FLAGS, VILL, env->vill);
+  | ...
+  | } else {
+  |     flags = FIELD_DP32(flags, TB_FLAGS, VILL, 1);
+  | }
+

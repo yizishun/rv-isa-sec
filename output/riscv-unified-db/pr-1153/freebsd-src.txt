@@ -1,0 +1,244 @@
+PR #1153  target=freebsd-src  overall=bug_confirmed
+Spec: FreeBSD S-mode kernel has zero Smepmp (PMP Enhancements for M-mode) awareness — if firmware activates this ratified spec's M-mode lockdown/allowlist, the kernel's implicit pre-Smepmp PMP assumptions cause boot-time panics or incorrect physmem reservations
+Violation:
+  FreeBSD runs as S-mode without any Smepmp awareness: it cannot read mseccfg
+  (sticky fields prevent polling), cannot write PMP CSRs, and implicitly
+  assumes pre-Smepmp PMP semantics where M-mode has unrestricted access to all
+  non-locked regions. If M-mode firmware (OpenSBI) enables MML=1 and MMWP=1
+  with PMP entries that do not cover all of FreeBSD's physical memory as
+  S/U-mode-accessible or Shared-Region, the kernel will trigger access faults
+  (panic at trap.c:338) when touching unprotected regions. Additionally, the
+  efi_exclude_sbi_pmp_cb() heuristic at machdep.c:541 assumes exactly one PMP
+  entry protects firmware — Smepmp may use multiple entries, causing false-
+  positive/false-negative physmem exclusion.
+Consequence: denial_of_service
+Pattern:
+  physmem_exclude_region|efi_exclude_sbi_pmp_cb|panic.*Memory access
+  exception|sbi_init|SCAUSE_LOAD_ACCESS_FAULT|SCAUSE_STORE_ACCESS_FAULT
+------------------------------------------------------------
+[bug_confirmed] sys/riscv/include/encoding.h:589-1100  (CSR definitions)
+  No mseccfg CSR definition (CSR number 0x747) exists anywhere in the FreeBSD
+  kernel tree. PMP CSRs (CSR_PMPCFG0-3 at 0x3a0-0x3a3, CSR_PMPADDR0-15 at
+  0x3b0-0x3bf) are declared via DECLARE_CSR macros but never called from any
+  .c or .S file. The kernel has zero ability to read mseccfg (a read/write
+  register accessible only from M-mode) or write PMP CSRs. This is the root
+  cause of total Smepmp blindness.
+  | DECLARE_CSR(pmpcfg0, CSR_PMPCFG0)
+  | DECLARE_CSR(pmpcfg1, CSR_PMPCFG1)
+  | /* ... pmpcfg2-3, pmpaddr0-15 declared but never used ... */
+  | /* NO mseccfg (0x747) CSR definition exists */
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2330-2335
+      "=== Machine Security Configuration (mseccfg) Register. mseccfg is a
+      64-bit read/write register. It exists if any extension that adds a
+      field to mseccf"
+    - riscv-isa-manual/src/priv/machine.adoc:2387-2389
+      "The Smepmp extension adds the RLB, MMWP, and the MML fields in
+      mseccfg."
+
+[bug_confirmed] sys/riscv/riscv/machdep.c:541-555  efi_exclude_sbi_pmp_cb
+  Three independent failure modes under Smepmp: (1) Only processes the first
+  EFI MD entry (bool 'first' consumed after one iteration), but Smepmp may use
+  multiple PMP entries (M-mode-only, Shared-Region, S/U-mode) to protect
+  different physical regions — subsequent protected regions are never excluded
+  from phys_avail, so the kernel will later access them and panic. (2) Only
+  excludes if md_type == EFI_MD_TYPE_BS_DATA; if the first entry's type is
+  BS_CODE, RT_CODE, CODE, or DATA, the callback returns without any exclusion
+  despite PMP protection being active. (3) Region size clamped to min(md_pages
+  * EFI_PAGE_SIZE, L2_SIZE) = 2MB; a TOR-based PMP entry pair can protect
+  regions larger than 2MB, and the uncapped tail causes access faults.
+  | static void
+  | efi_exclude_sbi_pmp_cb(struct efi_md *p, void *argp)
+  | {
+  | 	bool *first = (bool *)argp;
+  | 	if (!*first)
+  | 		return;
+  | 	*first = false;
+  | 	if (p->md_type == EFI_MD_TYPE_BS_DATA) {
+  | 		physmem_exclude_region(p->md_phys,
+  | 		    min(p->md_pages * EFI_PAGE_SIZE, L2_SIZE),
+  | 		    EXFLAG_NOALLOC);
+  | 	}
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2412-2418
+      "mseccfg.MMWP changes the default PMP policy for Machine mode when
+      accessing memory regions that don't have a matching PMP rule. ...
+      When set it change"
+
+[bug_confirmed] sys/riscv/riscv/trap.c:333-340  do_trap_supervisor
+  S-mode kernel access faults (SCAUSE_LOAD_ACCESS_FAULT=5,
+  SCAUSE_STORE_ACCESS_FAULT=7) immediately panic with 'Memory access
+  exception'. Under Smepmp MMWP=1 or MML=1, these are the precise trap causes
+  when M-mode PMP denies S-mode access to physical memory — even when satp-
+  based page table mappings are valid. The kernel cannot distinguish PMP-
+  denied access from true hardware bus errors because it cannot read mseccfg
+  (sticky MML/MMWP bits prevent S-mode discovery via polling per
+  smepmp.adoc:76).
+  | case SCAUSE_LOAD_ACCESS_FAULT:
+  | case SCAUSE_STORE_ACCESS_FAULT:
+  | case SCAUSE_INST_ACCESS_FAULT:
+  | 	dump_regs(frame);
+  | 	panic("Memory access exception at %#lx: %#lx",
+  | 	    frame->tf_sepc, frame->tf_stval);
+  | 	break;
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:76-77
+      "Since all fields defined in mseccfg as part of this extension are
+      locked when set (MMWP/MML) or locked when cleared (RLB), software
+      can't poll them fo"
+
+[bug_confirmed] sys/riscv/riscv/trap.c:348-355  page_fault_handler
+  Page fault handler only handles PTE-based faults (scause=12,13,15). PMP
+  access faults (scause=5,7) from Smepmp MMWP=1 blocking physical access
+  despite valid PTEs are a different trap cause and land at trap.c:338 panic
+  instead. The PMP layer sits below the MMU — valid PTEs do not guarantee
+  physical access when M-mode PMP restrictions are active.
+  | case SCAUSE_STORE_PAGE_FAULT:
+  | case SCAUSE_LOAD_PAGE_FAULT:
+  | case SCAUSE_INST_PAGE_FAULT:
+  | 	page_fault_handler(frame, 0);
+  | 	break;
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2412-2418
+      "mseccfg.MMWP ... changes the default PMP policy for Machine mode
+      when accessing memory regions that don't have a matching PMP rule,
+      to denied instead "
+
+[bug_confirmed] sys/riscv/riscv/sbi.c:289-347  sbi_init
+  sbi_init probes SBI extensions TIME, IPI, RFNC, HSM, SRST and legacy
+  extensions. No SBI PMP extension is defined or probed. The kernel has no
+  SBI-mediated channel to query or influence M-mode PMP configuration. Under
+  Smepmp, the firmware may have configured restrictive PMP entries that the
+  kernel cannot discover or negotiate.
+  | sbi_init(void)
+  | {
+  | 	sret = sbi_get_spec_version();
+  | 	/* probes TIME, IPI, RFNC, SRST, legacy extensions */
+  | 	/* NO SBI PMP extension probe */
+  | 	/* NO mseccfg or PMP state query */
+  | }
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:76-77
+      "It is expected that BootROM will set mseccfg.MMWP and/or
+      mseccfg.MML during early boot, before jumping to the firmware, so
+      that the firmware will be a"
+
+[bug_confirmed] sys/riscv/riscv/machdep.c:589-606  initriscv
+  Comment at line 596 documents pre-Smepmp assumption: 'OpenSBI uses the first
+  PMP entry to prevent buggy supervisor software from overwriting the
+  firmware.' Under Smepmp MML=1, pmpcfg.L semantics change from
+  'locked+enforced in all modes' to 'M-mode-only (L=1) vs S/U-mode-only
+  (L=0)'. OpenSBI may configure multiple PMP entries with varying modes, and
+  the physmem exclusion logic operates purely on EFI/FDT metadata without
+  cross-referencing actual PMP hardware state.
+  | /* OpenSBI uses the first PMP entry to prevent buggy supervisor
+  |  * software from overwriting the firmware. ...
+  |  * Fix this by excluding first EFI memory map entry
+  |  * if it is marked as 'BootServicesData'. */
+  | first = true;
+  | efi_map_foreach_entry(efihdr, efi_exclude_sbi_pmp_cb, &first);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2426-2435
+      "When mseccfg.MML is set: The meaning of pmpcfg.L changes — Instead
+      of marking a rule as locked and enforced in all modes, it now marks
+      a rule as M-mod"
+
+[bug_confirmed] sys/riscv/vmm/vmm.c:585-605  vm_handle_hyp_page_fault
+  bhyve guest page fault handler only handles
+  SCAUSE_STORE_GUEST_PAGE_FAULT(23), SCAUSE_FETCH_GUEST_PAGE_FAULT(20),
+  SCAUSE_LOAD_GUEST_PAGE_FAULT(21). Any other scause — including a PMP access
+  fault (scause=5,7) when HS-mode accesses guest physical memory restricted by
+  M-mode Smepmp — hits panic('unknown page trap: %lu'). PMP access faults are
+  invisible to the G-stage page fault handler and directly fatal to the
+  hypervisor host.
+  | switch (vme->scause) {
+  | case SCAUSE_STORE_GUEST_PAGE_FAULT:
+  | case SCAUSE_FETCH_GUEST_PAGE_FAULT:
+  | case SCAUSE_LOAD_GUEST_PAGE_FAULT:
+  | 	break;
+  | default:
+  | 	panic("unknown page trap: %lu", vme->scause);
+  | }
+
+[potential_risk] sys/riscv/riscv/locore.S:142-220  pagetables
+  Early boot assembly constructs a 1GB identity map (1:1 PA→VA) and enables
+  satp at line 220. If M-mode firmware has set Smepmp MMWP=1 or configured PMP
+  entries that deny S-mode access to the identity-mapped region, the
+  sfence.vma+csrw satp sequence at lines 219-220 will activate the MMU but PMP
+  policy will still block physical access, causing a fault in the bootstrap
+  path before the kernel reaches C code.
+  | /* Construct 1GB Identity Map (1:1 PA->VA) */
+  | /* ... */
+  | sfence.vma
+  | csrw	satp, s2          /* MMU enabled, zero PMP consideration */
+
+[not_implemented] sys/riscv/riscv/identcpu.c:80-104  identify_cpu_features
+  smode_extensions bitmap tracks only SV_SSTC, SV_SVNAPOT, SV_SVPBMT,
+  SV_SVINVAL, SV_SSCOFPMF. No slot for Smepmp or any PMP-related ISA
+  extension. The kernel cannot detect Smepmp support from the ISA string or
+  device tree, preventing conditional enabling of Smepmp-aware behavior.
+  | u_int smode_extensions;
+  | #define SV_SSTC    (1 << 0)
+  | #define SV_SVNAPOT (1 << 1)
+  | #define SV_SVPBMT  (1 << 2)
+  | #define SV_SVINVAL (1 << 3)
+  | #define SV_SSCOFPMF (1 << 4)
+  | /* No Smepmp or PMP-related ISA extension slot */
+
+[potential_risk] sys/riscv/riscv/machdep.c:508-531  fdt_physmem_hardware_region_cb
+  Unconditionally excludes the lowest 2MB of physical memory for SBI firmware
+  on FDT platforms. Under Smepmp, M-mode PMP may protect multiple non-
+  contiguous regions or regions not aligned to the lowest 2MB boundary,
+  causing either false-positive exclusion (excluding memory PMP does not
+  protect) or false-negative omission (failing to exclude memory PMP does
+  protect).
+  | /* XXX: Unconditionally exclude the lowest 2MB of physical
+  |  * memory, as this area is assumed to contain the SBI firmware */
+  | physmem_exclude_region(mr->mr_start, L2_SIZE,
+  |     EXFLAG_NODUMP | EXFLAG_NOALLOC);
+
+[potential_risk] sys/riscv/riscv/pmap.c:913-1010  pmap_bootstrap
+  Constructs kernel page tables (Sv39/Sv48) and excludes kernel staging area
+  via physmem_exclude_region. Assumes S-mode PTE protections are sufficient.
+  Under Smepmp MMWP=1, PMP may deny S-mode access to kernel pages even with
+  correct satp mappings. sfence_vma at line 960 invalidates TLB only — cannot
+  affect PMP.
+  | physmem_exclude_region(kernstart, kernlen, EXFLAG_NOALLOC);
+  | /* ... */
+  | sfence_vma();  /* TLB only, zero PMP effect */
+
+[potential_risk] sys/riscv/riscv/trap.c:410-417  do_trap_user
+  User-mode access faults deliver SIGBUS(BUS_ADRERR) instead of panicking.
+  Without mseccfg awareness, the kernel cannot distinguish PMP-denied access
+  from genuine bus errors, and provides no Smepmp-specific diagnostics.
+  | case SCAUSE_LOAD_ACCESS_FAULT:
+  | case SCAUSE_STORE_ACCESS_FAULT:
+  | 	call_trapsignal(td, SIGBUS, BUS_ADRERR, (void *)frame->tf_sepc, exception);
+  | 	userret(td, frame);
+  | 	break;
+
+[potential_risk] sys/riscv/riscv/machdep.c:557-626  initriscv
+  Boot ordering: sbi_init() at line 579 runs before physmem exclusion at
+  589-619. If OpenSBI has configured Smepmp PMP entries that restrict S-mode
+  access to physical regions, the boot-metadata-driven exclusion logic may
+  miss them. identify_cpu(0) at line 625 runs after physmem setup — any future
+  Smepmp ISA detection would come too late to inform physmem decisions.
+  | sbi_init();            /* line 579 — before PMP consideration */
+  | /* EFI/FDT physmem exclusion (lines 589-619) */
+  | identify_cpu(0);       /* line 625 — after physmem is set up */
+
+[potential_risk] sys/kern/subr_efi_map.c:78-95  handle_efi_map_entry
+  efi_map_exclude_entries excludes only RT_DATA entries from phys_avail, while
+  BS_DATA, BS_CODE, CODE, DATA, and FREE are added as available. Under Smepmp,
+  M-mode may protect physical memory regions that EFI classifies as
+  'available' (e.g., BS_DATA used by firmware but PMP-locked as M-mode-only),
+  creating a mismatch between EFI-reported availability and actual PMP-
+  enforced accessibility.
+  | case EFI_MD_TYPE_BS_DATA:
+  | case EFI_MD_TYPE_FREE:
+  | 	/* We're allowed to use any entry with these types. */
+  | 	if (!exclude)
+  | 		physmem_hardware_region(p->md_phys, p->md_pages * EFI_PAGE_SIZE);
+  | 	break;
+

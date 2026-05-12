@@ -1,0 +1,152 @@
+{
+  "pr_number": 1309,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1309,
+    "violation_condition": "QEMU TCG or helper iterates vector element operations (vadd.vv, vle8.v, vse8.v) up to vlmax (VLEN/SEW/LMUL) instead of CSR vl actual value, causing writes to destination vector register elements beyond the configured vector length that the guest expects to remain undisturbed per tail-agnostic/tail-undisturbed policy",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "vector loop bound uses vlmax or VLEN/SEW-derived maximum instead of env->vl or CSR vl; missing vl-based early termination in vext_ldst_us, vext_ldst_stride, or vector arith helpers; vstart not added to element index in memory address calculation for unit-stride loads/stores",
+    "affected_entities": [
+      "vadd.vv",
+      "vle8.v",
+      "vse8.v",
+      "vl",
+      "vstart",
+      "vtype"
+    ],
+    "summary": "Vector instruction emulation must iterate exactly CSR[vl] elements (not vlmax) and apply CSR[vstart] offset to source/dest bit positions, otherwise QEMU corrupts tail elements the guest kernel's undisturbed policy protects, breaking vector register isolation between guest processes"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/vector_internals.c",
+        "function_name": "do_vext_vv",
+        "line_start": 58,
+        "line_end": 82,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Vector VV operation loop bound uses vl=env->vl (line 71: for i=env->vstart; i<vl; i++). total_elems used only for tail element initialization (line 81). No vlmax-derived maximum is used as loop bound.",
+      "snippet": "    uint32_t vl = env->vl;\n    for (i = env->vstart; i < vl; i++) {\n        if (!vm && !vext_elem_mask(v0, i)) { ... continue; }\n        fn(vd, vs1, vs2, i);\n    }\n    vext_set_elems_1s(vd, vta, vl * esz, total_elems * esz);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_internals.c",
+        "function_name": "do_vext_vx",
+        "line_start": 84,
+        "line_end": 108,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Vector VX operation loop bound uses vl=env->vl (line 97: for i=env->vstart; i<vl; i++). total_elems only used for tail initialization.",
+      "snippet": "    uint32_t vl = env->vl;\n    for (i = env->vstart; i < vl; i++) {\n        if (!vm && !vext_elem_mask(v0, i)) { ... continue; }\n        fn(vd, s1, vs2, i);\n    }\n    vext_set_elems_1s(vd, vta, vl * esz, total_elems * esz);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_ldst_stride",
+        "line_start": 308,
+        "line_end": 340,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Strided load/store loop bound correctly uses env->vl (line 322). max_elems (VLEN/SEW-derived) used only for multi-field element indexing within register groups, not as loop bound. Memory address calculation (line 332) correctly uses stride * i with i starting from vstart.",
+      "snippet": "    for (i = env->vstart; i < env->vl; env->vstart = ++i) {\n        ...\n        target_ulong addr = base + stride * i + (k << log2_esz);\n        ldst_elem(env, adjust_addr(env, addr), i + k * max_elems, vd, ra);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_ldst_us",
+        "line_start": 429,
+        "line_end": 499,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Unit-stride load/store takes evl parameter (passed env->vl from GEN_VEXT_LD_US at line 518-519), not vlmax. Address calculation at line 462: addr = base + ((env->vstart * nf) << log2_esz) correctly includes vstart in the address offset.",
+      "snippet": "    VSTART_CHECK_EARLY_EXIT(env, evl);\n    addr = base + ((env->vstart * nf) << log2_esz);\n    ...\n    vext_set_tail_elems_1s(evl, vd, desc, nf, esz, max_elems);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_ldst_index",
+        "line_start": 587,
+        "line_end": 622,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Indexed load/store loop bound uses env->vl (line 604). get_index_addr reads index value from vs2 at position i (starting from vstart), correctly using element index to compute memory address.",
+      "snippet": "    for (i = env->vstart; i < env->vl; env->vstart = ++i) {\n        ...\n        abi_ptr addr = get_index_addr(base, i, vs2) + (k << log2_esz);\n        ldst_elem(env, adjust_addr(env, addr), i + k * max_elems, vd, ra);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_ldff",
+        "line_start": 678,
+        "line_end": 800,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Fault-only-first load correctly uses env->vl as loop bound throughout (lines 697, 701, 706, 711, 754, 777, 785). First element fault allowed, subsequent elements probed non-fault. Address calculation at line 697: addr = base + ((env->vstart * nf) << log2_esz) correctly includes vstart.",
+      "snippet": "    VSTART_CHECK_EARLY_EXIT(env, env->vl);\n    addr = base + ((env->vstart * nf) << log2_esz);\n    if (unlikely(env->vstart + elems >= env->vl))\n        elems = env->vl - env->vstart;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "vext_ldst_whole",
+        "line_start": 834,
+        "line_end": 882,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Whole-register load/store correctly uses vlenb for element count (evl = nf * vlenb >> log2_esz), which is spec-correct: whole-register instructions always operate on the entire register group regardless of vl.",
+      "snippet": "    uint32_t vlenb = riscv_cpu_cfg(env)->vlenb;\n    uint32_t max_elems = vlenb >> log2_esz;\n    uint32_t evl = nf * max_elems;",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "GEN_VEXT_VV_ENV",
+        "line_start": 3140,
+        "line_end": 3168,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Floating-point VV helper loop bound uses ecrp->vl=env->vl (line 3155). total_elems from vext_get_total_elems() correctly accounts for EEW/SEW/LMUL differences and is used only for tail element initialization.",
+      "snippet": "    uint32_t vl = env->vl;\n    for (i = env->vstart; i < vl; i++) {\n        if (!vm && !vext_elem_mask(v0, i)) { ... }\n        do_##NAME(vd, vs1, vs2, i, env);\n    }\n    vext_set_elems_1s(vd, vta, vl * ESZ, total_elems * ESZ);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "do_opivv_gvec",
+        "line_start": 1305,
+        "line_end": 1327,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "gvec fast-path only activates when vl_eq_vlmax is true (vl == vlmax), so using MAXSZ(s) as gvec size is safe. When vl != vlmax, falls through to the helper path where loop uses env->vl.",
+      "snippet": "    if (a->vm && s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {\n        gvec_fn(s->sew, vreg_ofs(s, a->rd), ..., MAXSZ(s), MAXSZ(s));\n    } else {\n        ... tcg_gen_gvec_4_ptr(..., s->cfg_ptr->vlenb, s->cfg_ptr->vlenb, data, fn);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "GEN_VEXT_CMP_VV / GEN_VEXT_VMADC_VVM / vmsetm / GEN_VEXT_VIOTA_M / GEN_VEXT_VID_V",
+        "line_start": 1476,
+        "line_end": 5421,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All remaining vector operations (compare, mask-adc, mask-set, iota, vid, vcpop, mask logical) use env->vl as the primary loop bound and total_elems only for tail element initialization. No instance found where vlmax/vext_max_elems is used as element iteration bound.",
+      "snippet": "    uint32_t vl = env->vl;\n    for (i = env->vstart; i < vl; i++) { ... }\n    env->vstart = 0;\n    /* tail initialization uses total_elems not as loop bound */",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

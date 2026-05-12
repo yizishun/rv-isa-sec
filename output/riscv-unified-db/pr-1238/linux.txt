@@ -1,0 +1,158 @@
+PR #1238  target=linux  overall=not_implemented
+Spec: Smctr/Ssctr CTR buffer holds branch history (source/target PCs, transfer type, cycle count) accessible via indirect CSRs (Smcsrind/Sscsrind); failing to save/restore this state on context switch leaks precise inter-process control flow data that defeats KASLR and enables side-channel key extraction.
+Violation:
+  Linux kernel context-switches a RISC-V hart with active CTR (Smctr/Ssctr)
+  state without saving and restoring the CTR buffer (ctrsource, ctrtarget,
+  ctrdata across all depth entries), cycle counter (CC/CCV), and CTR
+  configuration, allowing the next scheduled task to read the previous task's
+  control flow transfer history.
+Consequence: info_leak
+Pattern:
+  arch/riscv/kernel/process\.c|arch/riscv/kernel/asm-offsets\.c|arch/riscv/inc
+  lude/asm/switch_to\.h.*ctr|__switch_to.*ctr|sctrclr|ctrsource|ctrtarget|ctrd
+  ata|mstateen0.*CTR|hstateen0.*CTR
+------------------------------------------------------------
+[potential_risk] arch/riscv/include/asm/switch_to.h:113-126  switch_to
+  The switch_to() macro saves/restores FPU state (via __switch_to_fpu), vector
+  state (via __switch_to_vector), and envcfg (via __switch_to_envcfg), but has
+  zero CTR (Smctr/Ssctr) state save/restore. On hardware implementing
+  Smctr/Ssctr without Smstateen (where mstateen0.CTR would not gate access),
+  or where firmware has set mstateen0.CTR=1, CTR buffer entries (ctrsource,
+  ctrtarget, ctrdata across all depth entries), sctrstatus (WRPTR, FROZEN),
+  sctrctl, sctrdepth, and the cycle counter (CC/CCV) are not preserved across
+  context switches, allowing a subsequent task to read the previous task's
+  control flow transfer history.
+  | #define switch_to(prev, next, last)        \
+  | do {                                        \
+  |     struct task_struct *__prev = (prev);     \
+  |     struct task_struct *__next = (next);     \
+  |     __set_prev_cpu(__prev->thread);          \
+  |     if (has_fpu())                           \
+  |         __switch_to_fpu(__prev, __next);     \
+  |     if (has_vector() || has_xtheadvector())  \
+  |         __switch_to_vector(__prev, __next);  \
+  |     if (switch_to_should_flush_icache(__next))\
+  |         local_flush_icache_all();            \
+  |     __switch_to_envcfg(__next);              \
+  |     ((last) = __switch_to(__prev, __next));  \
+  | } while (0)
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:284-290
+      "The CTR buffer entries are logically accessed via the indirect
+      register access mechanism defined by the Sscsrind extension. The
+      siselect index range 0"
+    - riscv-isa-manual/src/priv/smctr.adoc:405-411
+      "When mstateen0.CTR=0 and the privilege mode is less privileged than
+      M-mode, the following operations raise an illegal-instruction
+      exception: Attempts "
+    - riscv-isa-manual/src/priv/smctr.adoc:411-411
+      "When mstateen0.CTR=0, qualified control transfers executed in
+      privilege modes less privileged than M-mode will continue to
+      implicitly update entry reg"
+    - riscv-isa-manual/src/priv/smstateen.adoc:153-161
+      "On reset, all writable mstateen bits are initialized by the
+      hardware to zeros. [...] Software at each privilege level should set
+      its respective statee"
+    - riscv-isa-manual/src/priv/smctr.adoc:430-435
+      "Implementations that support Smctr/Ssctr but not
+      Smstateen/Ssstateen may observe reduced performance. Because
+      Smctr/Ssctr introduces a significant num"
+    - riscv-isa-manual/src/priv/smctr.adoc:649-653
+      "The CtrCycleCounter is reset on writes to __x__ctrctl, and on
+      execution of SCTRCLR, to ensure that any accumulated cycle counts do
+      not persist across "
+
+[not_implemented] arch/riscv/kernel/process.c:1-1  arch/riscv/kernel/process.c (global)
+  No CTR (Smctr/Ssctr) ISA extension detection, no sctrclr instruction
+  emulation, no sctrstatus/sctrctl/sctrdepth CSR definitions, no CTR buffer
+  save/restore fields in thread_struct, and no signal frame CTR state
+  preservation. The kernel has zero knowledge of the CTR extension.
+  | (no CTR-related code exists in this file)
+
+[not_implemented] arch/riscv/kernel/asm-offsets.c:1-1  arch/riscv/kernel/asm-offsets.c (global)
+  No TSK_CTR_* or similar asm-offsets defined for CTR state. Without these
+  offsets, low-level assembly context-switch code (__switch_to in entry.S)
+  cannot save/restore CTR state even if it wanted to.
+  | (no CTR-related offsets exist in this file)
+
+[not_implemented] arch/riscv/include/asm/csr.h:233-243  arch/riscv/include/asm/csr.h (global)
+  The SMSTATEEN0 bit definitions cover HSENVCFG (bit 62), AIA (bits 58-60),
+  and SSTATEEN0 (bit 63), but do not include the CTR bit (bit 54 in
+  mstateen0/hstateen0, per Smstateen spec). Without this bit definition, the
+  kernel cannot discover or enable CTR access for S-mode, and KVM cannot
+  delegate CTR to guests.
+  | /* Smstateen bits */
+  | #define SMSTATEEN0_AIA_IMSIC_SHIFT  58
+  | #define SMSTATEEN0_AIA_IMSIC        (_ULL(1) << SMSTATEEN0_AIA_IMSIC_SHIFT)
+  | #define SMSTATEEN0_AIA_SHIFT        59
+  | #define SMSTATEEN0_AIA              (_ULL(1) << SMSTATEEN0_AIA_SHIFT)
+  | #define SMSTATEEN0_AIA_ISEL_SHIFT   60
+  | #define SMSTATEEN0_AIA_ISEL         (_ULL(1) << SMSTATEEN0_AIA_ISEL_SHIFT)
+  | #define SMSTATEEN0_HSENVCFG_SHIFT   62
+  | #define SMSTATEEN0_HSENVCFG         (_ULL(1) << SMSTATEEN0_HSENVCFG_SHIFT)
+  | #define SMSTATEEN0_SSTATEEN0_SHIFT  63
+  | #define SMSTATEEN0_SSTATEEN0        (_ULL(1) << SMSTATEEN0_SSTATEEN0_SHIFT)
+  References:
+    - riscv-isa-manual/src/priv/smstateen.adoc:185-206
+      "Machine State Enable 0 Register (mstateen0) bit layout: ...{bits:
+      1, name: 'CTR'}... The CTR bit (bit 54) controls access to CTR
+      register state from p"
+    - riscv-isa-manual/src/priv/smstateen.adoc:207-226
+      "Hypervisor State Enable 0 Register (hstateen0) bit layout:
+      ...{bits: 1, name: 'CTR'}... The hstateen0.CTR bit controls access
+      to supervisor CTR state "
+
+[not_implemented] arch/riscv/kvm/vcpu.c:564-571  kvm_riscv_vcpu_init_config
+  KVM vCPU config initialization sets hstateen0 bits for HSENVCFG, AIA, and
+  SSTATEEN0, but does not set the CTR bit (bit 54). This means VS-mode guests
+  can never access CTR state even if the hardware implements Smctr/Ssctr,
+  because hstateen0.CTR remains 0.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SMSTATEEN)) {
+  |     cfg->hstateen0 |= SMSTATEEN0_HSENVCFG;
+  |     if (riscv_isa_extension_available(isa, SSAIA))
+  |         cfg->hstateen0 |= SMSTATEEN0_AIA_IMSIC |
+  |                           SMSTATEEN0_AIA |
+  |                           SMSTATEEN0_AIA_ISEL;
+  |     if (riscv_isa_extension_available(isa, SMSTATEEN))
+  |         cfg->hstateen0 |= SMSTATEEN0_SSTATEEN0;
+  | }
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:413-415
+      "If the H extension is implemented and mstateen0.CTR=1, the
+      hstateen0.CTR bit controls access to supervisor CTR state when V=1.
+      [...] When mstateen0.CT"
+
+[not_implemented] arch/riscv/kvm/vcpu.c:578-641  kvm_arch_vcpu_load
+  KVM VCPU load saves/restores guest CSRs (VSSTATUS, VSIE, etc.) and
+  FPU/vector context, but performs no save/restore of CTR state (sctrctl
+  (vsctrctl), sctrstatus, sctrdepth, or CTR buffer entries via sireg*/siselect
+  range 0x200-0x2FF). A VM using CTR (if hstateen0.CTR were set) would leak
+  its CTR history to the next VM or host task.
+  | void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+  | {
+  |     // ... CSR and FPU/vector save/restore ...
+  |     kvm_riscv_vcpu_aia_load(vcpu, cpu);
+  |     vcpu->cpu = cpu;
+  | }
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:430-435
+      "Because Smctr/Ssctr introduces a significant number of new CSRs, it
+      is desirable to avoid save/restore of CTR state when possible. A
+      hypervisor is lik"
+
+[not_implemented] arch/riscv/kernel/cpufeature.c:1-1  arch/riscv/kernel/cpufeature.c (global)
+  No RISCV_ISA_EXT_SMCTR or RISCV_ISA_EXT_SSCTR entry in the ISA extension
+  data array. The kernel cannot detect whether the hardware supports CTR, so
+  it cannot conditionalize CTR save/restore or even warn about missing CTR
+  support.
+  | (no SMCTR/SSCTR ISA extension data entry exists; smstateen is the only related entry at line 581)
+  References:
+    - riscv-isa-manual/src/priv/smctr.adoc:17-17
+      "The machine-level extension, Smctr, encompasses all newly added
+      Control Status Registers (CSRs), instructions, and behavior
+      modifications for a hart a"
+    - riscv-isa-manual/src/priv/smctr.adoc:17-17
+      "The corresponding supervisor-level extension, Ssctr, is essentially
+      identical to Smctr, except that it excludes machine-level CSRs and
+      behaviors not i"
+

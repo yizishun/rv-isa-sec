@@ -1,0 +1,168 @@
+{
+  "pr_number": 1164,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 1164,
+    "violation_condition": "In XiangShan RTL, SCTRCLR executes as a multi-cycle operation iterating over DEPTH entries via the indirect CSR interface (siselect/sireg* writes). If a qualified control transfer (jump, branch, trap, or trap return) occurs during this clear window—after some entries are zeroed but before CTR_CYCLE_COUNTER and CCV_HW are reset—the hardware records a new transfer with CCV=1 and a non-zero CC field, violating the spec guarantee that 'the first recorded transfer following SCTRCLR will have ctrdata.CCV=0' and that 'any read of ctrsource/ctrtarget/ctrdata following SCTRCLR returns 0.'",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "SCTRCLR pipeline implementation lacks serialization/fence semantics preventing concurrent CTR buffer writes during the clear sequence; CTR_CYCLE_COUNTER reset not ordered-before entry zeroing; CCV_HW clear not atomic with respect to control transfer recording",
+    "affected_entities": [
+      "sctrclr",
+      "ctrdata",
+      "ctrsource",
+      "ctrtarget",
+      "sctrdepth",
+      "siselect",
+      "sireg1",
+      "sireg2",
+      "sireg3",
+      "CTR_CYCLE_COUNTER",
+      "CCV_HW",
+      "mstateen0",
+      "hstateen0"
+    ],
+    "summary": "SCTRCLR clear sequence must be atomic with respect to control transfer recording: a transfer arriving mid-clear produces CCV=1 violating the spec-mandated CCV=0 for the first post-clear record, leaking cycle-counter timing information"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "CSRs object (CTR CSR address constants)",
+        "line_start": 66,
+        "line_end": 67,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "CTR CSR address constants (sctrctl=0x14e, sctrstatus=0x14f, sctrdepth=0x15f, vsctrctl=0x24e, mctrctl=0x34e) are declared and registered in the 'all' CSR list (used for decode/routing), but no CSRModule instances back these addresses. Accesses will trigger noCSRIllegal exceptions, which is correct for an unimplemented extension. However, the presence in the decode list without implementation creates an ambiguity — if someone later adds CSRModule stubs that don't implement full WARL semantics, accesses could partially succeed without correct behavior.",
+      "snippet": "val sctrctl = 0x14e\nval sctrstatus = 0x14f",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 23,
+          "line_end": 25,
+          "excerpt": "The mctrctl register is a 64-bit read/write register that enables and configures the CTR capability."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (csrRwMap aggregation)",
+        "line_start": 320,
+        "line_end": 331,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The csrRwMap aggregates all CSR maps (machineLevel, supervisorLevel, hypervisor, virtualSupervisor, unprivileged, debug, aia, custom, ind, pmp, pma) but none contain CTR CSR implementations. Any access to CTR CSRs (sctrctl, sctrstatus, sctrdepth, mctrctl, vsctrctl) or the SCTRCLR instruction will raise an illegal-instruction exception via the noCSRIllegal logic at line 1021. No CTR buffer, cycle counter, CCV_HW, or entry clearing mechanism exists.",
+      "snippet": "var csrRwMap: SeqMap[Int, (CSRAddrWriteBundle[_], UInt)] =\n  machineLevelCSRMap ++\n  supervisorLevelCSRMap ++\n  hypervisorCSRMap ++\n  virtualSupervisorCSRMap ++\n  unprivilegedCSRMap ++\n  debugCSRMap ++\n  aiaCSRMap ++\n  customCSRMap ++\n  indCSRMap ++\n  pmpCSRMap ++\n  pmaCSRMap",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 394,
+          "line_end": 399,
+          "excerpt": "The SCTRCLR instruction performs the following operations: Zeroes all CTR Entry Registers, for all DEPTH values; Zeroes the CTR cycle counter and CCV. Any read of ctrsource, ctrtarget, or ctrdata that follows SCTRCLR, such that it precedes the next qualified control transfer, will return the value 0. Further, the first recorded transfer following SCTRCLR will have ctrdata.CCV=0."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "machineLevelCSRMods",
+        "line_start": 443,
+        "line_end": 481,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The machineLevelCSRMods list does not include mctrctl. No CSRModule for mctrctl is instantiated anywhere in the file. No CTR control register state (M/S/U mode enables, RASEMU, transfer type filter bits, BPFRZ, LCOFIFRZ, MTE/STE) is implemented.",
+      "snippet": "val machineLevelCSRMods: Seq[CSRModule[_]] = Seq(\n  mstatus, misa, medeleg, mideleg, mie, mtvec, mcounteren,\n  ...\n  mcontext,\n) ++ mhpmevents ++ mhpmcounters ++ ...",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 23,
+          "line_end": 110,
+          "excerpt": "The mctrctl register is a 64-bit read/write register that enables and configures the CTR capability. All fields are optional except for M, S, U, and BPFRZ."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala",
+        "function_name": "supervisorLevelCSRMods",
+        "line_start": 181,
+        "line_end": 199,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The supervisorLevelCSRMods list does not include sctrctl, sctrstatus, or sctrdepth. No S-mode CTR CSRs are implemented. The optional sctrstatus.WRPTR and FROZEN fields that must be updated by hardware on qualified transfer recording are absent.",
+      "snippet": "val supervisorLevelCSRMods: Seq[CSRModule[_]] = Seq(\n  sie, stvec, scounteren, senvcfg, sscratch, sepc, scause,\n  stval, sip, stimecmp, satp, scountovf,\n  sstateen0, sstateen1, sstateen2, sstateen3, scontext,\n)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 230,
+          "line_end": 252,
+          "excerpt": "The 32-bit sctrstatus register grants access to CTR status information and is updated by the hardware whenever CTR is active. WRPTR: WARL field that indicates the physical CTR buffer entry to be written next. FROZEN: Inhibit transfer recording."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/CSRIND.scala",
+        "function_name": "CSRIND trait (indirect CSR mireg2-6/sireg2-6)",
+        "line_start": 42,
+        "line_end": 90,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The sireg2-sireg6 indirect data registers, which per spec should expose ctrtarget (sireg2) and ctrdata (sireg3) when siselect is in the CTR range 0x200-0x2FF, are all hardwired to read-as-zero via ZeroFieldBundle. There is no CTR iselect decoding logic. The Iselect.isInOthers() function would categorize CTR siselect values as \"Others\" but no CTR-specific handling exists.",
+      "snippet": "val sireg2 = Module(new CSRModule(\"Sireg2\", new ZeroFieldBundle(...))\nval sireg3 = Module(new CSRModule(\"Sireg3\", new ZeroFieldBundle(...))\nval sireg4 = Module(new CSRModule(\"Sireg4\", new ZeroFieldBundle(...)))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 286,
+          "line_end": 287,
+          "excerpt": "The siselect index range 0x200 through 0x2FF is reserved for CTR logical entries 0 through 255. When siselect holds a value in this range, sireg provides access to ctrsource, sireg2 provides access to ctrtarget, and sireg3 provides access to ctrdata."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/StateEnBundle.scala",
+        "function_name": "Hstateen0Bundle / Mstateen0Bundle",
+        "line_start": 15,
+        "line_end": 37,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The mstateen0/hstateen0 CSR bundle definitions do not include the CTR bit required by Smctr/Ssctr for state-enable access control. Per spec, mstateen0.CTR controls access to CTR register state from less-privileged modes, and hstateen0.CTR controls VS-mode CTR access. The absence of these bits means CTR state-enable gating is not implemented.",
+      "snippet": "class Hstateen0Bundle extends Sstateen0Bundle {\n  override val len: Int = 64\n  val SE0     = RW(63)\n  val ENVCFG  = RW(62)\n  val CSRIND  = RW(60)\n  val AIA     = RW(59)\n  val IMSIC   = RW(58)\n  val CONTEXT = RW(57)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 403,
+          "line_end": 415,
+          "excerpt": "When Smstateen is implemented, the mstateen0.CTR bit controls access to CTR register state from privilege modes less privileged than M-mode. If the H extension is implemented and mstateen0.CTR=1, the hstateen0.CTR bit controls access to supervisor CTR state when V=1."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/XiangShan/src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR (noCSRIllegal logic)",
+        "line_start": 1021,
+        "line_end": 1021,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The noCSRIllegal check correctly raises an illegal-instruction exception for accesses to unimplemented CSR addresses, including CTR CSRs. Since XiangShan does not implement Smctr/Ssctr, this is the correct architectural behavior — unimplemented CSRs must trap. The SCTRCLR encoding (0x104 in func12 of SYSTEM opcode) has no decode table entry and will also raise an illegal-instruction exception, which is correct.",
+      "snippet": "private val noCSRIllegal = (ren || wen) && Cat(csrRwMap.keys.toSeq.sorted.map(csrAddr => !(addr === csrAddr.U))).andR",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

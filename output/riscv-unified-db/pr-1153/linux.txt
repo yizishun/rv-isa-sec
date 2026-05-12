@@ -1,0 +1,44 @@
+PR #1153  target=linux  overall=bug_confirmed
+Spec: Kernel PMP init in head.S has zero Smepmp awareness: L=0 all-access rule becomes S/U-mode-only under MML=1, denying M-mode access and bricking the kernel when firmware has enabled Smepmp lockdown prior to handoff.
+Violation:
+  Under CONFIG_RISCV_M_MODE, the kernel writes PMPCFG0 with L=0 RWX=111 (NAPOT
+  allow-all) at head.S:240 assuming legacy PMP semantics; if firmware sets
+  mseccfg.MML=1 before handoff (the expected Smepmp boot flow), this rule
+  becomes S/U-mode-only per the Smepmp truth table (L=0 → enforced on S/U,
+  denied in M), denying M-mode access to all memory. With mseccfg.MMWP also
+  set, M-mode has no fallback allowlist, causing an immediate instruction
+  fetch fault.
+Consequence: denial_of_service
+Pattern:
+  \bcsr[ws]\s+CSR_PMPCFG|\bcsr[ws]\s+CSR_PMPADDR|CSR_MSECCFG
+------------------------------------------------------------
+[bug_confirmed] arch/riscv/kernel/head.S:237-240  _start_kernel
+  Under CONFIG_RISCV_M_MODE, the kernel writes PMPCFG0 with L=0, RWX=111
+  (NAPOT allow-all) at lines 238–240 assuming legacy PMP semantics (M-mode
+  always has unrestricted access to unlocked regions). If firmware has set
+  mseccfg.MML=1 before handoff — the expected Smepmp boot flow per the 'Smepmp
+  software discovery' spec section — the Smepmp truth table maps L=0,RWX=111
+  to 'Access Exception' in M-mode, denying M-mode all access to all memory
+  (PMPADDR0=-1 covers the entire address space). With mseccfg.MMWP also set,
+  M-mode has no fallback allowlist, causing an immediate instruction fetch
+  fault on the very next instruction after the PMPCFG0 write. The kernel has
+  zero Smepmp awareness: no mseccfg.MML check, no MML/MMWP/RLB bit definitions
+  in csr.h (only PMM bits for Smmpm are defined), no 'smepmp' or 'Smepmp'
+  string in any source file.
+  | li a0, -1
+  | csrw CSR_PMPADDR0, a0
+  | li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+  | csrw CSR_PMPCFG0, a0
+
+[bug_confirmed] arch/riscv/include/asm/csr.h:245-249  N/A (header definitions)
+  csr.h defines only MSECCFG_PMM bit-fields (Smmpm pointer masking) but omits
+  MML, MMWP, and RLB bit definitions required for Smepmp. Without these
+  definitions, any kernel code that needs to check mseccfg.MML before writing
+  PMP registers (as head.S:238–240 should) has no way to reference the field.
+  This is the structural root cause of the Smepmp-blind PMP write in head.S.
+  | /* mseccfg bits */
+  | #define MSECCFG_PMM			ENVCFG_PMM
+  | #define MSECCFG_PMM_PMLEN_0		ENVCFG_PMM_PMLEN_0
+  | #define MSECCFG_PMM_PMLEN_7		ENVCFG_PMM_PMLEN_7
+  | #define MSECCFG_PMM_PMLEN_16		ENVCFG_PMM_PMLEN_16
+

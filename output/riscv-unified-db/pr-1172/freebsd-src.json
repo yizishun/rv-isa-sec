@@ -1,0 +1,298 @@
+{
+  "pr_number": 1172,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 1172,
+    "violation_condition": "FreeBSD kernel enables Smctr (sctrctl CSR at 0x14E) without adding sctrctl/mctrctl save/restore to the context-switch path in cpu_switch.S or the pcb, causing one process's CTR recording configuration (and potentially the recorded transfer buffer entries written in U/S mode) to persist across thread switches into another process",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "Smctr|sctrctl|mctrctl|vsctrctl|CTR_CTL|0x14E|0x34E|0x24E",
+    "affected_entities": [
+      "sctrctl",
+      "mctrctl",
+      "vsctrctl"
+    ],
+    "summary": "Smctr CSRs (sctrctl/mctrctl/vsctrctl) add per-hart CTR recording configuration that must be context-switched; failing to save/restore sctrctl in cpu_switch and bhyve VM-entry paths leaks control-flow trace configuration between processes and VMs"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_switch",
+        "line_start": 258,
+        "line_end": 358,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_switch saves/restores only GP registers (ra, sp, s0-s11) and conditionally FP state. No sctrctl (0x14E) save/restore exists. On hardware implementing Smctr, the new thread inherits the old thread's raw sctrctl hardware configuration — including privilege-mode enable bits (U/S), transfer-type filter bits, and recording-enable state. This causes one process's CTR recording configuration to persist across context switches into another process, enabling cross-process info leak via covert control-flow recording.",
+      "snippet": "ENTRY(cpu_switch)\n        /* Store the new curthread */\n        sd      a1, PC_CURTHREAD(tp)\n        /* And the new pcb */\n        ld      x13, TD_PCB(a1)\n        sd      x13, PC_CURPCB(tp)\n\n        /* Save the old context. */\n        ld      x13, TD_PCB(a0)\n\n        /* Store ra, sp and the callee-saved registers */\n        sd      ra, (PCB_RA)(x13)\n        sd      sp, (PCB_SP)(x13)\n        /* s[0-11] */\n        ...\n        /* NO sctrctl save/restore anywhere in this function */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 23,
+          "line_end": 25,
+          "excerpt": "The mctrctl register is a 64-bit read/write register that enables and configures the CTR capability."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 117,
+          "line_end": 121,
+          "excerpt": "The sctrctl register provides supervisor mode access to a subset of mctrctl."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 109,
+          "line_end": 109,
+          "excerpt": "All fields are optional except for M, S, U, and BPFRZ. All unimplemented fields are read-only 0, while all implemented fields are writable."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 439,
+          "line_end": 444,
+          "excerpt": "CTR records qualified control transfers. Control transfers are qualified if: The current privilege mode is enabled; The transfer type is not inhibited; sctrstatus.FROZEN is not set; The transfer completes/retires."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "cpu_throw",
+        "line_start": 206,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "cpu_throw (fast-path initial dispatch) restores GP registers and FP state from the PCB but never writes any value to sctrctl. A freshly-spawned or first-scheduled thread inherits whatever sctrctl value is in hardware from the prior occupant of this hart, potentially having CTR recording unexpectedly enabled with arbitrary filter configuration.",
+      "snippet": "ENTRY(cpu_throw)\n        /* Activate the new thread's pmap. */\n        mv      s0, a1\n        mv      a0, a1\n        call    _C_LABEL(pmap_activate_sw)\n        ...\n        /* NO sctrctl initialization for the new thread */\n        ret\nEND(cpu_throw)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 62,
+          "line_end": 67,
+          "excerpt": "M, S, U — Enable transfer recording in the selected privileged mode(s)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/pcb.h",
+        "function_name": "struct pcb",
+        "line_start": 42,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct pcb has no pcb_sctrctl field. Contains only pcb_ra, pcb_sp, pcb_gp, pcb_tp, pcb_s[12] (GP save), pcb_x[32][2] + pcb_fcsr (FP save), pcb_fpflags, and pcb_onfault. Without a storage slot in the PCB, sctrctl cannot be saved/restored across context switches even if the assembly code were modified to do so.",
+      "snippet": "struct pcb {\n        uint64_t        pcb_ra;\n        uint64_t        pcb_sp;\n        uint64_t        pcb_gp;\n        uint64_t        pcb_tp;\n        uint64_t        pcb_s[12];\n        uint64_t        pcb_x[32][2];\n        uint64_t        pcb_fcsr;\n        uint64_t        pcb_fpflags;\n#define PCB_FP_STARTED  0x1\n#define PCB_FP_USERMASK 0x1\n        vm_offset_t     pcb_onfault;\n        /* NO pcb_sctrctl field */\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 117,
+          "line_end": 121,
+          "excerpt": "The sctrctl register provides supervisor mode access to a subset of mctrctl. Bits 2 and 9 in sctrctl are read-only 0. As a result, the M and MTE fields in mctrctl are not accessible through sctrctl."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "savectx",
+        "line_start": 434,
+        "line_end": 457,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "savectx (called from mp_machdep.c for CPU suspend and kdb_trap for crash dumps) saves GP regs + FP state to the PCB but does not read sctrctl. This prevents forensic analysis from determining whether CTR recording was active at crash time, and means paused CPUs lose their CTR configuration on resume.",
+      "snippet": "ENTRY(savectx)\n        /* Store ra, sp and the callee-saved registers */\n        sd      ra, (PCB_RA)(a0)\n        sd      sp, (PCB_SP)(a0)\n        ...\n        __fpe_state_save a0\n        /* NO sctrctl read/save */\n        ret\nEND(savectx)",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "exec_setregs",
+        "line_start": 173,
+        "line_end": 189,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "exec_setregs clears the trapframe and resets FP flags on execve(), but does not zero sctrctl. The new process image inherits whatever sctrctl value is in hardware from the exec'ing process. If the old process had CTR recording enabled for U-mode, the new process starts with CTR already recording, potentially capturing its control-flow history from instruction zero.",
+      "snippet": "exec_setregs(struct thread *td, struct image_params *imgp, uintptr_t stack)\n{\n        struct trapframe *tf;\n        struct pcb *pcb;\n\n        tf = td->td_frame;\n        pcb = td->td_pcb;\n\n        memset(tf, 0, sizeof(struct trapframe));\n        ...\n        pcb->pcb_fpflags &= ~PCB_FP_STARTED;\n        /* NO sctrctl reset to zero */\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 467,
+          "line_end": 470,
+          "excerpt": "If privileged software is configuring CTR on behalf of less privileged software, it should ensure that its privilege mode enable bit (e.g., sctrctl.S for Supervisor software) is cleared before a trap return to the less privileged mode. Otherwise the trap return will be recorded, leaking the privileged source pc."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "get_mcontext",
+        "line_start": 206,
+        "line_end": 228,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "get_mcontext copies GP regs + FP state for signal delivery and user-level threading (ucontext). Does NOT read sctrctl from hardware. Signal handlers and user-level schedulers receive no information about the interrupted thread's CTR recording configuration, making it impossible for userspace threading libraries to correctly manage per-thread CTR state.",
+      "snippet": "get_mcontext(struct thread *td, mcontext_t *mcp, int clear_ret)\n{\n        struct trapframe *tf = td->td_frame;\n\n        memcpy(mcp->mc_gpregs.gp_t, tf->tf_t, sizeof(mcp->mc_gpregs.gp_t));\n        ...\n        mcp->mc_gpregs.gp_sstatus = tf->tf_sstatus;\n        get_fpcontext(td, mcp);\n        /* NO sctrctl read */\n        return (0);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exec_machdep.c",
+        "function_name": "set_mcontext",
+        "line_start": 231,
+        "line_end": 262,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "set_mcontext restores GP regs + FP state on sigreturn. Validates sstatus bits but ignores CTR state. Does NOT restore sctrctl. A signal handler can enable CTR recording via csrw sctrctl before sigreturn, leaving the resumed process unknowingly executing with CTR recording active.",
+      "snippet": "set_mcontext(struct thread *td, mcontext_t *mcp)\n{\n        ...\n        if (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &\n            ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_UPIE |\n            SSTATUS_UIE)) != 0)\n                return (EINVAL);\n        /* Validates sstatus but NOT sctrctl */\n        ...\n        set_fpcontext(td, mcp);\n        /* NO sctrctl restore */\n        return (0);\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/include/frame.h",
+        "function_name": "struct trapframe",
+        "line_start": 46,
+        "line_end": 58,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct trapframe has no tf_sctrctl field. Contains tf_ra, tf_sp, tf_gp, tf_tp, tf_t[7], tf_s[12], tf_a[8], tf_sepc, tf_sstatus, tf_stval, tf_scause. The fundamental exception entry/exit path cannot carry sctrctl state because the trapframe has no slot for it. This means even a minimal fix would require expanding the trapframe.",
+      "snippet": "struct trapframe {\n        uint64_t tf_ra;\n        uint64_t tf_sp;\n        uint64_t tf_gp;\n        uint64_t tf_tp;\n        uint64_t tf_t[7];\n        uint64_t tf_s[12];\n        uint64_t tf_a[8];\n        uint64_t tf_sepc;\n        uint64_t tf_sstatus;\n        uint64_t tf_stval;\n        uint64_t tf_scause;\n        /* NO tf_sctrctl field */\n};",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/genassym.c",
+        "function_name": "PCB/TF ASSYM definitions",
+        "line_start": 65,
+        "line_end": 101,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "genassym.c generates assembly symbol offsets for PCB_RA, PCB_SP, PCB_GP, PCB_TP, PCB_S, PCB_X, PCB_FCSR, TF_RA through TF_SSTATUS. No SCTRCTL-related ASSYM offsets exist. Even assembly code paths (cpu_switch, savectx, fork_trampoline) cannot reference sctrctl through the PCB or trapframe structures because the offset symbols do not exist.",
+      "snippet": "ASSYM(PCB_RA, offsetof(struct pcb, pcb_ra));\n...\nASSYM(PCB_FCSR, offsetof(struct pcb, pcb_fcsr));\n/* NO PCB_SCTRCTL ASSYM */\n\nASSYM(TF_SSTATUS, offsetof(struct trapframe, tf_sstatus));\n/* NO TF_SCTRCTL ASSYM */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch",
+        "line_start": 41,
+        "line_end": 203,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The bhyve VM enter/exit world-switch (vmm_switch) saves/restores host and guest GP registers, sstatus, hstatus, scounteren, stvec, sscratch, sepc. Does NOT save/restore sctrctl for host or vsctrctl for guest. The host's sctrctl configuration leaks into the guest on VM entry; the guest's vsctrctl configuration leaks into the host on VM exit. A malicious guest can enable CTR recording via vsctrctl before causing VM exit, recording the host kernel's post-exit control flow.",
+      "snippet": "/* vmm_switch saves: GP regs + sstatus/hstatus/scounteren/stvec/sscratch/sepc */\n/* NO sctrctl/vsctrctl save/restore for host or guest */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 123,
+          "line_end": 125,
+          "excerpt": "If the H extension is implemented, the vsctrctl register is a 64-bit read/write register that is VS-mode's version of supervisor register sctrctl. When V=1, vsctrctl substitutes for the usual sctrctl."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 125,
+          "line_end": 125,
+          "excerpt": "When V=1, vsctrctl substitutes for the usual sctrctl, so instructions that normally read or modify sctrctl actually access vsctrctl instead."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/riscv.h",
+        "function_name": "struct hypcsr",
+        "line_start": 56,
+        "line_end": 68,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "struct hypcsr (guest CSR save area for bhyve) contains hvip, vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, vsatp, scounteren, senvcfg. No sctrctl or vsctrctl field. Guest CTR recording configuration cannot be saved or restored across VM entries, making correct virtualization of Smctr impossible with the current structure layout.",
+      "snippet": "struct hypcsr {\n        uint64_t hvip;\n        uint64_t vsstatus;\n        uint64_t vsie;\n        uint64_t vstvec;\n        uint64_t vsscratch;\n        uint64_t vsepc;\n        uint64_t vscause;\n        uint64_t vstval;\n        uint64_t vsatp;\n        uint64_t scounteren;\n        uint64_t senvcfg;\n        /* NO sctrctl or vsctrctl field */\n};",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 413,
+          "line_end": 415,
+          "excerpt": "If the H extension is implemented and mstateen0.CTR=1, the hstateen0.CTR bit controls access to supervisor CTR state when V=1. This state includes sctrctl (really vsctrctl), sctrstatus, and sireg* (really vsireg*) when siselect (really vsiselect) is in 0x200..0x2FF."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_restore_csrs / vmmops_vcpu_save_csrs",
+        "line_start": 161,
+        "line_end": 195,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "Guest CSR save/restore functions called on each VM enter/exit handle only the CSRs in struct hypcsr (hvip, vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, vsatp, scounteren, senvcfg). No vsctrctl management. Combined with the missing hypcsr field, guest CTR state is lost on every VM exit and corrupted on every VM entry.",
+      "snippet": "/* vmmops_vcpu_restore_csrs / vmmops_vcpu_save_csrs: */\n/* handle only hypcsr fields -- no vsctrctl */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_init",
+        "line_start": 197,
+        "line_end": 238,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "vmmops_vcpu_init initializes a new vCPU by setting scounteren to CY|TM. Does NOT initialize vsctrctl to zero/disabled. The vCPU starts with whatever vsctrctl value is in hardware from the host or previous VM, potentially leaking host CTR configuration to the guest.",
+      "snippet": "/* vmmops_vcpu_init: sets scounteren = CY|TM */\n/* NO vsctrctl initialization to safe value */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/trap.c",
+        "function_name": "do_trap_user",
+        "line_start": 380,
+        "line_end": 460,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "do_trap_user (user-mode trap dispatcher) has no special handling for sctrctl CSR accesses. If mstateen0[58] grants S-mode CTR access, user-mode csrw to sctrctl does not trap—the write succeeds directly in hardware with zero kernel visibility. If mstateen0[58] is clear, the access traps as illegal instruction and the kernel delivers SIGILL with no CTR-specific interception logic. The kernel has no code path to filter or virtualize sctrctl.",
+      "snippet": "/* do_trap_user: dispatches exceptions -- NO sctrctl handling */\n/* csrw sctrctl from U-mode always traps (S-mode CSR), */\n/* but S-mode kernel code writing sctrctl has no interception */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smctr.adoc",
+          "line_start": 405,
+          "line_end": 409,
+          "excerpt": "When mstateen0.CTR=1, accesses to CTR register state behave as described... When mstateen0.CTR=0 and the privilege mode is less privileged than M-mode, the following operations raise an illegal-instruction exception: Attempts to access sctrctl, vsctrctl, sctrdepth, or sctrstatus."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/swtch.S",
+        "function_name": "fork_trampoline",
+        "line_start": 365,
+        "line_end": 432,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "fork_trampoline (new process entry after fork) restores sstatus, sepc, and all GP registers from the trapframe. Does NOT zero or write a safe value to sctrctl. The child process inherits the parent's sctrctl hardware value, meaning CTR recording may be unexpectedly active in the child with the parent's filter configuration.",
+      "snippet": "ENTRY(fork_trampoline)\n        ...\n        /* Restore sstatus */\n        ld      t0, (TF_SSTATUS)(sp)\n        li      t1, ~SSTATUS_SIE\n        and     t0, t0, t1\n        csrw    sstatus, t0\n        /* Restore exception program counter */\n        ld      t0, (TF_SEPC)(sp)\n        csrw    sepc, t0\n        /* NO sctrctl zero/reset */\n        ...\n        sret\nEND(fork_trampoline)",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

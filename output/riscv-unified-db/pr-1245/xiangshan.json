@@ -1,0 +1,425 @@
+{
+  "pr_number": 1245,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 1245,
+    "violation_condition": "In XiangShan RTL, if the vector LSU (Load/Store Unit) continues to write load data into destination vector register group elements with indices greater than the element that triggered a memory access exception (e.g., page fault, PMP violation, or access fault), the hardware overwrites architectural state past the precise trap boundary. This occurs when VECTOR_LOAD_PAST_TRAP is either explicitly enabled (parameter=true) or inadvertently implemented due to the LSU processing multiple elements in parallel across beats without aborting in-flight element writes upon trap detection on an earlier element index. The violation manifests when: (1) the trap is reported at element index i, (2) the trap handler inspects vstart (pointing to i) or vl, but (3) destination register elements at indices > i already contain data loaded from potentially protected/privileged memory addresses before the LSU pipeline was flushed. In Chisel/Verilog, this corresponds to the vector register writeback path not being gated by the trap-valid signal on a per-element-index basis, or the LSU writeback queue not being drained/cancelled upon exception detection.",
+    "security_consequence": "info_leak",
+    "vulnerability_pattern": "(vector.*load.*past.*trap|vecLsu.*writeback.*exception|vreg.*writeEn.*trap|lsu.*beat.*fault.*write|vectorLoadUnit.*cancel.*beat|vlWritebackQueue.*flush)",
+    "affected_entities": [
+      "vle8.v",
+      "vle16.v",
+      "vle32.v",
+      "vle64.v",
+      "vle128.v",
+      "vle256.v",
+      "vle512.v",
+      "vle1024.v",
+      "vse8.v",
+      "vse16.v",
+      "vse32.v",
+      "vse64.v",
+      "vse128.v",
+      "vse256.v",
+      "vse512.v",
+      "vse1024.v",
+      "vle8ff.v",
+      "vle16ff.v",
+      "vle32ff.v",
+      "vle64ff.v",
+      "vle128ff.v",
+      "vle256ff.v",
+      "vle512ff.v",
+      "vle1024ff.v",
+      "vlsege.v",
+      "vlssege.v",
+      "vluxei.v",
+      "vloxei.v",
+      "vsuxei.v",
+      "vsoxei.v",
+      "vstart",
+      "vl",
+      "vtype",
+      "mtval",
+      "stval",
+      "medeleg",
+      "sedeleg"
+    ],
+    "summary": "Unchecked vector register writeback past trap element index leaks data from protected memory into architected state visible to exception handlers, bypassing PMP/page-table access controls at hardware level"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/Parameters.scala",
+        "function_name": "XSCoreParameters.VLEN",
+        "line_start": 53,
+        "line_end": 53,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VLEN=128 is a valid implementation choice per the RISC-V V extension spec. It is a power of 2 >= 32 and >= ELEN(64). The derived vlWidth = log2Up(128)+1 = 8 correctly covers vl values 0-128. Cross-references with NewCSR.VLEN=128 at NewCSR.scala:45 are consistent.",
+      "snippet": "VLEN: Int = 128",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 30,
+          "line_end": 35,
+          "excerpt": "The upper limit on VLEN allows software to know that indices will fit into 16 bits (largest VLMAX of 65,536 occurs for LMUL=8 and SEW=8 with VLEN=65,536)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/Parameters.scala",
+        "function_name": "XSCoreParameters.ELEN",
+        "line_start": 54,
+        "line_end": 54,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ELEN=64 is correct for the standard V extension (supporting SEW up to 64 bits). With VLEN=128 and ELEN=64, the implementation must support fractional LMULs of 1/2, 1/4, and 1/8 per spec norm:vtype_lmul_fval — and the VLmul encoding table at Bundles.scala:172-174 (mf8,mf4,mf2) confirms this support.",
+      "snippet": "ELEN: Int = 64",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 288,
+          "line_end": 291,
+          "excerpt": "For vector extensions with ELEN=64 and ELEN ≤ VLEN, fractional LMULs of 1/2, 1/4, and 1/8 must be supported."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/vector/Bundles.scala",
+        "function_name": "object VSew",
+        "line_start": 135,
+        "line_end": 151,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "SEW encodings (e8='b000', e16='b001', e32='b010', e64='b011') match the RISC-V spec vsew[2:0] encoding table exactly. Reserved pattern BitPat('b1??') correctly flags encodings 100-111 as illegal. The isReserved method handles both 2-bit internal representation (always returns false, since 2 bits cannot match 'b1??') and 3-bit vtype CSR representation (matches bit 2 being set).",
+      "snippet": "def e8  : UInt = \"b000\".U(width.W)\ndef e16 : UInt = \"b001\".U(width.W)\ndef e32 : UInt = \"b010\".U(width.W)\ndef e64 : UInt = \"b011\".U(width.W)\ndef reserved: BitPat = BitPat(\"b1??\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 197,
+          "line_end": 208,
+          "excerpt": "vsew[2:0] (selected element width) encoding: 0 0 0 | 8, 0 0 1 | 16, 0 1 0 | 32, 0 1 1 | 64, 1 X X | Reserved. While it is anticipated the larger vsew[2:0] encodings (100-111) will be used to encode larger SEW, the encodings are formally reserved at this point."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/vector/Bundles.scala",
+        "function_name": "object VLmul",
+        "line_start": 167,
+        "line_end": 187,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "LMUL encodings (mf8='b101', mf4='b110', mf2='b111', m1='b000', m2='b001', m4='b010', m8='b011') match the spec encoding exactly. The reserved encoding 'b100' (LMUL=reserved in the spec table) is correctly flagged. makeNoLessThanM1 helper clamps fractional LMUL to m1 when bit 2 is set.",
+      "snippet": "def m1  : UInt = \"b000\".U(width.W)\ndef m2  : UInt = \"b001\".U(width.W)\ndef m4  : UInt = \"b010\".U(width.W)\ndef m8  : UInt = \"b011\".U(width.W)\ndef mf2 : UInt = \"b111\".U(width.W)\ndef mf4 : UInt = \"b110\".U(width.W)\ndef mf8 : UInt = \"b101\".U(width.W)\ndef reserved: BitPat = BitPat(\"b100\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 328,
+          "line_end": 334,
+          "excerpt": "vlmul[2:0] | LMUL: 1 0 0 | reserved, 1 0 1 | 1/8, 1 1 0 | 1/4, 1 1 1 | 1/2, 0 0 0 | 1, 0 0 1 | 2, 0 1 0 | 4, 0 1 1 | 8"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/Unprivileged.scala",
+        "function_name": "class CSRVTypeBundle",
+        "line_start": 240,
+        "line_end": 248,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vtype CSR field bit positions are correct per spec: VILL at bit 63 (XLEN-1), VMA at bit 7, VTA at bit 6, VSEW at bits 5:3, VLMUL at bits 2:0. The implicit reserved field in bits 62:8 is not explicitly declared but matches the bundle layout. VILL reset value of 1 matches the spec recommendation that vtype.vill be set at reset. All fields are RO (read-only), consistent with vtype being modified only by vset{i}vl{i} instructions.",
+      "snippet": "val VILL  = RO(  63).withReset(1.U)\nval VMA   = RO(   7).withReset(0.U)\nval VTA   = RO(   6).withReset(0.U)\nval VSEW  = RO(5, 3).withReset(0.U)\nval VLMUL = RO(2, 0).withReset(0.U)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/images/wavedrom/vtype-format.edn",
+          "line_start": 17,
+          "line_end": 28,
+          "excerpt": "vtype register layout: XLEN-1 | vill, XLEN-2:8 | 0 (Reserved if non-zero), 7 | vma, 6 | vta, 5:3 | vsew[2:0], 2:0 | vlmul[2:0]"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/CSR.scala",
+        "function_name": "class VtypeStruct",
+        "line_start": 120,
+        "line_end": 127,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VtypeStruct correctly carries the full 64-bit vtype CSR layout as a pipeline transport bundle: vill(1b), reserved(55b=XLEN-9=64-9), vma(1b), vta(1b), vsew(3b), vlmul(3b). Total 1+55+1+1+3+3=64 bits. When packed, the declared field order maps to bits 63:0 matching the spec layout exactly. The reserved field width of XLEN-9 correctly covers bits 62:8 (62-8+1=55=64-9).",
+      "snippet": "class VtypeStruct(implicit p: Parameters) extends XSBundle {\n  val vill = UInt(1.W)\n  val reserved = UInt((XLEN - 9).W)\n  val vma = UInt(1.W)\n  val vta = UInt(1.W)\n  val vsew = UInt(3.W)\n  val vlmul = UInt(3.W)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 161,
+          "line_end": 164,
+          "excerpt": "The vtype register has five fields, vill, vma, vta, vsew[2:0], and vlmul[2:0]. Bits vtype[XLEN-2:8] should be written with zero, and non-zero values in this field are reserved."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "object CSRs (vector unprivileged)",
+        "line_start": 8,
+        "line_end": 11,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Vector unprivileged CSR addresses vstart=0x008, vxsat=0x009, vxrm=0x00A, vcsr=0x00F match the RISC-V privileged spec CSR address map exactly.",
+      "snippet": "val vstart = 0x8\nval vxsat = 0x9\nval vxrm = 0xa\nval vcsr = 0xf",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 175,
+          "line_end": 182,
+          "excerpt": "vstart, vxsat, vxrm, vcsr — Vector start position (URO), vxsat (URO), vxrm (URO), vcsr (URO)"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/isa/CSRs.scala",
+        "function_name": "object CSRs (vector read-only)",
+        "line_start": 47,
+        "line_end": 49,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Vector read-only CSR addresses vl=0xC20, vtype=0xC21, vlenb=0xC22 match the RISC-V privileged spec exactly.",
+      "snippet": "val vl = 0xc20\nval vtype = 0xc21\nval vlenb = 0xc22",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/csrs.adoc",
+          "line_start": 178,
+          "line_end": 182,
+          "excerpt": "vl, vtype, vlenb — Vector length, Vector data type, Vector register length in bytes"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Vsetu.scala",
+        "function_name": "class VsetModule (VLMAX computation)",
+        "line_start": 86,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The VLMAX computation relies on unsigned integer wrapping to handle signed LMUL values for fractional LMUL. log2Vlmax = log2Vlen.U(3.W) + log2Vlmul - log2Vsew uses 3-bit unsigned arithmetic where fractional LMUL encodings (mf8=5, mf4=6, mf2=7) naturally produce correct results through truncation (e.g., 7+7-3=11 wraps to 3→VLMAX=8 for mf2+e8). This is functionally correct for the current VLEN=128,ELEN=64 configuration and all legal SEW/LMUL combinations, but is fragile: changing bit widths of any operand without understanding this signed-via-unsigned convention would silently break VLMAX computation.",
+      "snippet": "private val log2Vlmax: UInt = log2Vlen.U(3.W) + log2Vlmul - log2Vsew\nprivate val vlmax = (1.U(vlWidth.W) << log2Vlmax).asUInt",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 318,
+          "line_end": 324,
+          "excerpt": "LMUL is set by the signed vlmul field in vtype (i.e., LMUL = 2^vlmul[2:0]). The derived value VLMAX = LMUL*VLEN/SEW represents the maximum number of elements."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Vsetu.scala",
+        "function_name": "class VsetModule (SEW legality gate)",
+        "line_start": 95,
+        "line_end": 98,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "The SEW legality check log2VsewMax = Mux(log2Vlmul(2), log2Elen.U + log2Vlmul, log2Elen.U) uses the same implicit wrapping trick: for fractional LMUL, log2Elen(6) + vlmul_raw (e.g., 6+7=13→5 for mf2) correctly computes min(LMUL*ELEN) through unsigned truncation, producing the right max SEW per spec (mf2→SEW≤32, mf4→SEW≤16, mf8→SEW≤8). Functionally correct but the same fragility concern as the VLMAX computation — it depends on 3-bit unsigned overflow to emulate signed addition. Adding explicit sign-extension with a comment would make this self-documenting and robust.",
+      "snippet": "private val log2Elen = log2Up(ELEN)\nprivate val log2VsewMax = Mux(log2Vlmul(2), log2Elen.U + log2Vlmul, log2Elen.U)\nprivate val sewIllegal = VSew.isReserved(vsew) || (log2Vsew > log2VsewMax)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 301,
+          "line_end": 303,
+          "excerpt": "For a given supported fractional LMUL setting, implementations must support SEW settings between SEW_MIN and LMUL * min(ELEN, VLEN), inclusive."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/Vsetu.scala",
+        "function_name": "class VsetModule (vtypeIllegal, keepVlIllegal, illegal output)",
+        "line_start": 98,
+        "line_end": 125,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Illegal-vtype handling is correct: (1) vtypeIllegal = vtype.reserved.orR checks reserved bits XLEN-2:8 are all zero per spec norm:vtype_fields_sz; (2) keepVlIllegal correctly detects when the SEW/LMUL ratio changes under keep-vl, matching the spec's reservation of this case; (3) When illegal, vl=0 and all vtype fields=0 matching spec norm:vtype_vill_val ('the remaining bits in vtype are set to zero, and the vl register is also set to zero').",
+      "snippet": "private val vtypeIllegal = vtype.reserved.orR\nprivate val illegal = lmulIllegal | sewIllegal | vtypeIllegal | vtype.illegal | keepVlIllegal\noutVConfig.vl := Mux(illegal, 0.U, vl)\noutVConfig.vtype.illegal := illegal\noutVConfig.vtype.vta := Mux(illegal, 0.U, vtype.vta)\noutVConfig.vtype.vma := Mux(illegal, 0.U, vtype.vma)\noutVConfig.vtype.vlmul := Mux(illegal, 0.U, vtype.vlmul)\noutVConfig.vtype.vsew := Mux(illegal, 0.U, vtype.vsew)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 1244,
+          "line_end": 1246,
+          "excerpt": "If the vtype value is not supported by the implementation, then the vill bit is set in vtype, the remaining bits in vtype are set to zero, and the vl register is also set to zero."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/Unprivileged.scala",
+        "function_name": "vstart/vl/vtype/vlenb CSR modules",
+        "line_start": 62,
+        "line_end": 130,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All vector CSR modules are correctly instantiated: (a) vstart is RW with width VlWidth-2=6:0 (7 bits covering indices 0-127), reset to 0, with commit-based update from ROB — correct for VLEN=128 where max VLMAX=128 and max element index=127; (b) vl is RO with width VlWidth-1=7:0 (8 bits covering 0-128), reset to 0; (c) vtype is RO updated on robCommit.vtype.valid; (d) vlenb is RO initialized to VLEN/8=16. The vstart write path gates writes to bits (VlWidth-2,0) and the robCommit path correctly handles vsDirty/vstart updates.",
+      "snippet": "val vstart = RW(VlWidth - 2, 0).withReset(0.U)\nval VL = RO(VlWidth - 1, 0).withReset(0.U)\nval VLENB = VlenbField(63, 0).withReset(VlenbField.init)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 548,
+          "line_end": 554,
+          "excerpt": "The vstart CSR is defined to have only enough writable bits to hold the largest element index (one less than the maximum VLMAX). For VLEN=256, vstart would have 8 bits to represent indices from 0 through 255."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/Unprivileged.scala",
+        "function_name": "object VlenbField",
+        "line_start": 262,
+        "line_end": 264,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VlenbField.init = VLEN/8 = 128/8 = 16 correctly implements the spec-required value. The field is instantiated as RO (read-only) in the vlenb CSR module at line 128.",
+      "snippet": "object VlenbField extends CSREnum with ROApply {\n  val init = Value((VLEN / 8).U)\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 513,
+          "line_end": 515,
+          "excerpt": "The XLEN-bit-wide read-only CSR vlenb holds the value VLEN/8, i.e., the vector register length in bytes."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala",
+        "function_name": "NewCSR.VLEN / NewCSR.VlWidth",
+        "line_start": 45,
+        "line_end": 50,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "NewCSR.VLEN=128 and VlWidth=8 are consistent with Parameters.scala definitions. VlWidth=8 = log2Up(128+1) correctly holds vl values 0-128. Used as the compile-time constant for CSR field macro expansion since Chisel's log2Up cannot be used as a meta-programming function (line 47 comment explains this constraint).",
+      "snippet": "final val VLEN = 128\n// log2Up(128 + 1), hold 0~128\nfinal val VlWidth = 8",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/Parameters.scala",
+        "function_name": "XSCoreParams.vlWidth",
+        "line_start": 307,
+        "line_end": 307,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "vlWidth = log2Up(VLEN) + 1 = log2Up(128) + 1 = 7 + 1 = 8 is correct and cross-consistent with NewCSR.VlWidth=8. Used throughout the vector pipeline for vl/vstart field sizing.",
+      "snippet": "def vlWidth = log2Up(VLEN) + 1",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/Parameters.scala",
+        "function_name": "XSCoreParams.minVecElen / maxElemPerVreg",
+        "line_start": 317,
+        "line_end": 322,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "minVecElen=8 (smallest element width for standard V extension SEW_MIN=8) and maxElemPerVreg=VLEN/minVecElen=128/8=16 are correct derived implementation constants used for vector pipeline sizing. 16 elements per register is the maximum occupancy at SEW=8,LMUL=1.",
+      "snippet": "val minVecElen: Int = 8\nval maxElemPerVreg: Int = VLEN / minVecElen",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 210,
+          "line_end": 219,
+          "excerpt": "Example VLEN = 128 bits. SEW=8 → 16 elements per vector register."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/Parameters.scala",
+        "function_name": "XSCoreParams vector register counts",
+        "line_start": 93,
+        "line_end": 95,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VecLogicRegs=47 (32 arch + 15 tmp), V0LogicRegs=1, VlLogicRegs=1. The 15 temporary registers provide speculative register allocation capacity for vector renaming, sufficient for LMUL=8 operations that require up to 8 physical registers per operand. The separate V0 (mask) and Vl (length) registers are correctly allocated as distinct rename classes.",
+      "snippet": "VecLogicRegs: Int = 32 + 15, // 15: tmp\nV0LogicRegs: Int = 1, // V0\nVlLogicRegs: Int = 1, // Vl",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/mem/vector/VecCommon.scala",
+        "function_name": "trait VLSUConstants",
+        "line_start": 35,
+        "line_end": 77,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VLSU constants correctly bound the vector load/store pipeline: VLEN=128, maxMUL=8 (max LMUL per spec), maxFields=8 (max NFIELDS for segment load/store), maxUopNum=64 (maxMUL*maxFields), maxFlowNum=16 (memory pipeline parallelism), ewBits=3 and mulBits=3 (correctly sized for SEW and LMUL encodings). The comment at line 49-53 correctly documents the extreme case of a segment indexed instruction producing 64 uops.",
+      "snippet": "val VLEN = 128\ndef maxMUL = 8\ndef maxFields = 8\ndef maxUopNum = maxMUL * maxFields // 64\ndef maxFlowNum = 16\ndef ewBits = 3\ndef mulBits = 3",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/decode/DecodeUnitComp.scala",
+        "function_name": "trait VectorConstants",
+        "line_start": 79,
+        "line_end": 84,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "VectorConstants correctly defines decode-stage micro-op splitting bounds: MAX_VLMUL=8 (max LMUL per spec), VECTOR_TMP_REG_LMUL=32 (total allocated register space 32-46=15 tmp+1), VECTOR_COMPRESS=1 (v0 mask register), MAX_INDEXED_LS_UOPNUM=64 (consistent with VLSUConstants.maxUopNum).",
+      "snippet": "trait VectorConstants {\n  val MAX_VLMUL = 8\n  val VECTOR_TMP_REG_LMUL = 32\n  val VECTOR_COMPRESS = 1\n  val MAX_INDEXED_LS_UOPNUM = 64\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/vector/Bundles.scala",
+        "function_name": "objects Vl/Vstart/Vxsat/Vxrm/VEew/Nf/NumLsElem",
+        "line_start": 189,
+        "line_end": 213,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "All pipeline bundle field widths are correctly sized: Vl.width=8 (holds 0-128 for VLEN=128), Vstart.width=7 (holds indices 0-127), Vxsat.width=1, Vxrm.width=2 (4 rounding modes), Nf.width=3 (NFIELDS up to 8), VEew.width=2 (internal SEW representation), NumLsElem.width=log2Up(16)+1=5 (holds element counts per vector register).",
+      "snippet": "object Vl { def width = p(XSCoreParamsKey).vlWidth }\nobject Vstart { def width = p(XSCoreParamsKey).vlWidth - 1 }\nobject Vxsat extends NamedUInt(1)\nobject Vxrm extends NamedUInt(2)\nobject VEew extends NamedUInt(2)\nobject NumLsElem { def width = log2Up(p(XSCoreParamsKey).maxElemPerVreg) + 1 }",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

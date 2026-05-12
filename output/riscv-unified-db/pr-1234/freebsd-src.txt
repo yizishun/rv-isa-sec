@@ -1,0 +1,156 @@
+PR #1234  target=freebsd-src  overall=not_implemented
+Spec: Zcmt introduces jvt CSR holding a jump-table base pointer; FreeBSD must save/restore jvt on context switch, validate jvt.BASE alignment (64-byte), enforce jvt.MODE=0, and in bhyve correctly trap or proxy guest jvt access via hstateen0.JVT — omission allows cross-process control-flow hijacking via stale jump-table pointer
+Violation:
+  FreeBSD kernel context-switches between processes without saving/restoring
+  the jvt CSR. A malicious process sets jvt.BASE to point to attacker-
+  controlled memory, then yields the CPU. When the victim process executes
+  cm.jalt or cm.jt, the hardware reads the jump target from the attacker's
+  table via the stale jvt.BASE, redirecting the victim's control flow to an
+  attacker-chosen address.
+Consequence: privilege_escape
+Pattern:
+  cpu_switch|savectx|restorectx|set_regs|fill_regs.*jvt|CSR_JVT|jvt.*context|Z
+  cmt.*switch
+------------------------------------------------------------
+[not_implemented] sys/riscv/include/riscvreg.h:226-285  (global defines)
+  The jvt CSR (address 0x017) is not defined in riscvreg.h. The CSR access
+  macros (csr_read/csr_write/csr_swap) exist but no CSR_JVT constant is
+  provided. This means no kernel code can read, write, or context-switch the
+  jvt CSR.
+  | #define csr_read(csr)           \
+  |     ({  u_long val;              \
+  |         __asm __volatile("csrr %0, " #csr : "=r" (val)); \
+  |         val;                      \
+  |     })
+  References:
+    - riscv-isa-manual/src/unpriv/zcmt.adoc:90-97
+      "Table jump base vector and control register. Address: 0x017.
+      Permissions: URW."
+    - riscv-isa-manual/src/unpriv/zcmt.adoc:146-148
+      "csr:jvt[] CSR adds architectural state to the system software
+      context (such as an OS process), therefore must be saved/restored on
+      context switches."
+
+[not_implemented] sys/riscv/include/pcb.h:42-54  struct pcb
+  struct pcb has no pcb_jvt field to store the jvt CSR value across context
+  switches. The PCB stores ra, sp, gp, tp, s[0-11], FPU registers, and fcsr,
+  but no jvt state.
+  | struct pcb {
+  |     uint64_t pcb_ra;
+  |     uint64_t pcb_sp;
+  |     uint64_t pcb_gp;
+  |     uint64_t pcb_tp;
+  |     uint64_t pcb_s[12];
+  References:
+    - riscv-isa-manual/src/unpriv/zcmt.adoc:146-148
+      "csr:jvt[] CSR adds architectural state to the system software
+      context (such as an OS process), therefore must be saved/restored on
+      context switches."
+
+[not_implemented] sys/riscv/riscv/swtch.S:258-358  cpu_switch
+  cpu_switch() does not save/restore the jvt CSR. The context switch saves
+  only ra, sp, s[0-11], and conditionally the FPU state. On hardware
+  implementing Zcmt, leaving jvt un-switched allows a malicious process to set
+  jvt.BASE to attacker-controlled memory; when the victim executes
+  cm.jalt/cm.jt, the hardware fetches the jump target from the attacker's
+  table via the stale jvt.BASE, redirecting victim control flow.
+  | ENTRY(cpu_switch)
+  |     sd a1, PC_CURTHREAD(tp)
+  |     ...
+  |     sd ra, (PCB_RA)(x13)
+  |     sd sp, (PCB_SP)(x13)
+  |     sd s0, (PCB_S + 0 * 8)(x13)
+  |     ...
+  |     /* no jvt CSR save/restore anywhere */
+  References:
+    - riscv-isa-manual/src/unpriv/zcmt.adoc:146-148
+      "csr:jvt[] CSR adds architectural state to the system software
+      context (such as an OS process), therefore must be saved/restored on
+      context switches."
+    - riscv-isa-manual/src/unpriv/zcmt.adoc:192-193
+      "insn:cm.jt[] reads an entry from the jump vector table in memory
+      and jumps to the address that was read."
+
+[not_implemented] sys/riscv/riscv/swtch.S:434-457  savectx
+  savectx() does not save the jvt CSR to the PCB. It saves ra, sp, tp, gp,
+  s[0-11], and FPU state, but omits the jvt CSR. Any kernel path that uses
+  savectx to snapshot thread state (e.g., crash dumps, ptrace) will silently
+  lose the jvt value.
+  | ENTRY(savectx)
+  |     sd ra, (PCB_RA)(a0)
+  |     sd sp, (PCB_SP)(a0)
+  |     sd tp, (PCB_TP)(a0)
+  |     sd gp, (PCB_GP)(a0)
+  |     /* s[0-11] saved, FPU saved, but no jvt */
+  |     __fpe_state_save a0
+  |     ret
+  References:
+    - riscv-isa-manual/src/unpriv/zcmt.adoc:146-148
+      "csr:jvt[] CSR adds architectural state to the system software
+      context (such as an OS process), therefore must be saved/restored on
+      context switches."
+
+[not_implemented] sys/riscv/riscv/swtch.S:206-248  cpu_throw
+  cpu_throw() restores only ra, sp, s[0-11], and conditionally FPU state from
+  the PCB. The jvt CSR is not restored. A newly-scheduled thread will inherit
+  the previous thread's jvt value.
+  | ENTRY(cpu_throw)
+  |     ...
+  |     ld ra, (PCB_RA)(x13)
+  |     ld sp, (PCB_SP)(x13)
+  |     ld s0, (PCB_S + 0 * 8)(x13)
+  |     ...
+  |     /* no jvt CSR restore */
+  |     ret
+  References:
+    - riscv-isa-manual/src/unpriv/zcmt.adoc:146-148
+      "csr:jvt[] CSR adds architectural state to the system software
+      context (such as an OS process), therefore must be saved/restored on
+      context switches."
+
+[not_implemented] sys/riscv/riscv/exec_machdep.c:172-189  exec_setregs
+  exec_setregs() initializes a new process's register state but does not
+  initialize the jvt CSR. A new process inheriting a stale jvt.BASE from its
+  parent (via fork) could be exploited if the parent set jvt to point to
+  attacker-controlled memory during its previous timeslice.
+  | void exec_setregs(struct thread *td, struct image_params *imgp, uintptr_t stack) {
+  |     ...
+  |     memset(tf, 0, sizeof(struct trapframe));
+  |     tf->tf_a[0] = stack;
+  |     tf->tf_sp = STACKALIGN(stack);
+  |     tf->tf_ra = imgp->entry_addr;
+  |     tf->tf_sepc = imgp->entry_addr;
+  |     /* no jvt CSR initialization */
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/zcmt.adoc:146-148
+      "csr:jvt[] CSR adds architectural state to the system software
+      context (such as an OS process), therefore must be saved/restored on
+      context switches."
+
+[not_implemented] sys/riscv/riscv/exec_machdep.c:98-115  set_regs
+  set_regs() (used by ptrace) copies register state into the thread's
+  trapframe but has no jvt field in struct reg, so the jvt CSR cannot be read
+  or written via ptrace debugging interfaces.
+  | int set_regs(struct thread *td, struct reg *regs) {
+  |     ...
+  |     frame->tf_sepc = regs->sepc;
+  |     frame->tf_ra = regs->ra;
+  |     frame->tf_sp = regs->sp;
+  |     /* no jvt field in struct reg */
+  |     return (0);
+  | }
+
+[not_implemented] sys/riscv/include/reg.h:40-50  struct reg
+  struct reg (the ptrace-visible register set) has no jvt field. This means
+  debuggers and checkpoint/restore tools cannot inspect or modify the jvt CSR.
+  | struct reg {
+  |     __uint64_t ra;
+  |     __uint64_t sp;
+  |     __uint64_t gp;
+  |     __uint64_t tp;
+  |     __uint64_t t[7];
+  |     ...
+  |     /* no jvt field */
+  | };
+

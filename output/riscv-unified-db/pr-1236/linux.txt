@@ -1,0 +1,141 @@
+PR #1236  target=linux  overall=potential_risk
+Spec: sie bits are aliases of mie; they become read-only zero when mideleg delegation is inactive, so kernel writes to sie can silently fail and cause missed interrupts
+Violation:
+  Kernel at S-mode writes to sie (e.g., csr_set CSR_SIE) to enable supervisor
+  interrupts, but if M-mode firmware concurrently clears the corresponding
+  mideleg delegation bit, the sie bit becomes read-only zero — the write
+  silently fails, the kernel believes the interrupt is enabled but the hart
+  never delivers it
+Consequence: denial_of_service
+Pattern:
+  csr_set.*0x104|__enable_irq|arch_local_irq_enable|sie.*write|CSR_SIE
+------------------------------------------------------------
+[potential_risk] drivers/irqchip/irq-riscv-intc.c:60-66  riscv_intc_irq_unmask
+  csr_set(CSR_IE, BIT(d->hwirq)) writes to per-source sie bits without
+  verifying the write took effect. Per RISC-V priv spec, if M-mode firmware
+  clears the corresponding mideleg delegation bit, the sie bit becomes read-
+  only zero and the csr_set silently fails — the kernel believes the interrupt
+  is enabled but the hart will never deliver it. No csr_read(CSR_IE) is
+  performed after any csr_set(CSR_IE, ...) call anywhere in the kernel. This
+  is the single funnel through which all timer, IPI, external, PMU, and custom
+  local interrupts are enabled.
+  | static void riscv_intc_irq_unmask(struct irq_data *d)
+  | {
+  | 	if (IS_ENABLED(CONFIG_32BIT) && d->hwirq >= BITS_PER_LONG)
+  | 		csr_set(CSR_IEH, BIT(d->hwirq - BITS_PER_LONG));
+  | 	else
+  | 		csr_set(CSR_IE, BIT(d->hwirq));
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1520-1524
+      "Restricted views of the mip and mie registers appear as the sip and
+      sie registers for supervisor level. If an interrupt is delegated to
+      S-mode by sett"
+    - riscv-isa-manual/src/priv/supervisor.adoc:408-409
+      "A bit in sie must be writable if the corresponding interrupt can
+      ever become pending. Bits of sie that are not writable are read-only
+      zero."
+    - riscv-isa-manual/src/priv/supervisor.adoc:468-470
+      "The implemented interrupts may be found by writing one to every bit
+      location in sie, then reading back to see which bit positions hold a
+      one."
+
+[potential_risk] drivers/irqchip/irq-riscv-intc.c:83-91  andes_intc_irq_unmask
+  Same silent-failure risk as riscv_intc_irq_unmask: csr_set(CSR_IE, mask) for
+  standard interrupts and csr_set(ANDES_CSR_SLIE, mask) for Andes custom local
+  interrupts — neither has read-back verification.
+  | static void andes_intc_irq_unmask(struct irq_data *d)
+  | {
+  | 	unsigned int mask = BIT(d->hwirq % BITS_PER_LONG);
+  | 
+  | 	if (d->hwirq < ANDES_SLI_CAUSE_BASE)
+  | 		csr_set(CSR_IE, mask);
+  | 	else
+  | 		csr_set(ANDES_CSR_SLIE, mask);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1520-1524
+      "If an interrupt is delegated to S-mode by setting a bit in the
+      mideleg register, it becomes visible in the sip register and is
+      maskable using the sie "
+
+[potential_risk] arch/riscv/kernel/suspend.c:44-50  suspend_restore_csrs
+  csr_write(CSR_IE, context->ie) restores the saved sie value during
+  suspend/resume. If M-mode firmware changed mideleg during suspend (e.g., SBI
+  firmware update), the restored sie bits corresponding to now-undelegated
+  interrupts are silently dropped. No read-back verification after restore.
+  | void suspend_restore_csrs(struct suspend_context *context)
+  | {
+  | 	csr_write(CSR_SCRATCH, 0);
+  | 	if (riscv_has_extension_unlikely(RISCV_ISA_EXT_XLINUXENVCFG))
+  | 		csr_write(CSR_ENVCFG, context->envcfg);
+  | 	csr_write(CSR_TVEC, context->tvec);
+  | 	csr_write(CSR_IE, context->ie);
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:1520-1524
+      "If an interrupt is delegated to S-mode by setting a bit in the
+      mideleg register, it becomes visible in the sip register and is
+      maskable using the sie "
+
+[compliant] arch/riscv/include/asm/irqflags.h:19-22  arch_local_irq_enable
+  arch_local_irq_enable() writes to CSR_STATUS (sstatus), setting the global
+  SR_IE bit — not per-source sie bits. Per the RISC-V spec, sstatus.SIE must
+  be writable when S-mode is implemented (machine.adoc
+  §mstatus_sie_spie_rdonly0). This is not the same vulnerability as per-source
+  sie writes; sstatus.SIE is always writable in S-mode. The vulnerability only
+  applies to per-source enable bits in the sie CSR.
+  | static inline void arch_local_irq_enable(void)
+  | {
+  | 	csr_set(CSR_STATUS, SR_IE);
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:379-381
+      "MIE and MPIE must be writable. If supervisor mode is not
+      implemented, then SIE and SPIE are read-only 0; otherwise, they must
+      be writable."
+
+[compliant] arch/riscv/kernel/kexec_relocate.S:32-34  relocate_new_kernel
+  csrw CSR_SIE, zero disables all per-source interrupts during kexec. This is
+  a disable operation — even if some sie bits are already read-only zero
+  (undelegated), writing zero to them is harmless. The silent-failure risk
+  only applies when attempting to *enable* interrupts (set bits to 1), not
+  when disabling them (set bits to 0).
+  | /* Disable / cleanup interrupts */
+  | csrw	CSR_SIE, zero
+  | csrw	CSR_SIP, zero
+
+[compliant] arch/riscv/kvm/main.c:57-70  kvm_arch_disable_virtualization_cpu
+  KVM correctly orders CSR writes: clears VSIE before HIDELEG. The comment at
+  line 61-65 explicitly acknowledges the delegation-vs-enable interaction:
+  'After clearing the hideleg CSR, the host kernel will receive spurious
+  interrupts if hvip CSR has pending interrupts and the corresponding enable
+  bits in vsie CSR are asserted.' This shows the kernel developers are aware
+  of this exact class of problem in the HS/VS context, but the analogous guard
+  (verifying sie writes after mideleg could have changed) is absent from the
+  S-mode interrupt enable path.
+  | /*
+  |  * After clearing the hideleg CSR, the host kernel will receive
+  |  * spurious interrupts if hvip CSR has pending interrupts and the
+  |  * corresponding enable bits in vsie CSR are asserted. To avoid it,
+  |  * hvip CSR and vsie CSR must be cleared before clearing hideleg CSR.
+  |  */
+  | csr_write(CSR_VSIE, 0);
+  | csr_write(CSR_HVIP, 0);
+  | csr_write(CSR_HEDELEG, 0);
+  | csr_write(CSR_HIDELEG, 0);
+
+[compliant] arch/riscv/kernel/sbi-ipi.c:21-31  sbi_ipi_handle
+  csr_clear(CSR_IP, IE_SIE) writes to sip (interrupt pending), not sie
+  (interrupt enable). The vulnerability spec concerns writes to sie (the
+  enable register), not sip (the pending register). Clearing pending bits
+  cannot silently fail in a harmful way — if the bit is read-only, the clear
+  is a no-op, which is safe.
+  | static void sbi_ipi_handle(struct irq_desc *desc)
+  | {
+  | 	struct irq_chip *chip = irq_desc_get_chip(desc);
+  | 
+  | 	chained_irq_enter(chip, desc);
+  | 
+  | 	csr_clear(CSR_IP, IE_SIE);
+  | 	ipi_mux_process();
+
