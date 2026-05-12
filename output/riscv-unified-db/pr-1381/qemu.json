@@ -1,0 +1,147 @@
+{
+  "pr_number": 1381,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1381,
+    "violation_condition": "QEMU TCG does not implement stvec.MODE=Vectored dispatch logic (pc = stvec.BASE + 4 * cause for interrupts), yet the stvec CSR WARL mask does not constrain MODE to 0 (Direct only), allowing a guest to write MODE=1 and observe incorrect interrupt vectoring — either interrupts jump to the wrong PC or the vectored write is silently accepted but not honored, causing the guest kernel's per-cause entry points to be bypassed.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "stvec.*MODE.*warl|stvec.*vectored|riscv_cpu_do_interrupt.*stvec|stvec.*BASE.*cause|VECTORED_INTERRUPTS|sstvecv|stvec_mode",
+    "affected_entities": [
+      "stvec"
+    ],
+    "summary": "Missing Sstvecv emulation in QEMU causes stvec.MODE=1 writes to either be silently truncated (WARL mismatch vs hardware) or accepted but ignored, breaking per-interrupt-source vectored dispatch and causing guest kernel interrupt handlers to receive wrong/unexpected traps"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_stvec",
+        "line_start": 4153,
+        "line_end": 4163,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "write_stvec WARL mask accepts MODE values 0 (Direct) and 1 (Vectored), rejecting >=2 as reserved. This is correct because QEMU TCG fully implements vectored dispatch at cpu_helper.c:2421-2422. Every MODE=1 write that passes the mask is correctly honored during interrupt delivery.",
+      "snippet": "if ((val & 3) < 2) {\n    env->stvec = val;\n} else {\n    qemu_log_mask(LOG_UNIMP, \"CSR_STVEC: reserved mode not supported\\n\");\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "normative_rule_defs/supervisor.yaml",
+          "line_start": 84,
+          "line_end": 89,
+          "excerpt": "STVEC_MODE_WARL, STVEC_BASE_WARL: impl-def-category: WARL"
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 355,
+          "line_end": 363,
+          "excerpt": "When MODE=Vectored, all synchronous exceptions into supervisor mode cause the pc to be set to the address in the BASE field, whereas interrupts cause the pc to be set to the address in the BASE field plus four times the interrupt cause number."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2421,
+        "line_end": 2422,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "S-mode interrupt dispatch correctly implements the vectored formula: pc = stvec.BASE (masked via >>2<<2) + (async && MODE==1 ? cause*4 : 0). Synchronous exceptions always use BASE regardless of MODE. This matches the spec requirement identically.",
+      "snippet": "env->pc = (env->stvec >> 2 << 2) +\n          ((async && (env->stvec & 3) == 1) ? cause * 4 : 0);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 355,
+          "line_end": 364,
+          "excerpt": "When MODE=Vectored, all synchronous exceptions into supervisor mode cause the pc to be set to the address in the BASE field, whereas interrupts cause the pc to be set to the address in the BASE field plus four times the interrupt cause number."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_do_interrupt",
+        "line_start": 2506,
+        "line_end": 2507,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "M-mode interrupt dispatch uses the identical vectored formula for mtvec, confirming consistent implementation across privilege levels.",
+      "snippet": "env->pc = (env->mtvec >> 2 << 2) +\n          ((async && (env->mtvec & 3) == 1) ? cause * 4 : 0);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_vstvec",
+        "line_start": 5215,
+        "line_end": 5225,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Virtual supervisor stvec (vstvec) write handler uses the identical WARL mask as stvec, accepting MODE 0 and 1. Consistent with the hypervisor extension's requirement for independent VS-mode trap vectoring.",
+      "snippet": "if ((val & 3) < 2) {\n    env->vstvec = val;\n} else {\n    qemu_log_mask(LOG_UNIMP, \"CSR_VSTVEC: reserved mode not supported\\n\");\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "normative_rule_defs/hypervisor.yaml",
+          "line_start": 331,
+          "line_end": 336,
+          "excerpt": "VSTVEC_MODE_WARL, VSTVEC_BASE_WARL: impl-def-category: WARL"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/cpu.c",
+        "function_name": "riscv_cpu_extensions_init",
+        "line_start": 244,
+        "line_end": 245,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Sstvecd is registered in the ISA extension table but Sstvecv is not. A guest querying the ISA string will see Sstvecd (Direct mode support) without Sstvecv (Vectored mode support), yet the hardware functionally supports both MODE=0 and MODE=1. This could cause a guest OS to avoid using Vectored mode even though it works, relying on a less efficient single-entry-point handler. Not a security bug (no silent misrouting occurs) but could cause guest performance degradation.",
+      "snippet": "ISA_EXT_DATA_ENTRY(sstvecd, PRIV_VERSION_1_12_0, has_priv_1_12),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vmstate_riscv_cpu",
+        "line_start": 482,
+        "line_end": 482,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "stvec is included in VMStateDescription via VMSTATE_UINT64, ensuring it is correctly migrated across live-migration save/restore cycles.",
+      "snippet": "VMSTATE_UINT64(env.stvec, RISCVCPU),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/csr.c",
+        "function_name": "write_stvec",
+        "line_start": 4156,
+        "line_end": 4162,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "When an unsupported MODE (>=2) is written, the write is silently dropped — stvec retains its previous value. The spec says stvec.MODE is WARL, so this is legal WARL behavior. However, the qemu_log_mask with LOG_UNIMP is suboptimal: for a guest that mistakenly writes MODE=2, the register silently retains the old value, but since MODE>=2 is architecturally reserved, the guest should never rely on this. Not a security issue — the guest sees its write clamped, which is correct WARL semantics.",
+      "snippet": "if ((val & 3) < 2) {\n    env->stvec = val;\n} else {\n    qemu_log_mask(LOG_UNIMP, \"CSR_STVEC: reserved mode not supported\\n\");\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "normative_rule_defs/supervisor.yaml",
+          "line_start": 84,
+          "line_end": 89,
+          "excerpt": "STVEC_MODE_WARL: impl-def-category: WARL"
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

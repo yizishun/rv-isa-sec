@@ -1,0 +1,126 @@
+{
+  "pr_number": 1687,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 1687,
+    "violation_condition": "In XiangShan RTL, the mnstatus CSR module either (a) omits bit 9 (MNPELP) entirely from the CSR decode/write mask, causing reads to return 0 and writes to be silently dropped; or (b) implements MNPELP as unrestricted RW instead of RW-H, allowing software to arbitrarily set the saved ELP state and bypass Zicfilp forward-edge CFI on MNRET; or (c) fails to sample the active ELP microarchitectural state into MNPELP on NMI trap entry, causing stale/incorrect previous-ELP to be restored on MNRET; or (d) resets MNPELP to a deterministic 0 instead of UNDEFINED_LEGAL, creating an observable side channel where NMI entry reveals prior ELP state via the reset path. In all cases, the NMI save/restore path in the CSR module or trap controller does not correctly preserve the Zicfilp landing-pad tracking bit across privilege transitions.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "mnstatus.*MNPELP|bit.*9.*mnstatus|NMI.*ELP|Zicfilp.*mnstatus|RW-H.*MNPELP|UNDEFINED_LEGAL.*mnstatus|nmi_trap_entry.*elp|mnret.*elp_restore",
+    "affected_entities": [
+      "mnstatus",
+      "MNPELP",
+      "mncause",
+      "mnepc",
+      "MNRET",
+      "Zicfilp_ELP_state_machine"
+    ],
+    "summary": "MNPELP (bit 9 of mnstatus) must be sampled from the Zicfilp ELP tracking FSM on NMI entry and restored on MNRET; incorrect RW-H encoding, missing wire-up in the CSR write mask, or failure to latch the microarchitectural ELP bit at trap-entry time allows attacker-controlled ELP state manipulation and forward-edge CFI bypass via timed NMI delivery"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MnstatusBundle",
+        "line_start": 602,
+        "line_end": 602,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "MNPELP declared as RO (read-only, writes silently dropped) but spec mandates RW-H (hardware-writable, software-writable with WARL conversion). RO means CSR write instructions (CSRRW/CSRRS/CSRRC) that target bit 9 are silently ignored. The spec requires writes to be accepted and WARL-converted to legal values (0 or 1). This also means that even if the TrapEntryMNEvent were later wired to update MNPELP, software writes that interleave with NMI events would be lost rather than arbitrated through the CSRModule's write-path mux.",
+      "snippet": "val MNPELP = RO          (9).withReset(0.U).withDescription(\"Saved landing-pad state for resumable NMI handling.\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-unified-db",
+          "file_path": "spec/std/isa/csr/Smrnmi/mnstatus.yaml",
+          "line_start": 53,
+          "line_end": 64,
+          "excerpt": "MNPELP: location: 9, type: RW-H, reset_value: UNDEFINED_LEGAL, definedBy: Zicfilp"
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smrnmi.adoc",
+          "line_start": 94,
+          "line_end": 96,
+          "excerpt": "If the Zicfilp extension is implemented, mnstatus also holds the MNPELP field, which on entry to the RNMI trap handler holds the previous ELP state."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MnstatusBundle",
+        "line_start": 602,
+        "line_end": 602,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "MNPELP resets to deterministic 0 instead of UNDEFINED_LEGAL as specified. Per mnstatus.yaml, MNPELP reset_value is UNDEFINED_LEGAL. While 0 is a legal value for a 1-bit field, the spec allows implementations to choose any legal value at reset. A hardwired 0 is a conforming choice, but the combination of RO+reset=0 means the field is permanently 0 — it can never reflect a saved ELP state even if Zicfilp were later implemented, since RO prevents hardware from writing it through the event path. The practical risk is low since Zicfilp is not currently implemented (not in ISA string, menvcfg.LPE=mseccfg.MLPE=0), but this creates a silent trap: if Zicfilp is later enabled, MNPELP will still read as 0 on MNRET, restoring wrong ELP state.",
+      "snippet": "val MNPELP = RO          (9).withReset(0.U).withDescription(\"Saved landing-pad state for resumable NMI handling.\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-unified-db",
+          "file_path": "spec/std/isa/csr/Smrnmi/mnstatus.yaml",
+          "line_start": 60,
+          "line_end": 61,
+          "excerpt": "type: RW-H, reset_value: UNDEFINED_LEGAL"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/TrapEntryMNEvent.scala",
+        "function_name": "TrapEntryMNEventOutput",
+        "line_start": 13,
+        "line_end": 16,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "TrapEntryMNEvent's mnstatus output only updates MNPP, MNPV, NMIE — MNPELP is not included in addInEvent. Per smrnmi.adoc norm:mnstatus_mnpelp_update: 'When an RNMI trap is taken, MNPELP is set to ELP and ELP is set to 0.' Since XiangShan has no ELP microarchitectural state (Zicfilp not in ISA string, menvcfg.LPE and mseccfg.MLPE both hardwired RO=0), this is expected for the current configuration. However, when Zicfilp is later enabled, this path must be updated to capture ELP into MNPELP and clear ELP.",
+      "snippet": "val mnstatus = ValidIO((new MnstatusBundle ).addInEvent(_.MNPP, _.MNPV, _.NMIE))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smrnmi.adoc",
+          "line_start": 94,
+          "line_end": 96,
+          "excerpt": "When an RNMI trap is taken, MNPELP is set to ELP and ELP is set to 0."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/MNretEvent.scala",
+        "function_name": "MNretEventOutput",
+        "line_start": 16,
+        "line_end": 17,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "MNretEventOutput's mnstatus update only restores MNPP, MNPV, NMIE — MNPELP is not consumed from saved mnstatus and is not used to restore ELP. Per smrnmi.adoc norm:mnret_zicfilp: 'If the Zicfilp extension is implemented, then if the new privileged mode is y, MNRET sets ELP to the logical AND of yLPE and mnstatus.MNPELP.' Since XiangShan has no ELP microarchitectural state, this is expected. Must be addressed when Zicfilp is enabled.",
+      "snippet": "val mnstatus  = ValidIO((new MnstatusBundle).addInEvent(_.MNPP, _.MNPV, _.NMIE))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smrnmi.adoc",
+          "line_start": 144,
+          "line_end": 145,
+          "excerpt": "If the Zicfilp extension is implemented, then if the new privileged mode is y, MNRET sets ELP to the logical AND of yLPE and mnstatus.MNPELP."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MnstatusBundle",
+        "line_start": 598,
+        "line_end": 604,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Bit positions of all mnstatus fields are correct per spec: MNPELP at bit 9 (matches mnstatus.yaml location:9 and bytefield diagram span 3 at position 9), MNPP at 12-11, MNPV at 7, NMIE at 3.",
+      "snippet": "val NMIE=CSRRWField(3)  val MNPV=VirtMode(7)  val MNPELP=RO(9)  val MNPP=PrivMode(12,11)",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

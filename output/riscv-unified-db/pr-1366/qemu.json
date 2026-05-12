@@ -1,0 +1,231 @@
+{
+  "pr_number": 1366,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1366,
+    "violation_condition": "QEMU advertises Ssu32xl support (e.g., via misa or device tree) but hardwires sstatus.UXL to 2 (UXLEN=64), OR accepts UXL=1 writes but TCG continues to decode and execute U-mode instructions as 64-bit (e.g., translate.c does not consult get_ol(ctx) or equivalent when selecting insn32 vs insn64 decode paths, or gen_load/goto_tb do not truncate GPR writes to 32 bits in U-mode), OR a CSR write to sstatus.UXL does not trigger a TB flush causing stale translations to execute at the wrong XLEN, OR KVM passes through a UXL=1 write without validating host capability causing host-side misbehavior.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "sstatus_write.*uxl|set_uxl|get_xl.*ol|get_ol|has_ext.*Ssu32xl|uxl.*warl|warl.*uxl|translate.*xl|gen_goto_tb.*xl|truncate.*xlen|sign_extend.*xl|tb_flush.*uxl|sstatus.*mask.*0x[0-9a-f]*30000",
+    "affected_entities": [
+      "sstatus",
+      "sstatus.UXL"
+    ],
+    "summary": "Ssu32xl requires sstatus.UXL writable to 1 (UXLEN=32); QEMU must accept UXL=1 writes, flush TCG TBs on UXL change, and correctly restrict U-mode instruction decode, GPR width, and memory addressing to 32 bits — failure to do so lets a 32-bit guest U-mode process execute 64-bit instructions or leak upper register halves, crossing the architectural privilege boundary from U-mode into 64-bit supervisor-visible state."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/cpu.c",
+        "function_name": "riscv_isa_string_ext / isa_edata_arr",
+        "line_start": 123,
+        "line_end": 123,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "Ssu32xl is not present in isa_edata_arr[], misa_ext_info_arr[], or any ISA extension list. The extension is neither advertised via misa, device tree (riscv_isa_write_fdt), nor CPU property. QEMU has no Ssu32xl awareness at all.",
+      "snippet": "const RISCVIsaExtData isa_edata_arr[] = {\n    /* Ssu32xl not listed here */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 543,
+          "line_end": 546,
+          "excerpt": "When MXLEN=64, if U-mode is not supported, then UXL is read-only zero. Otherwise, it is a WARL field that encodes the current value of UXLEN. In particular, an implementation may make UXL be a read-only field whose value always ensures that UXLEN=MXLEN or UXLEN=SXLEN."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/csr.c",
+        "function_name": "write_mstatus",
+        "line_start": 2039,
+        "line_end": 2063,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "UXL field is writable (mask includes MSTATUS64_UXL when val has non-zero UXL bits) but there is no WARL legalization to constrain UXL to valid encodings {1:RV32, 2:RV64}. Value 3 (RV128) would pass through the mask unchanged. Additionally, env->xl is only recomputed when env->debugger is true, relying on the comment 'UXL/SXL can only be modified by higher privilege mode. So xl will not be changed in normal mode.' If Ssu32xl is added, this needs explicit legalization and TB flush handling for the scenario where a higher privilege mode writes a different UXL value that takes effect on the next trap return.",
+      "snippet": "if (xl != MXL_RV32 || env->debugger) {\n    if (riscv_has_ext(env, RVH)) {\n        mask |= MSTATUS_MPV | MSTATUS_GVA;\n    }\n    if ((val & MSTATUS64_UXL) != 0) {\n        mask |= MSTATUS64_UXL;\n    }\n}\n...\nif (env->debugger) {\n    env->xl = cpu_recompute_xl(env);\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 530,
+          "line_end": 532,
+          "excerpt": "For RV64 harts, the SXL and UXL fields are WARL fields that control the value of XLEN for S-mode and U-mode, respectively. The encoding of these fields is the same as the MXL field of misa."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "normative_rule_defs/machine.yaml",
+          "line_start": 217,
+          "line_end": 226,
+          "excerpt": "names: [MSTATUS_SXL_WARL, MSTATUS_UXL_WARL] tag: norm:mstatus_sxl_uxl_warl_op"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/csr.c",
+        "function_name": "write_vsstatus",
+        "line_start": 5190,
+        "line_end": 5206,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "write_vsstatus starts with mask of all-1s and removes VSSTATUS64_UXL only when val has no UXL bits set. There is no WARL legalization to constrain UXL to valid values {1, 2}. If Ssu32xl is supported and VSXLEN=64, a guest could set VU-mode UXL=3 (RV128), causing undefined behavior in cpu_get_xl for VU-mode.",
+      "snippet": "uint64_t mask = (target_ulong)-1;\nif ((val & VSSTATUS64_UXL) == 0) {\n    mask &= ~VSSTATUS64_UXL;\n}\n...\nenv->vsstatus = (env->vsstatus & ~mask) | (uint64_t)val;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 1183,
+          "line_end": 1185,
+          "excerpt": "When VSXLEN=64, UXL is a WARL field... In particular, an implementation may make UXL be a read-only copy of field VSXL of hstatus, forcing VU-mode XLEN=VSXLEN."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "normative_rule_defs/hypervisor.yaml",
+          "line_start": 282,
+          "line_end": 282,
+          "excerpt": "name: VSSTATUS_UXL_WARL"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/translate.c",
+        "function_name": "riscv_tr_translate_insn",
+        "line_start": 1280,
+        "line_end": 1280,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "ctx->ol is initialized from ctx->xl at translation time. ctx->xl derives from TB_FLAGS.XL which is set from env->xl. For U-mode, env->xl is recomputed via cpu_recompute_xl() in riscv_cpu_set_mode(), which reads the UXL field from mstatus. The chain UXL → env->xl → TB_FLAGS → ctx->xl → ctx->ol → get_ol() correctly propagates to GPR truncation in gen_set_gpr() and get_gpr(), ensuring UXL=1 correctly truncates GPR writes to 32 bits.",
+      "snippet": "ctx->ol = ctx->xl;",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 552,
+          "line_end": 558,
+          "excerpt": "Whenever XLEN in any mode is set to a value less than the widest supported XLEN, all operations must ignore source operand register bits above the configured XLEN, and must sign-extend results to fill the entire widest supported XLEN in the destination register."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/translate.c",
+        "function_name": "gen_set_gpr",
+        "line_start": 409,
+        "line_end": 428,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "gen_set_gpr correctly switches on get_ol(ctx): for MXL_RV32 it calls tcg_gen_ext32s_tl to truncate to 32 bits with sign extension; for MXL_RV64/RV128 it copies the full value. This satisfies the spec requirement that results must be sign-extended to fill the widest supported XLEN when XLEN is less than maximum.",
+      "snippet": "switch (get_ol(ctx)) {\ncase MXL_RV32:\n    tcg_gen_ext32s_tl(cpu_gpr[reg_num], t);\n    break;\ncase MXL_RV64:\ncase MXL_RV128:\n    tcg_gen_mov_tl(cpu_gpr[reg_num], t);\n    break;\n}",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 552,
+          "line_end": 558,
+          "excerpt": "all operations must ignore source operand register bits above the configured XLEN, and must sign-extend results to fill the entire widest supported XLEN in the destination register."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/cpu_helper.c",
+        "function_name": "riscv_cpu_set_mode",
+        "line_start": 1081,
+        "line_end": 1095,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "riscv_cpu_set_mode correctly recomputes env->xl via cpu_recompute_xl(env) on every privilege mode change. For PRV_U, cpu_recompute_xl reads the UXL field from mstatus, so a UXL=1 written by M-mode takes effect at the next transition into U-mode. No stale-TB issue arises because the mode switch naturally triggers TB lookup with updated TB_FLAGS.XL.",
+      "snippet": "env->priv = newpriv;\nenv->xl = cpu_recompute_xl(env);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 530,
+          "line_end": 534,
+          "excerpt": "For RV64 harts, the SXL and UXL fields are WARL fields that control the value of XLEN for S-mode and U-mode, respectively."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/machine.c",
+        "function_name": "riscv_cpu_post_load",
+        "line_start": 255,
+        "line_end": 261,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Migration post_load correctly recomputes env->xl from mstatus UXL field via cpu_recompute_xl(). Since mstatus (containing UXL) is in the base vmstate, migration correctly preserves UXL settings across live-migration.",
+      "snippet": "static int riscv_cpu_post_load(void *opaque, int version_id)\n{\n    RISCVCPU *cpu = opaque;\n    CPURISCVState *env = &cpu->env;\n\n    env->xl = cpu_recompute_xl(env);\n    return 0;\n}",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/cpu.c",
+        "function_name": "riscv_cpu_reset_hold",
+        "line_start": 702,
+        "line_end": 718,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Reset correctly sets UXL to env->misa_mxl (typically RV64). Both mstatus.UXL and vsstatus.UXL are initialized. env->xl is set from riscv_cpu_mxl(env). This is compliant because the spec allows UXL to be read-only and hardwired to MXLEN.",
+      "snippet": "env->mstatus = set_field(env->mstatus, MSTATUS64_SXL, env->misa_mxl);\nenv->mstatus = set_field(env->mstatus, MSTATUS64_UXL, env->misa_mxl);\nif (riscv_has_ext(env, RVH)) {\n    env->vsstatus = set_field(env->vsstatus, MSTATUS64_UXL, env->misa_mxl);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 543,
+          "line_end": 546,
+          "excerpt": "an implementation may make UXL be a read-only field whose value always ensures that UXLEN=MXLEN or UXLEN=SXLEN."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/kvm/kvm-cpu.c",
+        "function_name": "kvm_riscv_init_misa_ext_mask",
+        "line_start": 246,
+        "line_end": 246,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "KVM maps sstatus CSR directly to env->mstatus via KVM_CSR_CFG. UXL bits are passed through to host KVM, which performs its own WARL legalization. KVM does not expose Ssu32xl in the init_misa_ext_mask query, so the extension is gated by host capability. No QEMU-side KVM vulnerability exists for UXL handling.",
+      "snippet": "KVM_CSR_CFG(\"sstatus\",    mstatus,    RISCV_CSR_REG(sstatus)),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/csr.c",
+        "function_name": "read_sstatus",
+        "line_start": 3965,
+        "line_end": 3982,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "read_sstatus correctly includes SSTATUS64_UXL in the mask when env->xl != MXL_RV32 or in debug mode. The UXL bits are read from env->mstatus via bitwise AND with the mask, returning the actual stored value. The TODO comment about using SXL instead of MXL for add_status_sd placement is a pre-existing cosmetic issue unrelated to Ssu32xl security.",
+      "snippet": "if (env->xl != MXL_RV32 || env->debugger) {\n    mask |= SSTATUS64_UXL;\n}\n/* TODO: Use SXL not MXL. */\n*val = add_status_sd(riscv_cpu_mxl(env), env->mstatus & mask);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "/home/yzs/riscv/qemu/target/riscv/csr.c",
+        "function_name": "write_sstatus",
+        "line_start": 3984,
+        "line_end": 4003,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "write_sstatus conditionally includes SSTATUS64_UXL in the writable mask, then delegates to write_mstatus. The UXL bits can be written when the current mode is not RV32 or in debug mode. This correctly prevents U-mode (which would have xl=MXL_RV32 if UXL=1) from modifying UXL — only higher privilege modes can write it. The WARL legalization gap is in write_mstatus, not here.",
+      "snippet": "if (env->xl != MXL_RV32 || env->debugger) {\n    if ((val & SSTATUS64_UXL) != 0) {\n        mask |= SSTATUS64_UXL;\n    }\n}\n...\nreturn write_mstatus(env, CSR_MSTATUS, newval, ra);",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

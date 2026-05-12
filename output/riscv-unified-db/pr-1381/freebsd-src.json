@@ -1,0 +1,242 @@
+{
+  "pr_number": 1381,
+  "target_repo": "freebsd-src",
+  "security_spec": {
+    "pr_number": 1381,
+    "violation_condition": "FreeBSD writes stvec via csrw/csrrw with an address whose bits[1:0] ≠ 00 (i.e., MODE ≠ Direct). The kernel unconditionally assumes Direct mode dispatch through cpu_exception_handler and has no vector table infrastructure to handle MODE=Vectored. If a corrupted write sets MODE=Vectored (e.g., bhyve hypctx->host_stvec memory corruption during VM exit restore in vmm_switch.S:165), interrupts then jump to BASE + 4*cause — scattering each IRQ source to an uninitialized or attacker-controlled code pointer rather than the unified trap entry, with no kernel recovery path.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csrw stvec.*[^0c]0$|csr_write\\(stvec|csr_swap\\(stvec|csrrw.*stvec|host_stvec|vstvec",
+    "affected_entities": [
+      "stvec",
+      "vstvec",
+      "cpu_exception_handler",
+      "vmm_unpriv_trap"
+    ],
+    "summary": "FreeBSD never checks stvec.MODE and has no vectored-dispatch infrastructure — any accidental write of MODE=Vectored (e.g., via corrupted bhyve hypctx->host_stvec on VM exit) causes interrupts to jump to garbage BASE+4*cause offsets, crashing the hart"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "BSP bootstrap (early trap vector)",
+        "line_start": 212,
+        "line_end": 212,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Writes a physical address derived from 'va' label (which has .align 2, so bits[1:0]=00 → MODE=Direct). The 4-byte alignment guarantees the MODE field is Direct.",
+      "snippet": "csrw stvec, t0  /* t0 = va label, 4-byte aligned */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 329,
+          "line_end": 334,
+          "excerpt": "The BASE field in stvec is a field that can hold any valid virtual or physical address, subject to the following alignment constraints: the address must be 4-byte aligned"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "BSP bootstrap (final trap vector)",
+        "line_start": 231,
+        "line_end": 232,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Writes cpu_exception_handler address (ENTRY macro enforces .align 4 → bits[1:0]=00 → MODE=Direct). The kernel unconditionally uses Direct mode dispatch through cpu_exception_handler which handles all exceptions/interrupts via a unified entry point.",
+      "snippet": "la t0, cpu_exception_handler\ncsrw stvec, t0",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 348,
+          "line_end": 352,
+          "excerpt": "Direct: All exceptions set pc to BASE. Vectored: Asynchronous interrupts set pc to BASE+4×cause."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "AP mpentry (early trap vector)",
+        "line_start": 369,
+        "line_end": 369,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Same pattern as BSP early trap vector. Writes mpva label (4-byte aligned via .align 2) → MODE=Direct.",
+      "snippet": "csrw stvec, t0  /* t0 = mpva label, 4-byte aligned */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 329,
+          "line_end": 334,
+          "excerpt": "The address must be 4-byte aligned"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/locore.S",
+        "function_name": "AP mpentry (final trap vector)",
+        "line_start": 386,
+        "line_end": 387,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Same as BSP final trap vector. Writes cpu_exception_handler → MODE=Direct.",
+      "snippet": "la t0, cpu_exception_handler\ncsrw stvec, t0",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 348,
+          "line_end": 352,
+          "excerpt": "Direct: All exceptions set pc to BASE."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch (host-to-guest, stvec swap)",
+        "line_start": 70,
+        "line_end": 84,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Saves host stvec via csrrw then stores to hypctx->host_stvec. The replacement value (.Lswitch_return) has .align 2 → bits[1:0]=00 → MODE=Direct. The csrrw atomically returns the old host stvec value, which is saved unvalidated.",
+      "snippet": "la t4, .Lswitch_return  /* .align 2, MODE=Direct */\ncsrrw t4, stvec, t4    /* atomically swap */\nsd t4, (HYP_H_STVEC)(a0) /* save to hypctx */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 321,
+          "line_end": 324,
+          "excerpt": "The stvec register is an SXLEN-bit read/write register that holds trap vector configuration, consisting of a vector base address (BASE) and a vector mode (MODE)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_switch.S",
+        "function_name": "vmm_switch (guest-to-host, stvec restore)",
+        "line_start": 158,
+        "line_end": 165,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "On VM exit, restores host stvec by loading hypctx->host_stvec from memory and writing it to the hardware CSR without any validation that MODE bits[1:0]=00. If the hypctx struct in memory is corrupted (e.g., by a bit flip, buggy DMA, or attacker-controlled bhyve guest memory), MODE could become Vectored (01), causing all subsequent interrupts to jump to BASE+4×cause instead of cpu_exception_handler. The kernel has no Vectored-mode dispatch infrastructure and no recovery path from this state.",
+      "snippet": "ld t1, (HYP_H_STVEC)(a0)  /* load from memory, unvalidated */\ncsrr t0, sepc\ncsrw stvec, t1            /* write without MODE check */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 356,
+          "line_end": 364,
+          "excerpt": "When MODE=Vectored, all synchronous exceptions into supervisor mode cause the pc to be set to the address in the BASE field, whereas interrupts cause the pc to be set to the address in the BASE field plus four times the interrupt cause number."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/sstvecd.adoc",
+          "line_start": 4,
+          "line_end": 10,
+          "excerpt": "If the Sstvecd extension is implemented, then stvec.MODE must be capable of holding the value 0 (Direct). Furthermore, when stvec.MODE=Direct, stvec.BASE must be capable of holding any valid four-byte-aligned address."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "riscv_unpriv_read (stvec swap)",
+        "line_start": 278,
+        "line_end": 288,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Temporarily swaps stvec to vmm_unpriv_trap (ENTRY macro → .align 4 → MODE=Direct) for catching hlvx.hu faults. The swap entry point is correctly aligned with MODE=Direct, and interrupts are disabled (intr_disable at line 281) during the critical section.",
+      "snippet": "entry = (uintptr_t)&vmm_unpriv_trap;  /* .align 4, MODE=Direct */\nold_stvec = csr_swap(stvec, entry);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "riscv_unpriv_read (stvec restore)",
+        "line_start": 319,
+        "line_end": 319,
+        "relevance_rationale": ""
+      },
+      "severity": "potential_risk",
+      "finding": "Restores stvec from stack-local old_stvec (the pre-swap value from line 288) without validating MODE bits. The risk is lower than vmm_switch.S:165 because (a) interrupts are disabled, (b) old_stvec is a stack-local variable with very short lifetime between swap and restore, and (c) the value just came from reading the hardware CSR. However, there is still no explicit validation that bits[1:0]=00.",
+      "snippet": "csr_write(stvec, old_stvec);  /* no MODE validation */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 356,
+          "line_end": 364,
+          "excerpt": "When MODE=Vectored, interrupts cause the pc to be set to BASE+4×cause."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/vmm_riscv.c",
+        "function_name": "vmmops_vcpu_restore_csrs",
+        "line_start": 170,
+        "line_end": 170,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Restores guest vstvec from hypcsr struct. The guest kernel is responsible for its own trap vector mode — a guest may legitimately use Vectored mode. The hypervisor correctly virtualizes this CSR without imposing MODE restrictions.",
+      "snippet": "csr_write(vstvec, csrs->vstvec);  /* guest's choice of MODE */",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/shvstvecd.adoc",
+          "line_start": 4,
+          "line_end": 10,
+          "excerpt": "If the Shvstvecd extension is implemented, then vstvec.MODE must be capable of holding the value 0 (Direct)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/vmm/riscv.h",
+        "function_name": "struct hypctx, struct hypcsr",
+        "line_start": 56,
+        "line_end": 89,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The hypctx struct stores host_stvec as a plain uint64_t field and hypcsr stores vstvec similarly. The fields correctly capture full CSR width. No inline validation is performed here, but the data structures themselves are correct for save/restore.",
+      "snippet": "uint64_t vstvec;       /* hypcsr: line 60 */\nuint64_t host_stvec;    /* hypctx: line 89 */",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "sys/riscv/riscv/exception.S",
+        "function_name": "cpu_exception_handler",
+        "line_start": 208,
+        "line_end": 217,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The unified trap entry point dispatches all exceptions and interrupts through a single handler, relying on software to check scause and branch accordingly. This design implicitly assumes MODE=Direct: all traps arrive at this single entry point. Under MODE=Vectored, interrupts would bypass this handler entirely, jumping to BASE+4×cause instead.",
+      "snippet": "ENTRY(cpu_exception_handler)\n    csrrw sp, sscratch, sp\n    beqz sp, 1f\n    j cpu_exception_handler_user",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 348,
+          "line_end": 352,
+          "excerpt": "Direct: All exceptions set pc to BASE. Vectored: Asynchronous interrupts set pc to BASE+4×cause."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "potential_risk"
+}

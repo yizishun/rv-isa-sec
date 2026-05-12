@@ -1,0 +1,92 @@
+{
+  "pr_number": 1677,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1677,
+    "violation_condition": "QEMU's vmv.v.i implementation (both the tcg_gen_gvec_dup_imm fast path at trans_rvv.c.inc:2217 and the vmv_v_x helper slow path at vector_helper.c:2131) writes SEW-width typed elements directly at computed offsets rather than using register-level bit-slice concatenation, so the boundary bug in the spec reference model does not apply. However, if the helper's element-index macro H(i) miscomputes the byte offset within the vector register (e.g., off-by-one in H1/H2/H4/H8 in vector_internals.h), individual SEW-bit element writes could corrupt adjacent elements' bits that should remain untouched, matching the same class of defect as the spec fix guards against—failing to preserve bits outside the target element's bit-slice.",
+    "security_consequence": "data_corruption",
+    "vulnerability_pattern": "vector element write that computes byte offset from per-element index without validating SEW-aligned boundaries within the VLEN-wide register; specifically, any vector helper using (ETYPE *)vd + H(i) where H() is misdefined for the SEW/register-width ratio, or any gvec_dup_imm fast path whose vl_eq_vlmax guard incorrectly skips tail-element preservation",
+    "affected_entities": [
+      "vmv.v.i",
+      "vmv.v.x",
+      "vmv.v.v"
+    ],
+    "summary": "Spec fixes bit-slice boundary guards in vmv.v.i reference model; QEMU avoids the exact concat-range bug by using per-element typed stores, but the same vector-element placement correctness must be verified across GEN_VEXT_VMV_VX helpers and their H() indexing macros"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/vector_internals.h",
+        "function_name": "H1/H2/H4/H8 macros",
+        "line_start": 44,
+        "line_end": 58,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "On little-endian hosts (all common QEMU targets), all H macros are identity functions: H1(x)=x, H2(x)=x, H4(x)=x, H8(x)=x. On big-endian hosts, they correctly byte-reverse within 64-bit chunks to handle the host-endian storage layout of vector registers (stored as uint64_t[32*RV_VLEN_MAX/64]). No off-by-one or miscomputation exists. The element-index-to-byte-offset mapping is correct for all SEW values.",
+      "snippet": "#if HOST_BIG_ENDIAN\n#define H1(x)   ((x) ^ 7)\n...\n#else\n#define H1(x)   (x)\n#define H2(x)   (x)\n#define H4(x)   (x)\n#define H8(x)   (x)\n#endif",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/insn_trans/trans_rvv.c.inc",
+        "function_name": "trans_vmv_v_i",
+        "line_start": 2216,
+        "line_end": 2218,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The tcg_gen_gvec_dup_imm fast path is guarded by s->vl_eq_vlmax && !(s->vta && s->lmul < 0). The vl_eq_vlmax flag is set in tcg-cpu.c:126-127 only when maxsz >= 8 (preventing GVEC use when the vector group is < 8 bytes). The additional !(s->vta && s->lmul < 0) guard correctly prevents the GVEC fast path when tail-agnostic is set with fractional LMUL — GVEC would write only MAXSZ(s) bytes (covering only body elements), leaving tail elements in the same register unset. When vl_eq_vlmax and LMUL>=1, there are no tail elements (body fills the entire register group), so GVEC dup is safe. When VTA=0 (undisturbed), GVEC is safe even with fractional LMUL because tail elements should keep prior values.",
+      "snippet": "if (s->vl_eq_vlmax && !(s->vta && s->lmul < 0)) {\n    tcg_gen_gvec_dup_imm(s->sew, vreg_ofs(s, a->rd),\n                         MAXSZ(s), MAXSZ(s), simm);",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/vector-common.adoc",
+          "line_start": 3096,
+          "line_end": 3114,
+          "excerpt": "The vector integer move instructions copy a source operand to a vector register group. The vmv.v.v variant copies a vector register group, whereas the vmv.v.x and vmv.v.i variants splat a scalar register or immediate to all active elements of the destination vector register group. These instructions are encoded as unmasked instructions (vm=1)."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_helper.c",
+        "function_name": "GEN_VEXT_VMV_VX (vmv_v_x helpers, also used by vmv.v.i slow path)",
+        "line_start": 2119,
+        "line_end": 2137,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The slow-path helper writes SEW-width typed elements at correctly computed offsets: *((ETYPE *)vd + H(i)) = (ETYPE)s1 for i in [vstart, vl). Each element write is bounded by i < vl, which is the correct active-body-element range. After the loop, vext_set_elems_1s() writes 1s to tail elements in [vl*esz, total_elems*esz), where total_elems correctly accounts for fractional-LMUL register-group boundaries. No element-index computation bug exists — the H(i) macro is identity on LE and the byte offset within vd is determined by C pointer arithmetic on the ETYPE-typed pointer.",
+      "snippet": "for (i = env->vstart; i < vl; i++) {\n    *((ETYPE *)vd + H(i)) = (ETYPE)s1;\n}\nenv->vstart = 0;\nvext_set_elems_1s(vd, vta, vl * esz, total_elems * esz);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/vector_internals.c",
+        "function_name": "vext_set_elems_1s",
+        "line_start": 23,
+        "line_end": 56,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The tail-element fill function correctly implements the tail-agnostic policy. On little-endian hosts, it simply does memset(base + cnt, -1, tot - cnt), writing 1s to the byte range [cnt, tot) where cnt=vl*esz and tot=total_elems*esz. For fractional LMUL, total_elems includes elements past VLMAX within the same physical register, correctly covering the spec-defined tail region. When is_agnostic=0 (undisturbed policy), the function returns immediately, preserving prior values.",
+      "snippet": "if (is_agnostic == 0) {\n    return;\n}\nif (tot - cnt == 0) {\n    return;\n}\n...\nmemset(base + cnt, -1, tot - cnt);",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "target/riscv/machine.c",
+        "function_name": "vector VMStateDescription",
+        "line_start": 142,
+        "line_end": 144,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The vector register file is migrated via VMSTATE_UINT64_ARRAY(env.vreg, RISCVCPU, 32 * RV_VLEN_MAX / 64), which transfers the full statically-allocated vreg[] array (512 uint64_t entries for VLEN_MAX=1024). This preserves all vector state regardless of the configured VLEN, so no register bits are silently dropped during live migration. Other vector CSRs (vtype, vl, vstart, vxrm, vxsat, vcsr) are also included in the vmstate.",
+      "snippet": "VMSTATE_UINT64_ARRAY(env.vreg, RISCVCPU, 32 * RV_VLEN_MAX / 64),\nVMSTATE_UINTTL(env.vxrm, RISCVCPU),\nVMSTATE_UINTTL(env.vxsat, RISCVCPU),",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "compliant"
+}

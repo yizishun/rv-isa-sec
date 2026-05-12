@@ -1,0 +1,160 @@
+PR #1685  target=linux  overall=potential_risk
+Spec: JSON decode error
+Violation:
+
+Consequence: function_loss
+Pattern:
+
+------------------------------------------------------------
+[potential_risk] arch/riscv/kernel/cpufeature.c:1171-1186  riscv_user_isa_enable
+  Kernel sets senvcfg.CBCFE=1 for U-mode CBO.CLEAN/CBO.FLUSH enable but never
+  explicitly initializes the CBIE field (bits 5:4). The CBIE field is left at
+  the hardware reset value, which may be 11b (true invalidate, discards dirty
+  data without writeback), 01b (flush semantics), or 00b (exception). Without
+  explicit initialization, U-mode CBO.INVAL behavior is platform-dependent,
+  potentially allowing userspace to discard dirty D-cache lines on shared
+  mappings.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOM))
+  |     current->thread.envcfg |= ENVCFG_CBCFE;
+  | else if (any_cpu_has_zicbom)
+  |     pr_warn("Zicbom disabled as it is unavailable on some harts\n");
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:910-927
+      "The Zicbom extension adds the CBIE WARL field to senvcfg to control
+      execution of the CBO.INVAL instruction in U-mode. The encoding 10b
+      is reserved. Wh"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:545-597
+      "A CBO.INVAL instruction executes or raises either an illegal-
+      instruction exception or a virtual-instruction exception based on
+      the state of the envcfg"
+
+[potential_risk] arch/riscv/kvm/vcpu.c:554-555  kvm_riscv_vcpu_setup_config
+  KVM sets henvcfg.CBIE to ENVCFG_CBIE which is (0x3 << 4) = 0x30, encoding
+  CBIE=11b (invalidate mode). Per the hypervisor spec, CBIE=11b means VS/VU-
+  mode CBO.INVAL performs a true invalidate (discarding dirty data without
+  writeback). If the guest kernel issues CBO.INVAL on cache lines containing
+  dirty data (e.g., shared memory regions, DMA buffers), the dirty data will
+  be silently discarded without reaching memory. KVM should consider whether
+  the guest's CBIE should default to flush mode (01b) for safety, or document
+  that the guest kernel is responsible for CBIE configuration.
+  | if (riscv_isa_extension_available(isa, ZICBOM))
+  |     cfg->henvcfg |= (ENVCFG_CBIE | ENVCFG_CBCFE);
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:772-793
+      "The Zicbom extension adds the CBIE WARL field to henvcfg. The CBIE
+      field controls execution of CBO.INVAL in VS and VU modes. If
+      CBO.INVAL is enabled i"
+    - riscv-isa-manual/src/priv/machine.adoc:2255-2271
+      "CBIE WARL field in menvcfg controls CBO.INVAL in modes less
+      privileged than M. 01b performs flush operation even if configured
+      by a less privileged mo"
+
+[compliant] arch/riscv/mm/dma-noncoherent.c:31-43  arch_dma_cache_inv
+  arch_dma_cache_inv() uses ALT_CMO_OP(INVAL) which emits cbo.inval, but this
+  is architecturally correct for the DMA coherency path. DMA_FROM_DEVICE first
+  goes through arch_sync_dma_for_device() which does CBO.CLEAN (writeback
+  dirty lines before DMA starts) via the fallthrough from DMA_FROM_DEVICE to
+  the bidirectional path, then arch_sync_dma_for_cpu() does CBO.INVAL after
+  DMA completes. The clean-before-inval sequence ensures no dirty data is
+  discarded. DMA_BIDIRECTIONAL similarly uses CBO.CLEAN in
+  arch_sync_dma_for_device() and CBO.INVAL in arch_sync_dma_for_cpu(). The
+  kernel correctly avoids using CBO.INVAL on potentially dirty cache lines.
+  | static inline void arch_dma_cache_inv(phys_addr_t paddr, size_t size)
+  | {
+  |     void *vaddr = phys_to_virt(paddr);
+  |     ALT_CMO_OP(INVAL, vaddr, size, riscv_cbom_block_size);
+  | }
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:121-131
+      "An invalidate operation deallocates the copy of the cache block. A
+      clean operation performs a write transfer if data in the copy have
+      been modified. A"
+
+[compliant] arch/riscv/kernel/cpufeature.c:1173-1174  riscv_user_isa_enable
+  Kernel correctly sets senvcfg.CBZE=1 for U-mode when Zicboz is available on
+  all harts. This enables CBO.ZERO in userspace which is correct for userspace
+  memory allocators (glibc uses CBO.ZERO for fast page zeroing). The kernel
+  ensures Zicboz is uniformly available across all CPUs before enabling.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOZ))
+  |     current->thread.envcfg |= ENVCFG_CBZE;
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:894-900
+      "The Zicboz extension adds the CBZE field to senvcfg. The CBZE field
+      controls execution of the cache block zero instruction (CBO.ZERO) in
+      U-mode. Execu"
+
+[compliant] arch/riscv/kernel/cpufeature.c:1178-1179  riscv_user_isa_enable
+  Kernel correctly sets senvcfg.CBCFE=1 for U-mode when Zicbom is uniformly
+  available on all harts. This enables U-mode CBO.CLEAN and CBO.FLUSH
+  instructions, which perform safe writeback operations that do not discard
+  dirty data.
+  | if (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZICBOM))
+  |     current->thread.envcfg |= ENVCFG_CBCFE;
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:902-908
+      "The Zicbom extension adds the CBCFE field to senvcfg to control
+      execution of CBO.CLEAN and CBO.FLUSH instructions in U-mode.
+      Execution of these instru"
+
+[potential_risk] arch/riscv/kernel/setup.c:364-369  setup_arch
+  The kernel never explicitly writes menvcfg CSR. menvcfg CBO control fields
+  (CBIE, CBCFE, CBZE) control whether CBO instructions execute in S-mode and
+  constrain what senvcfg/henvcfg can enable. The kernel relies on hardware
+  reset values for menvcfg. Per the RISC-V spec, these reset values are
+  implementation-specific and may differ across platforms. If a platform
+  resets menvcfg.CBCFE=0 or menvcfg.CBZE=0, the kernel's own
+  CBO.CLEAN/CBO.FLUSH/CBO.ZERO in S-mode would raise illegal-instruction
+  exceptions, breaking DMA coherency and page zeroing.
+  | riscv_user_isa_enable();
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2241-2260
+      "The CBZE field in menvcfg enables CBO.ZERO in modes less privileged
+      than M. The CBCFE field in menvcfg enables CBO.CLEAN and CBO.FLUSH
+      in modes less p"
+
+[compliant] arch/riscv/include/asm/insn-def.h:310-312  CBO_INVAL
+  CBO_INVAL encoding is correct per the RISC-V spec: MISC-MEM opcode (0x0F),
+  funct3=2 (CBO), and SIMM12(0) for the CBO.INVAL operation code. CBO_CLEAN
+  (SIMM12=1), CBO_FLUSH (SIMM12=2), and CBO_ZERO (SIMM12=4) encodings are also
+  correct.
+  | #define CBO_INVAL(base)
+  |     INSN_I(OPCODE_MISC_MEM, FUNC3(2), __RD(0),
+  |            RS1(base), SIMM12(0))
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:900-909
+      "CBO.INVAL encoding: MISC-MEM opcode, funct3=2 (CBO), rs1=base,
+      12-bit immediate=0x000 (CBO.INVAL operation)."
+
+[compliant] arch/riscv/kvm/vcpu.c:596-617  kvm_arch_vcpu_load
+  KVM correctly saves/restores HENVCFG CSR on VCPU load/put. In
+  kvm_arch_vcpu_load(), cfg->henvcfg (which includes CBIE, CBCFE, CBZE bits)
+  is written to CSR_HENVCFG. The NACL path (nacl_csr_write) and the direct
+  csr_write path both handle this consistently. This ensures CBO permissions
+  are correctly virtualized per-guest.
+  | nacl_csr_write(nsh, CSR_HENVCFG, cfg->henvcfg);
+  | ...
+  | csr_write(CSR_HENVCFG, cfg->henvcfg);
+  References:
+    - riscv-isa-manual/src/priv/hypervisor.adoc:753-793
+      "henvcfg controls CBO instruction execution in VS and VU modes. The
+      CBZE, CBCFE, and CBIE fields gate CBO.ZERO, CBO.CLEAN/CBO.FLUSH, and
+      CBO.INVAL resp"
+
+[compliant] arch/riscv/include/asm/switch_to.h:84-89  __switch_to_envcfg
+  Context-switch correctly restores envcfg CSR on task switch.
+  envcfg_update_bits() also correctly updates the in-memory envcfg shadow and
+  writes CSR_ENVCFG when modifying the current task. The CBO control bits
+  (CBIE, CBCFE, CBZE) in envcfg are correctly saved/restored across context
+  switches, ensuring per-task CBO permissions.
+  | static inline void __switch_to_envcfg(struct task_struct *next)
+  | {
+  |     asm volatile (ALTERNATIVE("nop", "csrw " __stringify(CSR_ENVCFG) ", %0",
+  |                   0, RISCV_ISA_EXT_XLINUXENVCFG, 1)
+  |             :: "r" (next->thread.envcfg) : "memory");
+  | }
+  References:
+    - riscv-isa-manual/src/priv/supervisor.adoc:786-809
+      "The senvcfg CSR controls certain characteristics of the U-mode
+      execution environment, including CBIE, CBCFE, and CBZE fields for
+      CBO instruction contr"
+

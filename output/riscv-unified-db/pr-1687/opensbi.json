@@ -1,0 +1,104 @@
+{
+  "pr_number": 1687,
+  "target_repo": "opensbi",
+  "security_spec": {
+    "pr_number": 1687,
+    "violation_condition": "OpenSBI blindly saves and restores the full mnstatus CSR word (e.g., during HSM suspend/resume or trap entry/exit) without preserving bit 9 (MNPELP), overwriting the RW-H hardware-written Zicfilp Expected Landing Pad state with a stale or zeroed value",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "unconditional csr_write(CSR_MNSTATUS, saved_raw)|bitmask or bitfield insertion into mnstatus that clears bit 9|HSM suspend save array that reads whole mnstatus into a generic u64 slot without field-level masking for MNPELP|MNRET execution path after OpenSBI clobbered mnstatus without proper MNPELP preservation",
+    "affected_entities": [
+      "mnstatus",
+      "MNPELP",
+      "MNRET",
+      "Zicfilp"
+    ],
+    "summary": "MNPELP (mnstatus bit 9, RW-H) holds the Zicfilp ELP state latched by hardware on RNMI entry; MNRET restores ELP from it. If OpenSBI's CSR save/restore zeroes or corrupts bit 9, MNRET pops a wrong ELP, and the next indirect branch triggers a spurious Zicfilp landing-pad violation trap, crashing the resumed context"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "include/sbi/riscv_encoding.h",
+        "function_name": "N/A",
+        "line_start": 0,
+        "line_end": 0,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "OpenSBI does not define CSR_MNSTATUS or any mnstatus bit fields (NMIE, MNPV, MNPP, MNPELP). The encoding header defines CSR_MEPC (0x341), CSR_MCAUSE (0x342), CSR_MSTATUS (0x300), CSR_MSCRATCH (0x340) but has no Smrnmi CSR definitions. Without CSR_MNSTATUS macro and MNPELP bit definition, no code in the codebase can reference mnstatus state, so the vulnerability pattern (blind save/restore of full mnstatus CSR word overwriting MNPELP) cannot occur.",
+      "snippet": "#define CSR_MSTATUS 0x300\n#define CSR_MSCRATCH 0x340\n#define CSR_MEPC 0x341\n#define CSR_MCAUSE 0x342\n// MISSING: #define CSR_MNSTATUS, #define MNSTATUS_MNPELP",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smrnmi.adoc",
+          "line_start": 94,
+          "line_end": 96,
+          "excerpt": "If the Zicfilp extension is implemented, mnstatus also holds the MNPELP field, which on entry to the RNMI trap handler holds the previous ELP state. When an RNMI trap is taken, MNPELP is set to ELP and ELP is set to 0."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_save",
+        "line_start": 408,
+        "line_end": 433,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "HSM non-retentive suspend save path saves MIE, MIP, MEDELEG, MIDELEG, and MENVCFG but does not save mnstatus. Since OpenSBI has no Smrnmi support at all (no CSR_MNSTATUS macro, no saved_mnstatus field in sbi_hsm_data), there is no code path that reads or writes mnstatus. The vulnerability pattern of blindly saving/restoring the full mnstatus word and clobbering MNPELP is not applicable because the component is absent.",
+      "snippet": "hdata->saved_mie = csr_read(CSR_MIE);\nhdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);\nhdata->saved_medeleg = csr_read(CSR_MEDELEG);\nhdata->saved_mideleg = csr_read(CSR_MIDELEG);\nif (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)\n    hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);\n// MISSING: Smrnmi CSR save (mnstatus, mnepc, mncause, mnscratch)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smrnmi.adoc",
+          "line_start": 12,
+          "line_end": 14,
+          "excerpt": "The Smrnmi extension adds support for resumable non-maskable interrupts (RNMIs) to RISC-V. The extension adds four new CSRs (mnepc, mncause, mnstatus, and mnscratch) to hold the interrupted state, and one new instruction, MNRET, to resume from the RNMI handler."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "lib/sbi/sbi_hsm.c",
+        "function_name": "__sbi_hsm_suspend_non_ret_restore",
+        "line_start": 435,
+        "line_end": 446,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "HSM non-retentive suspend restore path restores MENVCFG, MIDELEG, MEDELEG, MIE, and MIP but does not restore mnstatus. No mnstatus CSR write exists anywhere in the codebase. The vulnerability condition (csr_write(CSR_MNSTATUS, saved_raw) overwriting MNPELP) cannot occur because there is no CSR_MNSTATUS definition and no mnstatus write code path.",
+      "snippet": "csr_write64(CSR_MENVCFG, hdata->saved_menvcfg);\ncsr_write(CSR_MIDELEG, hdata->saved_mideleg);\ncsr_write(CSR_MEDELEG, hdata->saved_medeleg);\ncsr_write(CSR_MIE, hdata->saved_mie);\ncsr_set(CSR_MIP, (hdata->saved_mip & (MIP_SSIP | MIP_STIP)));\n// MISSING: mnstatus restore",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smrnmi.adoc",
+          "line_start": 135,
+          "line_end": 136,
+          "excerpt": "The other bits in mnstatus are reserved; software should write zeros and hardware implementations should return zeros."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "firmware/fw_base.S",
+        "function_name": "_trap_handler",
+        "line_start": 670,
+        "line_end": 720,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "The trap entry/exit path uses TRAP_SAVE_MEPC_MSTATUS and TRAP_RESTORE_MEPC_MSTATUS macros which only save/restore mepc, mstatus, and mstatush. There is no mnstatus save/restore in the trap handler. No MNSTATUS CSR write path exists. No MNRET instruction exists. The vulnerability pattern (clobbering mnstatus.MNPELP during trap entry/exit) cannot occur because Smrnmi is not implemented.",
+      "snippet": "_trap_handler:\n    TRAP_SAVE_AND_SETUP_SP_T0\n    TRAP_SAVE_MEPC_MSTATUS 0\n    TRAP_SAVE_GENERAL_REGS_EXCEPT_SP_T0\n    TRAP_SAVE_INFO 0 0\n    TRAP_CALL_C_ROUTINE\n    TRAP_RESTORE_GENERAL_REGS_EXCEPT_A0_T0\n    TRAP_RESTORE_MEPC_MSTATUS 0\n    TRAP_RESTORE_A0_T0\n    mret\n// No MNRET, no mnstatus handling, no MNPELP clobbering path",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smrnmi.adoc",
+          "line_start": 140,
+          "line_end": 145,
+          "excerpt": "MNRET is an M-mode-only instruction that uses the values in mnepc and mnstatus to return to the program counter, privilege mode, and virtualization mode of the interrupted context. This instruction also sets mnstatus.NMIE. If the Zicfilp extension is implemented, then if the new privileged mode is y, MNRET sets ELP to the logical AND of yLPE and mnstatus.MNPELP."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "not_implemented"
+}

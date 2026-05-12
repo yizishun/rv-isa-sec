@@ -1,0 +1,96 @@
+{
+  "pr_number": 1380,
+  "target_repo": "linux",
+  "security_spec": {
+    "pr_number": 1380,
+    "violation_condition": "Linux kernel writes PMP configuration registers (e.g., head.S:239-240) and any future KVM PMP emulation code without first checking mseccfg.MML state. When Smepmp MML=1, the pmpcfg encoding table is redefined — the kernel's existing L=0, R/W/X=1 NAPOT rule no longer grants S-mode all-access but becomes M-mode-only, potentially leaving S-mode with no usable memory mappings and crashing the kernel at boot or during KVM guest entry.",
+    "security_consequence": "denial_of_service",
+    "vulnerability_pattern": "csrw\\s+CSR_PMPCFG|write_pmpcfg|pmpcfg.*write|pmp_set|__kvm_riscv.*pmp",
+    "affected_entities": [
+      "mseccfg",
+      "mseccfgh",
+      "pmpcfg0-15",
+      "pmpaddr0-63"
+    ],
+    "summary": "Kernel writes PMP configs assuming classic L-bit semantics without checking mseccfg.MML, so Smepmp-enabled firmware can redefine PMP encoding under the kernel's feet causing boot failure or privilege boundary collapse"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "arch/riscv/kernel/head.S",
+        "function_name": "_start_kernel",
+        "line_start": 237,
+        "line_end": 240,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "When CONFIG_RISCV_M_MODE=y, the kernel writes PMPCFG0 with encoding (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X) = L=0, R=1, W=1, X=1, A=NAPOT without checking mseccfg.MML. The Smepmp spec redefines the pmpcfg encoding table when MML=1: L=0,R/W/X=1 becomes an S/U-mode-only rule that is denied (access-fault) to M-mode, while granting full R/W/X access only to S/U mode. If BootROM sets mseccfg.MML=1 before handing off to the kernel, this csrw at line 240 immediately denies M-mode access to all memory — the next instruction fetch faults and the kernel crashes at boot. The kernel's csr.h (lines 246-249) defines only MSECCFG_PMM bits; MSECCFG_MML (bit 0) is not defined, and no Smepmp-aware code exists anywhere in arch/riscv/.",
+      "snippet": "li a0, -1\ncsrw CSR_PMPADDR0, a0\nli a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)\ncsrw CSR_PMPCFG0, a0",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/smepmp.adoc",
+          "line_start": 44,
+          "line_end": 66,
+          "excerpt": "The physical memory protection rules when mseccfg.MML is set to 1: Row L=0,R=1,W=1,X=1 → M Mode: Access Exception, S/U Mode: Read/Write/Execute region"
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2437,
+          "line_end": 2438,
+          "excerpt": "An S/U-mode-only rule is enforced on Supervisor and User modes and denied on Machine mode."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2422,
+          "line_end": 2423,
+          "excerpt": "This is a sticky bit, meaning that once set it cannot be unset until a PMP reset."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/include/asm/csr.h",
+        "function_name": "N/A (header definitions)",
+        "line_start": 245,
+        "line_end": 249,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The mseccfg bit definitions are incomplete: only MSECCFG_PMM and PMLEN variants are defined (lines 246-249). The Smepmp extension requires MSECCFG_MML (bit 0), MSECCFG_MMWP (bit 1), and MSECCFG_RLB (bit 2) definitions — none exist here. This absence means kernel code has no way to detect SMEPMP MML state before writing PMP configuration registers, contributing directly to the boot-crash vulnerability in head.S.",
+      "snippet": "/* mseccfg bits */\n#define MSECCFG_PMM\t\t\tENVCFG_PMM\n#define MSECCFG_PMM_PMLEN_0\t\tENVCFG_PMM_PMLEN_0\n#define MSECCFG_PMM_PMLEN_7\t\tENVCFG_PMM_PMLEN_7\n#define MSECCFG_PMM_PMLEN_16\t\tENVCFG_PMM_PMLEN_16",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/images/wavedrom/mseccfg.edn",
+          "line_start": 1,
+          "line_end": 16,
+          "excerpt": "mseccfg register layout: bit 0 = MML, bit 1 = MMWP, bit 2 = RLB"
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 2387,
+          "line_end": 2389,
+          "excerpt": "The Smepmp extension adds the RLB, MMWP, and the MML fields in mseccfg."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "arch/riscv/kvm",
+        "function_name": "N/A (KVM subsystem)",
+        "line_start": 0,
+        "line_end": 0,
+        "relevance_rationale": ""
+      },
+      "severity": "not_implemented",
+      "finding": "KVM on RISC-V has no PMP emulation or mseccfg virtualization code. While this means no current Smepmp/PMP KVM vulnerability exists, it also means that if KVM PMP emulation is added in the future, it must respect the Smepmp MML redefined encoding table for correct guest behavior. The KVM subsystem grep returns zero matches for 'pmp', 'PMP', 'mseccfg', or 'MSECCFG'.",
+      "snippet": "(no PMP or mseccfg handling in arch/riscv/kvm/)",
+      "spec_citations": []
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

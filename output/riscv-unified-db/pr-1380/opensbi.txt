@@ -1,0 +1,289 @@
+PR #1380  target=opensbi  overall=potential_risk
+Spec: Smepmp mseccfg.MML repurposes pmpcfg.L from 'locked' to 'M-mode-only' and RLB allows bypassing locks — OpenSBI must explicitly clear MML before setting locked PMP entries and must zero RLB before S-mode handoff, otherwise domain isolation via PMP locking is silently defeated
+Violation:
+  OpenSBI sets pmpcfg.L on PMP entries to enforce domain isolation or region
+  locking, but mseccfg.MML=1 silently changes L-bit semantics from 'locked' to
+  'M-mode-only', allowing S-mode domains to access regions OpenSBI intended to
+  be fully locked. Additionally, if mseccfg.RLB=1 is left set when jumping to
+  S-mode, locked PMP entries become modifiable by M-mode SBI handlers invoked
+  from S-mode, defeating firmware-enforced isolation.
+Consequence: privilege_escape
+Pattern:
+  sbi_mseccfg_write|pmp_set.*LOCK|pmpcfg.*CSR_TBL_L|mseccfg.*RLB|mseccfg.*MML(
+  ?!\s*==\s*0|\s*&\s*0)|pmp_lock_hart|__pmp_lock
+------------------------------------------------------------
+[compliant] lib/sbi/sbi_hart_pmp.c:139-139  sbi_hart_smepmp_configure
+  Setting MSECCFG_RLB=1 before programming PMP entries is the correct Smepmp
+  init protocol. The spec requires RLB=1 to modify locked PMP entries
+  (machine.adoc:2392-2394: 'When mseccfg.RLB is 1, locked PMP rules may be
+  removed or modified'). This is the standard first phase of the four-phase
+  Smepmp configuration sequence.
+  | csr_set(CSR_MSECCFG, MSECCFG_RLB);
+  References:
+    - riscv-isa-manual/modules/priv/pages/machine.adoc:2392-2397
+      "When mseccfg.RLB (Rule Locking Bypass) a WARL field that provides a
+      mechanism to temporarily modify *Locked* PMP rules. When mseccfg.RLB
+      is 1, locked "
+
+[compliant] lib/sbi/sbi_hart_pmp.c:185-185  sbi_hart_smepmp_configure
+  Setting MSECCFG_MML=1 after programming M-mode-only PMP entries (lines
+  144-180, under MML=0/legacy encoding) and before shared/SU regions (lines
+  187-209, under MML=1/Smepmp encoding) is the correct four-phase Smepmp
+  programming sequence.
+  | csr_set(CSR_MSECCFG, MSECCFG_MML);
+  References:
+    - riscv-isa-manual/modules/priv/pages/machine.adoc:2421-2428
+      "The MML bit changes the interpretation of the pmpcfg.L bit. When
+      mseccfg.MML is set... the meaning of pmpcfg.L changes: Instead of
+      marking a rule as l"
+
+[potential_risk] lib/sbi/sbi_hart_pmp.c:211-215  sbi_hart_smepmp_configure
+  RLB is intentionally left set after all PMP entries are programmed (comment:
+  'Keep the RLB bit so that dynamic mappings can be done'). Per
+  smepmp.adoc:68, locked rules cannot be removed or modified until PMP reset
+  unless RLB=1. With RLB=1 retained at runtime, any M-mode SBI handler invoked
+  via ecall from S-mode can overwrite locked PMP entries, defeating the
+  immutability guarantee that L=1 should provide under MML=1. The
+  map_range/unmap_range operations (lines 220-257) work correctly with RLB=1,
+  but it also enables unintended modifications via any code path.
+  | /* All entries are programmed.
+  |  * Keep the RLB bit so that dynamic mappings can be done.
+  |  */
+  References:
+    - riscv-isa-manual/modules/priv/pages/smepmp.adoc:68-68
+      "*Locked* rules cannot be removed or modified until a *PMP reset*,
+      unless mseccfg.RLB is set."
+
+[potential_risk] lib/sbi/sbi_hart_pmp.c:121-217  sbi_hart_smepmp_configure
+  The four-phase Smepmp init sequence (RLB=1 -> M-only PMP entries -> MML=1 ->
+  shared PMP entries) has no read-back validation after mseccfg CSR writes at
+  lines 139 and 185. Per spec (machine.adoc:2422), MML is a sticky bit: once
+  set it cannot be unset until PMP reset. If the csr_set(CSR_MSECCFG,
+  MSECCFG_MML) at line 185 is silently dropped (WARL field), M-only entries
+  programmed at lines 144-180 under MML=0/legacy-encoding would be
+  misinterpreted under Smepmp rules, and shared entries at lines 187-209 would
+  also be misinterpreted. A read-back-and-verify after the MML write would
+  catch this.
+  | csr_set(CSR_MSECCFG, MSECCFG_RLB);
+  | ...
+  | csr_set(CSR_MSECCFG, MSECCFG_MML);
+  References:
+    - riscv-isa-manual/modules/priv/pages/machine.adoc:2422-2423
+      "This is a sticky bit, meaning that once set it cannot be unset
+      until a PMP reset."
+
+[compliant] lib/sbi/sbi_domain.c:194-201  sbi_domain_get_smepmp_flags
+  M-mode-only regions correctly set PMP_L (pmp_flags |= PMP_L). Under MML=1
+  with RLB=1, L=1 combined with R/W/X permissions creates an M-mode-only
+  locked region per the Smepmp truth table. The encoding is correct: L=1 means
+  'M-mode-only' under MML=1, and the access bits encode the specific M-mode
+  permissions.
+  | /* M-mode only access regions are always locked */
+  | pmp_flags |= PMP_L;
+  | if (reg->flags & SBI_DOMAIN_MEMREGION_M_READABLE)
+  |     pmp_flags |= PMP_R;
+  | if (reg->flags & SBI_DOMAIN_MEMREGION_M_WRITABLE)
+  |     pmp_flags |= PMP_W;
+  References:
+    - riscv-isa-manual/modules/priv/pages/machine.adoc:2432-2435
+      "An M-mode-only rule is enforced on Machine mode and denied in
+      Supervisor or User mode. It also remains locked so that any further
+      modifications to its"
+
+[compliant] lib/sbi/sbi_domain.c:163-164  sbi_domain_get_smepmp_flags
+  Shared read-only region (SUR_MR) produces pmp_flags =
+  PMP_L|PMP_R|PMP_W|PMP_X (LRWX=1111). Per the Smepmp truth table
+  (smepmp.adoc:65), this encodes 'Locked Shared data region: Read only on both
+  M and S/U mode' — correct for a shared read-only region under MML=1.
+  | if (SBI_DOMAIN_MEMREGION_IS_SUR_MR(reg->flags))
+  |     pmp_flags = (PMP_L | PMP_R | PMP_W | PMP_X);
+  References:
+    - riscv-isa-manual/modules/priv/pages/smepmp.adoc:65-65
+      "1|1|1|1 2+|Locked Shared data region: Read only on both M and S/U
+      mode.*"
+
+[compliant] lib/sbi/sbi_domain.c:133-134  sbi_domain_get_oldpmp_flags
+  Sets PMP_L under the old-pmp path (non-Smepmp harts) for regions with
+  ENF_PERMISSIONS flag. This code path is only reached for non-Smepmp harts
+  (see sbi_hart_pmp.c:335-343, where Smepmp harts use the smepmp_configure
+  path). Additionally, hart_detect_features at sbi_hart.c:699-706 rejects
+  Smepmp harts with MML=1 at cold boot, so this old-pmp code never runs under
+  MML=1/Smepmp encoding. The L-bit here correctly means 'locked' under legacy
+  semantics.
+  | if (reg->flags & SBI_DOMAIN_MEMREGION_ENF_PERMISSIONS)
+  |     pmp_flags |= PMP_L;
+
+[potential_risk] lib/sbi/sbi_hart.c:699-706  hart_detect_features
+  The MML=1 rejection check on Smepmp harts (lines 704-705) runs only from
+  sbi_hart_init (cold boot and init_warm_startup paths). It is NOT run on the
+  warm resume path: init_warmboot → init_warm_resume → sbi_hart_reinit →
+  mstatus_init (sbi_init.c:483-498). sbi_hart_reinit does NOT call
+  hart_detect_features. If non-retentive suspend/resume hardware preserves
+  mseccfg with MML=1, OpenSBI proceeds to call sbi_hart_smepmp_configure which
+  tries csr_set(CSR_MSECCFG, MSECCFG_RLB) — but RLB is locked to 0 when MML=1
+  and any pmpcfg.L is set (machine.adoc:2395-2397), so the RLB write is
+  silently dropped. The subsequent pmp_disable/pmp_set calls on locked entries
+  would then be silently ignored.
+  | if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMEPMP) &&
+  |     (csr_read(CSR_MSECCFG) & MSECCFG_MML))
+  |     return SBI_EILL;
+  References:
+    - riscv-isa-manual/modules/priv/pages/machine.adoc:2393-2397
+      "When mseccfg.RLB is 0 and pmpcfg.L is 1 in any rule or entry
+      (including disabled entries), then mseccfg.RLB remains 0 and any
+      further modifications to"
+
+[compliant] lib/sbi/riscv_asm.c:376-380  pmp_set
+  pmp_set writes pmpaddr then pmpcfg without read-back validation. This is
+  standard RISC-V PMP programming practice. The bounds check at line 341 uses
+  PMP_COUNT (compile-time max 64) rather than the runtime pmp_count, but
+  callers (sbi_hart_smepmp_configure, sbi_hart_oldpmp_configure) validate
+  pmp_idx against the runtime count before calling pmp_set. Under RLB=1
+  (deliberately kept set), the write cannot be silently dropped due to
+  locking.
+  | csr_write_num(pmpaddr_csr, pmpaddr);
+  | csr_write_num(pmpcfg_csr, pmpcfg);
+  | return 0;
+
+[compliant] lib/sbi/riscv_asm.c:308-314  pmp_disable
+  pmp_disable clears pmpcfg address-matching bits without read-back
+  validation. Under RLB=1 (deliberately kept set), the write cannot be
+  silently dropped due to locking. The write is valid and effective.
+  | cfgmask = ~(0xffUL << pmpcfg_shift);
+  | pmpcfg  = (csr_read_num(pmpcfg_csr) & cfgmask);
+  | csr_write_num(pmpcfg_csr, pmpcfg);
+  | return SBI_OK;
+
+[potential_risk] lib/sbi/sbi_hsm.c:44-53  sbi_hsm_data
+  The per-hart suspend-save struct (sbi_hsm_data) saves mie, mip, medeleg,
+  mideleg, and menvcfg but has NO saved_mseccfg field. mseccfg (containing
+  MML, RLB, SSEED, USEED) is the only security-critical M-mode CSR not
+  explicitly saved/restored across non-retentive suspend. The warm-resume path
+  (init_warm_resume → sbi_hart_reinit → mstatus_init →
+  sbi_hart_protection_configure) implicitly reconstructs mseccfg state, but
+  this is a fragile undocumented dependency. If sbi_hart_reinit or the init
+  ordering changes, mseccfg state would be silently stale after resume.
+  | struct sbi_hsm_data {
+  |     atomic_t state;
+  |     unsigned long suspend_type;
+  |     unsigned long saved_mie;
+  |     unsigned long saved_mip;
+  |     unsigned long saved_medeleg;
+  |     unsigned long saved_mideleg;
+  |     u64 saved_menvcfg;
+  |     atomic_t start_ticket;
+  | };
+
+[potential_risk] lib/sbi/sbi_hsm.c:427-433  __sbi_hsm_suspend_non_ret_save
+  Saves mie, mip, medeleg, mideleg, menvcfg but does NOT read and save
+  CSR_MSECCFG across non-retentive suspend. The MML, RLB, SSEED/USEED state is
+  implicitly entrusted to be reconstructed by init_warm_resume re-running
+  mstatus_init and sbi_hart_protection_configure before
+  __sbi_hsm_suspend_non_ret_restore runs. This implicit ordering dependency is
+  undocumented in the code.
+  | hdata->saved_mie = csr_read(CSR_MIE);
+  | hdata->saved_mip = csr_read(CSR_MIP) & (MIP_SSIP | MIP_STIP);
+  | hdata->saved_medeleg = csr_read(CSR_MEDELEG);
+  | hdata->saved_mideleg = csr_read(CSR_MIDELEG);
+  | hdata->saved_menvcfg = csr_read64(CSR_MENVCFG);
+
+[potential_risk] lib/sbi/sbi_hsm.c:440-445  __sbi_hsm_suspend_non_ret_restore
+  Restores menvcfg, mideleg, medeleg, mie, mip but does NOT write CSR_MSECCFG.
+  Relies on init_warm_resume having called sbi_hart_protection_configure
+  (which sets RLB and MML on Smepmp harts) before this restore runs
+  (sbi_init.c:490-498). If the call order ever changes, mseccfg state will be
+  silently stale after resume — PMP entries would be interpreted under the
+  wrong MML/RLB regime.
+  | csr_write64(CSR_MENVCFG, hdata->saved_menvcfg);
+  | csr_write(CSR_MIDELEG, hdata->saved_mideleg);
+  | csr_write(CSR_MEDELEG, hdata->saved_medeleg);
+  | csr_write(CSR_MIE, hdata->saved_mie);
+  | csr_set(CSR_MIP, (hdata->saved_mip & (MIP_SSIP | MIP_STIP)));
+
+[compliant] lib/sbi/sbi_domain_context.c:127-128  switch_to_next_domain_context
+  Domain context switch correctly calls sbi_hart_protection_unconfigure then
+  sbi_hart_protection_configure. Under Smepmp with RLB=1 (deliberately kept
+  set at sbi_hart_pmp.c:212), pmp_disable in unconfigure works on all non-
+  firmware entries. The re-configure re-runs the full four-phase Smepmp init.
+  The window between unconfigure and configure has partially disabled PMP
+  entries, but this is inherent to PMP reprogramming — the hart must not
+  access protected memory during this window, which is guaranteed since the
+  code runs in M-mode with interrupts disabled.
+  | sbi_hart_protection_unconfigure(scratch);
+  | sbi_hart_protection_configure(scratch);
+
+[potential_risk] include/sbi/riscv_encoding.h:733-734  MSECCFG_MMWP
+  MSECCFG_MMWP (bit 1, Machine-Mode Allowlist Policy) is defined but NEVER
+  written by any source file in lib/sbi/ or platform/. Per spec
+  (machine.adoc:2413-2418), MMWP=1 provides default-deny for M-mode — memory
+  regions without matching PMP rules are denied instead of being accessible.
+  Without MMWP=1, M-mode retains full access to all unmatched memory regions.
+  OpenSBI's PMP configuration covers all regions with explicit entries
+  (including a catch-all SU region at sbi_domain.c:950-954), so MMWP is not
+  strictly required for basic protection. However, the Smepmp security model's
+  defense-in-depth is weakened without it — any PMP coverage gap would grant
+  M-mode unrestricted access.
+  | #define MSECCFG_MMWP_SHIFT     (1)
+  | #define MSECCFG_MMWP           (_UL(1) << MSECCFG_MMWP_SHIFT)
+  References:
+    - riscv-isa-manual/modules/priv/pages/machine.adoc:2413-2418
+      "The mseccfg.MMWP (Machine-Mode Allowlist Policy) is a WARL field.
+      This field changes the default PMP policy for Machine mode when
+      accessing memory reg"
+
+[potential_risk] lib/sbi/sbi_hart_pmp.c:300-311  sbi_hart_pmp_unconfigure
+  Disables non-firmware PMP entries during domain context switch. Does NOT
+  verify RLB is currently 1 before calling pmp_disable on locked entries.
+  Under Smepmp with MML=1, locked entries (L=1) cannot be modified unless
+  RLB=1. Since RLB is intentionally kept set at line 212, this works correctly
+  in normal operation. But if any code path between configure and unconfigure
+  were to clear RLB (e.g., a future platform callback), pmp_disable writes on
+  locked entries would be silently dropped, causing old-domain PMP entries to
+  persist into the new domain's configuration. An assertion or early check for
+  RLB==1 before the loop would catch this invariant violation.
+  | for (i = 0; i < pmp_count; i++) {
+  |     if (sbi_hart_smepmp_is_fw_region(i))
+  |         continue;
+  |     sbi_platform_pmp_disable(sbi_platform_ptr(scratch), i);
+  |     pmp_disable(i);
+  | }
+
+[potential_risk] platform/generic/eswin/eic770x.c:261-262  eswin_eic770x_final_init
+  Platform code calls pmp_set(PMP_RESERVED_A, PMP_L, ...) to lock the die-1 L3
+  zero device. This runs from platform final_init which is called BEFORE
+  sbi_hart_protection_configure (sbi_init.c:343 vs 394). If this platform had
+  Smepmp hardware with MML already set from a prior boot stage, PMP_L would be
+  interpreted as M-mode-only rather than locked — S-mode could access the
+  isolated region. The EIC770X likely does NOT support Smepmp, making this a
+  theoretical concern, but the pattern of platform code using PMP_L before
+  Smepmp configuration is architectural tech debt.
+  | pmp_set(PMP_RESERVED_A, PMP_L, EIC770X_L3_ZERO_REMOTE,
+  |        log2roundup(EIC770X_L3_ZERO_SIZE));
+
+[potential_risk] platform/generic/eswin/eic770x.c:270-271  eswin_eic770x_final_init
+  Platform code calls pmp_set(PMP_RESERVED_B, PMP_L, 0, ...) covering the
+  entire memory port. Same vulnerability pattern as line 261: PMP_L is set
+  without RLB protection, before sbi_hart_protection_configure runs. If Smepmp
+  hardware with MML=1 were present, this 'lock' would become an M-mode-only
+  entry that does NOT prevent S-mode access.
+  | pmp_set(PMP_RESERVED_B, PMP_L, 0,
+  |        log2roundup(EIC770X_MEMPORT_LIMIT));
+
+[compliant] lib/sbi/sbi_hart.c:177-180  mstatus_init
+  mstatus_init writes csr_set(CSR_MSECCFG, MSECCFG_SSEED) and
+  csr_clear(CSR_MSECCFG, MSECCFG_USEED) to enable S-mode access to the seed
+  CSR. SSEED and USEED are fields from the Zkr extension, not Smepmp. Per the
+  spec, only MMWP/MML are sticky-on-set and RLB is sticky-on-clear
+  (smepmp.adoc:76: 'all fields defined in mseccfg as part of this extension').
+  The Smepmp locking rules do NOT affect SSEED/USEED writeability — they are
+  separate WARL fields from a different extension. The writes are valid
+  regardless of MML/RLB state.
+  | if (sbi_hart_has_extension(scratch, SBI_HART_EXT_ZKR)) {
+  |     csr_set(CSR_MSECCFG, MSECCFG_SSEED);
+  |     csr_clear(CSR_MSECCFG, MSECCFG_USEED);
+  | }
+  References:
+    - riscv-isa-manual/modules/priv/pages/smepmp.adoc:76-76
+      "Since all fields defined in mseccfg as part of this extension are
+      locked when set (MMWP/MML) or locked when cleared (RLB)"
+

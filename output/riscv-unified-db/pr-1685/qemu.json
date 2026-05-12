@@ -1,0 +1,62 @@
+{
+  "pr_number": 1685,
+  "target_repo": "qemu",
+  "security_spec": {
+    "pr_number": 1685,
+    "violation_condition": "In check_zicbo_envcfg() at target/riscv/op_helper.c:148, when env->priv < PRV_M and the menvcfg enable bit (CBZE/CBCFE/CBIE) is 0, QEMU raises RISCV_EXCP_ILLEGAL_INST for all non-M modes without inspecting env->virt_enabled. The corrected spec requires VS/VU modes to raise VirtualInstruction (RISCV_EXCP_VIRT_INSTRUCTION_FAULT) instead, so the HS-mode hypervisor can trap-and-emulate. QEMU's flat menvcfg check at line 148 fires before the virt_enabled path at line 152 is reached, causing the exception to route to M-mode with the wrong exception code, bypassing the hypervisor delegation path (medeleg[22]).",
+    "security_consequence": "function_loss",
+    "vulnerability_pattern": "env->priv < PRV_M.*get_field.*menvcfg.*(CBZE|CBCFE|CBIE).*ILLEGAL_INST(?!.*virt_enabled)",
+    "affected_entities": [
+      "cbo.zero",
+      "cbo.clean",
+      "cbo.flush",
+      "cbo.inval",
+      "menvcfg.CBZE",
+      "menvcfg.CBCFE",
+      "menvcfg.CBIE",
+      "henvcfg.CBZE",
+      "henvcfg.CBCFE",
+      "senvcfg.CBZE",
+      "senvcfg.CBCFE"
+    ],
+    "summary": "check_zicbo_envcfg raises IllegalInstruction for VS/VU modes when menvcfg enable bit is 0, but spec requires VirtualInstruction so HS-mode hypervisor can trap-and-emulate CBO instructions"
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "target/riscv/op_helper.c",
+        "function_name": "check_zicbo_envcfg",
+        "line_start": 144,
+        "line_end": 162,
+        "relevance_rationale": ""
+      },
+      "severity": "bug_confirmed",
+      "finding": "The menvcfg check at line 148 fires for VS/VU modes (env->priv < PRV_M) before the virt_enabled path at line 152 is reached, causing QEMU to raise RISCV_EXCP_ILLEGAL_INST instead of RISCV_EXCP_VIRT_INSTRUCTION_FAULT. The sequential if structure (no else-if) means the menvcfg check at line 148 unconditionally catches all non-M modes including VS/VU, and riscv_raise_exception() longjmps out before the virt_enabled check at line 152 can execute. The corrected spec requires VS/VU modes to raise VirtualInstruction so the HS-mode hypervisor can trap-and-emulate, but QEMU routes the exception to M-mode with the wrong exception code, bypassing the hypervisor delegation path (medeleg[22] for illegal-instruction). Fix: add !env->virt_enabled guard to line 148, or restructure to use else-if matching the spec's pseudo-code.",
+      "snippet": "    if ((env->priv < PRV_M) && !get_field(env->menvcfg, envbits)) {\n        riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, ra);\n    }\n\n    if (env->virt_enabled &&\n        (((env->priv <= PRV_S) && !get_field(env->henvcfg, envbits)) ||\n         ((env->priv < PRV_S) && !get_field(env->senvcfg, envbits)))) {",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/cmo.adoc",
+          "line_start": 627,
+          "line_end": 649,
+          "excerpt": "[[norm:cbo-zero_basedon_xenvcfg-CBZE]] Finally, a cbo.zero instruction executes or raises an illegal-instruction or virtual-instruction exception based on the state of the envcfg[cbze] bits: // illegal-instruction exceptions if (((priv_mode != M) && !menvcfg.CBZE) || ((priv_mode == U) && !senvcfg.CBZE)) { <raise illegal-instruction exception> } // virtual-instruction exceptions else if (((priv_mode == VS) && !henvcfg.CBZE) || ((priv_mode == VU) && !(henvcfg.CBZE && senvcfg.CBZE))) { <raise virtual-instruction exception> }"
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/cmo.adoc",
+          "line_start": 545,
+          "line_end": 564,
+          "excerpt": "[[norm:cbo-inval]] A cbo.inval instruction executes or raises either an illegal-instruction exception or a virtual-instruction exception based on the state of the envcfg[cbie] fields: // illegal-instruction exceptions if (((priv_mode != M) && (menvcfg.CBIE == 00)) || ((priv_mode == U) && (senvcfg.CBIE == 00))) { <raise illegal-instruction exception> } // virtual-instruction exceptions else if (((priv_mode == VS) && (henvcfg.CBIE == 00)) || ((priv_mode == VU) && ((henvcfg.CBIE == 00) || (senvcfg.CBIE == 00)))) { <raise virtual-instruction exception> }"
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/unpriv/cmo.adoc",
+          "line_start": 599,
+          "line_end": 624,
+          "excerpt": "[[norm:cbo-clean_cbo-flush]] A cbo.clean or cbo.flush instruction executes or raises an illegal-instruction or virtual-instruction exception based on the state of the envcfg[cbcfe] bits: // illegal-instruction exceptions if (((priv_mode != M) && !menvcfg.CBCFE) || ((priv_mode == U) && !senvcfg.CBCFE)) { <raise illegal-instruction exception> } // virtual-instruction exceptions else if (((priv_mode == VS) && !henvcfg.CBCFE) || ((priv_mode == VU) && !(henvcfg.CBCFE && senvcfg.CBCFE))) { <raise virtual-instruction exception> }"
+        }
+      ]
+    }
+  ],
+  "overall_severity": "bug_confirmed"
+}

@@ -1,0 +1,242 @@
+{
+  "pr_number": 1366,
+  "target_repo": "xiangshan",
+  "security_spec": {
+    "pr_number": 1366,
+    "violation_condition": "XiangShan RTL writes to sstatus.UXL are not properly WARL-masked to the set of supported values: if Ssu32xl is claimed but the CSR module hardwires UXL to 2 (64-bit only) or masks bit writes such that value 1 (UXLEN=32) cannot be stored, the spec is violated. Conversely, if Ssu32xl is not implemented but UXL write logic contains a bit-encoding bug that allows value 1 to persist, U-mode executes with inconsistent XLEN semantics—register read/write paths in the integer datapath truncate to 32 bits while address-generation and memory-access paths use 64-bit full-width, creating an attacker-controllable mismatched-width execution state.",
+    "security_consequence": "privilege_escape",
+    "vulnerability_pattern": "(sstatus.*UXL|UXL.*WARL|Cat\\(.*UXL|MuxLookup.*UXL|when.*uxl===1|uxl_wen|uxl_field).*",
+    "affected_entities": [
+      "sstatus",
+      "sstatus.UXL",
+      "mstatus.UXL",
+      "mstatus.SXL"
+    ],
+    "summary": "sstatus.UXL CSR write datapath must WARL-mask to 1 (32-bit) only when Ssu32xl is asserted; a mask-versus-behavior mismatch between UXL field storage and XLEN-dependent datapath truncation creates a cross-width privilege-escalation primitive."
+  },
+  "findings": [
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/CSRDefines.scala",
+        "function_name": "XLENField object",
+        "line_start": 152,
+        "line_end": 156,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "XLENField extends ROApply, making all UXL/SXL/VSXL fields read-only. The encoding (XLEN32=1, XLEN64=2, XLEN128=3) matches the MXL encoding in the RISC-V spec (misa MXL field: 1=32, 2=64, 3=128). This is the correct WARL behavior for an implementation that hardwires UXL to 64-bit only. The ROType uses wNoEffect for writes, which correctly implements WARL: any write is silently ignored and the field retains its legal value (2).",
+      "snippet": "object XLENField extends CSREnum with ROApply {\n    val XLEN32 = Value(1.U)\n    val XLEN64 = Value(2.U)\n    val XLEN128 = Value(3.U)\n  }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 543,
+          "line_end": 546,
+          "excerpt": "When MXLEN=64, if U-mode is not supported, then UXL is read-only zero. Otherwise, it is a WARL field that encodes the current value of UXLEN. In particular, an implementation may make UXL be a read-only field whose value always ensures that UXLEN=MXLEN or UXLEN=SXLEN."
+        },
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 37,
+          "line_end": 47,
+          "excerpt": "Encoding of MXL field in misa: MXL 1 -> 32, 2 -> 64, 3 -> Reserved"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MstatusBundle",
+        "line_start": 521,
+        "line_end": 521,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "mstatus.UXL is defined at bits [33:32] with XLENField (ROApply), reset to XLEN64. Bit positions are correct per RISC-V privileged spec (sstatus bits 33:32). The ROApply trait ensures writes are silently ignored (wNoEffect), implementing correct WARL: any illegal write values are converted by not storing them. Reset value of 2 (XLEN64) matches the processor's 64-bit-only design.",
+      "snippet": "val UXL  = XLENField      (33, 32).withReset(XLENField.XLEN64).withDescription(\"Effective XLEN for U-mode.\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 530,
+          "line_end": 532,
+          "excerpt": "For RV64 harts, the SXL and UXL fields are WARL fields that control the value of XLEN for S-mode and U-mode, respectively. The encoding of these fields is the same as the MXL field of misa."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/SupervisorLevel.scala",
+        "function_name": "SstatusBundle",
+        "line_start": 225,
+        "line_end": 225,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "sstatus.UXL is defined at bits [33:32] with XLENField (ROApply), reset to XLEN64. sstatus is a write-alias of mstatus (line 202 routes CSR address 0x100 to mstatus.wAliasSstatus). The alias write path (MachineLevel.scala:548-552) applies isLegal check which returns false for RO fields, so sstatus.UXL writes are also silently discarded. Compliant with spec: sstatus.UXL is a WARL field per supervisor.adoc:137-146 and may be read-only ensuring UXLEN=SXLEN.",
+      "snippet": "val UXL  = XLENField      (33, 32).withReset(XLENField.XLEN64).withDescription(\"Effective XLEN for U-mode.\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 137,
+          "line_end": 146,
+          "excerpt": "The UXL field controls the value of XLEN for U-mode, termed UXLEN, which may differ from the value of XLEN for S-mode, termed SXLEN. When SXLEN=64, it is a WARL field that encodes the current value of UXLEN. In particular, an implementation may make UXL be a read-only field whose value always ensures that UXLEN=SXLEN."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala",
+        "function_name": "MstatusModule (sstatus alias write path)",
+        "line_start": 547,
+        "line_end": 553,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "The sstatus-to-mstatus alias write path correctly uses isLegal check before applying writes. Since UXL uses ROType (isLegal returns (!this.isRO).B = false.B), writes are blocked. The alias mechanism properly prevents sstatus writes from bypassing mstatus WARL protection for UXL.",
+      "snippet": "val wAliasSstatus = IO(Input(new CSRAddrWriteBundle(new SstatusBundle)))\n  for ((name, field) <- wAliasSstatus.wdataFields.elements) {\n    reg.elements(name).asInstanceOf[CSREnumType].addOtherUpdate(\n      wAliasSstatus.wen && field.asInstanceOf[CSREnumType].isLegal,\n      field.asInstanceOf[CSREnumType]\n    )\n  }",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 130,
+          "line_end": 131,
+          "excerpt": "sstatus is a subset of mstatus. Reading or writing any field in sstatus is equivalent to reading or writing the homonymous field in mstatus."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/CSR.scala",
+        "function_name": "MstatusStruct",
+        "line_start": 168,
+        "line_end": 168,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Old CSR module: uxl is a 2-bit Output field in MstatusStruct (only when XLEN==64). This is a hardware bundle declaration, not the write logic. Compliant with spec.",
+      "snippet": "val uxl  = if (XLEN == 64) Output(UInt(2.W))  else null",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/CSR.scala",
+        "function_name": "mstatusWMask (write mask)",
+        "line_start": 386,
+        "line_end": 386,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Old CSR module: mstatus write mask blocks bits [35:32] (both SXL and UXL). The comment at line 345-349 states 'uxl hardlinked to 10'. This correctly prevents any write from changing UXL from its reset value of 2 (b10). Compliant with WARL semantics — illegal values are silently converted to the legal value 2.",
+      "snippet": "GenMask(35, 32)       | // SXL and UXL cannot be changed",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 543,
+          "line_end": 546,
+          "excerpt": "an implementation may make UXL be a read-only field whose value always ensures that UXLEN=MXLEN or UXLEN=SXLEN."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/CSR.scala",
+        "function_name": "sstatusWNmask (write negate mask)",
+        "line_start": 420,
+        "line_end": 420,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Old CSR module: sstatus write negate mask explicitly blocks bits [33:32] (UXL), commented 'UXL is hard-wired to 64(b10)'. The sstatus write mask (sstatusWmask) is derived as BigIntNot(sstatusWNmask). This correctly prevents UXL writes at the sstatus alias. Read mask (line 434) correctly includes UXL bits so reads return the constant value 2.",
+      "snippet": "BigIntGenMask(33, 32) | // UXL is hard-wired to 64(b10)",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/supervisor.adoc",
+          "line_start": 142,
+          "line_end": 146,
+          "excerpt": "When SXLEN=64, it is a WARL field... an implementation may make UXL be a read-only field whose value always ensures that UXLEN=SXLEN."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/CSR.scala",
+        "function_name": "mstatus init value / sstatusRmask",
+        "line_start": 343,
+        "line_end": 343,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Old CSR module: mstatus reset value is 0xha00002200. Bits [33:32] = b10, correctly encoding UXL=2 (XLEN64). The sstatus read mask (line 432-434) correctly exposes UXL bits for reads while the write masks block writes. This dual-mask approach is a correct implementation of WARL with a read-only field.",
+      "snippet": "val mstatus = RegInit(\"ha00002200\".U(XLEN.W))",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/machine.adoc",
+          "line_start": 37,
+          "line_end": 47,
+          "excerpt": "Encoding of MXL field: 1=32, 2=64, 3=Reserved"
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/NewCSR/HypervisorLevel.scala",
+        "function_name": "HstatusBundle.VSXL",
+        "line_start": 242,
+        "line_end": 242,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "hstatus.VSXL is defined at bits [33:32] with XLENField (ROApply), reset to XLEN64. For hypervisor extension, VSXL controls effective XLEN for VS-mode. RO behavior is compliant with spec: hypervisor.adoc:227 states VSXL may be read-only.",
+      "snippet": "val VSXL  = XLENField(33, 32).withReset(XLENField.XLEN64).withDescription(\"Effective XLEN for VS-mode.\")",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/hypervisor.adoc",
+          "line_start": 1174,
+          "line_end": 1184,
+          "excerpt": "The UXL field controls the effective XLEN for VU-mode... When VSXLEN=64, UXL is a WARL field... In particular, an implementation may make UXL be a read-only copy of field VSXL of hstatus."
+        }
+      ]
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/backend/fu/CSR.scala",
+        "function_name": "Vsstatus alias mapping",
+        "line_start": 885,
+        "line_end": 885,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "Old CSR module: Vsstatus uses the same sstatusWmask and sstatusRmask, providing identical UXL read-only behavior for virtualized supervisor mode. Compliant with spec.",
+      "snippet": "MaskedRegMap(Vsstatus, vsstatus, rmask = sstatusRmask, wmask = sstatusWmask, wfn = vsstatusUpdateSideEffect),",
+      "spec_citations": []
+    },
+    {
+      "location": {
+        "file_path": "src/main/scala/xiangshan/Parameters.scala",
+        "function_name": "ISAExtensions",
+        "line_start": 299,
+        "line_end": 299,
+        "relevance_rationale": ""
+      },
+      "severity": "compliant",
+      "finding": "XiangShan advertises 'ssu64xl' in its ISA extensions list but does NOT advertise 'ssu32xl'. This is correct: the processor hardwires UXL=64 and only supports UXLEN=64. There is no mismatch between the advertised extension set and the CSR behavior.",
+      "snippet": "\"sspm\", \"ssstateen\", \"ssstrict\", \"sstc\", \"sstvala\", \"sstvecd\", \"ssu64xl\", \"supm\", \"sv39\",",
+      "spec_citations": [
+        {
+          "spec_repo": "riscv-isa-manual",
+          "file_path": "src/priv/ssu64xl.adoc",
+          "line_start": 4,
+          "line_end": 6,
+          "excerpt": "If the Ssu64xl extension is implemented, then sstatus.UXL must be capable of holding the value 2 (i.e., UXLEN=64 must be supported)."
+        }
+      ]
+    }
+  ],
+  "overall_severity": "compliant"
+}

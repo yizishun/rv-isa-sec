@@ -1,0 +1,211 @@
+PR #1380  target=xiangshan  overall=bug_confirmed
+Spec: Smepmp extension definition activates mseccfg CSR dependency but XiangShan hardwires MML/MMWP/RLB as RO=0 with no MML truth table in the PMP checker — M-mode unconditional memory access pass-through persists even when software configures Smepmp lockdown, creating a privilege-escalation gap where trusted-execution-environment isolation is silently absent in hardware.
+Violation:
+  When XiangShan RTL instantiates mseccfg (MachineLevel.scala:319-327) and the
+  CSR module unconditionally decodes mseccfg without checking the misa.Smepmp
+  extension bit, the hardware exposes MML/MMWP/RLB fields (bits 0-2) as RO=0.
+  If software writes mseccfg expecting Smepmp-compliant behavior, the write is
+  silently dropped at CSR write-back (wen asserted but reg hardwired via RO),
+  and the PMP checker at PMP.scala:424 continues granting M-mode unconditional
+  pass-through (passThrough = mode > 1.U) with no MML qualifier and no MML
+  truth table in pmp_check (PMP.scala:404-412). The result: hardware allows
+  M-mode to access all physical memory while software believes Smepmp
+  restrictions are active.
+Consequence: privilege_escape
+Pattern:
+  (mseccfg.*(MML|MMWP|RLB).*RO|mseccfg\.regOut.*(0|1|2)|pmp_match_res.*passThr
+  ough.*mode.*>.*1|pmp_check.*cfg\.r.*cfg\.w.*cfg\.x(?!.*mml|.*priv|.*mode))
+------------------------------------------------------------
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:324-326  mseccfg CSR instantiation
+  Smepmp fields MML (bit 0), MMWP (bit 1), RLB (bit 2) are unconditionally
+  defined as RO (read-only, hardwired to 0) with no mechanism (e.g.,
+  definedBy/isAvailable guard) to make them WARL when the Smepmp extension is
+  enabled. Per spec (machine.adoc:2387-2389,2413,2420), these fields must be
+  WARL and must implement sticky semantics (once-set-cannot-unset until PMP
+  reset). When Smepmp is declared in the extension config, software that
+  writes mseccfg to enable MML/MMWP expects the hardware to enforce the MML
+  truth table, but the writes are silently dropped (wNoEffect on ROType),
+  leaving M-mode with unlimited physical memory access.
+  | val RLB   = RO( 2).withDescription("Rule-locking bypass control from the Smepmp extension.")
+  | val MMWP  = RO( 1).withDescription("Machine-mode whitelist policy control from the Smepmp extension.")
+  | val MML   = RO( 0).withDescription("Machine-mode lock-down control from the Smepmp extension.")
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2387-2398
+      "The Smepmp extension adds the RLB, MMWP, and the MML fields in
+      mseccfg. When mseccfg.RLB (Rule Locking Bypass) a WARL field... When
+      mseccfg.RLB is 0 a"
+    - riscv-isa-manual/src/priv/machine.adoc:2412-2418
+      "The mseccfg.MMWP (Machine-Mode Allowlist Policy) is a WARL field.
+      This field changes the default PMP policy for Machine mode when
+      accessing memory reg"
+    - riscv-isa-manual/src/priv/machine.adoc:2420-2423
+      "The mseccfg.MML (Machine Mode Lockdown) is a WARL field. The MML
+      bit changes the interpretation of the pmpcfg.L bit defined in pmp-
+      locking. This is a "
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/PMP.scala:424-424  pmp_match_res
+  The PMP checker's passThrough logic unconditionally grants M-mode (mode >
+  1.U) full access to regions without a matching locked PMP entry. There is no
+  input for mseccfg.MML/MMWP from the CSR module, and no conditional logic to
+  apply the MML truth table (smepmp.adoc:44-66) when MML is set. When MML=1
+  per spec, M-mode access should be governed by the LRWX truth table where
+  M-mode-only rules (L=1) enforce on M-mode and S/U-mode-only rules (L=0) deny
+  M-mode. Without this, the Smepmp extension's core security
+  guarantee—restricting M-mode from accessing less-privileged memory—is
+  absent.
+  | val passThrough = if (pmpEntries.isEmpty) true.B else (mode > 1.U)
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:44-66
+      "The physical memory protection rules when mseccfg.MML is set to 1
+      are summarized in the truth table below. L=0: M-mode Access
+      Exception for most encod"
+    - riscv-isa-manual/src/priv/machine.adoc:2467-2470
+      "Executing code with Machine mode privileges is only possible from
+      memory regions with a matching M-mode-only rule or a locked Shared-
+      Region rule with "
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/PMP.scala:404-412  pmp_check
+  pmp_check performs simple permission bit matching (cfg.r/cfg.w/cfg.x)
+  without any awareness of privilege mode or mseccfg.MML. When MML=1, the PMP
+  cfg bits encode different semantics per the truth table (e.g., LRWX=0010
+  with L=0 means 'M-mode Read/Write, S/U Read-only' for shared data). The
+  current checker treats cfg.r/w/x literally regardless of MML, so it would
+  incorrectly allow S/U-mode writes to a shared-data region that should be
+  read-only for S/U, or incorrectly deny M-mode access to an M-mode-only rule
+  where M-mode should be enforced.
+  | def pmp_check(cmd: UInt, cfg: PMPConfig) = {
+  |   val resp = Wire(new PMPRespBundle)
+  |   resp.ld := TlbCmd.isRead(cmd) && !TlbCmd.isAmo(cmd) && !cfg.r
+  |   resp.st := (TlbCmd.isWrite(cmd) || TlbCmd.isAmo(cmd)) && !cfg.w
+  |   resp.instr := TlbCmd.isExec(cmd) && !cfg.x
+  |   resp.mmio := false.B
+  |   resp.atomic := false.B
+  |   resp
+  | }
+  References:
+    - riscv-isa-manual/src/priv/machine.adoc:2426-2438
+      "The meaning of pmpcfg.L changes: Instead of marking a rule as
+      locked and enforced in all modes, it now marks a rule as M-mode-only
+      when set and S/U-mo"
+
+[bug_confirmed] src/main/scala/xiangshan/backend/fu/PMP.scala:433-446  pmp_match_res (match loop)
+  The PMP entry match loop uses 'ignore = passThrough && !pmp.cfg.l' to bypass
+  unlocked entries for M-mode. When MML=1 per Smepmp spec, the L bit semantics
+  change: L=0 means S/U-mode-only (enforced on S/U, denied on M) and L=1 means
+  M-mode-only. The current ignore logic treats L=0 entries as 'always bypass
+  for M-mode' which is correct only for the pre-Smepmp baseline. With MML=1,
+  M-mode should instead be denied by L=0 entries (S/U-mode-only rules deny
+  M-mode). The ignore expression must be conditioned on !mseccfg.MML.
+  | pmpEntries.zip(pmpDefault +: pmpEntries.take(num-1)).zipWithIndex.foreach{ case ((pmp, last_pmp), i) =>
+  |   val is_match = pmp.is_match(addr, size, lgMaxSize, last_pmp)
+  |   val ignore = passThrough && !pmp.cfg.l
+  |   val aligned = pmp.aligned(addr, size, lgMaxSize, last_pmp)
+  |   val cur = WireInit(pmp)
+  |   cur.cfg.r := aligned && (pmp.cfg.r || ignore)
+  |   cur.cfg.w := aligned && (pmp.cfg.w || ignore)
+  |   cur.cfg.x := aligned && (pmp.cfg.x || ignore)
+  |   match_vec(i) := is_match
+  |   cfg_vec(i) := cur
+  | }
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:33-34
+      "Without the Smepmp extension, it is not possible for a PMP rule to
+      be enforced only on non-Machine modes and denied on Machine mode. It
+      is only possib"
+    - riscv-isa-manual/src/priv/machine.adoc:2437-2438
+      "An S/U-mode-only rule is enforced on Supervisor and User modes and
+      denied on Machine mode."
+
+[potential_risk] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:319-327  mseccfg CSR instantiation
+  The mseccfg CSR module has no 'definedBy' or extension-gating field that
+  ties its Smepmp fields (RLB, MMWP, MML) to an Smepmp extension
+  configuration. Per the PR review comment, mseccfg registers should declare
+  their dependency on the Smepmp extension so that the fields are either
+  RW/WARL when the extension is present or absent/hardwired-RO when not.
+  Without this, there is no hardware-software contract: software can't
+  discover Smepmp support (the spec says sticky-bit semantics prevent
+  polling), and hardware can't conditionally enable the PMP MML logic.
+  | val mseccfg = Module(new CSRModule("Mseccfg", new CSRBundle {
+  |   val PMM   = EnvPMM(33, 32, wNoEffect).withReset(EnvPMM.Disable).withDescription(...)
+  |   val MLPE  = RO(10).withDescription(...)
+  |   val SSEED = RO( 9).withDescription(...)
+  |   val USEED = RO( 8).withDescription(...)
+  |   val RLB   = RO( 2).withDescription("Rule-locking bypass control from the Smepmp extension.")
+  |   val MMWP  = RO( 1).withDescription("Machine-mode whitelist policy control from the Smepmp extension.")
+  |   val MML   = RO( 0).withDescription("Machine-mode lock-down control from the Smepmp extension.")
+  | })).setAddr(CSRs.mseccfg)
+  References:
+    - riscv-isa-manual/src/priv/smepmp.adoc:76-76
+      "Since all fields defined in mseccfg as part of this extension are
+      locked when set (MMWP/MML) or locked when cleared (RLB), software
+      can't poll them fo"
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:421-429  pmp_match_res
+  The PMP default entry (pmpDefault) correctly grants all permissions (r/w/x =
+  passThrough) when no PMP entry matches, which is the correct pre-Smepmp
+  baseline behavior where M-mode has unlimited access to unmarked regions.
+  This is compliant for a system that does not implement Smepmp (MML=0).
+  | val passThrough = if (pmpEntries.isEmpty) true.B else (mode > 1.U)
+  | val pmpDefault = WireInit(0.U.asTypeOf(new PMPEntry()))
+  | pmpDefault.cfg.r := passThrough
+  | pmpDefault.cfg.w := passThrough
+  | pmpDefault.cfg.x := passThrough
+
+[compliant] src/main/scala/xiangshan/backend/fu/PMP.scala:586-591  PMPChecker (class)
+  The PMPChecker correctly routes the pmp_match_res and pma_match_res results
+  through pmp_check/pma_check, producing a combined PMP+PMA+keyID response.
+  The pipeline (optional RegEnable for leaveHitMux/sameCycle modes) correctly
+  handles the PMP check within the memory access path. This architecture is
+  correct—the issue is that the upstream pmp_match_res and pmp_check functions
+  lack mseccfg/MML awareness.
+  | val res_pmp = pmp_match_res(leaveHitMux, io.req.valid)(check_addr, req.size, io.check_env.pmp, io.check_env.mode, lgMaxSize)
+  | val res_pma = pma_match_res(leaveHitMux, io.req.valid)(check_addr, req.size, io.check_env.pma, io.check_env.mode, lgMaxSize)
+  | val cmd = if(leaveHitMux) RegEnable(req.cmd, io.req.valid) else req.cmd
+  | val resp_pmp = pmp_check(cmd, res_pmp.cfg)
+  | val resp_pma = pma_check(cmd, res_pma.cfg)
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:320-320  mseccfg CSR instantiation
+  The PMM field at bits 33:32 is correctly implemented as EnvPMM (WARL with
+  legal values Disable/PMLEN7/PMLEN16) per the Smmpm extension. This field is
+  properly wired to the TLB (NewCSR.scala:1482) for pointer masking control.
+  This is independent of the Smepmp extension fields.
+  | val PMM   = EnvPMM(33, 32, wNoEffect).withReset(EnvPMM.Disable).withDescription("Machine security memory protection mode from the Smmpm extension.")
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:321-323  mseccfg CSR instantiation
+  The MLPE (Zicfilp, bit 10), SSEED (Zkr, bit 9), and USEED (Zkr, bit 8)
+  fields are correctly defined as RO, indicating these extensions are not yet
+  implemented. This is consistent with the general pattern of unimplemented
+  extension fields being hardwired RO=0.
+  | val MLPE  = RO(10).withDescription("Machine landing-pad enable from the Zicfilp extension.")
+  | val SSEED = RO( 9).withDescription("Seed CSR enable from the Zkr extension.")
+  | val USEED = RO( 8).withDescription("User seed CSR enable from the Zkr extension.")
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRDefines.scala:194-200  EnvPMM enum
+  The EnvPMM WARL enum correctly defines legal values: Disable (b00), PMLEN7
+  (b10), PMLEN16 (b11). The encoding b01 is not a legal value, which matches
+  the Smmpm spec. The WARL mechanism correctly legalizes illegal writes.
+  | object EnvPMM extends CSREnum with WARLApply {
+  |   val Disable  = Value("b00".U)
+  |   val PMLEN7   = Value("b10".U)
+  |   val PMLEN16  = Value("b11".U)
+  |   override protected def legalValues: Seq[EnumType] = Seq(Disable, PMLEN7, PMLEN16)
+  | }
+
+[compliant] src/main/scala/xiangshan/backend/fu/NewCSR/CSRModule.scala:29-41  CSRModule (reconnectReg)
+  The CSRModule field update mechanism correctly handles RO fields: ROType
+  fields have no write update case (empty case at line 38), meaning writes to
+  RO fields are silently ignored. The wNoEffect write function on ROType
+  (CSRFields.scala:46) means no hardware state change occurs on write. This is
+  the correct behavior for hardwired fields, and is not itself a bug—the bug
+  is that the fields should NOT be RO when Smepmp is implemented.
+  | field.rwType match {
+  |   case WARLType(wfn, _) =>
+  |     field.addOtherUpdate(wen && wfield.isLegal, wdata.elements(str).asInstanceOf[CSREnumType])
+  |   case WLRLType(wfn, _) =>
+  |     field.addOtherUpdate(wen && wfield.isLegal, wdata.elements(str).asInstanceOf[CSREnumType])
+  |   case RWType() =>
+  |     field.addOtherUpdate(wen, wdata.elements(str).asInstanceOf[CSREnumType])
+  |   case ROType(_) =>
+  |   case _ =>
+  | }
+

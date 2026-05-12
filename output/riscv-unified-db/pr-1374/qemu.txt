@@ -1,0 +1,64 @@
+PR #1374  target=qemu  overall=bug_confirmed
+Spec: QEMU helper_vsetvl lacks the mandatory LMUL/SEW ratio-change check for the rs1==x0,rd==x0 keep-vl case; it gates incomplete behavior behind a non-default knob that tests vl-change instead of ratio-change, so a ratio change with coincidentally-valid old vl proceeds without vill=1, leaving guest with inconsistent {vtype,vl} state.
+Violation:
+  When executing vsetvli/vsetvl with rs1==x0 and rd==x0, QEMU writes the new
+  vtype unconditionally (vector_helper.c:125) without first saving and
+  comparing the old LMUL/SEW ratio against the new one. If the LMUL/SEW ratio
+  changes but the old vl happens to still fit within the new VLMAX (e.g., old
+  vl=4, ratio change keeps vlmax large enough), QEMU does NOT set vill=1 and
+  does NOT zero vl, because the only guard (rvv_vsetvl_x0_vill knob, default
+  off, line 119) checks 'env->vl != vl' rather than checking 'old_ratio !=
+  new_ratio'.
+Consequence: data_corruption
+Pattern:
+  helper_vsetvl writes env->vtype without saving old LMUL/SEW; ratio-change
+  check missing or confused with vl-change check; rvv_vsetvl_x0_vill knob
+  gating fraction of the required behavior
+------------------------------------------------------------
+[bug_confirmed] target/riscv/vector_helper.c:119-122  HELPER(vsetvl)
+  rvv_vsetvl_x0_vill knob defaults to false (cpu.c:2696), so by default QEMU
+  never sets vill for vsetvl/vsetvli with rs1=x0 && rd=x0 even when the new
+  SEW/LMUL ratio would change VLMAX. The spec (vector-common.adoc:1298)
+  requires this form 'can only be used when VLMAX and hence vl is not actually
+  changed by the new SEW/LMUL ratio' — use with a changing ratio is reserved
+  and implementations may set vill. QEMU silently accepts the illegal usage by
+  default, writing the new vtype unconditionally (line 125) without checking
+  old vs new VLMAX.
+  | if (cpu->cfg.rvv_vsetvl_x0_vill && x0 && (env->vl != vl)) {
+  |         reset_ill_vtype(env);
+  |         return 0;
+  |     }
+  | 
+  |     env->vl = vl;
+  |     env->vtype = s2;
+
+[bug_confirmed] target/riscv/vector_helper.c:61-106  HELPER(vsetvl)
+  No check for pre-existing env->vill == 1 before computing vl/vtype for the
+  rs1=x0 && rd=x0 case. The spec (vector-common.adoc:1298) states: 'Use of the
+  instructions is also reserved if vill was 1 beforehand. Implementations may
+  set vill in either case.' QEMU only checks the vill bit from the NEW vtype
+  value s2 (line 72), never reads env->vill. A guest that calls vsetvl with
+  rs1=x0,rd=x0 while vill=1 should have the instruction treated as reserved,
+  but QEMU proceeds to compute new vl/vtype without detecting the pre-existing
+  vill condition.
+  | bool vill = (s2 >> (xlen - 1)) & 0x1;
+  |     ...
+  |     if ((sew > cpu->cfg.elen) || vill || (vtype_reserved(env, s2) != 0)) {
+  |         reset_ill_vtype(env);
+  |         return 0;
+  |     }
+
+[potential_risk] target/riscv/vector_helper.c:119-122  HELPER(vsetvl)
+  Even with rvv_vsetvl_x0_vill=true, the check uses 'env->vl != vl' to detect
+  ratio changes, rather than comparing old VLMAX against new VLMAX. This can
+  miss cases where the SEW/LMUL ratio changes (and thus VLMAX changes) but the
+  old vl happens to still fit within the new VLMAX, e.g. old VLMAX=1, vl=1,
+  new VLMAX=2 gives vl=min(1,2)=1 so env->vl==vl passes but VLMAX changed. The
+  spec's NOTE (vector-common.adoc:1300-1308) primarily concerns VLMAX
+  shrinking, but the normative text says 'VLMAX... is not actually changed'
+  without qualification.
+  | if (cpu->cfg.rvv_vsetvl_x0_vill && x0 && (env->vl != vl)) {
+  |         reset_ill_vtype(env);
+  |         return 0;
+  |     }
+

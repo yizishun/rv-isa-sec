@@ -1,0 +1,51 @@
+PR #1685  target=qemu  overall=bug_confirmed
+Spec: check_zicbo_envcfg raises IllegalInstruction for VS/VU modes when menvcfg enable bit is 0, but spec requires VirtualInstruction so HS-mode hypervisor can trap-and-emulate CBO instructions
+Violation:
+  In check_zicbo_envcfg() at target/riscv/op_helper.c:148, when env->priv <
+  PRV_M and the menvcfg enable bit (CBZE/CBCFE/CBIE) is 0, QEMU raises
+  RISCV_EXCP_ILLEGAL_INST for all non-M modes without inspecting
+  env->virt_enabled. The corrected spec requires VS/VU modes to raise
+  VirtualInstruction (RISCV_EXCP_VIRT_INSTRUCTION_FAULT) instead, so the HS-
+  mode hypervisor can trap-and-emulate. QEMU's flat menvcfg check at line 148
+  fires before the virt_enabled path at line 152 is reached, causing the
+  exception to route to M-mode with the wrong exception code, bypassing the
+  hypervisor delegation path (medeleg[22]).
+Consequence: function_loss
+Pattern:
+  env->priv <
+  PRV_M.*get_field.*menvcfg.*(CBZE|CBCFE|CBIE).*ILLEGAL_INST(?!.*virt_enabled)
+------------------------------------------------------------
+[bug_confirmed] target/riscv/op_helper.c:144-162  check_zicbo_envcfg
+  The menvcfg check at line 148 fires for VS/VU modes (env->priv < PRV_M)
+  before the virt_enabled path at line 152 is reached, causing QEMU to raise
+  RISCV_EXCP_ILLEGAL_INST instead of RISCV_EXCP_VIRT_INSTRUCTION_FAULT. The
+  sequential if structure (no else-if) means the menvcfg check at line 148
+  unconditionally catches all non-M modes including VS/VU, and
+  riscv_raise_exception() longjmps out before the virt_enabled check at line
+  152 can execute. The corrected spec requires VS/VU modes to raise
+  VirtualInstruction so the HS-mode hypervisor can trap-and-emulate, but QEMU
+  routes the exception to M-mode with the wrong exception code, bypassing the
+  hypervisor delegation path (medeleg[22] for illegal-instruction). Fix: add
+  !env->virt_enabled guard to line 148, or restructure to use else-if matching
+  the spec's pseudo-code.
+  | if ((env->priv < PRV_M) && !get_field(env->menvcfg, envbits)) {
+  |         riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, ra);
+  |     }
+  | 
+  |     if (env->virt_enabled &&
+  |         (((env->priv <= PRV_S) && !get_field(env->henvcfg, envbits)) ||
+  |          ((env->priv < PRV_S) && !get_field(env->senvcfg, envbits)))) {
+  References:
+    - riscv-isa-manual/src/unpriv/cmo.adoc:627-649
+      "[[norm:cbo-zero_basedon_xenvcfg-CBZE]] Finally, a cbo.zero
+      instruction executes or raises an illegal-instruction or virtual-
+      instruction exception base"
+    - riscv-isa-manual/src/unpriv/cmo.adoc:545-564
+      "[[norm:cbo-inval]] A cbo.inval instruction executes or raises
+      either an illegal-instruction exception or a virtual-instruction
+      exception based on the "
+    - riscv-isa-manual/src/unpriv/cmo.adoc:599-624
+      "[[norm:cbo-clean_cbo-flush]] A cbo.clean or cbo.flush instruction
+      executes or raises an illegal-instruction or virtual-instruction
+      exception based on "
+
